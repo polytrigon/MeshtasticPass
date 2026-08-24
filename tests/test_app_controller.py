@@ -34,9 +34,16 @@ class AppControllerTests(unittest.TestCase):
         named = self.make_message(long_name="Alice Trail", short_name="ALCE")
         fallback = self.make_message(long_name=None, short_name=None)
 
-        entry = received_chat_entry(named, accepted_at=123.0)
+        entry = received_chat_entry(
+            named,
+            accepted_at=123.0,
+            unread=True,
+            new_highlight_until=126.0,
+        )
         self.assertEqual(entry.author, "Alice Trail")
         self.assertEqual(entry.accepted_at, 123.0)
+        self.assertTrue(entry.unread)
+        self.assertEqual(entry.new_highlight_until, 126.0)
         self.assertEqual(received_chat_entry(fallback).author, "!a11ce001")
         self.assertFalse(entry.outgoing)
 
@@ -47,6 +54,8 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual(entry.text, "hello")
         self.assertEqual(entry.accepted_at, 456.0)
         self.assertTrue(entry.outgoing)
+        self.assertFalse(entry.unread)
+        self.assertIsNone(entry.new_highlight_until)
 
     def test_monitor_stops_and_closes_service_cleanly(self) -> None:
         radio = FakeRadio()
