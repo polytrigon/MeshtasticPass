@@ -68,6 +68,7 @@ python check_radio.py --device /dev/ttyACM0
 ```text
 check_radio.py     Small command-line connection check
 receive_messages.py  Text-message receive monitor
+send_message.py    One-shot real or simulated text sender
 radio_service.py   All Meshtastic connection and device-info logic
 simulated_radio_service.py  Deterministic radio simulator
 requirements.txt   Python dependency
@@ -115,3 +116,36 @@ therefore accept either service without parsing fake data or adding simulation
 branches throughout the application. Explicit hooks are available for later
 disconnect, reconnect, error, and custom-message scenarios; no StreetPass
 protocol behavior is simulated yet.
+
+## Milestone 4: send text messages
+
+Application code can send broadcast or direct text messages through the same
+small API on `RadioService` and `SimulatedRadioService`:
+
+```python
+radio.send_text(
+    "hello",
+    channel_index=0,
+    destination_node_id=None,
+)
+```
+
+On a connected real radio, try these one-shot commands:
+
+```bash
+python send_message.py "hello"
+python send_message.py "hello" --channel 1
+python send_message.py "hello" --to !a11ce001
+```
+
+Test the same application path without hardware:
+
+```bash
+python send_message.py "hello" --simulate
+```
+
+The real service translates the request to Meshtastic's `sendText` method.
+The simulator stores accepted sends in its read-only `sent_messages` history.
+An accepted send does not claim LoRa delivery or an acknowledgement. Invalid
+input, a disconnected radio, and SDK failures raise the application-level
+`RadioSendError`, so future Chat code does not need to handle SDK exceptions.
