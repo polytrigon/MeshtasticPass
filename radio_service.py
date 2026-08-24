@@ -35,6 +35,25 @@ class RadioSendError(Exception):
     """Raised when an application text message cannot be accepted for sending."""
 
 
+class DeliveryState(Enum):
+    """Truthful application-level knowledge about one outgoing message."""
+
+    SENDING = "SENDING"
+    SENT = "SENT"
+    HEARD = "HEARD"
+    UNCONFIRMED = "UNCONFIRMED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class SendStatus:
+    """An asynchronous ACK/NAK result with no SDK packet structures."""
+
+    state: DeliveryState
+    packet_id: int | None
+    detail: str = ""
+
+
 @dataclass(frozen=True)
 class RadioInfo:
     """Small, UI-friendly summary of the connected radio."""
@@ -77,11 +96,13 @@ class ReceivedMessage:
 
 @dataclass(frozen=True)
 class SentMessage:
-    """An application-level record of a text message accepted for sending."""
+    """An application-level record accepted by the local send API."""
 
     text: str
     channel_index: int
     destination_node_id: str | None
+    packet_id: int | None = None
+    immediate_state: DeliveryState | None = None
 
 
 def validate_send_request(
@@ -208,8 +229,13 @@ class RadioService:
         text: str,
         channel_index: int = 0,
         destination_node_id: str | None = None,
+        status_handler: Callable[[SendStatus], None] | None = None,
     ) -> SentMessage:
-        """Send text through Meshtastic without exposing SDK details to callers."""
+        """Submit text and optionally report matching routing ACK/NAK events.
+
+        A successful return means the Python SDK accepted the packet for local
+        radio submission. It does not mean another node received or read it.
+        """
         message = validate_send_request(
             text,
             channel_index,
@@ -225,13 +251,75 @@ class RadioService:
         if message.destination_node_id is not None:
             sdk_arguments["destinationId"] = message.destination_node_id
 
+        if status_handler is not None:
+            # Meshtastic 2.7.x only permits ordinary ACK packets through a
+            # sendText response callback when its name is exactly onAckNak.
+            def onAckNak(packet: dict[str, Any]) -> None:
+                status = self._parse_send_response(packet)
+                if status is not None:
+                    status_handler(status)
+
+            sdk_arguments.update(wantAck=True, onResponse=onAckNak)
+
         try:
-            self._interface.sendText(**sdk_arguments)
+            sdk_packet = self._interface.sendText(**sdk_arguments)
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
             raise RadioSendError(f"Could not send text message: {detail}") from error
 
-        return message
+        packet_id = self._optional_int(getattr(sdk_packet, "id", None))
+        return SentMessage(
+            message.text,
+            message.channel_index,
+            message.destination_node_id,
+            packet_id=packet_id,
+        )
+
+    def _parse_send_response(self, packet: Any) -> SendStatus | None:
+        """Convert a Meshtastic routing ACK/NAK into application state."""
+        if not isinstance(packet, dict):
+            return None
+        decoded = packet.get("decoded")
+        if not isinstance(decoded, dict) or decoded.get("portnum") != "ROUTING_APP":
+            return None
+        routing = decoded.get("routing")
+        if not isinstance(routing, dict):
+            return None
+        reason = self._normalize_routing_error(routing)
+        if reason is None:
+            return None
+        packet_id = self._optional_int(decoded.get("requestId"))
+        if reason == "NONE":
+            return SendStatus(DeliveryState.HEARD, packet_id)
+        return SendStatus(
+            DeliveryState.FAILED,
+            packet_id,
+            detail=f"Meshtastic routing failure: {reason}",
+        )
+
+    @staticmethod
+    def _normalize_routing_error(routing: dict[str, Any]) -> str | None:
+        """Normalize the enum shape emitted by Meshtastic SDK 2.7.11.
+
+        The SDK uses protobuf ``MessageToDict`` with its default enum behavior:
+        known values are symbolic strings, while an unset optional NONE field
+        is omitted. Unknown future enum numbers remain integers and must not be
+        interpreted as a definite ACK or NAK.
+        """
+        if "errorReason" not in routing:
+            return "NONE"
+
+        reason = routing["errorReason"]
+        if not isinstance(reason, str):
+            return None
+
+        try:
+            from meshtastic.protobuf import mesh_pb2
+
+            mesh_pb2.Routing.Error.Value(reason)
+        except (AttributeError, ImportError, ValueError):
+            return None
+        return reason
 
     def close(self) -> None:
         """Close the serial connection if it is open."""

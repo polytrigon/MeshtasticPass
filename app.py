@@ -20,10 +20,22 @@ from app_controller import (
     create_radio_service,
     outgoing_chat_entry,
     received_chat_entry,
+    stored_chat_entry,
 )
 from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
-from radio_service import RadioEvent, RadioInfo, RadioSendError, RadioState, ReceivedMessage
+from chat_store import ChatStore, ChatStoreError
+from radio_service import (
+    DeliveryState,
+    RadioEvent,
+    RadioInfo,
+    RadioSendError,
+    RadioState,
+    ReceivedMessage,
+    SendStatus,
+    SentMessage,
+)
 from relative_time import format_relative_age
+from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 from terminal_cursor import TerminalCursor
 
 
@@ -39,6 +51,9 @@ ANIMATED_STATUS = {
     RadioState.OFFLINE: "OFFLINE — RETRYING",
     RadioState.ERROR: "CONNECTION ERROR — RETRYING",
 }
+
+CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
+
 
 class StyleSelector(Static):
     """One focusable row in the keyboard-driven STYLE section."""
@@ -140,8 +155,69 @@ class RadioMessageReceived(Message):
         self.message = message
 
 
+class SendSubmitted(Message):
+    def __init__(
+        self,
+        entry: ChatEntry,
+        sent: SentMessage,
+        generation: int,
+    ) -> None:
+        super().__init__()
+        self.entry = entry
+        self.sent = sent
+        self.generation = generation
+
+
+class SendFailed(Message):
+    def __init__(self, entry: ChatEntry, detail: str, generation: int) -> None:
+        super().__init__()
+        self.entry = entry
+        self.detail = detail
+        self.generation = generation
+
+
+class DeliveryStatusReceived(Message):
+    def __init__(
+        self,
+        entry: ChatEntry,
+        status: SendStatus,
+        generation: int,
+    ) -> None:
+        super().__init__()
+        self.entry = entry
+        self.status = status
+        self.generation = generation
+
+
+class ChatTranscript(VerticalScroll):
+    """Focusable transcript so navigation never types into the message box."""
+
+    can_focus = True
+
+    def on_key(self, event: Key) -> None:
+        """Keep transcript navigation deterministic when this widget has focus."""
+        app = self.app
+        if event.key in ("up", "down"):
+            self.scroll_relative(y=-1 if event.key == "up" else 1)
+            app.call_after_refresh(app._clear_indicator_if_at_bottom)
+            event.stop()
+        elif event.key in ("pageup", "pagedown"):
+            step = max(1, self.region.height - 2)
+            self.scroll_relative(y=-step if event.key == "pageup" else step)
+            app.call_after_refresh(app._clear_indicator_if_at_bottom)
+            event.stop()
+        elif event.key == "end":
+            app._jump_to_newest()
+            event.stop()
+
+
 class ChatEntryWidget(Vertical):
     """One chat message whose relative timestamp can refresh in place."""
+
+    can_focus = True
+
+    class SelectionChanged(Message):
+        pass
 
     def __init__(self, entry: ChatEntry, now: float | None = None) -> None:
         self.entry = entry
@@ -152,15 +228,25 @@ class ChatEntryWidget(Vertical):
             classes="chat-entry-timestamp",
             markup=False,
         )
-        header = Horizontal(
-            Static(
-                self.entry.author,
-                classes="chat-entry-author",
+        header_parts: list[Static] = [
+            Static(self.entry.author, classes="chat-entry-author", markup=False),
+            Static(" / ", classes="chat-entry-separator", markup=False),
+        ]
+        self.delivery_label: Static | None = None
+        if self.entry.outgoing:
+            self.delivery_label = Static(
+                "",
+                classes="chat-entry-delivery",
                 markup=False,
-            ),
-            self.timestamp_label,
-            classes="chat-entry-header",
-        )
+            )
+            header_parts.extend(
+                [
+                    self.delivery_label,
+                    Static(" / ", classes="chat-entry-separator", markup=False),
+                ]
+            )
+        header_parts.append(self.timestamp_label)
+        header = Horizontal(*header_parts, classes="chat-entry-header")
         self.message_label = Static(
             self.entry.text,
             classes="chat-entry-text",
@@ -171,6 +257,7 @@ class ChatEntryWidget(Vertical):
             self.message_label,
             classes="chat-entry new-message" if is_new else "chat-entry",
         )
+        self.refresh_delivery_state(1)
 
     def refresh_timestamp(self, now: float) -> None:
         """Update only the existing timestamp child for this entry."""
@@ -182,6 +269,23 @@ class ChatEntryWidget(Vertical):
     def refresh_new_message_state(self) -> None:
         """Apply the entry's persistent new/read presentation state."""
         self.set_class(self.entry.is_new and not self.entry.outgoing, "new-message")
+
+    def refresh_delivery_state(self, dot_count: int) -> None:
+        if self.delivery_label is None:
+            return
+        state = self.entry.delivery_state or DeliveryState.SENT
+        text = state.value
+        if state is DeliveryState.SENDING:
+            text += "." * dot_count
+        self.delivery_label.update(text, layout=False)
+        for name in DeliveryState:
+            self.set_class(name is state, f"delivery-{name.value.lower()}")
+
+    def on_focus(self, _event: Focus) -> None:
+        self.post_message(self.SelectionChanged())
+
+    def on_blur(self, _event: Blur) -> None:
+        self.post_message(self.SelectionChanged())
 
 
 class MeshtasticPassApp(App[None]):
@@ -281,14 +385,22 @@ class MeshtasticPassApp(App[None]):
         margin-bottom: 1;
     }
 
+    .chat-entry:focus {
+        background: #181818;
+    }
+
     .chat-entry-header {
         height: 1;
     }
 
     .chat-entry-author {
         width: auto;
-        margin-right: 2;
         text-style: bold;
+    }
+
+    .chat-entry-separator, .chat-entry-delivery {
+        width: auto;
+        color: #8a8a8a;
     }
 
     .chat-entry-timestamp {
@@ -303,6 +415,36 @@ class MeshtasticPassApp(App[None]):
 
     Screen.theme-orange .chat-entry-timestamp {
         color: #a85c00;
+    }
+
+    Screen.theme-green .chat-entry-separator,
+    Screen.theme-green .chat-entry-delivery {
+        color: #168f0a;
+    }
+
+    Screen.theme-orange .chat-entry-separator,
+    Screen.theme-orange .chat-entry-delivery {
+        color: #a85c00;
+    }
+
+    .chat-entry.delivery-sending .chat-entry-delivery {
+        color: #f2f2f2;
+    }
+
+    Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery {
+        color: #39ff14;
+    }
+
+    Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery {
+        color: #ff8c00;
+    }
+
+    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: #ffb000;
+    }
+
+    .chat-entry.delivery-failed .chat-entry-delivery {
+        color: #ff1744;
     }
 
     .chat-entry-text {
@@ -339,6 +481,12 @@ class MeshtasticPassApp(App[None]):
         border: none;
     }
 
+    #chat-new-below {
+        height: 1;
+        color: #ffb000;
+        text-align: right;
+    }
+
     #footer {
         height: 2;
         padding: 0 1;
@@ -370,6 +518,8 @@ class MeshtasticPassApp(App[None]):
         radio: object,
         settings: AppSettings | None = None,
         terminal_cursor: TerminalCursor | None = None,
+        chat_store: ChatStore | None = None,
+        history_error: str = "",
     ) -> None:
         super().__init__()
         self.radio = radio
@@ -377,11 +527,16 @@ class MeshtasticPassApp(App[None]):
         self.current_tab = "connection"
         self.chat_history: list[ChatEntry] = []
         self.unread_count = 0
+        self.transcript_new_count = 0
+        self.chat_store = chat_store
+        self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
+        self._delivery_timer: Timer | None = None
+        self._send_dot_count = 1
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -402,7 +557,8 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="style-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield Static("> CHAT — PRIMARY", id="chat-title", classes="page-title")
-                yield VerticalScroll(id="chat-log")
+                yield ChatTranscript(id="chat-log")
+                yield Static(id="chat-new-below")
                 yield Static(id="send-error")
                 yield Input(placeholder="> message", id="chat-input")
             with Vertical(id="profile", classes="tab-page"):
@@ -428,6 +584,14 @@ class MeshtasticPassApp(App[None]):
             self._refresh_chat_timestamps,
             name="chat-relative-timestamps",
         )
+        self._delivery_timer = self.set_interval(
+            0.45,
+            self._advance_delivery_states,
+            name="chat-delivery-states",
+        )
+        self._load_chat_history()
+        if self._history_error:
+            self._show_send_error(self._history_error)
         self.query_one(FontSizeSelector).focus()
         self._monitor.start()
 
@@ -436,16 +600,47 @@ class MeshtasticPassApp(App[None]):
             self._connection_animation_timer.stop()
         if self._chat_timestamp_timer is not None:
             self._chat_timestamp_timer.stop()
+        if self._delivery_timer is not None:
+            self._delivery_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
+        if self.chat_store is not None:
+            self.chat_store.close()
 
     def on_key(self, event: Key) -> None:
         """Handle global keys only while the chat input is not focused."""
         if isinstance(self.focused, Input):
             if event.key == "escape":
-                self.set_focus(None)
+                self.query_one("#chat-log", ChatTranscript).focus()
                 event.stop()
             return
+
+        if self.current_tab == "chat":
+            transcript = self.query_one("#chat-log", ChatTranscript)
+            if event.key in ("up", "down"):
+                transcript.scroll_relative(y=-1 if event.key == "up" else 1)
+                self.call_after_refresh(self._clear_indicator_if_at_bottom)
+                event.stop()
+                return
+            if event.key in ("pageup", "pagedown"):
+                step = max(1, transcript.region.height - 2)
+                transcript.scroll_relative(
+                    y=-step if event.key == "pageup" else step
+                )
+                self.call_after_refresh(self._clear_indicator_if_at_bottom)
+                event.stop()
+                return
+            if event.key == "end":
+                self._jump_to_newest()
+                event.stop()
+                return
+            if event.key.lower() == "r" and isinstance(
+                self.focused, ChatEntryWidget
+            ):
+                if self.focused.entry.delivery_state is DeliveryState.UNCONFIRMED:
+                    self._rebroadcast(self.focused.entry)
+                    event.stop()
+                return
 
         tab_for_key = {
             "1": "connection",
@@ -476,6 +671,7 @@ class MeshtasticPassApp(App[None]):
             self.query_one(FontSizeSelector).focus()
         else:
             self.set_focus(None)
+        self._update_footer()
 
     @on(StyleSelector.Changed)
     def save_style_setting(self, event: StyleSelector.Changed) -> None:
@@ -512,27 +708,98 @@ class MeshtasticPassApp(App[None]):
         if not text.strip():
             self._show_send_error("Message text cannot be empty.")
             return
+        entry = self._start_outgoing(text)
+        generation = entry.send_generation
         self.run_worker(
-            lambda: self._send_from_thread(text),
+            lambda: self._send_from_thread(entry, generation),
             thread=True,
-            exclusive=True,
         )
 
-    def _send_from_thread(self, text: str) -> None:
-        try:
-            self.radio.send_text(text, channel_index=0)
-        except RadioSendError as error:
-            self.call_from_thread(self._show_send_error, str(error))
-        else:
-            self.call_from_thread(self._accepted_send, text)
+    def _send_from_thread(
+        self,
+        entry: ChatEntry,
+        generation: int | None = None,
+    ) -> None:
+        attempt_generation = entry.send_generation if generation is None else generation
 
-    def _accepted_send(self, text: str) -> None:
-        entry = outgoing_chat_entry(text)
+        def status_handler(status: SendStatus) -> None:
+            self.post_message(
+                DeliveryStatusReceived(entry, status, attempt_generation)
+            )
+
+        try:
+            sent = self.radio.send_text(
+                entry.text,
+                channel_index=entry.channel_index,
+                status_handler=status_handler,
+            )
+        except RadioSendError as error:
+            self.post_message(SendFailed(entry, str(error), attempt_generation))
+        else:
+            self.post_message(SendSubmitted(entry, sent, attempt_generation))
+
+    def _start_outgoing(self, text: str) -> ChatEntry:
+        entry = outgoing_chat_entry(text, delivery_state=DeliveryState.SENDING)
+        entry.send_generation = 1
         self.chat_history.append(entry)
+        self._persist_outgoing(entry)
         self._append_chat_widget(entry)
         chat_input = self.query_one("#chat-input", Input)
         chat_input.value = ""
         self._show_send_error("")
+        return entry
+
+    def _accepted_send(self, text: str) -> None:
+        """Compatibility helper for a locally accepted outgoing entry."""
+        entry = outgoing_chat_entry(text, delivery_state=DeliveryState.SENT)
+        self.chat_history.append(entry)
+        self._persist_outgoing(entry)
+        self._append_chat_widget(entry)
+        chat_input = self.query_one("#chat-input", Input)
+        chat_input.value = ""
+        self._show_send_error("")
+
+    @on(SendSubmitted)
+    def send_was_submitted(self, event: SendSubmitted) -> None:
+        entry = event.entry
+        if event.generation != entry.send_generation:
+            return
+        entry.packet_id = event.sent.packet_id
+        state = (
+            entry.delivery_state
+            if entry.delivery_state in (DeliveryState.HEARD, DeliveryState.FAILED)
+            else event.sent.immediate_state or DeliveryState.SENT
+        )
+        entry.confirmation_deadline = (
+            monotonic() + CHAT_CONFIRMATION_TIMEOUT_SECONDS
+            if state is DeliveryState.SENT
+            else None
+        )
+        self._set_delivery_state(entry, state, packet_id=event.sent.packet_id)
+
+    @on(SendFailed)
+    def send_failed(self, event: SendFailed) -> None:
+        if event.generation != event.entry.send_generation:
+            return
+        self._set_delivery_state(
+            event.entry,
+            DeliveryState.FAILED,
+            detail=event.detail,
+        )
+        self._show_send_error(event.detail)
+
+    @on(DeliveryStatusReceived)
+    def delivery_status_received(self, event: DeliveryStatusReceived) -> None:
+        if event.generation != event.entry.send_generation:
+            return
+        if event.entry.packet_id not in (None, event.status.packet_id):
+            return
+        self._set_delivery_state(
+            event.entry,
+            event.status.state,
+            packet_id=event.status.packet_id,
+            detail=event.status.detail,
+        )
 
     def _radio_event_from_thread(self, event: RadioEvent) -> None:
         try:
@@ -552,6 +819,8 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
+        if (message.channel_index or 0) != 0:
+            return
         received_at = time()
         monotonic_now = monotonic()
         chat_is_visible = self.current_tab == "chat"
@@ -562,6 +831,8 @@ class MeshtasticPassApp(App[None]):
             unread=not chat_is_visible,
             is_new=True,
         )
+        if not self._persist_incoming(entry):
+            return
         self.chat_history.append(entry)
         self._append_chat_widget(entry)
         if not chat_is_visible:
@@ -569,14 +840,55 @@ class MeshtasticPassApp(App[None]):
             self._update_tab_bar()
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
-        transcript = self.query_one("#chat-log", VerticalScroll)
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        should_follow = self._is_near_chat_bottom()
         transcript.mount(ChatEntryWidget(entry))
-        transcript.scroll_end(animate=False)
+        if should_follow:
+            self.call_after_refresh(self._jump_to_newest)
+        else:
+            self.transcript_new_count += 1
+            self._update_transcript_indicator()
 
     def _refresh_chat_timestamps(self, now: float | None = None) -> None:
         current_time = monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
+
+    def _advance_delivery_states(self) -> None:
+        self._send_dot_count = self._send_dot_count % 3 + 1
+        now = monotonic()
+        for entry in self.chat_history:
+            if (
+                entry.delivery_state is DeliveryState.SENT
+                and entry.confirmation_deadline is not None
+                and now >= entry.confirmation_deadline
+            ):
+                self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
+        for widget in self.query(ChatEntryWidget):
+            widget.refresh_delivery_state(self._send_dot_count)
+
+    def _is_near_chat_bottom(self) -> bool:
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        return transcript.max_scroll_y - transcript.scroll_y <= 1
+
+    def _jump_to_newest(self) -> None:
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        transcript.scroll_end(animate=False)
+        self.transcript_new_count = 0
+        self._update_transcript_indicator()
+
+    def _clear_indicator_if_at_bottom(self) -> None:
+        if self._is_near_chat_bottom() and self.transcript_new_count:
+            self.transcript_new_count = 0
+            self._update_transcript_indicator()
+
+    def _update_transcript_indicator(self) -> None:
+        label = (
+            f"↓ {self.transcript_new_count} NEW"
+            if self.transcript_new_count
+            else ""
+        )
+        self.query_one("#chat-new-below", Static).update(label)
 
     def _mark_unread_messages_viewed(self) -> None:
         for entry in self.chat_history:
@@ -593,6 +905,151 @@ class MeshtasticPassApp(App[None]):
             return
         for widget in self.query(ChatEntryWidget):
             widget.refresh_new_message_state()
+
+    def _load_chat_history(self) -> None:
+        if self.chat_store is None:
+            return
+        try:
+            stored_messages = self.chat_store.load_recent(channel_index=0)
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+            return
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        for stored in stored_messages:
+            entry = stored_chat_entry(stored)
+            self.chat_history.append(entry)
+            transcript.mount(ChatEntryWidget(entry))
+        if stored_messages:
+            self.call_after_refresh(self._jump_to_newest)
+
+    def _persist_incoming(self, entry: ChatEntry) -> bool:
+        if self.chat_store is None:
+            return True
+        try:
+            result = self.chat_store.add_incoming(
+                packet_id=entry.packet_id,
+                node_id=entry.node_id or "unknown",
+                sender_name=entry.sender_name,
+                sender_short_name=entry.sender_short_name,
+                channel_index=entry.channel_index,
+                text=entry.text,
+                radio_rx_at=entry.radio_rx_at,
+                received_at=entry.received_at,
+            )
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+            return True
+        entry.message_id = result.message_id
+        return result.inserted
+
+    def _persist_outgoing(self, entry: ChatEntry) -> None:
+        if self.chat_store is None:
+            return
+        try:
+            entry.message_id = self.chat_store.add_outgoing(
+                text=entry.text,
+                channel_index=entry.channel_index,
+                local_sent_at=entry.local_sent_at or entry.received_at,
+                delivery_state=(entry.delivery_state or DeliveryState.SENDING).value,
+            )
+            entry.active_attempt_id = self.chat_store.add_send_attempt(
+                entry.message_id,
+                time(),
+                (entry.delivery_state or DeliveryState.SENDING).value,
+            )
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+
+    def _persist_new_attempt(self, entry: ChatEntry) -> None:
+        if self.chat_store is None or entry.message_id is None:
+            entry.active_attempt_id = None
+            return
+        try:
+            entry.active_attempt_id = self.chat_store.add_send_attempt(
+                entry.message_id,
+                time(),
+            )
+            self.chat_store.update_delivery_state(
+                entry.message_id,
+                DeliveryState.SENDING.value,
+                attempt_id=entry.active_attempt_id,
+            )
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+
+    def _set_delivery_state(
+        self,
+        entry: ChatEntry,
+        state: DeliveryState,
+        *,
+        packet_id: int | None = None,
+        detail: str = "",
+    ) -> None:
+        entry.delivery_state = state
+        if packet_id is not None:
+            entry.packet_id = packet_id
+        if state is not DeliveryState.SENT:
+            entry.confirmation_deadline = None
+        completed_at = (
+            time()
+            if state in (
+                DeliveryState.HEARD,
+                DeliveryState.UNCONFIRMED,
+                DeliveryState.FAILED,
+            )
+            else None
+        )
+        if self.chat_store is not None and entry.message_id is not None:
+            try:
+                self.chat_store.update_delivery_state(
+                    entry.message_id,
+                    state.value,
+                    attempt_id=entry.active_attempt_id,
+                    packet_id=entry.packet_id,
+                    error=detail or None,
+                    completed_at=completed_at,
+                )
+            except ChatStoreError as error:
+                self._show_send_error(str(error))
+        for widget in self.query(ChatEntryWidget):
+            if widget.entry is entry:
+                widget.refresh_delivery_state(self._send_dot_count)
+                break
+        self._update_footer()
+
+    def _rebroadcast(self, entry: ChatEntry) -> None:
+        if entry.delivery_state is not DeliveryState.UNCONFIRMED:
+            return
+        entry.delivery_state = DeliveryState.SENDING
+        entry.send_generation += 1
+        entry.packet_id = None
+        entry.confirmation_deadline = None
+        self._persist_new_attempt(entry)
+        self._set_delivery_state(entry, DeliveryState.SENDING)
+        self._show_send_error("")
+        generation = entry.send_generation
+        self.run_worker(
+            lambda: self._send_from_thread(entry, generation),
+            thread=True,
+        )
+
+    @on(ChatEntryWidget.SelectionChanged)
+    def chat_selection_changed(
+        self,
+        _event: ChatEntryWidget.SelectionChanged,
+    ) -> None:
+        self._update_footer()
+
+    def _update_footer(self) -> None:
+        text = "1-4 switch tabs    Q quit"
+        if (
+            isinstance(self.focused, ChatEntryWidget)
+            and self.focused.entry.delivery_state is DeliveryState.UNCONFIRMED
+        ):
+            text += "    [R] REBROADCAST"
+        elif self.current_tab == "chat":
+            text += "    ESC scroll    END newest"
+        self.query_one("#footer", Static).update(text)
 
     def restore_terminal_cursor(self) -> None:
         """Restore the host terminal cursor; safe to call repeatedly."""
@@ -669,13 +1126,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="use the deterministic radio simulator",
     )
+    parser.add_argument(
+        "--simulate-send-outcome",
+        action="append",
+        choices=[outcome.value for outcome in SimulatedSendOutcome],
+        default=[],
+        help="script each simulated send result (may be repeated)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    radio = create_radio_service(args.simulate, args.device)
-    app = MeshtasticPassApp(radio, AppSettings.load())
+    if args.simulate and args.simulate_send_outcome:
+        radio = SimulatedRadioService(
+            send_outcomes=tuple(
+                SimulatedSendOutcome(value)
+                for value in args.simulate_send_outcome
+            )
+        )
+    else:
+        radio = create_radio_service(args.simulate, args.device)
+    history_error = ""
+    try:
+        chat_store = ChatStore.open()
+    except ChatStoreError as error:
+        chat_store = None
+        history_error = str(error)
+    app = MeshtasticPassApp(
+        radio,
+        AppSettings.load(),
+        chat_store=chat_store,
+        history_error=history_error,
+    )
     try:
         app.run()
     finally:
