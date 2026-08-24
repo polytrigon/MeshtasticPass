@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Event, Thread
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Callable
 
+from message_time import make_age_reference
 from radio_service import RadioEvent, ReceivedMessage, RadioService
 from simulated_radio_service import SimulatedRadioService
 
@@ -17,7 +18,9 @@ class ChatEntry:
 
     author: str
     text: str
-    accepted_at: float
+    sent_at: float | None
+    received_at: float
+    age_reference: float
     outgoing: bool = False
     unread: bool = False
     is_new: bool = False
@@ -25,11 +28,19 @@ class ChatEntry:
 
 def received_chat_entry(
     message: ReceivedMessage,
-    accepted_at: float | None = None,
+    received_at: float | None = None,
+    monotonic_now: float | None = None,
     unread: bool = False,
     is_new: bool = False,
 ) -> ChatEntry:
     """Convert an application message to display state without SDK details."""
+    local_received_at = time() if received_at is None else received_at
+    local_monotonic = monotonic() if monotonic_now is None else monotonic_now
+    valid_sent_at, age_reference = make_age_reference(
+        message.sent_at,
+        local_received_at,
+        local_monotonic,
+    )
     author = (
         message.sender_long_name
         or message.sender_short_name
@@ -38,18 +49,28 @@ def received_chat_entry(
     return ChatEntry(
         author=author,
         text=message.text,
-        accepted_at=monotonic() if accepted_at is None else accepted_at,
+        sent_at=valid_sent_at,
+        received_at=local_received_at,
+        age_reference=age_reference,
         unread=unread,
         is_new=is_new,
     )
 
 
-def outgoing_chat_entry(text: str, accepted_at: float | None = None) -> ChatEntry:
+def outgoing_chat_entry(
+    text: str,
+    received_at: float | None = None,
+    monotonic_now: float | None = None,
+) -> ChatEntry:
     """Create a local-only transcript entry for an accepted send."""
+    local_received_at = time() if received_at is None else received_at
+    local_monotonic = monotonic() if monotonic_now is None else monotonic_now
     return ChatEntry(
         author="YOU",
         text=text,
-        accepted_at=monotonic() if accepted_at is None else accepted_at,
+        sent_at=local_received_at,
+        received_at=local_received_at,
+        age_reference=local_monotonic,
         outgoing=True,
     )
 

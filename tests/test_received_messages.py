@@ -23,6 +23,7 @@ class ReceivedMessageTests(unittest.TestCase):
             "rxRssi": -87,
             "rxSnr": 6.5,
             "id": 123456789,
+            "rxTime": 1_700_000_000,
         }
 
         message = self.service._parse_text_packet(packet, None)
@@ -38,6 +39,7 @@ class ReceivedMessageTests(unittest.TestCase):
                 rssi=-87,
                 snr=6.5,
                 packet_id=123456789,
+                sent_at=1_700_000_000.0,
             ),
         )
 
@@ -62,6 +64,7 @@ class ReceivedMessageTests(unittest.TestCase):
             "rxRssi": object(),
             "rxSnr": "not-a-number",
             "id": None,
+            "rxTime": "not-a-time",
         }
 
         message = self.service._parse_text_packet(malformed, None)
@@ -74,6 +77,7 @@ class ReceivedMessageTests(unittest.TestCase):
         self.assertIsNone(message.rssi)
         self.assertIsNone(message.snr)
         self.assertIsNone(message.packet_id)
+        self.assertIsNone(message.sent_at)
         self.assertIsNone(self.service._parse_text_packet({}, None))
         self.assertIsNone(self.service._parse_text_packet(None, None))
 

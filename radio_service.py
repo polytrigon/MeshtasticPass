@@ -58,7 +58,11 @@ class RadioEvent:
 
 @dataclass(frozen=True)
 class ReceivedMessage:
-    """A decoded text message with no Meshtastic SDK-specific structures."""
+    """A decoded text message with no Meshtastic SDK-specific structures.
+
+    ``sent_at`` carries Meshtastic's receiver-stamped ``rxTime`` when present.
+    Ordinary text packets do not carry a true sender-origin timestamp.
+    """
 
     sender_node_id: str
     sender_long_name: str | None
@@ -68,6 +72,7 @@ class ReceivedMessage:
     rssi: int | None
     snr: float | None
     packet_id: int | None
+    sent_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -365,6 +370,7 @@ class RadioService:
             rssi=self._optional_int(packet.get("rxRssi")),
             snr=self._optional_float(packet.get("rxSnr")),
             packet_id=self._optional_int(packet.get("id")),
+            sent_at=self._optional_float(packet.get("rxTime")),
         )
 
     @staticmethod

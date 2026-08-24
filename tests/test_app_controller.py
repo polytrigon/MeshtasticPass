@@ -36,23 +36,32 @@ class AppControllerTests(unittest.TestCase):
 
         entry = received_chat_entry(
             named,
-            accepted_at=123.0,
+            received_at=1_700_000_000.0,
+            monotonic_now=123.0,
             unread=True,
             is_new=True,
         )
         self.assertEqual(entry.author, "Alice Trail")
-        self.assertEqual(entry.accepted_at, 123.0)
+        self.assertIsNone(entry.sent_at)
+        self.assertEqual(entry.received_at, 1_700_000_000.0)
+        self.assertEqual(entry.age_reference, 123.0)
         self.assertTrue(entry.unread)
         self.assertTrue(entry.is_new)
         self.assertEqual(received_chat_entry(fallback).author, "!a11ce001")
         self.assertFalse(entry.outgoing)
 
     def test_outgoing_entry_uses_you_marker(self) -> None:
-        entry = outgoing_chat_entry("hello", accepted_at=456.0)
+        entry = outgoing_chat_entry(
+            "hello",
+            received_at=1_700_000_000.0,
+            monotonic_now=456.0,
+        )
 
         self.assertEqual(entry.author, "YOU")
         self.assertEqual(entry.text, "hello")
-        self.assertEqual(entry.accepted_at, 456.0)
+        self.assertEqual(entry.sent_at, 1_700_000_000.0)
+        self.assertEqual(entry.received_at, 1_700_000_000.0)
+        self.assertEqual(entry.age_reference, 456.0)
         self.assertTrue(entry.outgoing)
         self.assertFalse(entry.unread)
         self.assertFalse(entry.is_new)

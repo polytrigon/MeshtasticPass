@@ -50,6 +50,7 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         states = list(service.connection_events(stop_event=stopped))
 
         self.assertEqual(received, list(SIMULATED_MESSAGES))
+        self.assertTrue(all(message.sent_at is not None for message in received))
         self.assertEqual(
             [event.state for event in states],
             [RadioState.CONNECTING, RadioState.ONLINE],
