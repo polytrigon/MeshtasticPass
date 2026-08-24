@@ -84,11 +84,13 @@ shows and sends on the currently selected configured broadcast channel. Press
 select, or Escape to cancel. While the chat input is focused, normal text and
 number keys remain input. Press `Escape` to focus the transcript, then use
 Up/Down to move one whole message or contextual control at a time. Page
-Up/Page Down still move by a viewport and End jumps to the newest edge. New
+Up/Page Down still move by a viewport. Right Arrow jumps to the newest edge;
+the physical End key remains an unadvertised equivalent. New
 messages follow the bottom
 only when the transcript is already near the bottom. If you are reading older
-messages, `↓ n NEW` counts messages below the viewport; End jumps to the newest
-entry and clears that indicator. There is no visible END OF CHAT control;
+messages, `↓ n NEW` counts messages below the viewport; either newest shortcut
+clears that indicator. Neither shortcut is advertised in the deliberately
+minimal CHAT footer. There is no visible END OF CHAT control;
 Up/Down stop at the newest meaningful message or action. Press `F4` to quit from
 any normal app context;
 `q` is ordinary input and is not a quit shortcut. Radio
@@ -120,6 +122,24 @@ supported per-scrollbar renderer hook, while retaining Textual's sizing, theme
 colors, mouse metadata, wheel scrolling, and drag behavior. Message content has
 one column of right padding before that far-right scrollbar, including when
 messages wrap at narrow terminal widths.
+
+Press Enter on a selected incoming CHAT entry to open its contextual node menu.
+The menu shows only synchronized metadata the selected radio service actually
+knows: Long Name, Short Name, and the optional Meshtastic node-database
+`hopsAway` value. Missing fields are omitted; hop count is never estimated from
+distance, packet age, or `hopLimit`, and opening the menu sends no radio traffic.
+Informational rows are skipped by Up/Down action navigation. Press Enter on
+FAVORITE or UNFAVORITE, or Escape to close and restore the message focus and
+reading position. Outgoing YOU entries do not expose this menu. Direct Message
+is intentionally not implemented yet.
+
+Favorites are stored by stable lower-case Node ID in the existing
+`~/.config/meshtasticpass/config.json` settings file. Favoriting immediately
+recolors every mounted entry from that node and also applies when older history
+is mounted later. Only the sender name receives persistent ACCENT styling;
+ordinary timestamps remain DIM_BASE and message/delivery styling keeps its
+existing semantics. The preference survives name changes and app restarts and
+is never written to the radio.
 
 ### Stock firmware and messages received while the app is absent
 
@@ -314,11 +334,13 @@ offline, recover in-flight callbacks after restart, or implement
 store-and-forward. Those behaviors are intentionally reserved for the next
 milestone.
 
-The first tab is **CONNECTION/CONFIG**. Its CONNECTION section immediately shows
-CONNECTING, then CONNECTED and live radio metadata after the initial sync. If the
+The first tab is **CONNECTION/CONFIG**. Its flat CONNECTION section immediately
+shows CONNECTING, then CONNECTED and live radio metadata after the initial sync.
+It has no heading caret or separate IDENTITY heading: Long Name, Short Name, and
+Node ID sit directly below the connection rows. If the
 radio disappears or a recoverable connection error occurs, the status clearly
 says that automatic retry is active and stale node metadata is hidden. The full
-CONNECTION / IDENTITY / STYLE surface scrolls vertically on short terminals;
+CONNECTION / STYLE surface scrolls vertically on short terminals;
 keyboard controls, dropdown operation, Long Name editing, mouse-wheel scrolling,
 and the one-cell themed scrollbar remain available instead of compressing the
 sections.
@@ -328,8 +350,7 @@ serial ports. Selecting a different port saves it, closes the old connection,
 and immediately starts the normal reconnect flow. Simulation offers the stable
 fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
 
-The **IDENTITY** section shows the connected radio's Long Name, Short Name, and
-Node ID. Long Name is a two-state keyboard control: use Up/Down to reach its
+Long Name is a two-state keyboard control: use Up/Down to reach its
 bracketed value, press Enter to edit, then press Enter to validate/save or Escape
 to restore the value from before editing. Arrow keys belong to the text caret
 only while edit mode is active. The field follows its content without creating
@@ -343,9 +364,9 @@ Identity fields are unavailable while disconnected, and the simulator provides
 the same deterministic edit behavior without touching hardware. The supported
 SDK operation may cause the firmware's normal identity propagation; the app
 does not add a separate announcement packet. During an active CONNECTING state,
-the heading says `waiting for connection` and the three values use dimmed `...`.
+NODES and the three identity values use dimmed `...`.
 Offline/error retry intervals use unavailable dashes instead of leaking the
-previous radio identity; the next active attempt returns to the waiting state.
+previous radio identity; the next active attempt returns to the connecting state.
 
 The STYLE section has FONT SIZE and COLOR dropdowns. Focus a dropdown and press
 Enter, then use Up/Down and Enter to select or Escape to cancel. Font choices
@@ -354,6 +375,14 @@ are WHITE (the default), GREEN, and ORANGE. All settings save to
 `~/.config/meshtasticpass/config.json`. Color changes the running Textual app
 immediately. Font size is also written only to the dedicated MeshtasticPass
 LXTerminal profile and applies on the next menu launch.
+
+USB DEVICE, FONT SIZE, COLOR, CHAT channel, and contextual node menus share one
+viewport-aware popup implementation. A popup prefers to open downward, opens
+upward when that is the complete visible fit, and otherwise uses the larger
+visible side with internal scrolling. Placement uses the terminal's real screen
+region rather than the virtual height of CONNECTION's scrollable content.
+Up/Down always keeps the highlighted option visible, including XXL at short
+terminal heights; mouse selection remains supported.
 
 ### Install the uConsole menu launcher
 

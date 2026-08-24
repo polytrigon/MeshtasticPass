@@ -81,6 +81,23 @@ class AppSettingsTests(unittest.TestCase):
 
                 self.assertEqual(AppSettings.load(config_path=config).color, color)
 
+    def test_favorites_persist_by_normalized_node_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            settings = AppSettings.load(config_path=config)
+            settings.set_favorite(" !A11CE001 ", True)
+            settings.save()
+
+            reloaded = AppSettings.load(config_path=config)
+            self.assertTrue(reloaded.is_favorite("!a11ce001"))
+            self.assertEqual(reloaded.favorite_node_ids, {"!a11ce001"})
+
+            reloaded.set_favorite("!A11CE001", False)
+            reloaded.save()
+            self.assertFalse(
+                AppSettings.load(config_path=config).is_favorite("!a11ce001")
+            )
+
     def test_existing_config_without_color_uses_white(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             config = Path(temporary_directory) / "config.json"

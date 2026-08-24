@@ -45,6 +45,7 @@ from radio_service import (
     RadioEvent,
     RadioIdentityError,
     RadioInfo,
+    NodeMetadata,
     RadioSendError,
     RadioState,
     ReceivedMessage,
@@ -56,6 +57,7 @@ from relative_time import format_relative_age
 from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 from terminal_cursor import TerminalCursor
 from theme_palette import ERROR, THEME_PALETTES
+from viewport_menu import PopupItem, ViewportMenu
 
 
 TAB_NAMES = {
@@ -324,7 +326,7 @@ class ChatTranscript(VerticalScroll):
             self.scroll_relative(y=-step if event.key == "pageup" else step)
             app.call_after_refresh(app._clear_indicator_if_at_bottom)
             event.stop()
-        elif event.key == "end":
+        elif event.key in ("end", "right"):
             app._jump_to_newest()
             event.stop()
 
@@ -466,8 +468,19 @@ class ChatEntryWidget(Vertical):
     class SelectionChanged(Message):
         pass
 
-    def __init__(self, entry: ChatEntry, now: float | None = None) -> None:
+    class UserMenuRequested(Message):
+        def __init__(self, widget: "ChatEntryWidget") -> None:
+            super().__init__()
+            self.widget = widget
+
+    def __init__(
+        self,
+        entry: ChatEntry,
+        now: float | None = None,
+        favorite: bool = False,
+    ) -> None:
         self.entry = entry
+        self.favorite = favorite and not entry.outgoing
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
         self.timestamp_label = Static(
@@ -515,6 +528,9 @@ class ChatEntryWidget(Vertical):
         self.selection_marker = Static(" ", classes="chat-selection-marker", markup=False)
         self.action_control = MessageActionControl(entry)
         self.action_control.display = False
+        classes = "chat-entry new-message" if is_new else "chat-entry"
+        if self.favorite:
+            classes += " favorite-sender"
         super().__init__(
             Horizontal(
                 self.selection_marker,
@@ -522,7 +538,7 @@ class ChatEntryWidget(Vertical):
                 classes="chat-entry-row",
             ),
             self.action_control,
-            classes="chat-entry new-message" if is_new else "chat-entry",
+            classes=classes,
         )
         self.refresh_delivery_state(1)
 
@@ -537,6 +553,10 @@ class ChatEntryWidget(Vertical):
     def refresh_new_message_state(self) -> None:
         """Apply the entry's persistent new/read presentation state."""
         self.set_class(self.entry.is_new and not self.entry.outgoing, "new-message")
+
+    def set_favorite(self, favorite: bool) -> None:
+        self.favorite = favorite and not self.entry.outgoing
+        self.set_class(self.favorite, "favorite-sender")
 
     def refresh_delivery_state(self, dot_count: int) -> None:
         if self.delivery_label is None:
@@ -566,6 +586,12 @@ class ChatEntryWidget(Vertical):
         self.selection_marker.update(" ")
         self.post_message(self.SelectionChanged())
 
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter" and not self.entry.outgoing:
+            if getattr(self.app, "_user_menu", None) is None:
+                self.post_message(self.UserMenuRequested(self))
+                event.stop()
+
 
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
@@ -580,6 +606,7 @@ class MeshtasticPassApp(App[None]):
     Screen {
         background: #101010;
         color: #d8d8d8;
+        layers: base popup;
     }
 
     Screen.theme-green {
@@ -627,25 +654,8 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
-    #identity-heading, #style-title {
+    #style-title {
         margin-top: 1;
-    }
-
-    #identity-heading {
-        height: 2;
-    }
-
-    #identity-title, #identity-waiting {
-        width: auto;
-        height: 2;
-    }
-
-    #identity-title {
-        color: #d8d8d8;
-    }
-
-    #identity-waiting {
-        color: $white_dim;
     }
 
     #identity-long-name {
@@ -780,22 +790,74 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
-    Screen.theme-green #identity-waiting,
     Screen.theme-green #identity-long-name-unavailable {
         color: $green_dim;
     }
 
-    Screen.theme-green #identity-title {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #identity-waiting,
     Screen.theme-orange #identity-long-name-unavailable {
         color: $orange_dim;
     }
 
-    Screen.theme-orange #identity-title {
+    .viewport-menu {
+        layer: popup;
+        position: absolute;
+        background: #101010;
+        border: solid $white_dim;
+        padding: 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: #d8d8d8;
+        scrollbar-background: $white_dim;
+    }
+
+    .viewport-menu-row {
+        height: 1;
+        padding: 0 1;
+        color: #d8d8d8;
+    }
+
+    .viewport-menu-row.highlighted {
+        color: #39ff14;
+        text-style: bold reverse;
+    }
+
+    .viewport-menu-row.informational {
+        color: $white_dim;
+    }
+
+    Screen.theme-green .viewport-menu {
+        border: solid $green_dim;
+        scrollbar-color: #39ff14;
+        scrollbar-background: $green_dim;
+    }
+
+    Screen.theme-green .viewport-menu-row {
+        color: #39ff14;
+    }
+
+    Screen.theme-green .viewport-menu-row.highlighted {
         color: #ff8c00;
+    }
+
+    Screen.theme-green .viewport-menu-row.informational {
+        color: $green_dim;
+    }
+
+    Screen.theme-orange .viewport-menu {
+        border: solid $orange_dim;
+        scrollbar-color: #ff8c00;
+        scrollbar-background: $orange_dim;
+    }
+
+    Screen.theme-orange .viewport-menu-row {
+        color: #ff8c00;
+    }
+
+    Screen.theme-orange .viewport-menu-row.highlighted {
+        color: #d8d8d8;
+    }
+
+    Screen.theme-orange .viewport-menu-row.informational {
+        color: $orange_dim;
     }
 
     #load-older, .message-action {
@@ -866,6 +928,18 @@ class MeshtasticPassApp(App[None]):
     .chat-entry-author {
         width: auto;
         text-style: bold;
+    }
+
+    Screen.theme-white .chat-entry.favorite-sender .chat-entry-author {
+        color: #39ff14;
+    }
+
+    Screen.theme-green .chat-entry.favorite-sender .chat-entry-author {
+        color: #ff8c00;
+    }
+
+    Screen.theme-orange .chat-entry.favorite-sender .chat-entry-author {
+        color: #d8d8d8;
     }
 
     .chat-entry-separator, .chat-entry-delivery {
@@ -1032,6 +1106,9 @@ class MeshtasticPassApp(App[None]):
         self._has_older_history = False
         self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
+        self._user_menu: ViewportMenu | None = None
+        self._user_menu_origin: ChatEntryWidget | None = None
+        self._user_menu_scroll_y: float | None = None
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -1047,18 +1124,15 @@ class MeshtasticPassApp(App[None]):
         yield Static(id="tab-bar")
         with ContentSwitcher(initial="connection", id="content"):
             with ConnectionPage(id="connection", classes="tab-page"):
-                yield Static("> CONNECTION", classes="page-title")
+                yield Static("CONNECTION", classes="page-title")
                 yield Static(id="connection-status")
                 yield DeviceSelector(self.settings.device_path, devices)
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
-                with Horizontal(id="identity-heading"):
-                    yield Static("> IDENTITY", id="identity-title", classes="page-title")
-                    yield Static(id="identity-waiting", markup=False)
                 yield LongNameControl()
                 yield Static(id="identity-values", markup=False)
                 yield Static(id="identity-status", markup=False)
-                yield Static("> STYLE", id="style-title", classes="page-title")
+                yield Static("STYLE", id="style-title", classes="page-title")
                 yield FontSizeSelector(self.settings.font_size)
                 yield ColorSelector(self.settings.color)
                 yield Static(id="style-status")
@@ -1120,6 +1194,17 @@ class MeshtasticPassApp(App[None]):
             self.exit()
             event.stop()
             return
+        if self._user_menu is not None:
+            if event.key in ("up", "down"):
+                self._user_menu.move_highlight(-1 if event.key == "up" else 1)
+                event.stop()
+            elif event.key == "enter":
+                self._user_menu.activate()
+                event.stop()
+            elif event.key == "escape":
+                self._close_user_menu()
+                event.stop()
+            return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
         if isinstance(self.focused, Input):
@@ -1151,7 +1236,7 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
-            if event.key == "end":
+            if event.key in ("end", "right"):
                 self._jump_to_newest()
                 event.stop()
                 return
@@ -1553,7 +1638,7 @@ class MeshtasticPassApp(App[None]):
             widgets.append(LoadOlderControl())
         elif state.entries and self.chat_store is not None:
             widgets.append(EndOfChatHistoryMarker())
-        widgets.extend(ChatEntryWidget(entry) for entry in state.entries)
+        widgets.extend(self._chat_entry_widget(entry) for entry in state.entries)
         if widgets:
             await transcript.mount(*widgets)
         if self.current_tab == "chat":
@@ -1572,14 +1657,14 @@ class MeshtasticPassApp(App[None]):
         if not self._has_older_history and self.chat_store is not None:
             self._ensure_end_history_marker(transcript)
         if self.current_tab != "chat":
-            transcript.mount(ChatEntryWidget(entry))
+            transcript.mount(self._chat_entry_widget(entry))
             self._trim_mounted_chat_window(transcript)
             self._chat_open_scroll_pending = True
             return
         should_follow = self._is_near_chat_bottom()
         if should_follow:
             transcript.anchor()
-        transcript.mount(ChatEntryWidget(entry))
+        transcript.mount(self._chat_entry_widget(entry))
         self._trim_mounted_chat_window(transcript)
         if should_follow:
             self.call_after_refresh(self._jump_to_newest)
@@ -1694,8 +1779,15 @@ class MeshtasticPassApp(App[None]):
     def _jump_to_newest(self) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
         transcript.anchor()
+        transcript.scroll_end(animate=False)
         self.transcript_new_count = 0
         self._update_transcript_indicator()
+
+    def _chat_entry_widget(self, entry: ChatEntry) -> ChatEntryWidget:
+        return ChatEntryWidget(
+            entry,
+            favorite=self.settings.is_favorite(entry.node_id),
+        )
 
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         targets: list[Static | ChatEntryWidget] = []
@@ -1732,6 +1824,104 @@ class MeshtasticPassApp(App[None]):
                 if widget.entry is event.action_control.entry:
                     widget.focus()
                     break
+
+    @on(ChatEntryWidget.UserMenuRequested)
+    def open_user_menu(self, event: ChatEntryWidget.UserMenuRequested) -> None:
+        """Open node details/actions without changing transcript layout."""
+        entry = event.widget.entry
+        if entry.outgoing or not entry.node_id:
+            return
+        getter = getattr(self.radio, "get_node_metadata", None)
+        metadata = NodeMetadata(
+            entry.node_id,
+            entry.sender_name,
+            entry.sender_short_name,
+        )
+        if callable(getter):
+            try:
+                current = getter(entry.node_id)
+            except Exception:
+                current = None
+            if isinstance(current, NodeMetadata):
+                metadata = NodeMetadata(
+                    entry.node_id,
+                    current.long_name or metadata.long_name,
+                    current.short_name or metadata.short_name,
+                    current.hops_away,
+                )
+
+        items: list[PopupItem] = []
+        if metadata.long_name:
+            items.append(PopupItem(metadata.long_name, actionable=False))
+        if metadata.short_name:
+            items.append(PopupItem(metadata.short_name, actionable=False))
+        if metadata.hops_away is not None:
+            unit = "HOP" if metadata.hops_away == 1 else "HOPS"
+            items.append(
+                PopupItem(
+                    f"{metadata.hops_away} {unit} AWAY",
+                    actionable=False,
+                )
+            )
+        favorite = self.settings.is_favorite(entry.node_id)
+        action = "unfavorite" if favorite else "favorite"
+        items.append(PopupItem(action.upper(), action, actionable=True))
+        highlighted = len(items) - 1
+        menu = ViewportMenu(
+            items,
+            highlighted_index=highlighted,
+            on_activate=lambda _index, item: self._activate_user_action(
+                event.widget,
+                str(item.value),
+            ),
+            menu_id="node-context-menu",
+        )
+        self._close_user_menu(restore_focus=False)
+        self._user_menu = menu
+        self._user_menu_origin = event.widget
+        self._user_menu_scroll_y = self.query_one(ChatTranscript).scroll_y
+        width = max(len(item.label) for item in items) + 4
+        self.screen.mount(menu)
+        menu.place(event.widget.region, self.screen.region, width)
+
+    def _activate_user_action(
+        self,
+        origin: ChatEntryWidget,
+        action: str,
+    ) -> None:
+        node_id = origin.entry.node_id
+        if not node_id or action not in ("favorite", "unfavorite"):
+            return
+        self.settings.set_favorite(node_id, action == "favorite")
+        try:
+            self.settings.save()
+        except OSError as error:
+            self._show_send_error(f"Could not save favorite: {error}")
+            return
+        for widget in self.query(ChatEntryWidget):
+            if widget.entry.node_id and widget.entry.node_id.lower() == node_id.lower():
+                widget.set_favorite(self.settings.is_favorite(node_id))
+        self._close_user_menu()
+
+    def _close_user_menu(self, *, restore_focus: bool = True) -> None:
+        menu = self._user_menu
+        origin = self._user_menu_origin
+        scroll_y = self._user_menu_scroll_y
+        self._user_menu = None
+        self._user_menu_origin = None
+        self._user_menu_scroll_y = None
+        if menu is not None:
+            menu.remove()
+        if restore_focus and origin is not None and origin.is_mounted:
+            origin.focus()
+            if scroll_y is not None:
+                transcript = self.query_one(ChatTranscript)
+                self.call_after_refresh(
+                    transcript.scroll_to,
+                    y=scroll_y,
+                    animate=False,
+                    force=True,
+                )
 
     def _clear_indicator_if_at_bottom(self) -> None:
         if self._is_near_chat_bottom() and self.transcript_new_count:
@@ -1784,7 +1974,7 @@ class MeshtasticPassApp(App[None]):
         elif state.entries and self.chat_store is not None:
             widgets.append(EndOfChatHistoryMarker())
         for entry in state.entries:
-            widgets.append(ChatEntryWidget(entry))
+            widgets.append(self._chat_entry_widget(entry))
         if widgets:
             transcript.mount(*widgets)
 
@@ -1823,7 +2013,7 @@ class MeshtasticPassApp(App[None]):
         old_virtual_height = transcript.virtual_size.height
         first_widget = next(iter(self.query(ChatEntryWidget)), None)
         entries = [stored_chat_entry(stored) for stored in page.messages]
-        widgets = [ChatEntryWidget(entry) for entry in entries]
+        widgets = [self._chat_entry_widget(entry) for entry in entries]
         self.chat_history[0:0] = entries
         self._mounted_chat_target += len(entries)
         await transcript.mount(*widgets, before=first_widget)
@@ -1989,7 +2179,7 @@ class MeshtasticPassApp(App[None]):
         if self.current_tab == "chat" and isinstance(self.focused, Input):
             text = "ENTER send    ESC messages    F4 quit"
         elif self.current_tab == "chat":
-            text = "↑↓ navigate    C channel    ENTER action    END newest    F4 quit"
+            text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
             text = "1-4 switch tabs    F4 quit"
         self.query_one("#footer", Static).update(text)
@@ -2066,18 +2256,24 @@ class MeshtasticPassApp(App[None]):
                     ("NODES", str(info.known_nodes)),
                 ]
             )
-        details = "\n".join(f"{label:<10} {value}" for label, value in values)
-        detail_widgets[0].update(details)
+        if values:
+            details = "\n".join(f"{label:<12} {value}" for label, value in values)
+            detail_widgets[0].update(details)
+        else:
+            placeholder = "..." if self._radio_state is RadioState.CONNECTING else "—"
+            palette = THEME_PALETTES[self._current_theme]
+            details = Text()
+            details.append(f"{'NODES':<12} ")
+            details.append(placeholder, style=palette.dim_base)
+            detail_widgets[0].update(details)
 
     def _render_identity(self, force_value: bool = False) -> None:
         control = self.query_one(LongNameControl)
         values = self.query_one("#identity-values", Static)
-        waiting = self.query_one("#identity-waiting", Static)
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
         if online:
             info = self._radio_info
             assert info is not None
-            waiting.update("")
             control.set_available(info.long_name, force_value=force_value)
             values.update(
                 f"{'SHORT NAME':<12} {info.short_name}\n"
@@ -2087,7 +2283,6 @@ class MeshtasticPassApp(App[None]):
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
             control.set_unavailable(placeholder)
-            waiting.update("  waiting for connection" if connecting else "")
             palette = THEME_PALETTES[self._current_theme]
             identity_text = Text()
             identity_text.append(f"{'SHORT NAME':<12} ")

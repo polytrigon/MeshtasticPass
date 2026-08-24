@@ -224,19 +224,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)):
             details = app.query_one("#connection-details", Static)
             status = app.query_one("#connection-status", Static)
-            waiting = app.query_one("#identity-waiting", Static)
-            identity_title = app.query_one("#identity-title", Static)
             unavailable = app.query_one(
                 "#identity-long-name-unavailable", Static
             )
             connecting = str(status.render())
             self.assertIn("STATUS       CONNECTING.", connecting)
-            self.assertEqual(str(waiting.render()), "  waiting for connection")
             self.assertEqual(str(unavailable.render()), "...")
-            self.assertEqual(
-                waiting.visual_style.foreground.hex6,
-                THEME_PALETTES["white"].dim_base,
-            )
+            self.assertIn("NODES        ...", str(details.render()))
             self.assertIn("SHORT NAME   ...", str(app.query_one("#identity-values", Static).render()))
             self.assertIn(
                 "/dev/ttyUSB0",
@@ -246,7 +240,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._show_connection(RadioState.ONLINE, info)
             online = str(details.render())
             self.assertIn("STATUS       CONNECTED", str(status.render()))
-            self.assertIn("NODES      100", online)
+            self.assertIn("NODES        100", online)
             identity = str(app.query_one("#identity-values", Static).render())
             self.assertIn("SHORT NAME   9a3c", identity)
             self.assertIn("NODE ID      !433a9a3c", identity)
@@ -254,7 +248,6 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 app.query_one("#long-name-input", Input).value,
                 "@Polytrigon",
             )
-            self.assertEqual(str(waiting.render()), "")
             self.assertFalse(unavailable.display)
 
             app._show_connection(RadioState.OFFLINE, info)
@@ -262,7 +255,6 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("STATUS       OFFLINE — RETRYING.", str(status.render()))
             self.assertNotIn("!433a9a3c", offline)
             self.assertNotIn("FIRMWARE", offline)
-            self.assertEqual(str(waiting.render()), "")
             self.assertEqual(str(unavailable.render()), "—")
             self.assertIn("NODE ID      —", str(app.query_one("#identity-values", Static).render()))
 
@@ -277,11 +269,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 "raw SDK exception",
                 str(app.query_one("#connection-error", Static).render()),
             )
-            self.assertEqual(str(waiting.render()), "")
             self.assertEqual(str(unavailable.render()), "—")
 
             app._show_connection(RadioState.CONNECTING, info)
-            self.assertEqual(str(waiting.render()), "  waiting for connection")
             self.assertEqual(str(unavailable.render()), "...")
             self.assertNotIn(
                 "@Polytrigon",
@@ -289,14 +279,6 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             )
             for name, palette in THEME_PALETTES.items():
                 app._apply_color_theme(name)
-                self.assertEqual(
-                    identity_title.visual_style.foreground.hex6,
-                    palette.base,
-                )
-                self.assertEqual(
-                    waiting.visual_style.foreground.hex6,
-                    palette.dim_base,
-                )
                 self.assertEqual(
                     unavailable.visual_style.foreground.hex6,
                     palette.dim_base,
@@ -938,7 +920,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._update_footer()
             footer = str(app.query_one("#footer", Static).render())
             self.assertTrue(footer.endswith("F4 quit"))
-            self.assertIn("END newest", footer)
+            self.assertNotIn("END newest", footer)
+            self.assertNotIn("RIGHT newest", footer)
+            self.assertNotIn("→ newest", footer)
 
             app.show_tab("connection")
             device = app.query_one(DeviceSelector)
@@ -978,7 +962,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 str(app.query_one("#chat-title", Static).render()),
             )
             self.assertIn(
-                "NODES      6",
+                "NODES        8",
                 str(app.query_one("#connection-details", Static).render()),
             )
 
