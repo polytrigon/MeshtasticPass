@@ -1,13 +1,25 @@
 """Meshtastic radio access for the StreetPass app."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from enum import Enum
 import os
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import Any, Iterator
 
 
 class RadioConnectionError(Exception):
     """Raised when the Meshtastic radio cannot be used."""
+
+
+class RadioState(Enum):
+    """Connection states that callers can display without knowing SDK details."""
+
+    CONNECTING = "CONNECTING"
+    ONLINE = "ONLINE"
+    OFFLINE = "OFFLINE"
 
 
 @dataclass(frozen=True)
@@ -22,22 +34,31 @@ class RadioInfo:
     known_nodes: int
 
 
+@dataclass(frozen=True)
+class RadioEvent:
+    """A connection state change emitted by RadioService."""
+
+    state: RadioState
+    info: RadioInfo | None = None
+    message: str = ""
+
+
 class RadioService:
     """Owns the connection between the app and a Meshtastic radio."""
 
     def __init__(self, device_path: str = "/dev/ttyUSB0") -> None:
         self.device_path = device_path
         self._interface: Any | None = None
+        self._connection_lost = Event()
+        self._pub: Any | None = None
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
+        self._connection_lost.clear()
         self._check_device()
 
         try:
-            # Import here so a missing dependency becomes a friendly runtime error.
-            from meshtastic.serial_interface import SerialInterface
-
-            self._interface = SerialInterface(devPath=self.device_path)
+            self._interface = self._open_interface()
             return self._read_radio_info()
         except RadioConnectionError:
             self.close()
@@ -55,6 +76,48 @@ class RadioService:
                 f"Could not connect to the radio on {self.device_path}: {message}"
             ) from error
 
+    def connection_events(
+        self,
+        retry_delay: float = 5.0,
+        stop_event: Event | None = None,
+        poll_interval: float = 0.25,
+    ) -> Iterator[RadioEvent]:
+        """Keep the radio connected and emit state changes until stopped."""
+        if retry_delay < 0:
+            raise ValueError("retry_delay cannot be negative")
+
+        stopped = stop_event or Event()
+
+        try:
+            while not stopped.is_set():
+                yield RadioEvent(RadioState.CONNECTING)
+
+                try:
+                    info = self.connect()
+                except RadioConnectionError as error:
+                    yield RadioEvent(RadioState.OFFLINE, message=str(error))
+                else:
+                    yield RadioEvent(RadioState.ONLINE, info=info)
+
+                    while not stopped.is_set():
+                        if self._connection_lost.wait(poll_interval):
+                            break
+
+                    if stopped.is_set():
+                        break
+
+                    self.close()
+                    yield RadioEvent(
+                        RadioState.OFFLINE,
+                        message=f"Connection to {self.device_path} was lost.",
+                    )
+
+                if stopped.wait(retry_delay):
+                    break
+        finally:
+            self.close()
+            self._unsubscribe_from_connection_loss()
+
     def close(self) -> None:
         """Close the serial connection if it is open."""
         if self._interface is not None:
@@ -62,6 +125,32 @@ class RadioService:
                 self._interface.close()
             finally:
                 self._interface = None
+
+    def _open_interface(self) -> Any:
+        # Import here so a missing dependency becomes a friendly runtime error.
+        from meshtastic.serial_interface import SerialInterface
+        from pubsub import pub
+
+        if self._pub is None:
+            pub.subscribe(
+                self._on_connection_lost,
+                "meshtastic.connection.lost",
+            )
+            self._pub = pub
+
+        return SerialInterface(devPath=self.device_path)
+
+    def _on_connection_lost(self, interface: Any, **_kwargs: Any) -> None:
+        if interface is self._interface:
+            self._connection_lost.set()
+
+    def _unsubscribe_from_connection_loss(self) -> None:
+        if self._pub is not None:
+            self._pub.unsubscribe(
+                self._on_connection_lost,
+                "meshtastic.connection.lost",
+            )
+            self._pub = None
 
     def _check_device(self) -> None:
         path = Path(self.device_path)
