@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import os
 from pathlib import Path
@@ -38,6 +38,27 @@ class RadioConnectionError(Exception):
 
 class RadioSendError(Exception):
     """Raised when an application text message cannot be accepted for sending."""
+
+
+class RadioIdentityError(Exception):
+    """Raised when the connected radio identity cannot be updated."""
+
+
+LONG_NAME_MAX_UTF8_BYTES = 39
+
+
+def validate_long_name(long_name: str) -> str:
+    """Apply the Meshtastic User.long_name nanopb string constraints."""
+    if not isinstance(long_name, str):
+        raise RadioIdentityError("Long Name must be text.")
+    normalized = long_name.strip()
+    if not normalized:
+        raise RadioIdentityError("Long Name cannot be empty.")
+    if len(normalized.encode("utf-8")) > LONG_NAME_MAX_UTF8_BYTES:
+        raise RadioIdentityError(
+            f"Long Name must be at most {LONG_NAME_MAX_UTF8_BYTES} UTF-8 bytes."
+        )
+    return normalized
 
 
 class DeliveryState(Enum):
@@ -157,6 +178,8 @@ class RadioService:
         self._connection_lost = Event()
         self._pub: Any | None = None
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
+        self._direct_observations: dict[str, float] = {}
+        self._activity_local_node_id: str | None = None
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -165,7 +188,14 @@ class RadioService:
 
         try:
             self._interface = self._open_interface()
-            return self._read_radio_info()
+            info = self._read_radio_info()
+            if (
+                self._activity_local_node_id is not None
+                and self._activity_local_node_id.lower() != info.node_id.lower()
+            ):
+                self._direct_observations.clear()
+            self._activity_local_node_id = info.node_id
+            return info
         except RadioConnectionError:
             self.close()
             raise
@@ -192,6 +222,8 @@ class RadioService:
             raise ValueError("USB device path cannot be empty.")
         self.close()
         self.device_path = device_path.strip()
+        self._direct_observations.clear()
+        self._activity_local_node_id = None
 
     def connection_events(
         self,
@@ -251,13 +283,15 @@ class RadioService:
         if interface is None:
             return None
         nodes_by_number = getattr(interface, "nodesByNum", None)
-        if not isinstance(nodes_by_number, dict):
-            return 0
-        try:
-            nodes = tuple(nodes_by_number.items())
-        except RuntimeError:
-            # The SDK may be updating the node database from its receive thread.
-            return None
+        if isinstance(nodes_by_number, dict):
+            try:
+                nodes = tuple(nodes_by_number.items())
+            except RuntimeError:
+                # The SDK may be updating the node database from its receive thread.
+                # Direct observations remain trustworthy during that brief race.
+                nodes = ()
+        else:
+            nodes = ()
 
         my_info = getattr(interface, "myInfo", None)
         local_number = getattr(my_info, "my_node_num", None)
@@ -265,17 +299,51 @@ class RadioService:
             local_number = None
         local_record = (
             nodes_by_number.get(local_number, {})
-            if local_number is not None
+            if isinstance(nodes_by_number, dict) and local_number is not None
             else {}
         )
         local_user = self._user_from_record(local_record)
         local_id = self._optional_string(local_user.get("id"))
+        if local_id is None:
+            local_id = self._activity_local_node_id
+        try:
+            observations = dict(self._direct_observations)
+        except RuntimeError:
+            observations = {}
         return count_active_other_nodes(
             nodes,
             local_node_number=local_number,
             local_node_id=local_id,
             now=time.time() if now is None else now,
+            direct_observations=observations,
         )
+
+    def set_long_name(self, long_name: str) -> RadioInfo:
+        """Update the local Meshtastic owner's advertised Long Name."""
+        normalized = validate_long_name(long_name)
+        interface = self._interface
+        if interface is None:
+            raise RadioIdentityError("The radio is not connected.")
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            raise RadioIdentityError("The connected radio identity is unavailable.")
+
+        try:
+            local_node.setOwner(long_name=normalized)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            raise RadioIdentityError(f"Could not save Long Name: {detail}") from error
+
+        my_info = getattr(interface, "myInfo", None)
+        local_number = getattr(my_info, "my_node_num", None)
+        nodes_by_number = getattr(interface, "nodesByNum", None)
+        if isinstance(nodes_by_number, dict) and local_number in nodes_by_number:
+            record = nodes_by_number.get(local_number)
+            if isinstance(record, dict):
+                user = record.setdefault("user", {})
+                if isinstance(user, dict):
+                    user["longName"] = normalized
+        return replace(self._read_radio_info(), long_name=normalized)
 
     def remove_message_handler(
         self,
@@ -441,12 +509,30 @@ class RadioService:
         if message is None:
             return
 
+        self._record_direct_observation(message.sender_node_id)
+
         for handler in tuple(self._message_handlers):
             try:
                 handler(message)
             except Exception:
                 # One consumer should not stop radio packet processing.
                 pass
+
+    def _record_direct_observation(
+        self,
+        node_id: str,
+        observed_at: float | None = None,
+    ) -> None:
+        """Remember a valid directly received packet without transmitting."""
+        if not isinstance(node_id, str):
+            return
+        normalized = node_id.strip().lower()
+        if not normalized or normalized == "unknown":
+            return
+        timestamp = time.time() if observed_at is None else observed_at
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            return
+        self._direct_observations[normalized] = float(timestamp)
 
     def _unsubscribe_from_events(self) -> None:
         if self._pub is not None:

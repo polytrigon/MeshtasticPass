@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from queue import Empty, Queue
 from threading import Event
@@ -16,12 +16,14 @@ from radio_service import (
     RadioEvent,
     DeliveryState,
     RadioInfo,
+    RadioIdentityError,
     RadioSendError,
     RadioState,
     ReceivedMessage,
     SentMessage,
     SendStatus,
     validate_send_request,
+    validate_long_name,
 )
 
 
@@ -137,7 +139,7 @@ class SimulatedRadioService:
         self.info = RadioInfo(
             device_path=self.device_path,
             node_id="!51a00001",
-            long_name="MeshtasticPass Simulator",
+            long_name="Simulated Node",
             short_name="SIM",
             firmware_version="sim-1.0.0",
             known_nodes=len(SIMULATED_NODES) + 1,
@@ -155,6 +157,7 @@ class SimulatedRadioService:
         self._sent_messages: list[SentMessage] = []
         self._send_count = 0
         self._activity_reference_time: float | None = None
+        self._direct_observations: dict[str, float] = {}
 
     def available_device_paths(self) -> tuple[str, ...]:
         """Return fake ports without asking the host operating system."""
@@ -175,6 +178,7 @@ class SimulatedRadioService:
             known_nodes=self.info.known_nodes,
             channels=self.info.channels,
         )
+        self._direct_observations.clear()
 
     @property
     def is_closed(self) -> bool:
@@ -223,7 +227,16 @@ class SimulatedRadioService:
             local_node_number=local_number,
             local_node_id=self.info.node_id,
             now=current_time,
+            direct_observations=self._direct_observations,
         )
+
+    def set_long_name(self, long_name: str) -> RadioInfo:
+        """Update the deterministic local identity while simulated online."""
+        normalized = validate_long_name(long_name)
+        if not self._online or self._stop_event.is_set():
+            raise RadioIdentityError("The simulated radio is not connected.")
+        self.info = replace(self.info, long_name=normalized)
+        return self.info
 
     def connection_events(
         self,
@@ -326,6 +339,10 @@ class SimulatedRadioService:
         """Deliver one fake message to every registered consumer."""
         if not self._online or self._stop_event.is_set():
             return
+
+        node_id = message.sender_node_id.strip().lower()
+        if node_id and node_id != "unknown":
+            self._direct_observations[node_id] = time.time()
 
         for handler in tuple(self._message_handlers):
             try:

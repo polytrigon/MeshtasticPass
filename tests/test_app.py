@@ -13,12 +13,14 @@ from unittest.mock import Mock
 
 from rich.color import Color
 from textual.containers import Horizontal
+from textual.css.query import NoMatches
 from textual.widgets import Input, Static
 
 from app import (
     ChatTranscript,
     ChatEntryWidget,
     ColorSelector,
+    DeviceSelector,
     FontSizeSelector,
     LoadOlderControl,
     MeshtasticPassApp,
@@ -32,6 +34,7 @@ from radio_service import (
     DeliveryState,
     RadioEvent,
     RadioInfo,
+    RadioIdentityError,
     RadioService,
     RadioState,
 )
@@ -54,6 +57,7 @@ class CallbackRadioService(RadioService):
                 }
             },
             nodes={},
+            sendText=Mock(),
         )
         self.info = RadioInfo(
             device_path=self.device_path,
@@ -225,14 +229,21 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._show_connection(RadioState.ONLINE, info)
             online = str(details.render())
             self.assertIn("STATUS       CONNECTED", str(status.render()))
-            self.assertIn("NODE       !433a9a3c", online)
-            self.assertIn("NAME       @Polytrigon (9a3c)", online)
+            self.assertIn("NODES      100", online)
+            identity = str(app.query_one("#identity-values", Static).render())
+            self.assertIn("SHORT NAME   9a3c", identity)
+            self.assertIn("NODE ID      !433a9a3c", identity)
+            self.assertEqual(
+                app.query_one("#long-name-input", Input).value,
+                "@Polytrigon",
+            )
 
             app._show_connection(RadioState.OFFLINE, info)
             offline = str(details.render())
             self.assertIn("STATUS       OFFLINE — RETRYING.", str(status.render()))
             self.assertNotIn("!433a9a3c", offline)
             self.assertNotIn("FIRMWARE", offline)
+            self.assertIn("NODE ID      —", str(app.query_one("#identity-values", Static).render()))
 
             app._show_connection(RadioState.ERROR, info, "raw SDK exception")
             error = str(details.render())
@@ -245,6 +256,62 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 "raw SDK exception",
                 str(app.query_one("#connection-error", Static).render()),
             )
+
+    async def test_identity_edit_success_failure_and_protocol_validation(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            editor = app.query_one("#long-name-input", Input)
+            identity = app.query_one("#identity-values", Static)
+            status = app.query_one("#identity-status", Static)
+            self.assertEqual(editor.value, "Simulated Node")
+            self.assertFalse(editor.disabled)
+            self.assertIn("SHORT NAME   SIM", str(identity.render()))
+            self.assertIn("NODE ID      !51a00001", str(identity.render()))
+
+            editor.focus()
+            editor.value = "Clockwork Nomad"
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NAME SAVED" in str(status.render()):
+                    break
+            self.assertEqual(radio.info.long_name, "Clockwork Nomad")
+            self.assertEqual(editor.value, "Clockwork Nomad")
+            self.assertIn("NAME SAVED", str(status.render()))
+            self.assertEqual(status.visual_style.foreground.hex6, "#39FF14")
+
+            radio.set_long_name = Mock(
+                side_effect=RadioIdentityError("simulated identity failure")
+            )
+            editor.value = "Broken Name"
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "simulated identity failure" in str(status.render()):
+                    break
+            self.assertIn("simulated identity failure", str(status.render()))
+            self.assertEqual(status.visual_style.foreground.hex6, "#FF1744")
+
+            editor.value = "🚲" * 10
+            radio.set_long_name = SimulatedRadioService.set_long_name.__get__(radio)
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "39 UTF-8 bytes" in str(status.render()):
+                    break
+            self.assertIn("39 UTF-8 bytes", str(status.render()))
+
+            app._show_connection(RadioState.OFFLINE)
+            self.assertTrue(editor.disabled)
+            self.assertEqual(editor.value, "")
+            self.assertIn("NODE ID      —", str(identity.render()))
 
     async def test_connection_status_animation_reuses_one_timer(self) -> None:
         radio = SimulatedRadioService(
@@ -592,13 +659,99 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             if segment.style is not None
             and segment.style.meta.get("@mouse.down") == "grab"
         ]
+        track_segments = [
+            segment
+            for segment in rendered.segments
+            if segment.text != "\n" and segment not in thumb_segments
+        ]
 
         self.assertTrue(thumb_segments)
+        self.assertTrue(track_segments)
         self.assertTrue(all(segment.text == "▕" for segment in thumb_segments))
+        self.assertTrue(all(segment.text == "▕" for segment in track_segments))
         self.assertTrue(all(segment.cell_length == 1 for segment in thumb_segments))
+        self.assertTrue(all(segment.cell_length == 1 for segment in track_segments))
         self.assertTrue(
             all(segment.style.color.name == "#39ff14" for segment in thumb_segments)
         )
+        self.assertTrue(
+            all(segment.style.color.name == "#2c2c2c" for segment in track_segments)
+        )
+
+    async def test_chat_content_has_gutter_before_far_right_scrollbar(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=()),
+            self.settings,
+        )
+        async with app.run_test(size=(42, 18)) as pilot:
+            app.show_tab("chat")
+            app._accept_received_message(
+                replace(SIMULATED_MESSAGES[0], text="wrapped message " * 10)
+            )
+            await pilot.pause()
+            transcript = app.query_one(ChatTranscript)
+            widget = app.query_one(ChatEntryWidget)
+            content = widget.query_one(".chat-entry-content")
+            scrollbar = transcript.vertical_scrollbar
+            self.assertEqual(widget.styles.padding.right, 1)
+            self.assertEqual(transcript.styles.scrollbar_size_vertical, 1)
+            self.assertLess(content.region.right, transcript.region.right)
+            self.assertGreater(widget.region.height, 2)
+
+    async def test_middle_dot_heading_no_end_control_and_f4_quit_last(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        exit_mock = Mock()
+        app.exit = exit_mock
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn("CHAT · [ LongFast ▾ ] · ACTIVE", heading)
+            self.assertNotIn("CHAT —", heading)
+            with self.assertRaises(NoMatches):
+                app.query_one("#end-of-chat")
+
+            await pilot.press("q")
+            exit_mock.assert_not_called()
+            footer = str(app.query_one("#footer", Static).render())
+            self.assertTrue(footer.endswith("F4 quit"))
+            self.assertNotIn("Q quit", footer)
+
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            await pilot.press("q")
+            self.assertEqual(chat_input.value, "q")
+            app.query_one(ChatTranscript).focus()
+            await pilot.pause()
+            app._update_footer()
+            footer = str(app.query_one("#footer", Static).render())
+            self.assertTrue(footer.endswith("F4 quit"))
+            self.assertIn("END newest", footer)
+
+            app.show_tab("connection")
+            device = app.query_one(DeviceSelector)
+            device.focus()
+            await pilot.press("enter", "f4")
+            exit_mock.assert_called_once_with()
+
+    async def test_f4_exit_runs_normal_cursor_cleanup(self) -> None:
+        cursor = Mock()
+        app = MeshtasticPassApp(
+            SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=()),
+            self.settings,
+            terminal_cursor=cursor,
+        )
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("f4")
+            await pilot.pause()
+
+        cursor.hide.assert_called_once_with()
+        cursor.restore.assert_called_once_with()
 
     async def test_active_heading_ages_and_nodes_remain_total_database_count(self) -> None:
         radio = SimulatedRadioService(
@@ -614,7 +767,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(reference)
             app._refresh_chat_timestamps(wall_now=reference)
             self.assertIn(
-                "CHAT — [ LongFast ▾ ] — ACTIVE 2",
+                "CHAT · [ LongFast ▾ ] · ACTIVE 2",
                 str(app.query_one("#chat-title", Static).render()),
             )
             self.assertIn(
@@ -659,7 +812,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             timestamp = widget.query_one(".chat-entry-timestamp", Static)
             distance = widget.query_one(".chat-entry-distance", Static)
 
-            self.assertIn("CHAT — [ LongFast ▾ ]", str(heading.render()))
+            self.assertIn("CHAT · [ LongFast ▾ ]", str(heading.render()))
+            self.assertNotIn("—", str(heading.render()))
             self.assertIs(author.parent, timestamp.parent)
             self.assertIs(author.parent, distance.parent)
             self.assertIsInstance(author.parent, Horizontal)
@@ -947,6 +1101,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(entry.local_sent_at)
             self.assertEqual(str(widget.timestamp_label.render()), "RX 2h")
             self.assertNotIn("DELAYED", str(widget.timestamp_label.render()))
+            self.assertIn(
+                "ACTIVE 1",
+                str(app.query_one("#chat-title", Static).render()),
+            )
+            radio.interface.sendText.assert_not_called()
             for part in parts:
                 self.assertEqual(part.visual_style.foreground.hex6, "#FF8C00")
 

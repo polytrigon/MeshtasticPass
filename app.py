@@ -39,7 +39,9 @@ from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from radio_service import (
     ChannelInfo,
     DeliveryState,
+    LONG_NAME_MAX_UTF8_BYTES,
     RadioEvent,
+    RadioIdentityError,
     RadioInfo,
     RadioSendError,
     RadioState,
@@ -78,7 +80,7 @@ def can_manual_resend(entry: ChatEntry) -> bool:
 
 
 class ThinScrollBarRender(ScrollBarRender):
-    """Use a narrow one-cell thumb while preserving Textual scroll behavior."""
+    """Use one aligned narrow glyph for both track and draggable thumb."""
 
     @classmethod
     def render_bar(
@@ -105,18 +107,19 @@ class ThinScrollBarRender(ScrollBarRender):
         if not vertical:
             return rendered
 
-        thumb_style = Style(
-            color=bar_color,
-            bgcolor=back_color,
-            meta={"@mouse.down": "grab"},
-        )
-        segments = [
-            Segment(CHAT_SCROLLBAR_THUMB_GLYPH * thickness, thumb_style)
-            if segment.style is not None
-            and segment.style.meta.get("@mouse.down") == "grab"
-            else segment
-            for segment in rendered.segments
-        ]
+        segments = []
+        for segment in rendered.segments:
+            if segment.text == "\n":
+                segments.append(segment)
+                continue
+            metadata = segment.style.meta if segment.style is not None else {}
+            is_thumb = metadata.get("@mouse.down") == "grab"
+            segments.append(
+                Segment(
+                    CHAT_SCROLLBAR_THUMB_GLYPH * thickness,
+                    Style(color=bar_color if is_thumb else back_color, meta=metadata),
+                )
+            )
         return Segments(segments, new_lines=rendered.new_lines)
 
 
@@ -165,7 +168,7 @@ class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
             "channel_index",
-            "CHAT —",
+            "CHAT ·",
             (DropdownOption(channel.name, channel.index) for channel in channels),
             value,
             widget_id="chat-title",
@@ -226,6 +229,22 @@ class DeliveryStatusReceived(Message):
         self.generation = generation
 
 
+class IdentitySaved(Message):
+    """The radio accepted an advertised Long Name update."""
+
+    def __init__(self, info: RadioInfo) -> None:
+        super().__init__()
+        self.info = info
+
+
+class IdentitySaveFailed(Message):
+    """A Long Name update failed validation or radio submission."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__()
+        self.detail = detail
+
+
 class LoadOlderControl(Static):
     """Focusable, keyboard-only control for one bounded history page."""
 
@@ -268,28 +287,6 @@ class MessageActionControl(Static):
             event.stop()
 
 
-class EndOfChatControl(Static):
-    """Focusable navigation target for returning to the newest message."""
-
-    can_focus = True
-
-    class Activated(Message):
-        pass
-
-    def __init__(self) -> None:
-        super().__init__(
-            "[ END OF CHAT ]",
-            id="end-of-chat",
-            classes="chat-nav-target",
-            markup=False,
-        )
-
-    def on_key(self, event: Key) -> None:
-        if event.key == "enter":
-            self.post_message(self.Activated())
-            event.stop()
-
-
 class ChatTranscript(VerticalScroll):
     """Focusable transcript so navigation never types into the message box."""
 
@@ -297,6 +294,7 @@ class ChatTranscript(VerticalScroll):
 
     def on_mount(self) -> None:
         self.vertical_scrollbar.renderer = ThinScrollBarRender
+        self.anchor()
 
     def on_key(self, event: Key) -> None:
         """Keep transcript navigation deterministic when this widget has focus."""
@@ -467,8 +465,57 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
-    #style-title {
+    #identity-title, #style-title {
         margin-top: 1;
+    }
+
+    #identity-long-name {
+        height: 1;
+    }
+
+    .identity-label {
+        width: 13;
+        height: 1;
+    }
+
+    .identity-bracket {
+        width: auto;
+        height: 1;
+    }
+
+    #long-name-input {
+        width: 1fr;
+        height: 1;
+        border: none;
+        padding: 0;
+        background: #101010;
+        color: #d8d8d8;
+    }
+
+    #long-name-input:disabled {
+        color: #8a8a8a;
+        opacity: 1;
+    }
+
+    #identity-values, #identity-status {
+        height: auto;
+        min-height: 1;
+    }
+
+    #identity-status {
+        color: #39ff14;
+    }
+
+    #identity-status.setting-error {
+        color: #ff1744;
+    }
+
+    Screen.theme-green #long-name-input {
+        color: #39ff14;
+    }
+
+    Screen.theme-orange #long-name-input {
+        color: #ff8c00;
     }
 
     .keyboard-dropdown {
@@ -546,25 +593,23 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: #6f3d00;
     }
 
-    #load-older, #end-of-chat, .message-action {
+    #load-older, .message-action {
         width: auto;
         height: 1;
         color: #d8d8d8;
         margin-bottom: 1;
     }
 
-    #load-older:focus, #end-of-chat:focus, .message-action:focus {
+    #load-older:focus, .message-action:focus {
         text-style: reverse;
     }
 
     Screen.theme-green #load-older,
-    Screen.theme-green #end-of-chat,
     Screen.theme-green .message-action {
         color: #39ff14;
     }
 
     Screen.theme-orange #load-older,
-    Screen.theme-orange #end-of-chat,
     Screen.theme-orange .message-action {
         color: #ff8c00;
     }
@@ -572,6 +617,7 @@ class MeshtasticPassApp(App[None]):
     .chat-entry {
         height: auto;
         margin-bottom: 1;
+        padding-right: 1;
     }
 
     .chat-entry-row, .chat-entry-content {
@@ -784,14 +830,25 @@ class MeshtasticPassApp(App[None]):
                 yield DeviceSelector(self.settings.device_path, devices)
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
+                yield Static("> IDENTITY", id="identity-title", classes="page-title")
+                with Horizontal(id="identity-long-name"):
+                    yield Static("LONG NAME", classes="identity-label", markup=False)
+                    yield Static("[ ", classes="identity-bracket", markup=False)
+                    yield Input(
+                        id="long-name-input",
+                        max_length=LONG_NAME_MAX_UTF8_BYTES,
+                        disabled=True,
+                    )
+                    yield Static(" ]", classes="identity-bracket", markup=False)
+                yield Static(id="identity-values", markup=False)
+                yield Static(id="identity-status", markup=False)
                 yield Static("> STYLE", id="style-title", classes="page-title")
                 yield FontSizeSelector(self.settings.font_size)
                 yield ColorSelector(self.settings.color)
                 yield Static(id="style-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield ChannelSelector(self._channels, self.current_channel_index)
-                with ChatTranscript(id="chat-log"):
-                    yield EndOfChatControl()
+                yield ChatTranscript(id="chat-log")
                 yield Static(id="chat-new-below")
                 yield Static(id="send-error")
                 yield Input(placeholder="> message", id="chat-input")
@@ -801,7 +858,7 @@ class MeshtasticPassApp(App[None]):
             with Vertical(id="pass-map", classes="tab-page"):
                 yield Static("> PASS MAP", classes="page-title")
                 yield Static("Coming in a future milestone.")
-        yield Static("1-4 switch tabs    Q quit", id="footer")
+        yield Static("1-4 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -843,11 +900,18 @@ class MeshtasticPassApp(App[None]):
 
     def on_key(self, event: Key) -> None:
         """Handle global keys only while the chat input is not focused."""
+        if event.key == "f4":
+            self.exit()
+            event.stop()
+            return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
         if isinstance(self.focused, Input):
-            if event.key == "escape":
+            if self.focused.id == "chat-input" and event.key == "escape":
                 self.query_one("#chat-log", ChatTranscript).focus()
+                event.stop()
+            elif self.focused.id == "long-name-input" and event.key == "escape":
+                self.query_one(DeviceSelector).focus()
                 event.stop()
             return
 
@@ -879,6 +943,7 @@ class MeshtasticPassApp(App[None]):
         if self.current_tab == "connection" and event.key in ("up", "down"):
             controls = [
                 self.query_one(DeviceSelector),
+                self.query_one("#long-name-input", Input),
                 self.query_one(FontSizeSelector),
                 self.query_one(ColorSelector),
             ]
@@ -905,9 +970,45 @@ class MeshtasticPassApp(App[None]):
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
             event.stop()
-        elif event.key.lower() == "q":
-            self.exit()
-            event.stop()
+
+    @on(Input.Submitted, "#long-name-input")
+    def save_long_name(self, event: Input.Submitted) -> None:
+        """Apply an identity edit through the active radio service."""
+        status = self.query_one("#identity-status", Static)
+        status.remove_class("setting-error")
+        status.update("SAVING NAME...")
+        self.run_worker(
+            lambda: self._save_long_name_from_thread(event.value),
+            thread=True,
+            name="save-radio-long-name",
+            exclusive=True,
+        )
+
+    def _save_long_name_from_thread(self, long_name: str) -> None:
+        try:
+            info = self.radio.set_long_name(long_name)
+        except (RadioIdentityError, AttributeError) as error:
+            detail = str(error).strip() or "The radio identity could not be saved."
+            self.post_message(IdentitySaveFailed(detail))
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            self.post_message(IdentitySaveFailed(f"Could not save Long Name: {detail}"))
+        else:
+            self.post_message(IdentitySaved(info))
+
+    @on(IdentitySaved)
+    def identity_saved(self, event: IdentitySaved) -> None:
+        self._radio_info = event.info
+        self._render_identity(force_value=True)
+        status = self.query_one("#identity-status", Static)
+        status.remove_class("setting-error")
+        status.update("NAME SAVED")
+
+    @on(IdentitySaveFailed)
+    def identity_save_failed(self, event: IdentitySaveFailed) -> None:
+        status = self.query_one("#identity-status", Static)
+        status.add_class("setting-error")
+        status.update(event.detail)
 
     def show_tab(self, tab_id: str) -> None:
         if self.current_tab == "chat" and tab_id != "chat":
@@ -1155,6 +1256,7 @@ class MeshtasticPassApp(App[None]):
             state.unread_count += 1
             self._recount_unread()
             self._update_tab_bar()
+        self._render_chat_heading()
 
     def _state_for(self, channel_index: int) -> ChannelChatState:
         return self._channel_states.setdefault(channel_index, ChannelChatState())
@@ -1210,8 +1312,8 @@ class MeshtasticPassApp(App[None]):
         if state.has_older_history:
             widgets.append(LoadOlderControl())
         widgets.extend(ChatEntryWidget(entry) for entry in state.entries)
-        widgets.append(EndOfChatControl())
-        await transcript.mount(*widgets)
+        if widgets:
+            await transcript.mount(*widgets)
         if self.current_tab == "chat":
             self._mark_unread_messages_viewed()
             self._recount_unread()
@@ -1225,14 +1327,15 @@ class MeshtasticPassApp(App[None]):
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
-        end_control = self.query_one(EndOfChatControl)
         if self.current_tab != "chat":
-            transcript.mount(ChatEntryWidget(entry), before=end_control)
+            transcript.mount(ChatEntryWidget(entry))
             self._trim_mounted_chat_window(transcript)
             self._chat_open_scroll_pending = True
             return
         should_follow = self._is_near_chat_bottom()
-        transcript.mount(ChatEntryWidget(entry), before=end_control)
+        if should_follow:
+            transcript.anchor()
+        transcript.mount(ChatEntryWidget(entry))
         self._trim_mounted_chat_window(transcript)
         if should_follow:
             self.call_after_refresh(self._jump_to_newest)
@@ -1278,8 +1381,10 @@ class MeshtasticPassApp(App[None]):
         if len(self.query(LoadOlderControl)):
             return
         first_widget = next(iter(self.query(ChatEntryWidget)), None)
-        before = first_widget or self.query_one(EndOfChatControl)
-        transcript.mount(LoadOlderControl(), before=before)
+        if first_widget is None:
+            transcript.mount(LoadOlderControl())
+        else:
+            transcript.mount(LoadOlderControl(), before=first_widget)
 
     def _refresh_chat_timestamps(
         self,
@@ -1305,7 +1410,7 @@ class MeshtasticPassApp(App[None]):
                 except Exception:
                     active = None
         value = "—" if active is None else str(active)
-        selectors[0].set_suffix(f"— ACTIVE {value}")
+        selectors[0].set_suffix(f"· ACTIVE {value}")
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
@@ -1326,7 +1431,7 @@ class MeshtasticPassApp(App[None]):
 
     def _jump_to_newest(self) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
-        transcript.scroll_end(animate=False)
+        transcript.anchor()
         self.transcript_new_count = 0
         self._update_transcript_indicator()
 
@@ -1336,7 +1441,7 @@ class MeshtasticPassApp(App[None]):
         for widget in transcript.walk_children():
             if isinstance(
                 widget,
-                (LoadOlderControl, ChatEntryWidget, MessageActionControl, EndOfChatControl),
+                (LoadOlderControl, ChatEntryWidget, MessageActionControl),
             ) and widget.display:
                 targets.append(widget)
         return targets
@@ -1353,11 +1458,6 @@ class MeshtasticPassApp(App[None]):
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
-
-    @on(EndOfChatControl.Activated)
-    def end_of_chat_activated(self, _event: EndOfChatControl.Activated) -> None:
-        self._jump_to_newest()
-        self.query_one(EndOfChatControl).focus()
 
     @on(MessageActionControl.Activated)
     def message_action_activated(
@@ -1422,7 +1522,7 @@ class MeshtasticPassApp(App[None]):
         for entry in state.entries:
             widgets.append(ChatEntryWidget(entry))
         if widgets:
-            transcript.mount(*widgets, before=self.query_one(EndOfChatControl))
+            transcript.mount(*widgets)
 
     @on(LoadOlderControl.Activated)
     async def load_older_chat_history(
@@ -1613,11 +1713,12 @@ class MeshtasticPassApp(App[None]):
         self._update_footer()
 
     def _update_footer(self) -> None:
-        text = "1-4 switch tabs    Q quit"
         if self.current_tab == "chat" and isinstance(self.focused, Input):
-            text += "    ENTER send    ESC messages"
+            text = "ENTER send    ESC messages    F4 quit"
         elif self.current_tab == "chat":
-            text += "    ↑↓ navigate    C channel    ENTER action    END newest"
+            text = "↑↓ navigate    C channel    ENTER action    END newest    F4 quit"
+        else:
+            text = "1-4 switch tabs    F4 quit"
         self.query_one("#footer", Static).update(text)
 
     def restore_terminal_cursor(self) -> None:
@@ -1658,7 +1759,11 @@ class MeshtasticPassApp(App[None]):
                 self._connection_animation_timer.pause()
             else:
                 self._connection_animation_timer.resume()
+        identity_status = self.query_one("#identity-status", Static)
+        identity_status.remove_class("setting-error")
+        identity_status.update("")
         self._render_connection_details()
+        self._render_identity(force_value=True)
         self._render_chat_heading()
         self.query_one("#connection-error", Static).update("")
 
@@ -1682,14 +1787,32 @@ class MeshtasticPassApp(App[None]):
             info = self._radio_info
             values.extend(
                 [
-                    ("NODE", info.node_id),
-                    ("NAME", f"{info.long_name} ({info.short_name})"),
-                    ("FIRMWARE", info.firmware_version),
                     ("NODES", str(info.known_nodes)),
                 ]
             )
         details = "\n".join(f"{label:<10} {value}" for label, value in values)
         self.query_one("#connection-details", Static).update(details)
+
+    def _render_identity(self, force_value: bool = False) -> None:
+        editor = self.query_one("#long-name-input", Input)
+        values = self.query_one("#identity-values", Static)
+        online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
+        editor.disabled = not online
+        if online:
+            info = self._radio_info
+            assert info is not None
+            if force_value or not editor.has_focus:
+                editor.value = info.long_name
+            values.update(
+                f"{'SHORT NAME':<12} {info.short_name}\n"
+                f"{'NODE ID':<12} {info.node_id}"
+            )
+        else:
+            editor.value = ""
+            values.update(
+                f"{'SHORT NAME':<12} —\n"
+                f"{'NODE ID':<12} —"
+            )
 
     def _show_send_error(self, message: str) -> None:
         self.query_one("#send-error", Static).update(message)

@@ -88,16 +88,23 @@ Up/Page Down still move by a viewport and End jumps to the newest edge. New
 messages follow the bottom
 only when the transcript is already near the bottom. If you are reading older
 messages, `↓ n NEW` counts messages below the viewport; End jumps to the newest
-entry and clears that indicator. Press `q` outside the input to quit. Radio
+entry and clears that indicator. There is no visible END OF CHAT control;
+Up/Down stop at the newest meaningful message or action. Press `F4` to quit from
+any normal app context;
+`q` is ordinary input and is not a quit shortcut. Radio
 monitoring, CHAT storage, and the radio service close during shutdown.
 
-The selected channel heading includes `ACTIVE N`, a passive count of unique *other*
-nodes whose node-database `lastHeard` value is less than five minutes old.
+The selected channel heading uses the format
+`CHAT · [ configured channel ▾ ] · ACTIVE N`. ACTIVE is a passive count of
+unique *other* nodes whose freshest trustworthy node-database `lastHeard` or
+packet directly observed by MeshtasticPass is less than five minutes old.
 Exactly five minutes old is inactive. Missing, malformed, future, and otherwise
 impossible timestamps are ignored, and the local node is excluded. The shared
 one-second CHAT refresh ages this count even when no packets arrive. `ACTIVE —`
 means the radio or activity data is unavailable; connected with no recent nodes
-shows `ACTIVE 0`. This reads the node database only and sends no LoRa traffic.
+shows `ACTIVE 0`. Direct observations are held only in memory, deduplicated by
+node ID, and cleared when the USB/radio selection changes. The receive callback
+and node-database read call no transmission API, so ACTIVE sends no LoRa traffic.
 The CONNECTION page's `NODES` value remains the total known node-database size,
 so it is intentionally different from ACTIVE.
 
@@ -107,10 +114,12 @@ with malformed or missing activity timestamps. It initially displays
 leaving `ACTIVE 1`. This deterministic transition makes activity aging testable
 without a second radio.
 
-CHAT keeps its one-cell scrollbar allocation. Its vertical thumb uses the
-narrow Unicode `▕` glyph through Textual's supported per-scrollbar renderer
-hook, while retaining Textual's sizing, theme colors, mouse metadata, wheel
-scrolling, and drag behavior.
+CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
+thumb use the same right-aligned narrow Unicode `▕` glyph through Textual's
+supported per-scrollbar renderer hook, while retaining Textual's sizing, theme
+colors, mouse metadata, wheel scrolling, and drag behavior. Message content has
+one column of right padding before that far-right scrollbar, including when
+messages wrap at narrow terminal widths.
 
 ### Stock firmware and messages received while the app is absent
 
@@ -306,6 +315,18 @@ CONNECTION also has a USB DEVICE dropdown populated from currently discovered
 serial ports. Selecting a different port saves it, closes the old connection,
 and immediately starts the normal reconnect flow. Simulation offers the stable
 fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
+
+The **IDENTITY** section shows the connected radio's Long Name, Short Name, and
+Node ID. Long Name is editable: focus the field and press Enter to apply it to
+the actual radio through Meshtastic Python SDK 2.7.11's supported
+`interface.localNode.setOwner(long_name=...)` path. It is not a local app-only
+preference. The protobuf's 40-byte nanopb string buffer permits at most 39 UTF-8
+bytes plus its terminator; MeshtasticPass rejects empty or oversized names
+instead of silently truncating them. Short Name and Node ID are read-only.
+Identity fields are unavailable while disconnected, and the simulator provides
+the same deterministic edit behavior without touching hardware. The supported
+SDK operation may cause the firmware's normal identity propagation; the app
+does not add a separate announcement packet.
 
 The STYLE section has FONT SIZE and COLOR dropdowns. Focus a dropdown and press
 Enter, then use Up/Down and Enter to select or Escape to cancel. Font choices

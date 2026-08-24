@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from radio_service import (
     ChannelInfo,
     RadioConnectionError,
+    RadioIdentityError,
     RadioInfo,
     RadioService,
     RadioState,
@@ -246,6 +247,73 @@ class RadioServiceTests(unittest.TestCase):
 
     def test_active_node_count_is_unavailable_while_disconnected(self) -> None:
         self.assertIsNone(RadioService().active_node_count(now=1_000))
+
+    def test_received_text_updates_passive_activity_without_transmitting(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        interface.nodesByNum[2] = {
+            "user": {"id": "!00000002", "longName": "Alice"},
+            "lastHeard": 100,
+        }
+        interface.sendText = Mock()
+        service._interface = interface
+        service._activity_local_node_id = "!12345678"
+        packet = {
+            "from": 2,
+            "fromId": "!00000002",
+            "id": 77,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hello"},
+        }
+
+        with patch("radio_service.time.time", return_value=1_000):
+            service._on_text_received(packet, interface)
+            service._on_text_received(packet, interface)
+
+        self.assertEqual(service.active_node_count(now=1_000), 1)
+        self.assertEqual(service.active_node_count(now=1_300), 0)
+        interface.sendText.assert_not_called()
+
+    def test_direct_activity_excludes_self_and_clears_on_device_switch(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        service._activity_local_node_id = "!12345678"
+        service._record_direct_observation("!12345678", 1_000)
+        service._record_direct_observation("!00000002", 1_000)
+
+        self.assertEqual(service.active_node_count(now=1_000), 1)
+        service.set_device_path("/dev/ttyUSB1")
+        self.assertEqual(service._direct_observations, {})
+
+    def test_set_long_name_uses_sdk_local_node_and_refreshes_info(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        interface.localNode = SimpleNamespace(channels=(), setOwner=Mock())
+        service._interface = interface
+
+        info = service.set_long_name("  Clockwork Nomad  ")
+
+        interface.localNode.setOwner.assert_called_once_with(
+            long_name="Clockwork Nomad"
+        )
+        self.assertEqual(info.long_name, "Clockwork Nomad")
+        self.assertEqual(
+            interface.nodesByNum[interface.myInfo.my_node_num]["user"]["longName"],
+            "Clockwork Nomad",
+        )
+
+    def test_long_name_validation_blocks_empty_oversize_and_disconnected(self) -> None:
+        service = RadioService()
+        with self.assertRaises(RadioIdentityError):
+            service.set_long_name("Offline")
+
+        interface = make_interface()
+        interface.localNode = SimpleNamespace(channels=(), setOwner=Mock())
+        service._interface = interface
+        for invalid in ("   ", "x" * 40, "🚲" * 10):
+            with self.subTest(invalid=invalid), self.assertRaises(RadioIdentityError):
+                service.set_long_name(invalid)
+        interface.localNode.setOwner.assert_not_called()
 
 
 if __name__ == "__main__":

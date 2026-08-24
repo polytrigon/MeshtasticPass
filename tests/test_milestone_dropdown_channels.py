@@ -15,7 +15,6 @@ from app import (
     ChatEntryWidget,
     ColorSelector,
     DeviceSelector,
-    EndOfChatControl,
     FontSizeSelector,
     MessageActionControl,
     MeshtasticPassApp,
@@ -169,8 +168,12 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             app._rebroadcast = Mock()
             await pilot.press("enter")
             app._rebroadcast.assert_called_once_with(entry)
-            app.query_one(EndOfChatControl).focus()
-            await pilot.press("enter")
+            widgets[-1].focus()
+            await pilot.press("down")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            app.transcript_new_count = 2
+            app.query_one("#chat-log").focus()
+            await pilot.press("end")
             self.assertEqual(app.transcript_new_count, 0)
 
             footer = str(app.query_one("#footer", Static).render())

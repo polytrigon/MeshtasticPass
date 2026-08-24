@@ -1,11 +1,12 @@
 """Hardware-free tests for SimulatedRadioService."""
 
+from dataclasses import replace
 import sys
 from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
-from radio_service import RadioState
+from radio_service import RadioIdentityError, RadioState
 from simulated_radio_service import (
     SIMULATED_MESSAGES,
     SIMULATED_LOCAL_POSITION,
@@ -174,6 +175,29 @@ class SimulatedRadioServiceTests(unittest.TestCase):
 
         service.close()
         self.assertIsNone(service.active_node_count(now=1_002))
+
+    def test_direct_message_activity_and_identity_edit_are_deterministic(self) -> None:
+        service = self.make_service()
+        with patch("simulated_radio_service.time.time", return_value=1_000):
+            service.connect()
+            service.emit_message(
+                replace(
+                    SIMULATED_MESSAGES[0],
+                    sender_node_id="!new00006",
+                    packet_id=999,
+                )
+            )
+
+        self.assertEqual(service.active_node_count(now=1_000), 3)
+        info = service.set_long_name("Clockwork Nomad")
+        self.assertEqual(info.long_name, "Clockwork Nomad")
+        self.assertEqual(service.info.long_name, "Clockwork Nomad")
+        self.assertEqual(service.sent_messages, ())
+
+        service.set_device_path("/dev/ttyUSB1")
+        self.assertEqual(service._direct_observations, {})
+        with self.assertRaises(RadioIdentityError):
+            service.set_long_name("Offline Name")
 
 
 if __name__ == "__main__":

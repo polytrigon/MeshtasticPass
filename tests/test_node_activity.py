@@ -85,6 +85,41 @@ class NodeActivityTests(unittest.TestCase):
             1,
         )
 
+    def test_combines_direct_observations_with_database_by_unique_node(self) -> None:
+        now = 1_000.0
+        nodes = (
+            (2, {"user": {"id": "!alice001"}, "lastHeard": now - 900}),
+            (3, {"user": {"id": "!bob00003"}, "lastHeard": now - 10}),
+        )
+        observations = {
+            "!ALICE001": now,
+            "!bob00003": now - 900,
+            "!self0001": now,
+        }
+
+        self.assertEqual(
+            count_active_other_nodes(
+                nodes,
+                local_node_number=1,
+                local_node_id="!self0001",
+                now=now,
+                direct_observations=observations,
+            ),
+            2,
+        )
+
+    def test_direct_observation_ages_out_at_exact_boundary(self) -> None:
+        self.assertEqual(
+            count_active_other_nodes(
+                (),
+                local_node_number=1,
+                local_node_id="!self0001",
+                now=1_000,
+                direct_observations={"!alice001": 700},
+            ),
+            0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
