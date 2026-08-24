@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
+from geo import GeoPosition
 from app_controller import (
     RadioMonitor,
     create_radio_service,
@@ -48,6 +50,7 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual(entry.age_reference, 123.0)
         self.assertTrue(entry.unread)
         self.assertTrue(entry.is_new)
+        self.assertIsNone(entry.distance_miles)
         self.assertEqual(received_chat_entry(fallback).author, "!a11ce001")
         self.assertFalse(entry.outgoing)
 
@@ -67,6 +70,19 @@ class AppControllerTests(unittest.TestCase):
         self.assertTrue(entry.outgoing)
         self.assertFalse(entry.unread)
         self.assertFalse(entry.is_new)
+        self.assertIsNone(entry.distance_miles)
+
+    def test_received_entry_calculates_sender_distance(self) -> None:
+        message = self.make_message(long_name="Alice", short_name="ALCE")
+        message = replace(
+            message,
+            local_position=GeoPosition(0.0, 0.0),
+            sender_position=GeoPosition(0.0, 1.0),
+        )
+
+        entry = received_chat_entry(message)
+
+        self.assertAlmostEqual(entry.distance_miles, 69.09, places=2)
 
     def test_monitor_stops_and_closes_service_cleanly(self) -> None:
         radio = FakeRadio()

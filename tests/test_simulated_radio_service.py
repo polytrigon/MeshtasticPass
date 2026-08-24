@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from radio_service import RadioState
 from simulated_radio_service import (
     SIMULATED_MESSAGES,
+    SIMULATED_LOCAL_POSITION,
     SimulatedRadioService,
 )
 
@@ -53,6 +54,9 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         self.assertTrue(
             all(message.radio_rx_at is not None for message in received)
         )
+        self.assertEqual(received[0].local_position, SIMULATED_LOCAL_POSITION)
+        self.assertIsNotNone(received[0].sender_position)
+        self.assertIsNone(received[1].sender_position)
         self.assertEqual(
             [event.state for event in states],
             [RadioState.CONNECTING, RadioState.ONLINE],

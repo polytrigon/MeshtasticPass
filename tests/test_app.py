@@ -23,6 +23,7 @@ from app import (
 )
 from app_settings import AppSettings
 from chat_store import ChatStore
+from geo import format_distance_miles
 from radio_service import (
     DeliveryState,
     RadioEvent,
@@ -406,6 +407,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         incoming = SIMULATED_MESSAGES[0]
 
         async with app.run_test(size=(100, 30)) as pilot:
+            app.show_tab("chat")
             timestamp_timer = app._chat_timestamp_timer
             self.assertIsNotNone(timestamp_timer)
 
@@ -441,6 +443,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 ".chat-entry-timestamp", Static
             )
             self.assertEqual(str(incoming_timestamp.render()), "1h 3min")
+            self.assertGreaterEqual(incoming_timestamp.region.width, len("1h 3min"))
 
         self.assertIsNone(timestamp_timer._task)
 
@@ -487,14 +490,39 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             widget = app.query_one(ChatEntryWidget)
             author = widget.query_one(".chat-entry-author", Static)
             timestamp = widget.query_one(".chat-entry-timestamp", Static)
+            distance = widget.query_one(".chat-entry-distance", Static)
 
             self.assertIn("CHAT — PRIMARY", str(heading.render()))
             self.assertIs(author.parent, timestamp.parent)
+            self.assertIs(author.parent, distance.parent)
             self.assertIsInstance(author.parent, Horizontal)
             self.assertEqual(author.region.y, timestamp.region.y)
+            self.assertEqual(author.region.y, distance.region.y)
+            self.assertEqual(
+                str(distance.render()),
+                format_distance_miles(app.chat_history[0].distance_miles),
+            )
+            header_text = [
+                str(part.render())
+                for part in widget.query(".chat-entry-header Static")
+            ]
+            self.assertEqual(header_text[0], "Alice Trail")
+            self.assertEqual(header_text[1], " / ")
+            self.assertEqual(header_text[3], " / ")
+            self.assertTrue(header_text[4].endswith("miles"))
             self.assertTrue(author.visual_style.bold)
             self.assertFalse(bool(timestamp.visual_style.bold))
             self.assertTrue(timestamp.visual_style.dim)
+            self.assertTrue(distance.visual_style.dim)
+
+            app._accept_received_message(SIMULATED_MESSAGES[1])
+            await pilot.pause()
+            without_position = list(app.query(ChatEntryWidget))[-1]
+            self.assertIsNone(without_position.distance_label)
+            self.assertEqual(
+                len(list(without_position.query(".chat-entry-header Static"))),
+                3,
+            )
 
     async def test_new_message_header_lifecycle_and_themes(self) -> None:
         radio = SimulatedRadioService(
@@ -519,7 +547,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             unread_widget = list(app.query(ChatEntryWidget))[-1]
             unread_author = unread_widget.query_one(".chat-entry-author", Static)
             unread_timestamp = unread_widget.timestamp_label
+            unread_distance = unread_widget.distance_label
             unread_body = unread_widget.message_label
+            self.assertIsNotNone(unread_distance)
             self.assertFalse(unread_entry.unread)
             self.assertTrue(unread_entry.is_new)
             self.assertTrue(unread_widget.has_class("new-message"))
@@ -533,7 +563,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             for theme, expected in expected_highlight_colors.items():
                 app._apply_color_theme(theme)
                 await pilot.pause()
-                for part in (unread_author, unread_timestamp, unread_body):
+                for part in (
+                    unread_author,
+                    unread_timestamp,
+                    unread_distance,
+                    unread_body,
+                ):
                     self.assertEqual(part.visual_style.foreground.hex6, expected)
 
             app._refresh_chat_timestamps(
@@ -553,6 +588,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(unread_widget.has_class("new-message"))
             self.assertEqual(unread_author.visual_style.foreground.hex6, "#FF8C00")
             self.assertEqual(unread_timestamp.visual_style.foreground.hex6, "#A85C00")
+            self.assertEqual(unread_distance.visual_style.foreground.hex6, "#A85C00")
             self.assertEqual(unread_body.visual_style.foreground.hex6, "#FF8C00")
 
             app._accept_received_message(incoming)
@@ -567,9 +603,125 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.chat_history[-1].outgoing)
             self.assertFalse(app.chat_history[-1].is_new)
             self.assertFalse(outgoing_widget.has_class("new-message"))
+            self.assertIsNone(outgoing_widget.distance_label)
 
             app.show_tab("connection")
             self.assertFalse(app.chat_history[-2].is_new)
+
+    async def test_visible_delivery_states_and_theme_colors(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.show_tab("chat")
+            app._accepted_send("visible states")
+            entry = app.chat_history[-1]
+            widget = list(app.query(ChatEntryWidget))[-1]
+            self.assertIs(entry.delivery_state, DeliveryState.SENT)
+            self.assertIn(DeliveryState.SENT, DeliveryState)
+
+            palettes = {
+                "white": ("#F2F2F2", "#D8D8D8"),
+                "green": ("#7CFF6B", "#39FF14"),
+                "orange": ("#FFB000", "#FF8C00"),
+            }
+            for theme, (accent, base) in palettes.items():
+                app._apply_color_theme(theme)
+
+                entry.delivery_state = DeliveryState.SENDING
+                widget.refresh_delivery_state(1)
+                await pilot.pause()
+                self.assertIn(
+                    str(widget.delivery_label.render()),
+                    ("SENDING.", "SENDING..", "SENDING..."),
+                )
+                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
+
+                entry.delivery_state = DeliveryState.SENT
+                widget.refresh_delivery_state(2)
+                await pilot.pause()
+                self.assertIn(
+                    str(widget.delivery_label.render()),
+                    ("SENDING.", "SENDING..", "SENDING..."),
+                )
+                self.assertTrue(widget.has_class("delivery-sending"))
+                self.assertFalse(widget.has_class("delivery-sent"))
+                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
+
+                entry.delivery_state = DeliveryState.HEARD
+                widget.refresh_delivery_state(1)
+                await pilot.pause()
+                self.assertEqual(str(widget.delivery_label.render()), "HEARD")
+                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, base)
+
+                entry.delivery_state = DeliveryState.UNCONFIRMED
+                widget.refresh_delivery_state(1)
+                await pilot.pause()
+                self.assertEqual(
+                    str(widget.delivery_label.render()),
+                    "UNCONFIRMED",
+                )
+                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
+
+                entry.delivery_state = DeliveryState.FAILED
+                widget.refresh_delivery_state(1)
+                await pilot.pause()
+                self.assertEqual(str(widget.delivery_label.render()), "FAILED")
+                self.assertEqual(
+                    widget.delivery_label.visual_style.foreground.hex6,
+                    "#FF1744",
+                )
+
+            entry.delivery_state = DeliveryState.SENT
+            widget.refresh_delivery_state(1)
+            app._advance_delivery_states()
+            self.assertIn(
+                str(widget.delivery_label.render()),
+                ("SENDING.", "SENDING..", "SENDING..."),
+            )
+            self.assertIsNone(widget.distance_label)
+
+    async def test_delivery_label_reflows_between_visible_states(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.show_tab("chat")
+            app._accepted_send("delivery layout")
+            entry = app.chat_history[-1]
+            widget = list(app.query(ChatEntryWidget))[-1]
+            label = widget.delivery_label
+            self.assertIsNotNone(label)
+
+            transitions = (
+                (DeliveryState.SENDING, 3, "SENDING..."),
+                (DeliveryState.HEARD, 1, "HEARD"),
+                (DeliveryState.FAILED, 1, "FAILED"),
+                (DeliveryState.UNCONFIRMED, 1, "UNCONFIRMED"),
+            )
+            widths = []
+            for state, dot_count, expected in transitions:
+                entry.delivery_state = state
+                widget.refresh_delivery_state(dot_count)
+                await pilot.pause()
+
+                rendered = str(label.render())
+                self.assertEqual(rendered, expected)
+                self.assertEqual(label.region.width, len(expected))
+                self.assertNotIn(" ", rendered)
+                widths.append(label.region.width)
+
+            self.assertLess(widths[1], widths[0])
+            self.assertGreater(widths[2], widths[1])
+            self.assertGreater(widths[3], widths[2])
 
     async def test_terminal_cursor_guard_runs_for_app_lifecycle(self) -> None:
         radio = SimulatedRadioService(

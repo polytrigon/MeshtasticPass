@@ -8,6 +8,7 @@ from time import monotonic, time
 from typing import Any, Callable
 
 from chat_store import StoredMessage
+from geo import distance_between
 from message_time import make_age_reference
 from radio_service import (
     DeliveryState,
@@ -28,6 +29,7 @@ class ChatEntry:
     local_sent_at: float | None
     received_at: float
     age_reference: float
+    distance_miles: float | None = None
     outgoing: bool = False
     unread: bool = False
     is_new: bool = False
@@ -70,6 +72,10 @@ def received_chat_entry(
         local_sent_at=None,
         received_at=local_received_at,
         age_reference=age_reference,
+        distance_miles=distance_between(
+            message.local_position,
+            message.sender_position,
+        ),
         unread=unread,
         is_new=is_new,
         packet_id=message.packet_id,

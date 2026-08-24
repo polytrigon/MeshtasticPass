@@ -9,6 +9,7 @@ from threading import Event
 import time
 from typing import Callable, Iterator
 
+from geo import GeoPosition
 from radio_service import (
     RadioEvent,
     DeliveryState,
@@ -38,12 +39,25 @@ class SimulatedNode:
     node_id: str
     long_name: str
     short_name: str
+    position: GeoPosition | None
 
+
+SIMULATED_LOCAL_POSITION = GeoPosition(40.7128, -74.0060, 1_700_000_000.0)
 
 SIMULATED_NODES = (
-    SimulatedNode("!a11ce001", "Alice Trail", "ALCE"),
-    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB"),
-    SimulatedNode("!cafe0003", "Cafe Relay", "CAFE"),
+    SimulatedNode(
+        "!a11ce001",
+        "Alice Trail",
+        "ALCE",
+        GeoPosition(40.7736, -73.9566, 1_700_000_100.0),
+    ),
+    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None),
+    SimulatedNode(
+        "!cafe0003",
+        "Cafe Relay",
+        "CAFE",
+        GeoPosition(40.6501, -73.9496, 1_700_000_200.0),
+    ),
 )
 
 _SIMULATED_REFERENCE_TIME = time.time()
@@ -60,6 +74,8 @@ SIMULATED_MESSAGES = (
         snr=6.5,
         packet_id=350000001,
         radio_rx_at=_SIMULATED_REFERENCE_TIME - 8,
+        local_position=SIMULATED_LOCAL_POSITION,
+        sender_position=SIMULATED_NODES[0].position,
     ),
     ReceivedMessage(
         sender_node_id=SIMULATED_NODES[1].node_id,
@@ -71,6 +87,8 @@ SIMULATED_MESSAGES = (
         snr=8.25,
         packet_id=350000002,
         radio_rx_at=_SIMULATED_REFERENCE_TIME - 27 * 60,
+        local_position=SIMULATED_LOCAL_POSITION,
+        sender_position=SIMULATED_NODES[1].position,
     ),
     ReceivedMessage(
         sender_node_id=SIMULATED_NODES[2].node_id,
@@ -82,6 +100,8 @@ SIMULATED_MESSAGES = (
         snr=2.0,
         packet_id=350000003,
         radio_rx_at=_SIMULATED_REFERENCE_TIME - (2 * 60 + 12) * 60,
+        local_position=SIMULATED_LOCAL_POSITION,
+        sender_position=SIMULATED_NODES[2].position,
     ),
 )
 

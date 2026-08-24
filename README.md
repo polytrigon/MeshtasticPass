@@ -109,6 +109,36 @@ If the database cannot be opened or one history write fails, the app reports a
 CHAT history error and keeps the radio/UI running. It never deletes or silently
 replaces a malformed database.
 
+### CHAT age and distance metadata
+
+Relative time uses `s`, `min`, `h`, and `d`. Textual now recalculates the
+timestamp widget's layout when a value grows (for example, from `5s` to
+`5min`). Previously the formatter produced `5min`, but the old shorter widget
+width clipped the final `n` and made the screen appear to say `5mi`.
+
+When both nodes have usable positions, an incoming header also shows the
+straight-line Haversine distance in miles:
+
+```text
+Alice Trail / 5min / 5.1miles
+```
+
+`RadioService` reads the latest local and sender positions from the SDK 2.7.11
+node database. The SDK normally supplies decimal `latitude` and `longitude`
+after converting `latitudeI` and `longitudeI`; both forms are accepted safely.
+The application-level position model also retains the GPS-solution `timestamp`,
+or the received-position `time` when available, so freshness policy can be
+added later. This milestone does not reject an otherwise valid coordinate by
+age.
+
+Distances below 0.1 mile show `<0.1miles`, distances below 10 miles use one
+decimal place, and distances of 10 miles or more use whole miles. Distance is
+omitted when either coordinate is unavailable or malformed. It is never
+estimated from RSSI, SNR, hops, or routing data, and it reflects last-known
+positions rather than guaranteed current locations. Outgoing `YOU` entries do
+not show distance. Simulated Alice has deterministic coordinates; simulated
+Bob intentionally has no position to exercise the omitted case.
+
 ### Outgoing state meanings
 
 MeshtasticPass is tested against the pinned Meshtastic Python SDK 2.7.11.
@@ -126,7 +156,7 @@ the packet likely propagated, but delivery cannot be guaranteed. The Python
 SDK does not expose a human read receipt, and its response-handler table does
 not implement its own expiry.
 
-The UI therefore uses only these meanings:
+The internal state and persistence model keeps all five meanings:
 
 - `SENDING`: MeshtasticPass has started the SDK call.
 - `SENT`: SDK 2.7.11 returned a packet ID after accepting local submission;
@@ -136,6 +166,12 @@ The UI therefore uses only these meanings:
 - `UNCONFIRMED`: no matching ACK/NAK arrived during the SDK's default
   300-second response window. Transmission may still have occurred.
 - `FAILED`: a definite local SDK exception or routing NAK occurred.
+
+CHAT intentionally presents both internal `SENDING` and `SENT` as the same
+animated `SENDING...` state. `SENT` remains internal because it drives the
+ACK timeout, SQLite history, send attempts, and diagnostics, but local SDK
+acceptance is not useful as a separate user-facing delivery claim. The visible
+resolved states are `HEARD`, `UNCONFIRMED`, and `FAILED`.
 
 `SENDING` uses one shared UI animation timer. No state triggers an automatic
 application-level resend. To rebroadcast an `UNCONFIRMED` entry, press Escape,
@@ -215,6 +251,7 @@ send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
 chat_store.py      Versioned SQLite CHAT history and send attempts
+geo.py             Position validation, Haversine distance, and mile formatting
 app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup
 radio_service.py   All Meshtastic connection and device-info logic
