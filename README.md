@@ -69,6 +69,7 @@ python check_radio.py --device /dev/ttyACM0
 check_radio.py     Small command-line connection check
 receive_messages.py  Text-message receive monitor
 radio_service.py   All Meshtastic connection and device-info logic
+simulated_radio_service.py  Deterministic radio simulator
 requirements.txt   Python dependency
 tests/             Hardware-free connection resilience tests
 ```
@@ -95,3 +96,22 @@ then send another text message and confirm it is printed exactly once.
 `ReceivedMessage` is the application-level message type. Future chat or UI code
 should register a handler with `RadioService` instead of parsing Meshtastic SDK
 packet dictionaries.
+
+## Milestone 3.5: simulation mode
+
+Run the same message monitor without Meshtastic hardware:
+
+```bash
+python receive_messages.py --simulate
+```
+
+The simulator transitions from `RADIO CONNECTING` to `RADIO ONLINE`, then emits
+three deterministic `RX MESSAGE` blocks from stable fake nodes. It remains
+running until `Ctrl+C`, just like the real-radio path.
+
+`SimulatedRadioService` implements the same connection-event, message-handler,
+and shutdown methods used by `receive_messages.py`. Future application code can
+therefore accept either service without parsing fake data or adding simulation
+branches throughout the application. Explicit hooks are available for later
+disconnect, reconnect, error, and custom-message scenarios; no StreetPass
+protocol behavior is simulated yet.
