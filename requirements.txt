@@ -1,2 +1,2 @@
-meshtastic>=2.7,<3
+meshtastic==2.7.11
 textual==8.2.8

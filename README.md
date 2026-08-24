@@ -79,10 +79,82 @@ python app.py --simulate
 ```
 
 Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or PASS MAP. CHAT
-accepts broadcast text on channel 0 and shows accepted local sends as `YOU`;
-this marker does not imply delivery. While the chat input is focused, normal
-text and number keys remain input. Press `Escape` to leave the input, then `q`
-to quit. Radio monitoring stops and the service closes during shutdown.
+accepts broadcast text on channel 0. While the chat input is focused, normal
+text and number keys remain input. Press `Escape` to focus the transcript,
+then use Up/Down, Page Up/Page Down, or End. New messages follow the bottom
+only when the transcript is already near the bottom. If you are reading older
+messages, `↓ n NEW` counts messages below the viewport; End jumps to the newest
+entry and clears that indicator. Press `q` outside the input to quit. Radio
+monitoring, CHAT storage, and the radio service close during shutdown.
+
+### Persistent CHAT history
+
+CHAT history is stored in SQLite at
+`~/.local/share/meshtasticpass/chat.db`, or under `$XDG_DATA_HOME` when that
+variable is set. The app creates the parent directory and version-1 schema on
+first launch, then loads the newest 200 PRIMARY-channel messages in
+chronological order. Historical messages load as read/normal; only messages
+received during the current process participate in NEW styling and `CHAT(n)`.
+
+The `messages` table stores logical incoming/outgoing entries, packet and node
+identity, channel, text, receiver-side `radio_rx_at`, local acceptance/send
+times, and the last known delivery state. The `send_attempts` table stores each
+intentional transmission attempt separately. Incoming packets with an ID are
+deduplicated by `(node_id, packet_id, channel_index)`; packets without an ID
+are retained because they have no safe stable deduplication key. Monotonic
+values are never persisted. Runtime age references are reconstructed from the
+stored wall clock values at startup.
+
+If the database cannot be opened or one history write fails, the app reports a
+CHAT history error and keeps the radio/UI running. It never deletes or silently
+replaces a malformed database.
+
+### Outgoing state meanings
+
+MeshtasticPass is tested against the pinned Meshtastic Python SDK 2.7.11.
+That SDK's `sendText` returns a packet with an ID after the packet is accepted
+for local submission. With `wantAck=True`, its response handler receives a
+matching `ROUTING_APP` packet whose `requestId` is the outbound packet ID.
+`errorReason=NONE` is an ACK; any other routing reason is a definite NAK.
+The SDK describes a broadcast ACK from the local node as an implicit ACK:
+the packet likely propagated, but delivery cannot be guaranteed. The Python
+SDK does not expose a human read receipt, and its response-handler table does
+not implement its own expiry.
+
+The UI therefore uses only these meanings:
+
+- `SENDING`: MeshtasticPass has started the SDK call.
+- `SENT`: SDK 2.7.11 returned a packet ID after accepting local submission;
+  this is not remote delivery.
+- `HEARD`: a matching routing ACK with `errorReason=NONE` arrived. For the
+  PRIMARY broadcast this is implicit mesh evidence, not a human read receipt.
+- `UNCONFIRMED`: no matching ACK/NAK arrived during the SDK's default
+  300-second response window. Transmission may still have occurred.
+- `FAILED`: a definite local SDK exception or routing NAK occurred.
+
+`SENDING` uses one shared UI animation timer. No state triggers an automatic
+application-level resend. To rebroadcast an `UNCONFIRMED` entry, press Escape,
+focus that exact outgoing entry with Tab/Shift+Tab, then press `R`
+when `[R] REBROADCAST` appears. This records another send attempt against the
+same visible message rather than duplicating the transcript entry.
+
+Simulation outcomes are explicit and repeatable. The default is successful
+local submission. To exercise an unconfirmed attempt followed by a successful
+manual rebroadcast, run:
+
+```bash
+python app.py --simulate \
+  --simulate-send-outcome unconfirmed \
+  --simulate-send-outcome sent
+```
+
+Use `heard` or `failed` for the other deterministic outcomes. Simulation does
+not claim a real LoRa acknowledgement.
+
+Known limitation: this milestone does not queue sends while the radio is
+offline, recover in-flight callbacks after restart, or implement
+store-and-forward. Those behaviors are intentionally reserved for the next
+milestone.
 
 The first tab is **CONNECTION/CONFIG**. Its CONNECTION section immediately shows
 CONNECTING, then ONLINE and live radio metadata after the initial sync. If the
@@ -137,6 +209,7 @@ receive_messages.py  Text-message receive monitor
 send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
+chat_store.py      Versioned SQLite CHAT history and send attempts
 app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup
 radio_service.py   All Meshtastic connection and device-info logic

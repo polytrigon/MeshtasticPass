@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from queue import Empty, Queue
 from threading import Event
 import time
@@ -10,13 +11,24 @@ from typing import Callable, Iterator
 
 from radio_service import (
     RadioEvent,
+    DeliveryState,
     RadioInfo,
     RadioSendError,
     RadioState,
     ReceivedMessage,
     SentMessage,
+    SendStatus,
     validate_send_request,
 )
+
+
+class SimulatedSendOutcome(Enum):
+    """Explicit deterministic result for one simulated send attempt."""
+
+    SENT = "sent"
+    HEARD = "heard"
+    UNCONFIRMED = "unconfirmed"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -82,6 +94,7 @@ class SimulatedRadioService:
         connect_delay: float = 0.25,
         message_interval: float = 0.75,
         scripted_messages: tuple[ReceivedMessage, ...] = SIMULATED_MESSAGES,
+        send_outcomes: tuple[SimulatedSendOutcome, ...] = (),
     ) -> None:
         self.device_path = "simulated://meshtastic"
         self.info = RadioInfo(
@@ -95,12 +108,14 @@ class SimulatedRadioService:
         self.connect_delay = connect_delay
         self.message_interval = message_interval
         self.scripted_messages = scripted_messages
+        self.send_outcomes = send_outcomes
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._state_events: Queue[RadioEvent] = Queue()
         self._stop_event = Event()
         self._online = False
         self._closed = False
         self._sent_messages: list[SentMessage] = []
+        self._send_count = 0
 
     @property
     def is_closed(self) -> bool:
@@ -178,8 +193,9 @@ class SimulatedRadioService:
         text: str,
         channel_index: int = 0,
         destination_node_id: str | None = None,
+        status_handler: Callable[[SendStatus], None] | None = None,
     ) -> SentMessage:
-        """Record a simulated send without claiming delivery or an ACK."""
+        """Record a send using the next explicitly scripted outcome."""
         message = validate_send_request(
             text,
             channel_index,
@@ -188,8 +204,30 @@ class SimulatedRadioService:
         if not self._online or self._stop_event.is_set():
             raise RadioSendError("The simulated radio is not connected.")
 
-        self._sent_messages.append(message)
-        return message
+        outcome = (
+            self.send_outcomes[self._send_count]
+            if self._send_count < len(self.send_outcomes)
+            else SimulatedSendOutcome.SENT
+        )
+        self._send_count += 1
+        if outcome is SimulatedSendOutcome.FAILED:
+            raise RadioSendError("Simulated definite send failure.")
+
+        packet_id = 450000000 + self._send_count
+        immediate_state = {
+            SimulatedSendOutcome.SENT: DeliveryState.SENT,
+            SimulatedSendOutcome.HEARD: DeliveryState.HEARD,
+            SimulatedSendOutcome.UNCONFIRMED: DeliveryState.UNCONFIRMED,
+        }[outcome]
+        sent = SentMessage(
+            message.text,
+            message.channel_index,
+            message.destination_node_id,
+            packet_id=packet_id,
+            immediate_state=immediate_state,
+        )
+        self._sent_messages.append(sent)
+        return sent
 
     def emit_message(self, message: ReceivedMessage) -> None:
         """Deliver one fake message to every registered consumer."""

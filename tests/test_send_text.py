@@ -1,10 +1,16 @@
 """Hardware-free tests for application-level text sending."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
-from radio_service import RadioSendError, RadioService, SentMessage
-from simulated_radio_service import SimulatedRadioService
+from radio_service import (
+    DeliveryState,
+    RadioSendError,
+    RadioService,
+    SentMessage,
+)
+from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 
 
 class SimulatedSendTests(unittest.TestCase):
@@ -18,7 +24,10 @@ class SimulatedSendTests(unittest.TestCase):
     def test_broadcast_send(self) -> None:
         sent = self.service.send_text("hello", channel_index=1)
 
-        self.assertEqual(sent, SentMessage("hello", 1, None))
+        self.assertEqual(sent.text, "hello")
+        self.assertEqual(sent.channel_index, 1)
+        self.assertEqual(sent.immediate_state, DeliveryState.SENT)
+        self.assertIsNotNone(sent.packet_id)
 
     def test_direct_send(self) -> None:
         sent = self.service.send_text(
@@ -26,10 +35,29 @@ class SimulatedSendTests(unittest.TestCase):
             destination_node_id="!a11ce001",
         )
 
-        self.assertEqual(
-            sent,
-            SentMessage("private hello", 0, "!a11ce001"),
+        self.assertEqual(sent.destination_node_id, "!a11ce001")
+
+    def test_explicit_outcomes_are_deterministic(self) -> None:
+        service = SimulatedRadioService(
+            send_outcomes=(
+                SimulatedSendOutcome.HEARD,
+                SimulatedSendOutcome.UNCONFIRMED,
+                SimulatedSendOutcome.FAILED,
+            )
         )
+        service.connect()
+        self.addCleanup(service.close)
+
+        self.assertEqual(
+            service.send_text("heard").immediate_state,
+            DeliveryState.HEARD,
+        )
+        self.assertEqual(
+            service.send_text("uncertain").immediate_state,
+            DeliveryState.UNCONFIRMED,
+        )
+        with self.assertRaisesRegex(RadioSendError, "definite"):
+            service.send_text("failed")
 
     def test_sent_history_is_ordered_and_read_only(self) -> None:
         first = self.service.send_text("one")
@@ -100,6 +128,50 @@ class RealRadioSendTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RadioSendError, "not connected"):
             self.service.send_text("hello")
+
+    def test_sdk_ack_callback_uses_real_2711_signature(self) -> None:
+        statuses = []
+        self.interface.sendText.return_value = SimpleNamespace(id=123456)
+
+        sent = self.service.send_text("hello", status_handler=statuses.append)
+
+        kwargs = self.interface.sendText.call_args.kwargs
+        self.assertEqual(kwargs["text"], "hello")
+        self.assertEqual(kwargs["channelIndex"], 0)
+        self.assertTrue(kwargs["wantAck"])
+        self.assertEqual(kwargs["onResponse"].__name__, "onAckNak")
+        self.assertEqual(sent.packet_id, 123456)
+
+        kwargs["onResponse"](
+            {
+                "decoded": {
+                    "portnum": "ROUTING_APP",
+                    "requestId": 123456,
+                    "routing": {"errorReason": "NONE"},
+                }
+            }
+        )
+        self.assertEqual(statuses[0].state, DeliveryState.HEARD)
+        self.assertEqual(statuses[0].packet_id, 123456)
+
+    def test_sdk_routing_nak_is_definite_failure(self) -> None:
+        statuses = []
+        self.interface.sendText.return_value = SimpleNamespace(id=99)
+        self.service.send_text("hello", status_handler=statuses.append)
+        callback = self.interface.sendText.call_args.kwargs["onResponse"]
+
+        callback(
+            {
+                "decoded": {
+                    "portnum": "ROUTING_APP",
+                    "requestId": 99,
+                    "routing": {"errorReason": "MAX_RETRANSMIT"},
+                }
+            }
+        )
+
+        self.assertEqual(statuses[0].state, DeliveryState.FAILED)
+        self.assertIn("MAX_RETRANSMIT", statuses[0].detail)
 
 
 if __name__ == "__main__":

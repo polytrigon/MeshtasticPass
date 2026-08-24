@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 from threading import Event
@@ -14,14 +15,26 @@ from textual.containers import Horizontal
 from textual.widgets import Input, Static
 
 from app import (
+    ChatTranscript,
     ChatEntryWidget,
     ColorSelector,
     FontSizeSelector,
     MeshtasticPassApp,
 )
 from app_settings import AppSettings
-from radio_service import RadioEvent, RadioInfo, RadioService, RadioState
-from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
+from chat_store import ChatStore
+from radio_service import (
+    DeliveryState,
+    RadioEvent,
+    RadioInfo,
+    RadioService,
+    RadioState,
+)
+from simulated_radio_service import (
+    SIMULATED_MESSAGES,
+    SimulatedRadioService,
+    SimulatedSendOutcome,
+)
 
 
 class CallbackRadioService(RadioService):
@@ -68,6 +81,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             config_path=root / "meshtasticpass" / "config.json",
             profile_path=root / "lxterminal" / "lxterminal-meshtasticpass.conf",
         )
+        self.chat_db_path = root / "data" / "chat.db"
 
     async def test_connection_tabs_input_and_send(self) -> None:
         radio = SimulatedRadioService(
@@ -108,20 +122,25 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         app = MeshtasticPassApp(radio, self.settings)
 
         async with app.run_test(size=(100, 30)) as pilot:
+            primary_messages = [
+                message
+                for message in SIMULATED_MESSAGES
+                if (message.channel_index or 0) == 0
+            ]
             for _ in range(5):
                 await pilot.pause()
-                if len(app.chat_history) == len(SIMULATED_MESSAGES):
+                if len(app.chat_history) == len(primary_messages):
                     break
 
-            self.assertEqual(len(app.chat_history), len(SIMULATED_MESSAGES))
+            self.assertEqual(len(app.chat_history), len(primary_messages))
             self.assertEqual(app.chat_history[0].author, "Alice Trail")
             self.assertEqual(
                 [entry.text for entry in app.chat_history],
-                [message.text for message in SIMULATED_MESSAGES],
+                [message.text for message in primary_messages],
             )
             self.assertEqual(
                 [entry.radio_rx_at for entry in app.chat_history],
-                [message.radio_rx_at for message in SIMULATED_MESSAGES],
+                [message.radio_rx_at for message in primary_messages],
             )
             self.assertTrue(
                 all(
@@ -129,9 +148,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     for entry in app.chat_history
                 )
             )
-            self.assertEqual(app.unread_count, len(SIMULATED_MESSAGES))
+            self.assertEqual(app.unread_count, len(primary_messages))
             self.assertIn(
-                f"CHAT({len(SIMULATED_MESSAGES)})",
+                f"CHAT({len(primary_messages)})",
                 str(app.query_one("#tab-bar", Static).render()),
             )
 
@@ -633,6 +652,180 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.chat_history[-1].is_new)
             self.assertTrue(app.chat_history[-1].unread)
             self.assertEqual(app.unread_count, 1)
+
+    async def test_persisted_history_reloads_read_with_delivery_state(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            app._accepted_send("persist me")
+            await pilot.pause()
+
+        reopened = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        second_app = MeshtasticPassApp(
+            second_radio,
+            self.settings,
+            chat_store=reopened,
+        )
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(
+                [entry.text for entry in second_app.chat_history],
+                [SIMULATED_MESSAGES[0].text, "persist me"],
+            )
+            self.assertTrue(
+                all(
+                    not entry.unread and not entry.is_new
+                    for entry in second_app.chat_history
+                )
+            )
+            self.assertEqual(
+                second_app.chat_history[-1].delivery_state,
+                DeliveryState.SENT,
+            )
+            self.assertEqual(second_app.unread_count, 0)
+
+    async def test_smart_scroll_and_end_newest_indicator(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(80, 18)) as pilot:
+            app.show_tab("chat")
+            for index in range(20):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=9000 + index,
+                        text=f"scroll message {index}",
+                    )
+                )
+            await pilot.pause()
+            transcript = app.query_one("#chat-log", ChatTranscript)
+            self.assertEqual(transcript.scroll_y, transcript.max_scroll_y)
+
+            transcript.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            app._accept_received_message(
+                replace(
+                    SIMULATED_MESSAGES[0],
+                    packet_id=9999,
+                    text="below viewport",
+                )
+            )
+            await pilot.pause()
+            self.assertLess(transcript.scroll_y, transcript.max_scroll_y)
+            self.assertEqual(app.transcript_new_count, 1)
+            self.assertEqual(
+                str(app.query_one("#chat-new-below", Static).render()),
+                "↓ 1 NEW",
+            )
+            self.assertEqual(app.unread_count, 0)
+
+            await pilot.press("escape", "end")
+            await pilot.pause()
+            self.assertEqual(transcript.scroll_y, transcript.max_scroll_y)
+            self.assertEqual(app.transcript_new_count, 0)
+
+    async def test_outgoing_states_timeout_failure_and_manual_rebroadcast(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(
+                SimulatedSendOutcome.UNCONFIRMED,
+                SimulatedSendOutcome.SENT,
+                SimulatedSendOutcome.FAILED,
+            ),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.show_tab("chat")
+            immediate = app._start_outgoing("manual retry")
+            self.assertEqual(immediate.delivery_state, DeliveryState.SENDING)
+            immediate_widget = list(app.query(ChatEntryWidget))[-1]
+            await pilot.pause()
+            self.assertEqual(
+                str(immediate_widget.delivery_label.render()),
+                "SENDING.",
+            )
+            self.assertEqual(
+                [
+                    str(child.render())
+                    for child in immediate_widget.query(".chat-entry-header Static")
+                ],
+                ["YOU", " / ", "SENDING.", " / ", "0s"],
+            )
+            app._advance_delivery_states()
+            self.assertEqual(
+                str(immediate_widget.delivery_label.render()),
+                "SENDING..",
+            )
+            self.assertIsNotNone(app._delivery_timer)
+            self.assertEqual(
+                len([timer for timer in app._timers if timer.name == "chat-delivery-states"]),
+                1,
+            )
+            app.run_worker(lambda: app._send_from_thread(immediate), thread=True)
+            for _ in range(5):
+                await pilot.pause()
+                if immediate.delivery_state is DeliveryState.UNCONFIRMED:
+                    break
+            self.assertEqual(immediate.delivery_state, DeliveryState.UNCONFIRMED)
+
+            widget = list(app.query(ChatEntryWidget))[-1]
+            await pilot.press("shift+tab")
+            self.assertIs(app.focused, widget)
+            await pilot.press("r")
+            for _ in range(5):
+                await pilot.pause()
+                if immediate.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(immediate.delivery_state, DeliveryState.SENT)
+            self.assertEqual(len(radio.sent_messages), 2)
+            self.assertEqual(len(app.chat_history), 1)
+
+            failed = app._start_outgoing("definite failure")
+            app.run_worker(lambda: app._send_from_thread(failed), thread=True)
+            for _ in range(5):
+                await pilot.pause()
+                if failed.delivery_state is DeliveryState.FAILED:
+                    break
+            self.assertEqual(failed.delivery_state, DeliveryState.FAILED)
+
+            immediate.delivery_state = DeliveryState.SENT
+            immediate.confirmation_deadline = monotonic() - 1
+            before = len(radio.sent_messages)
+            app._advance_delivery_states()
+            self.assertEqual(immediate.delivery_state, DeliveryState.UNCONFIRMED)
+            self.assertEqual(len(radio.sent_messages), before)
+
+        reopened = ChatStore.open(self.chat_db_path)
+        self.addCleanup(reopened.close)
+        stored_messages = reopened.load_recent()
+        self.assertEqual(len(stored_messages), 2)
+        self.assertEqual(stored_messages[0].delivery_state, "UNCONFIRMED")
+        self.assertEqual(stored_messages[1].delivery_state, "FAILED")
+        self.assertEqual(
+            len(reopened.load_send_attempts(stored_messages[0].id)),
+            2,
+        )
 
 
 if __name__ == "__main__":
