@@ -3,6 +3,7 @@
 import argparse
 
 from radio_service import ReceivedMessage, RadioService, RadioState
+from simulated_radio_service import SimulatedRadioService
 
 
 def parse_args() -> argparse.Namespace:
@@ -17,6 +18,11 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         type=float,
         help="seconds between connection attempts (default: 5)",
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="use deterministic fake radio events instead of hardware",
     )
     return parser.parse_args()
 
@@ -41,13 +47,13 @@ def print_message(message: ReceivedMessage) -> None:
 
 def main() -> int:
     args = parse_args()
-    radio = RadioService(args.device)
+    radio = SimulatedRadioService() if args.simulate else RadioService(args.device)
     radio.add_message_handler(print_message)
 
     try:
         for event in radio.connection_events(args.retry_delay):
             if event.state is RadioState.CONNECTING:
-                print(f"RADIO CONNECTING: {args.device}")
+                print(f"RADIO CONNECTING: {radio.device_path}")
             elif event.state is RadioState.ONLINE:
                 print("RADIO ONLINE")
             elif event.state is RadioState.OFFLINE:
