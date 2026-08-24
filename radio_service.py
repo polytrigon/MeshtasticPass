@@ -7,7 +7,7 @@ from enum import Enum
 import os
 from pathlib import Path
 from threading import Event
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 class RadioState(Enum):
@@ -52,6 +52,20 @@ class RadioEvent:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class ReceivedMessage:
+    """A decoded text message with no Meshtastic SDK-specific structures."""
+
+    sender_node_id: str
+    sender_long_name: str | None
+    sender_short_name: str | None
+    channel_index: int | None
+    text: str
+    rssi: int | None
+    snr: float | None
+    packet_id: int | None
+
+
 class RadioService:
     """Owns the connection between the app and a Meshtastic radio."""
 
@@ -60,6 +74,7 @@ class RadioService:
         self._interface: Any | None = None
         self._connection_lost = Event()
         self._pub: Any | None = None
+        self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -127,7 +142,23 @@ class RadioService:
                     break
         finally:
             self.close()
-            self._unsubscribe_from_connection_loss()
+            self._unsubscribe_from_events()
+
+    def add_message_handler(
+        self,
+        handler: Callable[[ReceivedMessage], None],
+    ) -> None:
+        """Call handler for each valid received text message."""
+        if handler not in self._message_handlers:
+            self._message_handlers.append(handler)
+
+    def remove_message_handler(
+        self,
+        handler: Callable[[ReceivedMessage], None],
+    ) -> None:
+        """Stop calling a previously registered message handler."""
+        if handler in self._message_handlers:
+            self._message_handlers.remove(handler)
 
     def close(self) -> None:
         """Close the serial connection if it is open."""
@@ -145,30 +176,68 @@ class RadioService:
         from meshtastic.serial_interface import SerialInterface
         from pubsub import pub
 
-        if self._pub is None:
+        self._subscribe_to_events(pub)
+
+        return SerialInterface(devPath=self.device_path)
+
+    def _subscribe_to_events(self, pub: Any) -> None:
+        if self._pub is not None:
+            return
+
+        pub.subscribe(
+            self._on_connection_lost,
+            "meshtastic.connection.lost",
+        )
+        try:
             pub.subscribe(
+                self._on_text_received,
+                "meshtastic.receive.text",
+            )
+        except Exception:
+            pub.unsubscribe(
                 self._on_connection_lost,
                 "meshtastic.connection.lost",
             )
-            self._pub = pub
+            raise
 
-        return SerialInterface(devPath=self.device_path)
+        self._pub = pub
 
     def _on_connection_lost(self, interface: Any, **_kwargs: Any) -> None:
         if interface is self._interface:
             self._connection_lost.set()
 
-    def _unsubscribe_from_connection_loss(self) -> None:
-        if self._pub is not None:
+    def _on_text_received(
+        self,
+        packet: Any = None,
+        interface: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        if interface is not None and interface is not self._interface:
+            return
+
+        message = self._parse_text_packet(packet, self._interface)
+        if message is None:
+            return
+
+        for handler in tuple(self._message_handlers):
             try:
-                self._pub.unsubscribe(
-                    self._on_connection_lost,
-                    "meshtastic.connection.lost",
-                )
+                handler(message)
             except Exception:
+                # One consumer should not stop radio packet processing.
                 pass
-            finally:
-                self._pub = None
+
+    def _unsubscribe_from_events(self) -> None:
+        if self._pub is not None:
+            subscriptions = (
+                (self._on_connection_lost, "meshtastic.connection.lost"),
+                (self._on_text_received, "meshtastic.receive.text"),
+            )
+            for callback, topic in subscriptions:
+                try:
+                    self._pub.unsubscribe(callback, topic)
+                except Exception:
+                    pass
+            self._pub = None
 
     def _check_device(self) -> None:
         path = Path(self.device_path)
@@ -188,6 +257,114 @@ class RadioService:
 
     def _device_exists(self) -> bool:
         return Path(self.device_path).exists()
+
+    def _parse_text_packet(
+        self,
+        packet: Any,
+        interface: Any,
+    ) -> ReceivedMessage | None:
+        if not isinstance(packet, dict):
+            return None
+
+        decoded = packet.get("decoded")
+        if not isinstance(decoded, dict):
+            return None
+        if decoded.get("portnum") not in ("TEXT_MESSAGE_APP", 1):
+            return None
+
+        text = self._decode_text(decoded)
+        if text is None or text == "":
+            return None
+
+        sender_number = self._optional_int(packet.get("from"))
+        sender_id = packet.get("fromId")
+        if not isinstance(sender_id, str) or not sender_id:
+            sender_id = (
+                f"!{sender_number:08x}"
+                if sender_number is not None
+                else "unknown"
+            )
+
+        user = self._lookup_sender_user(interface, sender_number, sender_id)
+
+        channel_value = packet.get("channel", 0)
+        return ReceivedMessage(
+            sender_node_id=sender_id,
+            sender_long_name=self._optional_string(user.get("longName")),
+            sender_short_name=self._optional_string(user.get("shortName")),
+            channel_index=self._optional_int(channel_value),
+            text=text,
+            rssi=self._optional_int(packet.get("rxRssi")),
+            snr=self._optional_float(packet.get("rxSnr")),
+            packet_id=self._optional_int(packet.get("id")),
+        )
+
+    @staticmethod
+    def _decode_text(decoded: dict[str, Any]) -> str | None:
+        value = decoded.get("text")
+        if value is None:
+            value = decoded.get("payload")
+
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return None
+
+    @staticmethod
+    def _lookup_sender_user(
+        interface: Any,
+        sender_number: int | None,
+        sender_id: str,
+    ) -> dict[str, Any]:
+        if interface is None:
+            return {}
+
+        record: Any = None
+        nodes_by_number = getattr(interface, "nodesByNum", None)
+        if isinstance(nodes_by_number, dict) and sender_number is not None:
+            record = nodes_by_number.get(sender_number)
+
+        if not isinstance(record, dict):
+            nodes_by_id = getattr(interface, "nodes", None)
+            if isinstance(nodes_by_id, dict):
+                record = nodes_by_id.get(sender_id)
+
+        if not isinstance(record, dict):
+            return {}
+
+        user = record.get("user")
+        return user if isinstance(user, dict) else {}
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _optional_string(value: Any) -> str | None:
+        return value if isinstance(value, str) and value else None
 
     def _read_radio_info(self) -> RadioInfo:
         if self._interface is None:
