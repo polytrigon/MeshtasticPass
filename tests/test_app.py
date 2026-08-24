@@ -131,7 +131,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)):
             details = app.query_one("#connection-details", Static)
             connecting = str(details.render())
-            self.assertIn("STATUS     CONNECTING...", connecting)
+            self.assertIn("STATUS     CONNECTING.", connecting)
             self.assertIn("DEVICE     simulated://meshtastic", connecting)
 
             app._show_connection(RadioState.ONLINE, info)
@@ -142,18 +142,69 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
             app._show_connection(RadioState.OFFLINE, info)
             offline = str(details.render())
-            self.assertIn("STATUS     OFFLINE — RETRYING...", offline)
+            self.assertIn("STATUS     OFFLINE — RETRYING.", offline)
             self.assertNotIn("!433a9a3c", offline)
             self.assertNotIn("FIRMWARE", offline)
 
             app._show_connection(RadioState.ERROR, info, "raw SDK exception")
             error = str(details.render())
-            self.assertIn("STATUS     CONNECTION ERROR — RETRYING...", error)
+            self.assertIn("STATUS     CONNECTION ERROR — RETRYING.", error)
             self.assertNotIn("!433a9a3c", error)
             self.assertNotIn(
                 "raw SDK exception",
                 str(app.query_one("#connection-error", Static).render()),
             )
+
+    async def test_connection_status_animation_reuses_one_timer(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=10,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        info = radio.info
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            details = app.query_one("#connection-details", Static)
+            timer = app._connection_animation_timer
+            self.assertIsNotNone(timer)
+
+            self.assertIn("STATUS     CONNECTING.", str(details.render()))
+            await pilot.pause(0.5)
+            self.assertIn("STATUS     CONNECTING..", str(details.render()))
+            app._advance_connection_animation()
+            self.assertIn("STATUS     CONNECTING...", str(details.render()))
+            app._advance_connection_animation()
+            self.assertIn("STATUS     CONNECTING.", str(details.render()))
+
+            app._show_connection(RadioState.OFFLINE)
+            app._advance_connection_animation()
+            self.assertIn("STATUS     OFFLINE — RETRYING..", str(details.render()))
+
+            app._show_connection(RadioState.ERROR)
+            app._advance_connection_animation()
+            self.assertIn(
+                "STATUS     CONNECTION ERROR — RETRYING..",
+                str(details.render()),
+            )
+
+            app._show_connection(RadioState.ONLINE, info)
+            online = str(details.render())
+            app._advance_connection_animation()
+            self.assertEqual(str(details.render()), online)
+            self.assertIn("STATUS     ONLINE", online)
+            self.assertNotIn("ONLINE.", online)
+
+            for state in (
+                RadioState.CONNECTING,
+                RadioState.OFFLINE,
+                RadioState.ERROR,
+                RadioState.ONLINE,
+            ):
+                app._show_connection(state, info)
+                self.assertIs(app._connection_animation_timer, timer)
+
+        self.assertIsNone(timer._task)  # Timer is explicitly stopped on unmount.
 
     async def test_style_keyboard_navigation_and_live_color(self) -> None:
         radio = SimulatedRadioService(
