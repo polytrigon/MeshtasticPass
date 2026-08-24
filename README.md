@@ -67,6 +67,7 @@ python check_radio.py --device /dev/ttyACM0
 
 ```text
 check_radio.py     Small command-line connection check
+receive_messages.py  Text-message receive monitor
 radio_service.py   All Meshtastic connection and device-info logic
 requirements.txt   Python dependency
 tests/             Hardware-free connection resilience tests
@@ -74,3 +75,23 @@ tests/             Hardware-free connection resilience tests
 
 Future UI code should call `RadioService`; it should not import or manage the
 Meshtastic SDK directly.
+
+## Milestone 3: receive text messages
+
+Run the message monitor with the virtual environment active:
+
+```bash
+python receive_messages.py
+```
+
+Send a normal Meshtastic text message to this radio from another node or client.
+Confirm that one `RX MESSAGE` block appears with the sender, channel, text,
+signal information, and packet ID. Non-text packets are ignored.
+
+While the monitor is still running, unplug and reconnect the ESP32. Confirm the
+state changes from `RADIO ONLINE` to `RADIO OFFLINE` and back to `RADIO ONLINE`,
+then send another text message and confirm it is printed exactly once.
+
+`ReceivedMessage` is the application-level message type. Future chat or UI code
+should register a handler with `RadioService` instead of parsing Meshtastic SDK
+packet dictionaries.
