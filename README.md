@@ -63,12 +63,35 @@ Use a different serial device when needed:
 python check_radio.py --device /dev/ttyACM0
 ```
 
+## Milestone 5: terminal application
+
+Install the updated dependencies, then start the real-radio terminal UI:
+
+```bash
+python -m pip install -r requirements.txt
+python app.py
+```
+
+Develop and test without radio hardware:
+
+```bash
+python app.py --simulate
+```
+
+Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or PASS MAP. CHAT
+accepts broadcast text on channel 0 and shows accepted local sends as `YOU`;
+this marker does not imply delivery. While the chat input is focused, normal
+text and number keys remain input. Press `Escape` to leave the input, then `q`
+to quit. Radio monitoring stops and the service closes during shutdown.
+
 ## Current structure
 
 ```text
 check_radio.py     Small command-line connection check
 receive_messages.py  Text-message receive monitor
 send_message.py    One-shot real or simulated text sender
+app.py             Keyboard-first Textual application
+app_controller.py  Non-visual chat state and radio monitor
 radio_service.py   All Meshtastic connection and device-info logic
 simulated_radio_service.py  Deterministic radio simulator
 requirements.txt   Python dependency
