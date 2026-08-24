@@ -134,11 +134,11 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-green {
-        color: #5eea76;
+        color: #39ff14;
     }
 
     Screen.theme-orange {
-        color: #f0a64a;
+        color: #ff8c00;
     }
 
     #tab-bar {
@@ -182,22 +182,22 @@ class MeshtasticPassApp(App[None]):
 
     Screen.theme-green .style-selector,
     Screen.theme-green #chat-input {
-        color: #5eea76;
+        color: #39ff14;
     }
 
     Screen.theme-orange .style-selector,
     Screen.theme-orange #chat-input {
-        color: #f0a64a;
+        color: #ff8c00;
     }
 
     Screen.theme-green .style-selector:focus,
     Screen.theme-green .page-title {
-        color: #9cffab;
+        color: #7cff6b;
     }
 
     Screen.theme-orange .style-selector:focus,
     Screen.theme-orange .page-title {
-        color: #ffc56f;
+        color: #ffb000;
     }
 
     #style-status {
@@ -242,20 +242,20 @@ class MeshtasticPassApp(App[None]):
 
     Screen.theme-green #tab-bar,
     Screen.theme-green #footer {
-        color: #367f45;
+        color: #168f0a;
     }
 
     Screen.theme-orange #tab-bar,
     Screen.theme-orange #footer {
-        color: #96652f;
+        color: #a85c00;
     }
 
     Screen.theme-green #footer {
-        border-top: solid #285c33;
+        border-top: solid #0e5f08;
     }
 
     Screen.theme-orange #footer {
-        border-top: solid #6d471f;
+        border-top: solid #6f3d00;
     }
     """
 
