@@ -7,9 +7,15 @@ import tempfile
 from time import monotonic
 import unittest
 
+from textual.containers import Horizontal
 from textual.widgets import Input, Static
 
-from app import ChatEntryWidget, ColorSelector, FontSizeSelector, MeshtasticPassApp
+from app import (
+    ChatEntryWidget,
+    ColorSelector,
+    FontSizeSelector,
+    MeshtasticPassApp,
+)
 from app_settings import AppSettings
 from radio_service import RadioInfo, RadioState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
@@ -385,6 +391,91 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(timestamp.visual_style.foreground.hex6, expected)
                 self.assertEqual(error.visual_style.foreground.hex6, "#FF1744")
+
+    async def test_chat_primary_heading_and_timestamp_hierarchy(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+
+            heading = app.query_one("#chat-title", Static)
+            widget = app.query_one(ChatEntryWidget)
+            author = widget.query_one(".chat-entry-author", Static)
+            timestamp = widget.query_one(".chat-entry-timestamp", Static)
+
+            self.assertIn("CHAT — PRIMARY", str(heading.render()))
+            self.assertIs(author.parent, timestamp.parent)
+            self.assertIsInstance(author.parent, Horizontal)
+            self.assertEqual(author.region.y, timestamp.region.y)
+            self.assertTrue(author.visual_style.bold)
+            self.assertFalse(bool(timestamp.visual_style.bold))
+            self.assertTrue(timestamp.visual_style.dim)
+
+    async def test_incoming_new_message_highlight_lifecycle_and_themes(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        incoming = SIMULATED_MESSAGES[0]
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            highlight_timer = app._new_message_timer
+            self.assertIsNotNone(highlight_timer)
+
+            app._accept_received_message(incoming)
+            unread_entry = app.chat_history[-1]
+            self.assertTrue(unread_entry.unread)
+            self.assertIsNone(unread_entry.new_highlight_until)
+            self.assertEqual(app.unread_count, 1)
+
+            app.show_tab("chat")
+            await pilot.pause()
+            unread_widget = list(app.query(ChatEntryWidget))[-1]
+            unread_body = unread_widget.message_label
+            self.assertFalse(unread_entry.unread)
+            self.assertIsNotNone(unread_entry.new_highlight_until)
+            self.assertTrue(unread_widget.has_class("new-message"))
+            self.assertEqual(app.unread_count, 0)
+
+            expected_highlight_colors = {
+                "white": "#39FF14",
+                "green": "#FF8C00",
+                "orange": "#D8D8D8",
+            }
+            for theme, expected in expected_highlight_colors.items():
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                self.assertEqual(unread_body.visual_style.foreground.hex6, expected)
+
+            highlight_until = unread_entry.new_highlight_until
+            self.assertIsNotNone(highlight_until)
+            app._refresh_new_message_highlights(highlight_until)
+            await pilot.pause()
+            self.assertFalse(unread_widget.has_class("new-message"))
+            self.assertIsNone(unread_entry.new_highlight_until)
+            self.assertEqual(unread_body.visual_style.foreground.hex6, "#FF8C00")
+
+            app._accept_received_message(incoming)
+            visible_widget = list(app.query(ChatEntryWidget))[-1]
+            self.assertEqual(app.unread_count, 0)
+            self.assertFalse(app.chat_history[-1].unread)
+            self.assertTrue(visible_widget.has_class("new-message"))
+
+            app._accepted_send("local message")
+            outgoing_widget = list(app.query(ChatEntryWidget))[-1]
+            self.assertTrue(app.chat_history[-1].outgoing)
+            self.assertFalse(outgoing_widget.has_class("new-message"))
+            self.assertIs(app._new_message_timer, highlight_timer)
+
+        self.assertIsNone(highlight_timer._task)
 
 
 if __name__ == "__main__":

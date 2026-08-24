@@ -11,7 +11,7 @@ from radio_service import RadioEvent, ReceivedMessage, RadioService
 from simulated_radio_service import SimulatedRadioService
 
 
-@dataclass(frozen=True)
+@dataclass
 class ChatEntry:
     """One in-memory line item ready for the chat transcript."""
 
@@ -19,11 +19,15 @@ class ChatEntry:
     text: str
     accepted_at: float
     outgoing: bool = False
+    unread: bool = False
+    new_highlight_until: float | None = None
 
 
 def received_chat_entry(
     message: ReceivedMessage,
     accepted_at: float | None = None,
+    unread: bool = False,
+    new_highlight_until: float | None = None,
 ) -> ChatEntry:
     """Convert an application message to display state without SDK details."""
     author = (
@@ -35,6 +39,8 @@ def received_chat_entry(
         author=author,
         text=message.text,
         accepted_at=monotonic() if accepted_at is None else accepted_at,
+        unread=unread,
+        new_highlight_until=new_highlight_until,
     )
 
 
