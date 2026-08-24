@@ -87,6 +87,61 @@ messages, `↓ n NEW` counts messages below the viewport; End jumps to the newes
 entry and clears that indicator. Press `q` outside the input to quit. Radio
 monitoring, CHAT storage, and the radio service close during shutdown.
 
+The PRIMARY heading includes `ACTIVE N`, a passive count of unique *other*
+nodes whose node-database `lastHeard` value is less than five minutes old.
+Exactly five minutes old is inactive. Missing, malformed, future, and otherwise
+impossible timestamps are ignored, and the local node is excluded. The shared
+one-second CHAT refresh ages this count even when no packets arrive. `ACTIVE —`
+means the radio or activity data is unavailable; connected with no recent nodes
+shows `ACTIVE 0`. This reads the node database only and sends no LoRa traffic.
+The CONNECTION page's `NODES` value remains the total known node-database size,
+so it is intentionally different from ACTIVE.
+
+Simulation includes the local node, two recent nodes, one stale node, and nodes
+with malformed or missing activity timestamps. It initially displays
+`ACTIVE 2`; one node reaches the exact five-minute boundary after one second,
+leaving `ACTIVE 1`. This deterministic transition makes activity aging testable
+without a second radio.
+
+CHAT keeps its one-cell scrollbar allocation. Its vertical thumb uses the
+narrow Unicode `▕` glyph through Textual's supported per-scrollbar renderer
+hook, while retaining Textual's sizing, theme colors, mouse metadata, wheel
+scrolling, and drag behavior.
+
+### Stock firmware and messages received while the app is absent
+
+Meshtastic firmware 2.7.11 does not provide a reliable persisted inbox for
+ordinary text messages. Its normal phone/API path has a finite in-memory
+`toPhoneQueue`: the classic ESP32 build allows 8 queued packets and other
+supported configurations at that release allow 32. The queue is shared with
+other packet types, can overflow, and is lost on reboot or power loss. When the
+Python client reconnects, firmware drains surviving entries through the normal
+receive callback automatically. There is no separate inbox-query API and no
+live-versus-replayed marker. See the exact 2.7.11 firmware sources for
+[`MAX_RX_TOPHONE`](https://github.com/meshtastic/firmware/blob/v2.7.11.ee68575/src/mesh/mesh-pb-constants.h),
+[`MeshService::sendToPhone`](https://github.com/meshtastic/firmware/blob/v2.7.11.ee68575/src/mesh/MeshService.cpp),
+and the [`PhoneAPI` queue drain](https://github.com/meshtastic/firmware/blob/v2.7.11.ee68575/src/mesh/PhoneAPI.cpp).
+
+Queued packets retain their normal sender, packet ID, channel, and receiver-side
+`rxTime`. MeshtasticPass's existing callback therefore accepts any surviving
+queued text exactly like live text. SQLite's `(node_id, packet_id,
+channel_index)` key deduplicates packets with IDs; packets lacking an ID cannot
+be deduplicated safely. Because the callback exposes no replay marker, the UI
+cannot truthfully label a packet as recovered rather than live.
+
+The Python SDK's internal queue is for transmit flow control, not a received
+message archive. SDK 2.7.11 decodes `STORE_FORWARD_APP`, but it has no high-level
+reliable-inbox/history API. Firmware's optional
+[`StoreForwardModule`](https://github.com/meshtastic/firmware/blob/v2.7.11.ee68575/src/modules/StoreForwardModule.cpp)
+requires explicit configuration, suitable ESP32/Portduino hardware, server role
+configuration, and PSRAM. Its history is also volatile, and remote history
+requests transmit over LoRa. It is therefore not enabled or queried by
+MeshtasticPass for this milestone. Short app absences may recover a small
+best-effort set through the stock RAM queue, but the application does not claim
+offline delivery guarantees. A reliable offline inbox would need a separately
+designed, explicitly configured feature rather than hidden traffic or custom
+firmware behavior.
+
 ### Persistent CHAT history
 
 CHAT history is stored in SQLite at

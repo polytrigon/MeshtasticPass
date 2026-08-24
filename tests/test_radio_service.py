@@ -172,6 +172,35 @@ class RadioServiceTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(events)
 
+    def test_active_node_count_reads_node_database_without_sending(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        local_number = interface.myInfo.my_node_num
+        interface.nodesByNum[local_number]["lastHeard"] = 1_000
+        interface.nodesByNum[2] = {
+            "user": {"id": "!00000002"},
+            "lastHeard": 990,
+        }
+        interface.nodesByNum[3] = {
+            "user": {"id": "!00000003"},
+            "lastHeard": 600,
+        }
+        interface.sendText = Mock()
+        service._interface = interface
+
+        self.assertEqual(service.active_node_count(now=1_000), 1)
+        interface.sendText.assert_not_called()
+
+        interface.nodesByNum[4] = {
+            "user": {"id": "!00000004"},
+            "lastHeard": 999,
+        }
+        self.assertEqual(service.active_node_count(now=1_000), 2)
+        interface.sendText.assert_not_called()
+
+    def test_active_node_count_is_unavailable_while_disconnected(self) -> None:
+        self.assertIsNone(RadioService().active_node_count(now=1_000))
+
 
 if __name__ == "__main__":
     unittest.main()

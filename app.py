@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 from time import monotonic, time
 
+from rich.color import Color
+from rich.segment import Segment, Segments
+from rich.style import Style
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Blur, Focus, Key
 from textual.message import Message
+from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Input, Static
 
@@ -59,6 +63,50 @@ ANIMATED_STATUS = {
 }
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
+CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
+
+
+class ThinScrollBarRender(ScrollBarRender):
+    """Use a narrow one-cell thumb while preserving Textual scroll behavior."""
+
+    @classmethod
+    def render_bar(
+        cls,
+        size: int = 25,
+        virtual_size: float = 50,
+        window_size: float = 20,
+        position: float = 0,
+        thickness: int = 1,
+        vertical: bool = True,
+        back_color: Color = Color.parse("#555555"),
+        bar_color: Color = Color.parse("bright_magenta"),
+    ) -> Segments:
+        rendered = super().render_bar(
+            size=size,
+            virtual_size=virtual_size,
+            window_size=window_size,
+            position=position,
+            thickness=thickness,
+            vertical=vertical,
+            back_color=back_color,
+            bar_color=bar_color,
+        )
+        if not vertical:
+            return rendered
+
+        thumb_style = Style(
+            color=bar_color,
+            bgcolor=back_color,
+            meta={"@mouse.down": "grab"},
+        )
+        segments = [
+            Segment(CHAT_SCROLLBAR_THUMB_GLYPH * thickness, thumb_style)
+            if segment.style is not None
+            and segment.style.meta.get("@mouse.down") == "grab"
+            else segment
+            for segment in rendered.segments
+        ]
+        return Segments(segments, new_lines=rendered.new_lines)
 
 
 class StyleSelector(Static):
@@ -216,6 +264,9 @@ class ChatTranscript(VerticalScroll):
     """Focusable transcript so navigation never types into the message box."""
 
     can_focus = True
+
+    def on_mount(self) -> None:
+        self.vertical_scrollbar.renderer = ThinScrollBarRender
 
     def on_key(self, event: Key) -> None:
         """Keep transcript navigation deterministic when this widget has focus."""
@@ -663,7 +714,11 @@ class MeshtasticPassApp(App[None]):
                 yield ColorSelector(self.settings.color)
                 yield Static(id="style-status")
             with Vertical(id="chat", classes="tab-page"):
-                yield Static("> CHAT — PRIMARY", id="chat-title", classes="page-title")
+                yield Static(
+                    "> CHAT — PRIMARY — ACTIVE —",
+                    id="chat-title",
+                    classes="page-title",
+                )
                 yield ChatTranscript(id="chat-log")
                 yield Static(id="chat-new-below")
                 yield Static(id="send-error")
@@ -1004,10 +1059,31 @@ class MeshtasticPassApp(App[None]):
         first_widget = next(iter(self.query(ChatEntryWidget)), None)
         transcript.mount(LoadOlderControl(), before=first_widget)
 
-    def _refresh_chat_timestamps(self, now: float | None = None) -> None:
+    def _refresh_chat_timestamps(
+        self,
+        now: float | None = None,
+        wall_now: float | None = None,
+    ) -> None:
         current_time = monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
+        self._render_chat_heading(wall_now)
+
+    def _render_chat_heading(self, wall_now: float | None = None) -> None:
+        titles = list(self.query("#chat-title"))
+        if not titles:
+            # A final timer tick may race with Textual dismantling the screen.
+            return
+        active: int | None = None
+        if self._radio_state is RadioState.ONLINE:
+            counter = getattr(self.radio, "active_node_count", None)
+            if callable(counter):
+                try:
+                    active = counter(now=time() if wall_now is None else wall_now)
+                except Exception:
+                    active = None
+        value = "—" if active is None else str(active)
+        titles[0].update(f"> CHAT — PRIMARY — ACTIVE {value}")
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
@@ -1302,6 +1378,7 @@ class MeshtasticPassApp(App[None]):
             else:
                 self._connection_animation_timer.resume()
         self._render_connection_details()
+        self._render_chat_heading()
         self.query_one("#connection-error", Static).update("")
 
     def _advance_connection_animation(self) -> None:

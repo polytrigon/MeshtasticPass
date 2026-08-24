@@ -148,6 +148,21 @@ class SimulatedRadioServiceTests(unittest.TestCase):
 
         self.assertTrue(service.is_closed)
 
+    def test_activity_is_deterministic_and_ages_without_messages(self) -> None:
+        service = self.make_service()
+        self.assertIsNone(service.active_node_count(now=1_000))
+
+        with patch("simulated_radio_service.time.time", return_value=1_000):
+            service.connect()
+
+        self.assertEqual(service.active_node_count(now=1_000), 2)
+        self.assertEqual(service.active_node_count(now=1_001), 1)
+        self.assertEqual(service.info.known_nodes, 6)
+        self.assertEqual(service.sent_messages, ())
+
+        service.close()
+        self.assertIsNone(service.active_node_count(now=1_002))
+
 
 if __name__ == "__main__":
     unittest.main()

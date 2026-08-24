@@ -7,9 +7,11 @@ from enum import Enum
 import os
 from pathlib import Path
 from threading import Event
+import time
 from typing import Any, Callable, Iterator
 
 from geo import GeoPosition, make_geo_position
+from node_activity import count_active_other_nodes
 
 
 class RadioState(Enum):
@@ -221,6 +223,38 @@ class RadioService:
         """Call handler for each valid received text message."""
         if handler not in self._message_handlers:
             self._message_handlers.append(handler)
+
+    def active_node_count(self, now: float | None = None) -> int | None:
+        """Return recently heard other nodes without transmitting anything."""
+        interface = self._interface
+        if interface is None:
+            return None
+        nodes_by_number = getattr(interface, "nodesByNum", None)
+        if not isinstance(nodes_by_number, dict):
+            return 0
+        try:
+            nodes = tuple(nodes_by_number.items())
+        except RuntimeError:
+            # The SDK may be updating the node database from its receive thread.
+            return None
+
+        my_info = getattr(interface, "myInfo", None)
+        local_number = getattr(my_info, "my_node_num", None)
+        if isinstance(local_number, bool) or not isinstance(local_number, int):
+            local_number = None
+        local_record = (
+            nodes_by_number.get(local_number, {})
+            if local_number is not None
+            else {}
+        )
+        local_user = self._user_from_record(local_record)
+        local_id = self._optional_string(local_user.get("id"))
+        return count_active_other_nodes(
+            nodes,
+            local_node_number=local_number,
+            local_node_id=local_id,
+            now=time.time() if now is None else now,
+        )
 
     def remove_message_handler(
         self,
