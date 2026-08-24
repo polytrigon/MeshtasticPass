@@ -43,6 +43,10 @@ def main() -> int:
                 print("RADIO OFFLINE")
                 print(event.message)
                 print(f"Retrying in {args.retry_delay:g} seconds...")
+            elif event.state is RadioState.ERROR:
+                print("RADIO ERROR")
+                print(event.message)
+                print(f"Retrying in {args.retry_delay:g} seconds...")
     except KeyboardInterrupt:
         print("\nRadio monitor stopped.")
     finally:

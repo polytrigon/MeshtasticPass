@@ -10,16 +10,25 @@ from threading import Event
 from typing import Any, Iterator
 
 
-class RadioConnectionError(Exception):
-    """Raised when the Meshtastic radio cannot be used."""
-
-
 class RadioState(Enum):
     """Connection states that callers can display without knowing SDK details."""
 
     CONNECTING = "CONNECTING"
     ONLINE = "ONLINE"
     OFFLINE = "OFFLINE"
+    ERROR = "ERROR"
+
+
+class RadioConnectionError(Exception):
+    """Raised when the Meshtastic radio cannot be used."""
+
+    def __init__(
+        self,
+        message: str,
+        state: RadioState = RadioState.ERROR,
+    ) -> None:
+        super().__init__(message)
+        self.state = state
 
 
 @dataclass(frozen=True)
@@ -95,12 +104,14 @@ class RadioService:
                 try:
                     info = self.connect()
                 except RadioConnectionError as error:
-                    yield RadioEvent(RadioState.OFFLINE, message=str(error))
+                    yield RadioEvent(error.state, message=str(error))
                 else:
                     yield RadioEvent(RadioState.ONLINE, info=info)
 
                     while not stopped.is_set():
                         if self._connection_lost.wait(poll_interval):
+                            break
+                        if not self._device_exists():
                             break
 
                     if stopped.is_set():
@@ -121,10 +132,13 @@ class RadioService:
     def close(self) -> None:
         """Close the serial connection if it is open."""
         if self._interface is not None:
+            interface = self._interface
+            self._interface = None
             try:
-                self._interface.close()
-            finally:
-                self._interface = None
+                interface.close()
+            except Exception:
+                # An unplugged serial device can fail while it is being closed.
+                pass
 
     def _open_interface(self) -> Any:
         # Import here so a missing dependency becomes a friendly runtime error.
@@ -146,18 +160,23 @@ class RadioService:
 
     def _unsubscribe_from_connection_loss(self) -> None:
         if self._pub is not None:
-            self._pub.unsubscribe(
-                self._on_connection_lost,
-                "meshtastic.connection.lost",
-            )
-            self._pub = None
+            try:
+                self._pub.unsubscribe(
+                    self._on_connection_lost,
+                    "meshtastic.connection.lost",
+                )
+            except Exception:
+                pass
+            finally:
+                self._pub = None
 
     def _check_device(self) -> None:
         path = Path(self.device_path)
-        if not path.exists():
+        if not self._device_exists():
             raise RadioConnectionError(
                 f"Serial device {self.device_path} was not found. "
-                "Check the USB cable and run: ls -l /dev/ttyUSB0"
+                "Check the USB cable and run: ls -l /dev/ttyUSB0",
+                state=RadioState.OFFLINE,
             )
 
         if not os.access(path, os.R_OK | os.W_OK):
@@ -166,6 +185,9 @@ class RadioService:
                 "Add user 'mt' to the dialout group, then log out and back in: "
                 "sudo usermod -aG dialout mt"
             )
+
+    def _device_exists(self) -> bool:
+        return Path(self.device_path).exists()
 
     def _read_radio_info(self) -> RadioInfo:
         if self._interface is None:

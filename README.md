@@ -48,7 +48,8 @@ Nodes:    1 known
 Leave the monitor running and unplug the radio. It will report `RADIO OFFLINE`
 and retry every five seconds. After the radio is plugged back in and its initial
 sync completes, the monitor reports `RADIO ONLINE` again. Press `Ctrl+C` to
-stop it.
+stop it. Setup or SDK failures are reported separately as `RADIO ERROR`, and
+the monitor continues retrying instead of crashing.
 
 Change the retry interval when needed:
 
