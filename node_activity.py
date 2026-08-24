@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from math import isfinite
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 ACTIVE_WINDOW_SECONDS = 300.0
@@ -15,11 +15,14 @@ def count_active_other_nodes(
     local_node_number: int | None,
     local_node_id: str | None,
     now: float,
+    direct_observations: Mapping[str, float] | None = None,
 ) -> int:
     """Count unique other nodes heard less than five minutes ago.
 
-    A node heard exactly ``ACTIVE_WINDOW_SECONDS`` ago is no longer active.
-    Future, missing, malformed, and non-finite timestamps are ignored.
+    Node-database ``lastHeard`` values and packets directly observed by the
+    application are combined by node ID. A node heard exactly
+    ``ACTIVE_WINDOW_SECONDS`` ago is no longer active. Future, missing,
+    malformed, and non-finite timestamps are ignored.
     """
     if not isinstance(now, (int, float)) or isinstance(now, bool) or not isfinite(now):
         return 0
@@ -50,6 +53,21 @@ def count_active_other_nodes(
         ):
             continue
         age = float(now) - float(last_heard)
+        if 0 <= age < ACTIVE_WINDOW_SECONDS:
+            active_ids.add(node_id)
+
+    for raw_node_id, observed_at in (direct_observations or {}).items():
+        node_id = _normalize_node_id(raw_node_id)
+        if node_id is None or node_id == normalized_local_id:
+            continue
+        if (
+            not isinstance(observed_at, (int, float))
+            or isinstance(observed_at, bool)
+            or not isfinite(observed_at)
+            or observed_at <= 0
+        ):
+            continue
+        age = float(now) - float(observed_at)
         if 0 <= age < ACTIVE_WINDOW_SECONDS:
             active_ids.add(node_id)
 
