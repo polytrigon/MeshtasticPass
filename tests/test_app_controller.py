@@ -34,15 +34,18 @@ class AppControllerTests(unittest.TestCase):
         named = self.make_message(long_name="Alice Trail", short_name="ALCE")
         fallback = self.make_message(long_name=None, short_name=None)
 
-        self.assertEqual(received_chat_entry(named).author, "Alice Trail")
+        entry = received_chat_entry(named, accepted_at=123.0)
+        self.assertEqual(entry.author, "Alice Trail")
+        self.assertEqual(entry.accepted_at, 123.0)
         self.assertEqual(received_chat_entry(fallback).author, "!a11ce001")
-        self.assertFalse(received_chat_entry(named).outgoing)
+        self.assertFalse(entry.outgoing)
 
     def test_outgoing_entry_uses_you_marker(self) -> None:
-        entry = outgoing_chat_entry("hello")
+        entry = outgoing_chat_entry("hello", accepted_at=456.0)
 
         self.assertEqual(entry.author, "YOU")
         self.assertEqual(entry.text, "hello")
+        self.assertEqual(entry.accepted_at, 456.0)
         self.assertTrue(entry.outgoing)
 
     def test_monitor_stops_and_closes_service_cleanly(self) -> None:

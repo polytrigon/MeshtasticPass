@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+from time import monotonic
 import unittest
 
 from textual.widgets import Input, Static
 
-from app import ColorSelector, FontSizeSelector, MeshtasticPassApp
+from app import ChatEntryWidget, ColorSelector, FontSizeSelector, MeshtasticPassApp
 from app_settings import AppSettings
 from radio_service import RadioInfo, RadioState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
@@ -321,6 +322,69 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app.show_tab("chat")
             self.assertEqual(app.unread_count, 0)
             self.assertNotIn("CHAT(", str(tab_bar.render()))
+
+    async def test_chat_entries_timestamp_and_refresh_with_one_shared_timer(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        incoming = SIMULATED_MESSAGES[0]
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            timestamp_timer = app._chat_timestamp_timer
+            self.assertIsNotNone(timestamp_timer)
+
+            before_incoming = monotonic()
+            app._accept_received_message(incoming)
+            incoming_entry = app.chat_history[-1]
+            self.assertGreaterEqual(incoming_entry.accepted_at, before_incoming)
+
+            before_outgoing = monotonic()
+            app._accepted_send("local timestamp")
+            outgoing_entry = app.chat_history[-1]
+            self.assertGreaterEqual(outgoing_entry.accepted_at, before_outgoing)
+            self.assertTrue(outgoing_entry.outgoing)
+
+            await pilot.pause()
+            widgets = list(app.query(ChatEntryWidget))
+            self.assertEqual(len(widgets), 2)
+            self.assertIs(app._chat_timestamp_timer, timestamp_timer)
+
+            app._refresh_chat_timestamps(incoming_entry.accepted_at + 63 * 60)
+            await pilot.pause()
+            incoming_timestamp = widgets[0].query_one(
+                ".chat-entry-timestamp", Static
+            )
+            self.assertEqual(str(incoming_timestamp.render()), "1h 3min")
+
+        self.assertIsNone(timestamp_timer._task)
+
+    async def test_timestamp_theme_colors_and_electric_errors(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+            timestamp = app.query_one(".chat-entry-timestamp", Static)
+            error = app.query_one("#send-error", Static)
+
+            expected_timestamp_colors = {
+                "white": "#8A8A8A",
+                "green": "#168F0A",
+                "orange": "#A85C00",
+            }
+            for color, expected in expected_timestamp_colors.items():
+                app._apply_color_theme(color)
+                await pilot.pause()
+                self.assertEqual(timestamp.visual_style.foreground.hex6, expected)
+                self.assertEqual(error.visual_style.foreground.hex6, "#FF1744")
 
 
 if __name__ == "__main__":
