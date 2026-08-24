@@ -47,7 +47,7 @@ SIMULATED_MESSAGES = (
         rssi=-87,
         snr=6.5,
         packet_id=350000001,
-        sent_at=_SIMULATED_REFERENCE_TIME - 8,
+        radio_rx_at=_SIMULATED_REFERENCE_TIME - 8,
     ),
     ReceivedMessage(
         sender_node_id=SIMULATED_NODES[1].node_id,
@@ -58,7 +58,7 @@ SIMULATED_MESSAGES = (
         rssi=-73,
         snr=8.25,
         packet_id=350000002,
-        sent_at=_SIMULATED_REFERENCE_TIME - 27 * 60,
+        radio_rx_at=_SIMULATED_REFERENCE_TIME - 27 * 60,
     ),
     ReceivedMessage(
         sender_node_id=SIMULATED_NODES[2].node_id,
@@ -69,7 +69,7 @@ SIMULATED_MESSAGES = (
         rssi=-101,
         snr=2.0,
         packet_id=350000003,
-        sent_at=_SIMULATED_REFERENCE_TIME - (2 * 60 + 12) * 60,
+        radio_rx_at=_SIMULATED_REFERENCE_TIME - (2 * 60 + 12) * 60,
     ),
 )
 

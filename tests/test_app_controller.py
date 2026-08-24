@@ -42,7 +42,8 @@ class AppControllerTests(unittest.TestCase):
             is_new=True,
         )
         self.assertEqual(entry.author, "Alice Trail")
-        self.assertIsNone(entry.sent_at)
+        self.assertIsNone(entry.radio_rx_at)
+        self.assertIsNone(entry.local_sent_at)
         self.assertEqual(entry.received_at, 1_700_000_000.0)
         self.assertEqual(entry.age_reference, 123.0)
         self.assertTrue(entry.unread)
@@ -59,7 +60,8 @@ class AppControllerTests(unittest.TestCase):
 
         self.assertEqual(entry.author, "YOU")
         self.assertEqual(entry.text, "hello")
-        self.assertEqual(entry.sent_at, 1_700_000_000.0)
+        self.assertIsNone(entry.radio_rx_at)
+        self.assertEqual(entry.local_sent_at, 1_700_000_000.0)
         self.assertEqual(entry.received_at, 1_700_000_000.0)
         self.assertEqual(entry.age_reference, 456.0)
         self.assertTrue(entry.outgoing)

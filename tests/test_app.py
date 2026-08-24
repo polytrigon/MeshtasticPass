@@ -120,12 +120,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 [message.text for message in SIMULATED_MESSAGES],
             )
             self.assertEqual(
-                [entry.sent_at for entry in app.chat_history],
-                [message.sent_at for message in SIMULATED_MESSAGES],
+                [entry.radio_rx_at for entry in app.chat_history],
+                [message.radio_rx_at for message in SIMULATED_MESSAGES],
             )
             self.assertTrue(
                 all(
-                    entry.sent_at != entry.received_at
+                    entry.radio_rx_at != entry.received_at
                     for entry in app.chat_history
                 )
             )
@@ -394,13 +394,21 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._accept_received_message(incoming)
             incoming_entry = app.chat_history[-1]
             self.assertGreaterEqual(incoming_entry.received_at, before_incoming)
-            self.assertEqual(incoming_entry.sent_at, incoming.sent_at)
+            self.assertEqual(
+                incoming_entry.radio_rx_at,
+                incoming.radio_rx_at,
+            )
+            self.assertIsNone(incoming_entry.local_sent_at)
 
             before_outgoing = time()
             app._accepted_send("local timestamp")
             outgoing_entry = app.chat_history[-1]
             self.assertGreaterEqual(outgoing_entry.received_at, before_outgoing)
-            self.assertEqual(outgoing_entry.sent_at, outgoing_entry.received_at)
+            self.assertIsNone(outgoing_entry.radio_rx_at)
+            self.assertEqual(
+                outgoing_entry.local_sent_at,
+                outgoing_entry.received_at,
+            )
             self.assertTrue(outgoing_entry.outgoing)
 
             await pilot.pause()
@@ -559,7 +567,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         cursor.restore.assert_called_once_with()
 
-    async def test_real_radio_callback_uses_new_state_and_packet_time(self) -> None:
+    async def test_real_callback_uses_new_state_and_radio_receive_time(self) -> None:
         radio = CallbackRadioService()
         app = MeshtasticPassApp(radio, self.settings)
         packet = {
@@ -596,7 +604,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(entry.is_new)
             self.assertFalse(entry.unread)
             self.assertEqual(app.unread_count, 0)
-            self.assertNotEqual(entry.sent_at, entry.received_at)
+            self.assertNotEqual(entry.radio_rx_at, entry.received_at)
+            self.assertIsNone(entry.local_sent_at)
             self.assertEqual(str(widget.timestamp_label.render()), "2h")
             for part in parts:
                 self.assertEqual(part.visual_style.foreground.hex6, "#FF8C00")

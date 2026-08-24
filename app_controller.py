@@ -18,7 +18,8 @@ class ChatEntry:
 
     author: str
     text: str
-    sent_at: float | None
+    radio_rx_at: float | None
+    local_sent_at: float | None
     received_at: float
     age_reference: float
     outgoing: bool = False
@@ -36,8 +37,8 @@ def received_chat_entry(
     """Convert an application message to display state without SDK details."""
     local_received_at = time() if received_at is None else received_at
     local_monotonic = monotonic() if monotonic_now is None else monotonic_now
-    valid_sent_at, age_reference = make_age_reference(
-        message.sent_at,
+    valid_radio_rx_at, age_reference = make_age_reference(
+        message.radio_rx_at,
         local_received_at,
         local_monotonic,
     )
@@ -49,7 +50,8 @@ def received_chat_entry(
     return ChatEntry(
         author=author,
         text=message.text,
-        sent_at=valid_sent_at,
+        radio_rx_at=valid_radio_rx_at,
+        local_sent_at=None,
         received_at=local_received_at,
         age_reference=age_reference,
         unread=unread,
@@ -68,7 +70,8 @@ def outgoing_chat_entry(
     return ChatEntry(
         author="YOU",
         text=text,
-        sent_at=local_received_at,
+        radio_rx_at=None,
+        local_sent_at=local_received_at,
         received_at=local_received_at,
         age_reference=local_monotonic,
         outgoing=True,

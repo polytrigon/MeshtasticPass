@@ -9,8 +9,8 @@ from typing import Any
 MAX_FUTURE_SKEW_SECONDS = 5 * 60
 
 
-def validate_sent_at(value: Any, received_at: float) -> float | None:
-    """Return a usable packet wall-clock timestamp or ``None``."""
+def validate_radio_rx_at(value: Any, received_at: float) -> float | None:
+    """Return a usable receiver-stamped wall-clock time or ``None``."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
 
@@ -23,15 +23,15 @@ def validate_sent_at(value: Any, received_at: float) -> float | None:
 
 
 def make_age_reference(
-    sent_at: Any,
+    radio_rx_at: Any,
     received_at: float,
     monotonic_now: float,
 ) -> tuple[float | None, float]:
-    """Convert optional wall-clock packet time to a monotonic reference."""
-    valid_sent_at = validate_sent_at(sent_at, received_at)
+    """Convert optional radio receive time to a monotonic age reference."""
+    valid_radio_rx_at = validate_radio_rx_at(radio_rx_at, received_at)
     initial_age = (
-        max(0.0, received_at - valid_sent_at)
-        if valid_sent_at is not None
+        max(0.0, received_at - valid_radio_rx_at)
+        if valid_radio_rx_at is not None
         else 0.0
     )
-    return valid_sent_at, monotonic_now - initial_age
+    return valid_radio_rx_at, monotonic_now - initial_age
