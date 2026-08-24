@@ -31,7 +31,7 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         self.assertEqual(connecting.state, RadioState.CONNECTING)
         self.assertEqual(online.state, RadioState.ONLINE)
         self.assertEqual(online.info, service.info)
-        self.assertEqual(service.info.device_path, "simulated://meshtastic")
+        self.assertEqual(service.info.device_path, "/dev/ttyUSB0")
         self.assertEqual(service.info.node_id, "!51a00001")
         service.close()
         with self.assertRaises(StopIteration):
@@ -147,6 +147,18 @@ class SimulatedRadioServiceTests(unittest.TestCase):
             list(service.connection_events(stop_event=stopped))
 
         self.assertTrue(service.is_closed)
+
+    def test_fake_usb_choices_switch_without_real_enumeration(self) -> None:
+        service = self.make_service()
+        with patch("serial_devices.discover_serial_devices") as discover:
+            self.assertEqual(
+                service.available_device_paths(),
+                ("/dev/ttyUSB0", "/dev/ttyUSB1"),
+            )
+            service.set_device_path("/dev/ttyUSB1")
+        discover.assert_not_called()
+        self.assertEqual(service.device_path, "/dev/ttyUSB1")
+        self.assertEqual(service.info.device_path, "/dev/ttyUSB1")
 
     def test_activity_is_deterministic_and_ages_without_messages(self) -> None:
         service = self.make_service()

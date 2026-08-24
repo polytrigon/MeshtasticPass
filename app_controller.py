@@ -176,7 +176,7 @@ def create_radio_service(
 ) -> RadioService | SimulatedRadioService:
     """Select the real or deterministic radio behind the same app boundary."""
     if simulate:
-        return SimulatedRadioService()
+        return SimulatedRadioService(device_path=device_path)
     return RadioService(device_path=device_path)
 
 

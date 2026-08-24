@@ -5,7 +5,13 @@ from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
-from radio_service import RadioConnectionError, RadioInfo, RadioService, RadioState
+from radio_service import (
+    ChannelInfo,
+    RadioConnectionError,
+    RadioInfo,
+    RadioService,
+    RadioState,
+)
 
 
 def make_interface() -> SimpleNamespace:
@@ -29,6 +35,46 @@ def make_interface() -> SimpleNamespace:
 
 
 class RadioServiceTests(unittest.TestCase):
+    def test_discovers_serial_devices_and_closes_before_switching(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        service.close = Mock()
+        with patch("radio_service.discover_serial_devices", return_value=("/dev/a",)):
+            self.assertEqual(service.available_device_paths(), ("/dev/a",))
+
+        service.set_device_path("/dev/ttyACM0")
+        service.close.assert_called_once_with()
+        self.assertEqual(service.device_path, "/dev/ttyACM0")
+
+    def test_reads_enabled_channel_names_and_configured_primary_preset(self) -> None:
+        channels = [
+            SimpleNamespace(
+                index=0,
+                role=1,
+                settings=SimpleNamespace(name=""),
+            ),
+            SimpleNamespace(
+                index=1,
+                role=2,
+                settings=SimpleNamespace(name="Hiking"),
+            ),
+            SimpleNamespace(
+                index=2,
+                role=0,
+                settings=SimpleNamespace(name="Disabled"),
+            ),
+        ]
+        local_node = SimpleNamespace(
+            channels=channels,
+            localConfig=SimpleNamespace(
+                lora=SimpleNamespace(use_preset=True, modem_preset=0)
+            ),
+        )
+
+        self.assertEqual(
+            RadioService._read_channel_info(local_node),
+            (ChannelInfo(0, "LongFast"), ChannelInfo(1, "Hiking")),
+        )
+
     def test_close_does_not_crash_after_unplug(self) -> None:
         service = RadioService()
         interface = make_interface()

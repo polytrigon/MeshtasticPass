@@ -12,6 +12,7 @@ from typing import Callable, Iterator
 from geo import GeoPosition
 from node_activity import count_active_other_nodes
 from radio_service import (
+    ChannelInfo,
     RadioEvent,
     DeliveryState,
     RadioInfo,
@@ -21,6 +22,13 @@ from radio_service import (
     SentMessage,
     SendStatus,
     validate_send_request,
+)
+
+
+SIMULATED_DEVICE_PATHS = ("/dev/ttyUSB0", "/dev/ttyUSB1")
+SIMULATED_CHANNELS = (
+    ChannelInfo(0, "LongFast"),
+    ChannelInfo(1, "Hiking"),
 )
 
 
@@ -117,12 +125,15 @@ class SimulatedRadioService:
 
     def __init__(
         self,
+        device_path: str = SIMULATED_DEVICE_PATHS[0],
         connect_delay: float = 0.25,
         message_interval: float = 0.75,
         scripted_messages: tuple[ReceivedMessage, ...] = SIMULATED_MESSAGES,
         send_outcomes: tuple[SimulatedSendOutcome, ...] = (),
     ) -> None:
-        self.device_path = "simulated://meshtastic"
+        if device_path not in SIMULATED_DEVICE_PATHS:
+            device_path = SIMULATED_DEVICE_PATHS[0]
+        self.device_path = device_path
         self.info = RadioInfo(
             device_path=self.device_path,
             node_id="!51a00001",
@@ -130,6 +141,7 @@ class SimulatedRadioService:
             short_name="SIM",
             firmware_version="sim-1.0.0",
             known_nodes=len(SIMULATED_NODES) + 1,
+            channels=SIMULATED_CHANNELS,
         )
         self.connect_delay = connect_delay
         self.message_interval = message_interval
@@ -143,6 +155,26 @@ class SimulatedRadioService:
         self._sent_messages: list[SentMessage] = []
         self._send_count = 0
         self._activity_reference_time: float | None = None
+
+    def available_device_paths(self) -> tuple[str, ...]:
+        """Return fake ports without asking the host operating system."""
+        return SIMULATED_DEVICE_PATHS
+
+    def set_device_path(self, device_path: str) -> None:
+        """Switch deterministic fake ports without touching real hardware."""
+        if device_path not in SIMULATED_DEVICE_PATHS:
+            raise ValueError("Unknown simulated USB device.")
+        self.close()
+        self.device_path = device_path
+        self.info = RadioInfo(
+            device_path=device_path,
+            node_id=self.info.node_id,
+            long_name=self.info.long_name,
+            short_name=self.info.short_name,
+            firmware_version=self.info.firmware_version,
+            known_nodes=self.info.known_nodes,
+            channels=self.info.channels,
+        )
 
     @property
     def is_closed(self) -> bool:
@@ -206,6 +238,7 @@ class SimulatedRadioService:
             raise ValueError("simulation delays cannot be negative")
 
         stopped = stop_event or Event()
+        self._stop_event.clear()
         self._closed = False
 
         try:

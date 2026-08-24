@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterator
 
 from geo import GeoPosition, make_geo_position
 from node_activity import count_active_other_nodes
+from serial_devices import discover_serial_devices
 
 
 class RadioState(Enum):
@@ -59,6 +60,14 @@ class SendStatus:
 
 
 @dataclass(frozen=True)
+class ChannelInfo:
+    """One enabled application-facing Meshtastic channel."""
+
+    index: int
+    name: str
+
+
+@dataclass(frozen=True)
 class RadioInfo:
     """Small, UI-friendly summary of the connected radio."""
 
@@ -68,6 +77,7 @@ class RadioInfo:
     short_name: str
     firmware_version: str
     known_nodes: int
+    channels: tuple[ChannelInfo, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,6 +181,17 @@ class RadioService:
             raise RadioConnectionError(
                 f"Could not connect to the radio on {self.device_path}: {message}"
             ) from error
+
+    def available_device_paths(self) -> tuple[str, ...]:
+        """Return serial devices currently reported by pyserial."""
+        return discover_serial_devices()
+
+    def set_device_path(self, device_path: str) -> None:
+        """Change ports only after closing the current serial interface."""
+        if not isinstance(device_path, str) or not device_path.strip():
+            raise ValueError("USB device path cannot be empty.")
+        self.close()
+        self.device_path = device_path.strip()
 
     def connection_events(
         self,
@@ -658,4 +679,53 @@ class RadioService:
             short_name=user.get("shortName", "unknown"),
             firmware_version=getattr(metadata, "firmware_version", "unknown"),
             known_nodes=len(self._interface.nodesByNum),
+            channels=self._read_channel_info(local_node),
         )
+
+    @staticmethod
+    def _read_channel_info(local_node: Any) -> tuple[ChannelInfo, ...]:
+        """Convert enabled SDK channel protobufs into stable app values."""
+        channels = getattr(local_node, "channels", None)
+        if not channels:
+            return ()
+        try:
+            from meshtastic.protobuf import channel_pb2
+
+            disabled_role = channel_pb2.Channel.Role.DISABLED
+        except (ImportError, AttributeError):
+            disabled_role = 0
+
+        result: list[ChannelInfo] = []
+        seen_indexes: set[int] = set()
+        for fallback_index, channel in enumerate(channels):
+            role = getattr(channel, "role", disabled_role)
+            if role == disabled_role or role == "DISABLED":
+                continue
+            raw_index = getattr(channel, "index", fallback_index)
+            index = RadioService._optional_int(raw_index)
+            if index is None or not 0 <= index <= 7 or index in seen_indexes:
+                continue
+            settings = getattr(channel, "settings", None)
+            raw_name = getattr(settings, "name", "")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            if not name and index == 0:
+                name = RadioService._primary_channel_default_name(local_node)
+            result.append(ChannelInfo(index, name or f"Channel {index + 1}"))
+            seen_indexes.add(index)
+        return tuple(sorted(result, key=lambda channel: channel.index))
+
+    @staticmethod
+    def _primary_channel_default_name(local_node: Any) -> str:
+        """Derive the unnamed primary channel label from the radio preset."""
+        try:
+            from meshtastic.protobuf import config_pb2
+
+            lora = local_node.localConfig.lora
+            if not lora.use_preset:
+                return ""
+            enum_name = config_pb2.Config.LoRaConfig.ModemPreset.Name(
+                lora.modem_preset
+            )
+        except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+            return ""
+        return "".join(part.title() for part in enum_name.split("_"))

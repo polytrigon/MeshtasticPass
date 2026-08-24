@@ -15,6 +15,7 @@ FONT_SIZE_CHOICES = (
     ("MEDIUM", 13),
     ("LARGE", 16),
     ("XL", 18),
+    ("XXL", 22),
 )
 VALID_FONT_SIZES = tuple(size for _name, size in FONT_SIZE_CHOICES)
 DEFAULT_FONT_SIZE = 13
@@ -25,6 +26,7 @@ COLOR_CHOICES = (
 )
 VALID_COLORS = tuple(value for _name, value in COLOR_CHOICES)
 DEFAULT_COLOR = "white"
+DEFAULT_DEVICE_PATH = "/dev/ttyUSB0"
 
 
 def default_config_home() -> Path:
@@ -37,6 +39,7 @@ class AppSettings:
 
     font_size: int = DEFAULT_FONT_SIZE
     color: str = DEFAULT_COLOR
+    device_path: str = DEFAULT_DEVICE_PATH
     config_path: Path = field(
         default_factory=lambda: default_config_home()
         / "meshtasticpass"
@@ -73,7 +76,7 @@ class AppSettings:
         settings._unknown = {
             key: value
             for key, value in raw.items()
-            if key not in ("font_size", "color")
+            if key not in ("font_size", "color", "device_path")
         }
         candidate = raw.get("font_size")
         if cls.is_valid_font_size(candidate):
@@ -81,6 +84,9 @@ class AppSettings:
         color_candidate = raw.get("color")
         if cls.is_valid_color(color_candidate):
             settings.color = color_candidate
+        device_candidate = raw.get("device_path")
+        if cls.is_valid_device_path(device_candidate):
+            settings.device_path = device_candidate
         return settings
 
     @staticmethod
@@ -107,11 +113,21 @@ class AppSettings:
             raise ValueError(f"Color must be one of: {choices}")
         self.color = color
 
+    @staticmethod
+    def is_valid_device_path(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def set_device_path(self, device_path: str) -> None:
+        if not self.is_valid_device_path(device_path):
+            raise ValueError("USB device path cannot be empty.")
+        self.device_path = device_path.strip()
+
     def save(self) -> None:
         """Atomically save known settings while retaining unknown future keys."""
         data = dict(self._unknown)
         data["font_size"] = self.font_size
         data["color"] = self.color
+        data["device_path"] = self.device_path
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         self._atomic_write(self.config_path, content)
 
