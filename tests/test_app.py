@@ -153,9 +153,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     for entry in app.chat_history
                 )
             )
-            self.assertEqual(app.unread_count, len(primary_messages))
+            self.assertEqual(app.unread_count, len(SIMULATED_MESSAGES))
             self.assertIn(
-                f"CHAT({len(primary_messages)})",
+                f"CHAT({len(SIMULATED_MESSAGES)})",
                 str(app.query_one("#tab-bar", Static).render()),
             )
 
@@ -176,7 +176,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 str(app.query_one("#tab-bar", Static).render()),
             )
 
-            await pilot.press("right")
+            await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
             self.assertEqual(selector.font_size, 16)
@@ -214,25 +214,32 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test(size=(100, 30)):
             details = app.query_one("#connection-details", Static)
-            connecting = str(details.render())
-            self.assertIn("STATUS     CONNECTING.", connecting)
-            self.assertIn("DEVICE     simulated://meshtastic", connecting)
+            status = app.query_one("#connection-status", Static)
+            connecting = str(status.render())
+            self.assertIn("STATUS       CONNECTING.", connecting)
+            self.assertIn(
+                "/dev/ttyUSB0",
+                str(app.query_one("#device-selector", Static).render()),
+            )
 
             app._show_connection(RadioState.ONLINE, info)
             online = str(details.render())
-            self.assertIn("STATUS     ONLINE", online)
+            self.assertIn("STATUS       CONNECTED", str(status.render()))
             self.assertIn("NODE       !433a9a3c", online)
             self.assertIn("NAME       @Polytrigon (9a3c)", online)
 
             app._show_connection(RadioState.OFFLINE, info)
             offline = str(details.render())
-            self.assertIn("STATUS     OFFLINE — RETRYING.", offline)
+            self.assertIn("STATUS       OFFLINE — RETRYING.", str(status.render()))
             self.assertNotIn("!433a9a3c", offline)
             self.assertNotIn("FIRMWARE", offline)
 
             app._show_connection(RadioState.ERROR, info, "raw SDK exception")
             error = str(details.render())
-            self.assertIn("STATUS     CONNECTION ERROR — RETRYING.", error)
+            self.assertIn(
+                "STATUS       CONNECTION ERROR — RETRYING.",
+                str(status.render()),
+            )
             self.assertNotIn("!433a9a3c", error)
             self.assertNotIn(
                 "raw SDK exception",
@@ -249,26 +256,26 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         info = radio.info
 
         async with app.run_test(size=(100, 30)) as pilot:
-            details = app.query_one("#connection-details", Static)
+            details = app.query_one("#connection-status", Static)
             timer = app._connection_animation_timer
             self.assertIsNotNone(timer)
 
-            self.assertIn("STATUS     CONNECTING.", str(details.render()))
+            self.assertIn("STATUS       CONNECTING.", str(details.render()))
             await pilot.pause(0.5)
-            self.assertIn("STATUS     CONNECTING..", str(details.render()))
+            self.assertIn("STATUS       CONNECTING..", str(details.render()))
             app._advance_connection_animation()
-            self.assertIn("STATUS     CONNECTING...", str(details.render()))
+            self.assertIn("STATUS       CONNECTING...", str(details.render()))
             app._advance_connection_animation()
-            self.assertIn("STATUS     CONNECTING.", str(details.render()))
+            self.assertIn("STATUS       CONNECTING.", str(details.render()))
 
             app._show_connection(RadioState.OFFLINE)
             app._advance_connection_animation()
-            self.assertIn("STATUS     OFFLINE — RETRYING..", str(details.render()))
+            self.assertIn("STATUS       OFFLINE — RETRYING..", str(details.render()))
 
             app._show_connection(RadioState.ERROR)
             app._advance_connection_animation()
             self.assertIn(
-                "STATUS     CONNECTION ERROR — RETRYING..",
+                "STATUS       CONNECTION ERROR — RETRYING..",
                 str(details.render()),
             )
 
@@ -276,7 +283,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             online = str(details.render())
             app._advance_connection_animation()
             self.assertEqual(str(details.render()), online)
-            self.assertIn("STATUS     ONLINE", online)
+            self.assertIn("STATUS       CONNECTED", online)
             self.assertNotIn("ONLINE.", online)
 
             for state in (
@@ -310,7 +317,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(color_selector.has_focus)
             self.assertTrue(str(color_selector.render()).startswith("> COLOR"))
             self.assertTrue(str(font_selector.render()).startswith("  FONT SIZE"))
-            await pilot.press("right")
+            await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
             self.assertEqual(color_selector.color, "green")
@@ -318,12 +325,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.screen.has_class("theme-green"))
             self.assertFalse(app.screen.has_class("theme-white"))
 
-            await pilot.press("right")
+            await pilot.press("enter", "down", "enter")
             await pilot.pause()
             self.assertEqual(color_selector.color, "orange")
             self.assertTrue(app.screen.has_class("theme-orange"))
 
-            await pilot.press("up", "right")
+            await pilot.press("up", "enter", "down", "enter")
             await pilot.pause()
             self.assertTrue(font_selector.has_focus)
             self.assertEqual(font_selector.font_size, 16)
@@ -344,16 +351,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             status = app.query_one("#style-status", Static)
             self.assertEqual(status.visual_style.foreground.hex6, "#D8D8D8")
 
-            await pilot.press("down", "right")
+            await pilot.press("down", "enter", "down", "enter")
             await pilot.pause()
             self.assertIn("COLOR SAVED", str(status.render()))
             self.assertEqual(status.visual_style.foreground.hex6, "#39FF14")
 
-            await pilot.press("right")
+            await pilot.press("enter", "down", "enter")
             await pilot.pause()
             self.assertEqual(status.visual_style.foreground.hex6, "#FF8C00")
 
-            await pilot.press("right")
+            await pilot.press("enter", "down", "enter")
             await pilot.pause()
             self.assertEqual(status.visual_style.foreground.hex6, "#D8D8D8")
 
@@ -607,7 +614,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(reference)
             app._refresh_chat_timestamps(wall_now=reference)
             self.assertIn(
-                "CHAT — PRIMARY — ACTIVE 2",
+                "CHAT — [ LongFast ▾ ] — ACTIVE 2",
                 str(app.query_one("#chat-title", Static).render()),
             )
             self.assertIn(
@@ -652,7 +659,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             timestamp = widget.query_one(".chat-entry-timestamp", Static)
             distance = widget.query_one(".chat-entry-distance", Static)
 
-            self.assertIn("CHAT — PRIMARY", str(heading.render()))
+            self.assertIn("CHAT — [ LongFast ▾ ]", str(heading.render()))
             self.assertIs(author.parent, timestamp.parent)
             self.assertIs(author.parent, distance.parent)
             self.assertIsInstance(author.parent, Horizontal)
@@ -1307,9 +1314,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(immediate.delivery_state, DeliveryState.UNCONFIRMED)
 
             widget = list(app.query(ChatEntryWidget))[-1]
-            await pilot.press("shift+tab")
-            self.assertIs(app.focused, widget)
-            await pilot.press("r")
+            widget.focus()
+            await pilot.press("down", "enter")
             for _ in range(5):
                 await pilot.pause()
                 if immediate.delivery_state is DeliveryState.SENT:

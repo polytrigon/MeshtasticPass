@@ -79,15 +79,19 @@ python app.py --simulate
 ```
 
 Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or PASS MAP. CHAT
-accepts broadcast text on channel 0. While the chat input is focused, normal
-text and number keys remain input. Press `Escape` to focus the transcript,
-then use Up/Down, Page Up/Page Down, or End. New messages follow the bottom
+shows and sends on the currently selected configured broadcast channel. Press
+`C` outside the input to open the channel dropdown; use Up/Down and Enter to
+select, or Escape to cancel. While the chat input is focused, normal text and
+number keys remain input. Press `Escape` to focus the transcript, then use
+Up/Down to move one whole message or contextual control at a time. Page
+Up/Page Down still move by a viewport and End jumps to the newest edge. New
+messages follow the bottom
 only when the transcript is already near the bottom. If you are reading older
 messages, `↓ n NEW` counts messages below the viewport; End jumps to the newest
 entry and clears that indicator. Press `q` outside the input to quit. Radio
 monitoring, CHAT storage, and the radio service close during shutdown.
 
-The PRIMARY heading includes `ACTIVE N`, a passive count of unique *other*
+The selected channel heading includes `ACTIVE N`, a passive count of unique *other*
 nodes whose node-database `lastHeard` value is less than five minutes old.
 Exactly five minutes old is inactive. Missing, malformed, future, and otherwise
 impossible timestamps are ignored, and the local node is excluded. The shared
@@ -147,7 +151,7 @@ firmware behavior.
 CHAT history is stored in SQLite at
 `~/.local/share/meshtasticpass/chat.db`, or under `$XDG_DATA_HOME` when that
 variable is set. The app creates the parent directory and version-1 schema on
-first launch. The TUI mounts only the newest 100 PRIMARY-channel messages in
+first launch. Each channel transcript mounts only its newest 100 messages in
 chronological order. When older rows exist, focus `[ LOAD OLDER ]` at the top
 of CHAT and press Enter to prepend the next 50. SQLite uses the oldest loaded
 message ID as a stable cursor, never loads the whole archive for Python-side
@@ -251,7 +255,7 @@ The internal state and persistence model keeps all five meanings:
 - `SENT`: SDK 2.7.11 returned a packet ID after accepting local submission;
   this is not remote delivery.
 - `HEARD`: a matching routing ACK with `errorReason=NONE` arrived. For the
-  PRIMARY broadcast this is implicit mesh evidence, not a human read receipt.
+  broadcast CHAT this is implicit mesh evidence, not a human read receipt.
 - `UNCONFIRMED`: no matching ACK/NAK arrived during the SDK's default
   300-second response window. Transmission may still have occurred.
 - `FAILED`: a definite local SDK exception or routing NAK occurred.
@@ -270,10 +274,10 @@ WHITE/GREEN/ORANGE base and its track uses the corresponding subdued gray,
 dark green, or dark orange.
 
 `SENDING` uses one shared UI animation timer. No state triggers an automatic
-application-level resend. To rebroadcast an `UNCONFIRMED` entry, press Escape,
-focus that exact outgoing entry with Tab/Shift+Tab, then press `R`
-when `[R] REBROADCAST` appears. This records another send attempt against the
-same visible message rather than duplicating the transcript entry.
+application-level resend. To rebroadcast an `UNCONFIRMED` or `FAILED` entry,
+select it with Up/Down, move to its `[ RESEND ]` action, and press Enter. This records
+another send attempt against the same visible message rather than duplicating
+the transcript entry.
 
 Simulation outcomes are explicit and repeatable. The default is successful
 local submission. To exercise an unconfirmed attempt followed by a successful
@@ -294,14 +298,19 @@ store-and-forward. Those behaviors are intentionally reserved for the next
 milestone.
 
 The first tab is **CONNECTION/CONFIG**. Its CONNECTION section immediately shows
-CONNECTING, then ONLINE and live radio metadata after the initial sync. If the
+CONNECTING, then CONNECTED and live radio metadata after the initial sync. If the
 radio disappears or a recoverable connection error occurs, the status clearly
 says that automatic retry is active and stale node metadata is hidden.
 
-The STYLE section has FONT SIZE and COLOR rows. Use Up/Down to move between the
-rows and Left/Right to select a value. Font choices are SMALL (11), MEDIUM (13),
-LARGE (16), and XL (18). Color choices are WHITE (the default), GREEN, and
-ORANGE. Both values save immediately to
+CONNECTION also has a USB DEVICE dropdown populated from currently discovered
+serial ports. Selecting a different port saves it, closes the old connection,
+and immediately starts the normal reconnect flow. Simulation offers the stable
+fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
+
+The STYLE section has FONT SIZE and COLOR dropdowns. Focus a dropdown and press
+Enter, then use Up/Down and Enter to select or Escape to cancel. Font choices
+are SMALL (11), MEDIUM (13), LARGE (16), XL (18), and XXL (22). Color choices
+are WHITE (the default), GREEN, and ORANGE. All settings save to
 `~/.config/meshtasticpass/config.json`. Color changes the running Textual app
 immediately. Font size is also written only to the dedicated MeshtasticPass
 LXTerminal profile and applies on the next menu launch.

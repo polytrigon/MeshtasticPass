@@ -23,7 +23,7 @@ class AppControllerTests(unittest.TestCase):
             selected = create_radio_service(True, "/dev/test")
 
         self.assertIs(selected, simulator.return_value)
-        simulator.assert_called_once_with()
+        simulator.assert_called_once_with(device_path="/dev/test")
 
     def test_selects_real_service_and_device(self) -> None:
         with patch("app_controller.RadioService") as real_service:

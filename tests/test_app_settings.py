@@ -10,6 +10,7 @@ import unittest
 from app_settings import (
     AppSettings,
     DEFAULT_COLOR,
+    DEFAULT_DEVICE_PATH,
     DEFAULT_FONT_SIZE,
     VALID_COLORS,
     VALID_FONT_SIZES,
@@ -25,6 +26,25 @@ class AppSettingsTests(unittest.TestCase):
 
             self.assertEqual(settings.font_size, DEFAULT_FONT_SIZE)
             self.assertEqual(settings.color, DEFAULT_COLOR)
+            self.assertEqual(settings.device_path, DEFAULT_DEVICE_PATH)
+
+    def test_persists_usb_device_and_supports_xxl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            settings = AppSettings.load(config_path=config)
+            settings.set_device_path(" /dev/ttyACM0 ")
+            settings.set_font_size(22)
+            settings.save()
+
+            reloaded = AppSettings.load(config_path=config)
+            self.assertEqual(reloaded.device_path, "/dev/ttyACM0")
+            self.assertEqual(reloaded.font_size, 22)
+
+    def test_rejects_empty_usb_device(self) -> None:
+        settings = AppSettings()
+        for invalid in ("", "   ", None, 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                settings.set_device_path(invalid)  # type: ignore[arg-type]
 
     def test_persists_font_size_and_unknown_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
