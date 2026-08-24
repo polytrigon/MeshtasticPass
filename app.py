@@ -209,10 +209,9 @@ class MeshtasticPassApp(App[None]):
 
     #style-status {
         height: 2;
-        color: #8fcf8f;
     }
 
-    #connection-error, #send-error {
+    #connection-error, #send-error, #style-status.setting-error {
         height: auto;
         min-height: 1;
         color: #ff6b6b;
@@ -272,6 +271,7 @@ class MeshtasticPassApp(App[None]):
         self.settings = settings or AppSettings.load()
         self.current_tab = "connection"
         self.chat_history: list[ChatEntry] = []
+        self.unread_count = 0
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
         self._status_dot_count = 1
@@ -346,6 +346,8 @@ class MeshtasticPassApp(App[None]):
 
     def show_tab(self, tab_id: str) -> None:
         self.current_tab = tab_id
+        if tab_id == "chat":
+            self.unread_count = 0
         self.query_one("#content", ContentSwitcher).current = tab_id
         self._update_tab_bar()
         if tab_id == "chat":
@@ -368,8 +370,10 @@ class MeshtasticPassApp(App[None]):
                 self.settings.save()
                 self._apply_color_theme(self.settings.color)
         except (OSError, ValueError) as error:
+            status.add_class("setting-error")
             status.update(f"SETTING NOT SAVED — {error}")
         else:
+            status.remove_class("setting-error")
             message = (
                 "FONT SIZE SAVED — APPLIES ON NEXT LAUNCH"
                 if event.setting == "font_size"
@@ -430,6 +434,9 @@ class MeshtasticPassApp(App[None]):
         entry = received_chat_entry(message)
         self.chat_history.append(entry)
         self._append_chat_widget(entry)
+        if self.current_tab != "chat":
+            self.unread_count += 1
+            self._update_tab_bar()
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         transcript = self.query_one("#chat-log", VerticalScroll)
@@ -493,6 +500,8 @@ class MeshtasticPassApp(App[None]):
     def _update_tab_bar(self) -> None:
         labels = []
         for number, (tab_id, name) in enumerate(TAB_NAMES.items(), start=1):
+            if tab_id == "chat" and self.unread_count:
+                name = f"{name}({self.unread_count})"
             label = f"[{number}] {name}"
             labels.append(f"[reverse]{label}[/reverse]" if tab_id == self.current_tab else label)
         self.query_one("#tab-bar", Static).update("   ".join(labels))

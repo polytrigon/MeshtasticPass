@@ -74,6 +74,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 [entry.text for entry in app.chat_history],
                 [message.text for message in SIMULATED_MESSAGES],
             )
+            self.assertEqual(app.unread_count, len(SIMULATED_MESSAGES))
+            self.assertIn(
+                f"CHAT({len(SIMULATED_MESSAGES)})",
+                str(app.query_one("#tab-bar", Static).render()),
+            )
 
     async def test_font_size_selection_saves_setting_and_profile(self) -> None:
         radio = SimulatedRadioService(
@@ -247,6 +252,75 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         reloaded = AppSettings.load(config_path=self.settings.config_path)
         self.assertEqual(reloaded.color, "orange")
+
+    async def test_style_status_inherits_white_green_and_orange(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            status = app.query_one("#style-status", Static)
+            self.assertEqual(status.visual_style.foreground.hex6, "#D8D8D8")
+
+            await pilot.press("down", "right")
+            await pilot.pause()
+            self.assertIn("COLOR SAVED", str(status.render()))
+            self.assertEqual(status.visual_style.foreground.hex6, "#39FF14")
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(status.visual_style.foreground.hex6, "#FF8C00")
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(status.visual_style.foreground.hex6, "#D8D8D8")
+
+    async def test_chat_unread_counter_tracks_only_hidden_incoming_messages(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        incoming = SIMULATED_MESSAGES[0]
+
+        async with app.run_test(size=(100, 30)):
+            tab_bar = app.query_one("#tab-bar", Static)
+
+            app._accept_received_message(incoming)
+            self.assertEqual(app.unread_count, 1)
+            self.assertIn("CHAT(1)", str(tab_bar.render()))
+
+            app._accept_received_message(incoming)
+            rendered = str(tab_bar.render())
+            self.assertEqual(app.unread_count, 2)
+            self.assertIn("CHAT(2)", rendered)
+            self.assertNotIn("CHAT (2)", rendered)
+
+            app.show_tab("chat")
+            self.assertEqual(app.unread_count, 0)
+            self.assertNotIn("CHAT(", str(tab_bar.render()))
+
+            app._accept_received_message(incoming)
+            self.assertEqual(app.unread_count, 0)
+
+            app.show_tab("connection")
+            app._accepted_send("local message")
+            self.assertEqual(app.unread_count, 0)
+            self.assertNotIn("CHAT(", str(tab_bar.render()))
+
+            app.show_tab("profile")
+            self.assertEqual(app.unread_count, 0)
+            app._accept_received_message(incoming)
+            self.assertEqual(app.unread_count, 1)
+            self.assertIn("CHAT(1)", str(tab_bar.render()))
+
+            app.show_tab("chat")
+            self.assertEqual(app.unread_count, 0)
+            self.assertNotIn("CHAT(", str(tab_bar.render()))
 
 
 if __name__ == "__main__":
