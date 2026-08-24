@@ -26,6 +26,7 @@ from app import (
     EndOfChatHistoryMarker,
     FontSizeSelector,
     LoadOlderControl,
+    LongNameControl,
     MeshtasticPassApp,
     ThinScrollBarRender,
 )
@@ -320,14 +321,20 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 34)) as pilot:
             await pilot.pause()
             editor = app.query_one("#long-name-input", Input)
+            control = app.query_one(LongNameControl)
             identity = app.query_one("#identity-values", Static)
             status = app.query_one("#identity-status", Static)
             self.assertEqual(editor.value, "Simulated Node")
-            self.assertFalse(editor.disabled)
+            self.assertTrue(editor.disabled)
+            self.assertFalse(control.disabled)
             self.assertIn("SHORT NAME   SIM", str(identity.render()))
             self.assertIn("NODE ID      !51a00001", str(identity.render()))
 
-            editor.focus()
+            control.focus()
+            await pilot.press("enter")
+            self.assertTrue(control.editing)
+            self.assertIs(app.focused, editor)
+            self.assertFalse(editor.disabled)
             editor.value = "Clockwork Nomad"
             await pilot.press("enter")
             for _ in range(10):
@@ -336,12 +343,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(radio.info.long_name, "Clockwork Nomad")
             self.assertEqual(editor.value, "Clockwork Nomad")
+            self.assertFalse(control.editing)
+            self.assertTrue(editor.disabled)
+            self.assertIs(app.focused, control)
             self.assertIn("NAME SAVED", str(status.render()))
             self.assertEqual(status.visual_style.foreground.hex6, "#39FF14")
 
             radio.set_long_name = Mock(
                 side_effect=RadioIdentityError("simulated identity failure")
             )
+            await pilot.press("enter")
             editor.value = "Broken Name"
             await pilot.press("enter")
             for _ in range(10):
@@ -350,7 +361,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertIn("simulated identity failure", str(status.render()))
             self.assertEqual(status.visual_style.foreground.hex6, "#FF1744")
+            self.assertEqual(editor.value, "Clockwork Nomad")
+            self.assertIs(app.focused, control)
 
+            await pilot.press("enter")
             editor.value = "🚲" * 10
             radio.set_long_name = SimulatedRadioService.set_long_name.__get__(radio)
             await pilot.press("enter")
@@ -359,11 +373,95 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 if "39 UTF-8 bytes" in str(status.render()):
                     break
             self.assertIn("39 UTF-8 bytes", str(status.render()))
+            self.assertEqual(editor.value, "Clockwork Nomad")
+            self.assertIs(app.focused, control)
 
             app._show_connection(RadioState.OFFLINE)
             self.assertTrue(editor.disabled)
             self.assertEqual(editor.value, "")
             self.assertIn("NODE ID      —", str(identity.render()))
+
+    async def test_long_name_navigation_edit_cancel_save_and_arrow_ownership(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(62, 18)) as pilot:
+            await pilot.pause()
+            control = app.query_one(LongNameControl)
+            editor = control.editor
+            font = app.query_one(FontSizeSelector)
+
+            control.focus()
+            original = editor.value
+            original_cursor = editor.cursor_position
+            await pilot.press("left", "right")
+            self.assertIs(app.focused, control)
+            self.assertEqual(editor.cursor_position, original_cursor)
+
+            await pilot.press("down")
+            self.assertIs(app.focused, font)
+            await pilot.press("up", "enter")
+            self.assertIs(app.focused, editor)
+            self.assertTrue(control.editing)
+            self.assertFalse(editor.disabled)
+
+            editor.value = "Cancel Me"
+            editor.cursor_position = len(editor.value)
+            await pilot.press("left")
+            self.assertEqual(editor.cursor_position, len("Cancel Me") - 1)
+            await pilot.press("down")
+            self.assertIs(app.focused, editor)
+
+            await pilot.press("escape")
+            self.assertFalse(control.editing)
+            self.assertTrue(editor.disabled)
+            self.assertIs(app.focused, control)
+            self.assertEqual(editor.value, original)
+
+            await pilot.press("enter")
+            editor.value = "Saved Name"
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if radio.info.long_name == "Saved Name":
+                    break
+            self.assertEqual(radio.info.long_name, "Saved Name")
+            self.assertEqual(editor.value, "Saved Name")
+            self.assertFalse(control.editing)
+            self.assertIs(app.focused, control)
+
+    async def test_long_name_field_resizes_without_horizontal_page_scroll(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(35, 18)) as pilot:
+            await pilot.pause()
+            page = app.query_one(ConnectionPage)
+            control = app.query_one(LongNameControl)
+            editor = control.editor
+            control.focus()
+            await pilot.press("enter")
+
+            editor.value = "A"
+            await pilot.pause()
+            minimum_width = editor.region.width
+            self.assertGreaterEqual(minimum_width, 8)
+
+            editor.value = "A" * 39
+            await pilot.pause()
+            self.assertGreater(editor.region.width, minimum_width)
+            self.assertLessEqual(editor.region.width, 39)
+            self.assertLessEqual(editor.region.right, page.region.right)
+            self.assertFalse(page.allow_horizontal_scroll)
 
     async def test_connection_status_animation_reuses_one_timer(self) -> None:
         radio = SimulatedRadioService(
@@ -739,12 +837,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(page.scroll_y, 0)
 
             editor = app.query_one("#long-name-input", Input)
-            self.assertFalse(editor.disabled)
-            editor.focus()
-            editor.scroll_visible(animate=False)
+            control = app.query_one(LongNameControl)
+            self.assertTrue(editor.disabled)
+            control.focus()
+            control.scroll_visible(animate=False)
             await pilot.pause()
-            self.assertGreaterEqual(editor.region.y, page.region.y)
-            self.assertLess(editor.region.y, page.region.bottom)
+            self.assertGreaterEqual(control.region.y, page.region.y)
+            self.assertLess(control.region.y, page.region.bottom)
 
     def test_thin_scrollbar_uses_one_cell_mouse_draggable_thumb(self) -> None:
         rendered = ThinScrollBarRender.render_bar(

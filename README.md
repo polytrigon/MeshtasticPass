@@ -329,8 +329,12 @@ and immediately starts the normal reconnect flow. Simulation offers the stable
 fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
 
 The **IDENTITY** section shows the connected radio's Long Name, Short Name, and
-Node ID. Long Name is editable: focus the field and press Enter to apply it to
-the actual radio through Meshtastic Python SDK 2.7.11's supported
+Node ID. Long Name is a two-state keyboard control: use Up/Down to reach its
+bracketed value, press Enter to edit, then press Enter to validate/save or Escape
+to restore the value from before editing. Arrow keys belong to the text caret
+only while edit mode is active. The field follows its content without creating
+horizontal page scrolling. A saved name is applied to the actual radio through
+Meshtastic Python SDK 2.7.11's supported
 `interface.localNode.setOwner(long_name=...)` path. It is not a local app-only
 preference. The protobuf's 40-byte nanopb string buffer permits at most 39 UTF-8
 bytes plus its terminator; MeshtasticPass rejects empty or oversized names

@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass, field
 from time import monotonic, time
 
+from rich.cells import cell_len
 from rich.color import Color
 from rich.segment import Segment, Segments
 from rich.style import Style
@@ -49,6 +50,7 @@ from radio_service import (
     ReceivedMessage,
     SendStatus,
     SentMessage,
+    validate_long_name,
 )
 from relative_time import format_relative_age
 from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
@@ -334,6 +336,128 @@ class ConnectionPage(VerticalScroll):
         self.vertical_scrollbar.renderer = ThinScrollBarRender
 
 
+class LongNameControl(Horizontal):
+    """Two-state Long Name control for keyboard navigation and editing."""
+
+    can_focus = True
+    MIN_FIELD_WIDTH = 8
+    FIXED_ROW_WIDTH = 17  # 13-cell label plus the two bracket widgets.
+
+    def __init__(self) -> None:
+        super().__init__(id="identity-long-name")
+        self.editing = False
+        self._pre_edit_value = ""
+
+    def compose(self) -> ComposeResult:
+        yield Static("  LONG NAME", classes="identity-label", markup=False)
+        yield Static("[ ", classes="identity-bracket", markup=False)
+        yield Input(
+            id="long-name-input",
+            max_length=LONG_NAME_MAX_UTF8_BYTES,
+            disabled=True,
+        )
+        yield Static(" ]", classes="identity-bracket", markup=False)
+        yield Static(
+            "...",
+            id="identity-long-name-unavailable",
+            markup=False,
+        )
+
+    @property
+    def editor(self) -> Input:
+        return self.query_one("#long-name-input", Input)
+
+    def set_available(self, value: str, *, force_value: bool = False) -> None:
+        """Show a confirmed value while keeping navigation mode arrow-safe."""
+        self.disabled = False
+        self.editor.display = True
+        self.query_one("#identity-long-name-unavailable", Static).display = False
+        for bracket in self.query(".identity-bracket"):
+            bracket.display = True
+        if force_value or not self.editing:
+            self.editor.value = value
+        if not self.editing:
+            self.editor.disabled = True
+        self._resize_field()
+
+    def set_unavailable(self, placeholder: str) -> None:
+        """Leave editing and show a truthful unavailable value."""
+        if self.editing:
+            self.cancel_edit()
+        self.editor.value = ""
+        self.editor.disabled = True
+        self.editor.display = False
+        for bracket in self.query(".identity-bracket"):
+            bracket.display = False
+        unavailable = self.query_one("#identity-long-name-unavailable", Static)
+        unavailable.update(placeholder)
+        unavailable.display = True
+        self.disabled = True
+        self._update_label()
+
+    def begin_edit(self) -> None:
+        """Enable and focus the real text input for one edit session."""
+        if self.disabled or self.editing:
+            return
+        self._pre_edit_value = self.editor.value
+        self.editing = True
+        self.editor.disabled = False
+        self._update_label()
+        self.editor.focus()
+        self.editor.cursor_position = len(self.editor.value)
+        self._resize_field()
+
+    def finish_edit(self, value: str) -> None:
+        """Commit the displayed value and return to navigation mode."""
+        self.editor.value = value
+        self.editing = False
+        self.editor.disabled = True
+        self._update_label()
+        self.focus()
+        self._resize_field()
+
+    def cancel_edit(self) -> None:
+        """Restore the pre-edit value and return to navigation mode."""
+        if self.editing:
+            self.editor.value = self._pre_edit_value
+        self.editing = False
+        self.editor.disabled = True
+        self._update_label()
+        if not self.disabled:
+            self.focus()
+        self._resize_field()
+
+    def _update_label(self) -> None:
+        marker = ">" if (self.has_focus or self.editing) and not self.disabled else " "
+        self.query_one(".identity-label", Static).update(f"{marker} LONG NAME")
+
+    def _resize_field(self) -> None:
+        if not self.is_mounted:
+            return
+        desired = max(self.MIN_FIELD_WIDTH, cell_len(self.editor.value))
+        desired = min(desired, LONG_NAME_MAX_UTF8_BYTES)
+        available = max(1, self.size.width - self.FIXED_ROW_WIDTH)
+        self.editor.styles.width = min(desired, available)
+
+    def on_focus(self, _event: Focus) -> None:
+        self._update_label()
+
+    def on_blur(self) -> None:
+        self._update_label()
+
+    def on_resize(self) -> None:
+        self._resize_field()
+
+    @on(Input.Changed, "#long-name-input")
+    def resize_for_value(self) -> None:
+        self._resize_field()
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter" and not self.editing and not self.disabled:
+            self.begin_edit()
+            event.stop()
+
+
 class ChatEntryWidget(Vertical):
     """One chat message whose relative timestamp can refresh in place."""
 
@@ -483,6 +607,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #connection {
+        overflow-x: hidden;
         scrollbar-size: 1 1;
         scrollbar-color: #d8d8d8;
         scrollbar-color-hover: #d8d8d8;
@@ -525,6 +650,8 @@ class MeshtasticPassApp(App[None]):
 
     #identity-long-name {
         height: 1;
+        width: 1fr;
+        overflow-x: hidden;
     }
 
     .identity-label {
@@ -544,7 +671,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #long-name-input {
-        width: 1fr;
+        width: 8;
         height: 1;
         border: none;
         padding: 0;
@@ -928,20 +1055,7 @@ class MeshtasticPassApp(App[None]):
                 with Horizontal(id="identity-heading"):
                     yield Static("> IDENTITY", id="identity-title", classes="page-title")
                     yield Static(id="identity-waiting", markup=False)
-                with Horizontal(id="identity-long-name"):
-                    yield Static("LONG NAME", classes="identity-label", markup=False)
-                    yield Static("[ ", classes="identity-bracket", markup=False)
-                    yield Input(
-                        id="long-name-input",
-                        max_length=LONG_NAME_MAX_UTF8_BYTES,
-                        disabled=True,
-                    )
-                    yield Static(" ]", classes="identity-bracket", markup=False)
-                    yield Static(
-                        "...",
-                        id="identity-long-name-unavailable",
-                        markup=False,
-                    )
+                yield LongNameControl()
                 yield Static(id="identity-values", markup=False)
                 yield Static(id="identity-status", markup=False)
                 yield Static("> STYLE", id="style-title", classes="page-title")
@@ -1013,7 +1127,7 @@ class MeshtasticPassApp(App[None]):
                 self.query_one("#chat-log", ChatTranscript).focus()
                 event.stop()
             elif self.focused.id == "long-name-input" and event.key == "escape":
-                self.query_one(DeviceSelector).focus()
+                self.query_one(LongNameControl).cancel_edit()
                 event.stop()
             return
 
@@ -1047,7 +1161,7 @@ class MeshtasticPassApp(App[None]):
                 control
                 for control in (
                     self.query_one(DeviceSelector),
-                    self.query_one("#long-name-input", Input),
+                    self.query_one(LongNameControl),
                     self.query_one(FontSizeSelector),
                     self.query_one(ColorSelector),
                 )
@@ -1083,14 +1197,24 @@ class MeshtasticPassApp(App[None]):
     def save_long_name(self, event: Input.Submitted) -> None:
         """Apply an identity edit through the active radio service."""
         status = self.query_one("#identity-status", Static)
+        control = self.query_one(LongNameControl)
         if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
+            control.cancel_edit()
             status.add_class("setting-error")
             status.update("LONG NAME UNAVAILABLE — RADIO NOT CONNECTED")
             return
+        try:
+            long_name = validate_long_name(event.value)
+        except RadioIdentityError as error:
+            control.cancel_edit()
+            status.add_class("setting-error")
+            status.update(str(error))
+            return
+        control.finish_edit(long_name)
         status.remove_class("setting-error")
         status.update("SAVING NAME...")
         self.run_worker(
-            lambda: self._save_long_name_from_thread(event.value),
+            lambda: self._save_long_name_from_thread(long_name),
             thread=True,
             name="save-radio-long-name",
             exclusive=True,
@@ -1118,6 +1242,7 @@ class MeshtasticPassApp(App[None]):
 
     @on(IdentitySaveFailed)
     def identity_save_failed(self, event: IdentitySaveFailed) -> None:
+        self._render_identity(force_value=True)
         status = self.query_one("#identity-status", Static)
         status.add_class("setting-error")
         status.update(event.detail)
@@ -1945,33 +2070,24 @@ class MeshtasticPassApp(App[None]):
         detail_widgets[0].update(details)
 
     def _render_identity(self, force_value: bool = False) -> None:
-        editor = self.query_one("#long-name-input", Input)
+        control = self.query_one(LongNameControl)
         values = self.query_one("#identity-values", Static)
         waiting = self.query_one("#identity-waiting", Static)
-        unavailable = self.query_one("#identity-long-name-unavailable", Static)
-        brackets = list(self.query(".identity-bracket"))
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
-        editor.disabled = not online
-        editor.display = online
-        unavailable.display = not online
-        for bracket in brackets:
-            bracket.display = online
         if online:
             info = self._radio_info
             assert info is not None
             waiting.update("")
-            if force_value or not editor.has_focus:
-                editor.value = info.long_name
+            control.set_available(info.long_name, force_value=force_value)
             values.update(
                 f"{'SHORT NAME':<12} {info.short_name}\n"
                 f"{'NODE ID':<12} {info.node_id}"
             )
         else:
-            editor.value = ""
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
+            control.set_unavailable(placeholder)
             waiting.update("  waiting for connection" if connecting else "")
-            unavailable.update(placeholder)
             palette = THEME_PALETTES[self._current_theme]
             identity_text = Text()
             identity_text.append(f"{'SHORT NAME':<12} ")
