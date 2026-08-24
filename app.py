@@ -24,6 +24,7 @@ from app_controller import (
 )
 from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
 from chat_store import ChatStore, ChatStoreError
+from geo import format_distance_miles
 from radio_service import (
     DeliveryState,
     RadioEvent,
@@ -246,6 +247,19 @@ class ChatEntryWidget(Vertical):
                 ]
             )
         header_parts.append(self.timestamp_label)
+        self.distance_label: Static | None = None
+        if not self.entry.outgoing and self.entry.distance_miles is not None:
+            self.distance_label = Static(
+                format_distance_miles(self.entry.distance_miles),
+                classes="chat-entry-distance",
+                markup=False,
+            )
+            header_parts.extend(
+                [
+                    Static(" / ", classes="chat-entry-separator", markup=False),
+                    self.distance_label,
+                ]
+            )
         header = Horizontal(*header_parts, classes="chat-entry-header")
         self.message_label = Static(
             self.entry.text,
@@ -263,7 +277,6 @@ class ChatEntryWidget(Vertical):
         """Update only the existing timestamp child for this entry."""
         self.timestamp_label.update(
             format_relative_age(now - self.entry.age_reference),
-            layout=False,
         )
 
     def refresh_new_message_state(self) -> None:
@@ -273,13 +286,21 @@ class ChatEntryWidget(Vertical):
     def refresh_delivery_state(self, dot_count: int) -> None:
         if self.delivery_label is None:
             return
-        state = self.entry.delivery_state or DeliveryState.SENT
-        text = state.value
-        if state is DeliveryState.SENDING:
+        internal_state = self.entry.delivery_state or DeliveryState.SENT
+        visible_state = (
+            DeliveryState.SENDING
+            if internal_state in (DeliveryState.SENDING, DeliveryState.SENT)
+            else internal_state
+        )
+        text = visible_state.value
+        if visible_state is DeliveryState.SENDING:
             text += "." * dot_count
         self.delivery_label.update(text, layout=False)
         for name in DeliveryState:
-            self.set_class(name is state, f"delivery-{name.value.lower()}")
+            self.set_class(
+                name is visible_state,
+                f"delivery-{name.value.lower()}",
+            )
 
     def on_focus(self, _event: Focus) -> None:
         self.post_message(self.SelectionChanged())
@@ -403,17 +424,19 @@ class MeshtasticPassApp(App[None]):
         color: #8a8a8a;
     }
 
-    .chat-entry-timestamp {
+    .chat-entry-timestamp, .chat-entry-distance {
         width: auto;
         color: #8a8a8a;
         text-style: dim;
     }
 
-    Screen.theme-green .chat-entry-timestamp {
+    Screen.theme-green .chat-entry-timestamp,
+    Screen.theme-green .chat-entry-distance {
         color: #168f0a;
     }
 
-    Screen.theme-orange .chat-entry-timestamp {
+    Screen.theme-orange .chat-entry-timestamp,
+    Screen.theme-orange .chat-entry-distance {
         color: #a85c00;
     }
 
@@ -427,20 +450,31 @@ class MeshtasticPassApp(App[None]):
         color: #a85c00;
     }
 
-    .chat-entry.delivery-sending .chat-entry-delivery {
+    .chat-entry.delivery-sending .chat-entry-delivery,
+    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #f2f2f2;
     }
 
-    Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery {
+    Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-green .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: #7cff6b;
+    }
+
+    Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-orange .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: #ffb000;
+    }
+
+    .chat-entry.delivery-heard .chat-entry-delivery {
+        color: #d8d8d8;
+    }
+
+    Screen.theme-green .chat-entry.delivery-heard .chat-entry-delivery {
         color: #39ff14;
     }
 
-    Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery {
+    Screen.theme-orange .chat-entry.delivery-heard .chat-entry-delivery {
         color: #ff8c00;
-    }
-
-    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #ffb000;
     }
 
     .chat-entry.delivery-failed .chat-entry-delivery {
@@ -453,18 +487,21 @@ class MeshtasticPassApp(App[None]):
 
     Screen.theme-white .chat-entry.new-message .chat-entry-author,
     Screen.theme-white .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-white .chat-entry.new-message .chat-entry-distance,
     Screen.theme-white .chat-entry.new-message .chat-entry-text {
         color: #39ff14;
     }
 
     Screen.theme-green .chat-entry.new-message .chat-entry-author,
     Screen.theme-green .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-green .chat-entry.new-message .chat-entry-distance,
     Screen.theme-green .chat-entry.new-message .chat-entry-text {
         color: #ff8c00;
     }
 
     Screen.theme-orange .chat-entry.new-message .chat-entry-author,
     Screen.theme-orange .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-orange .chat-entry.new-message .chat-entry-distance,
     Screen.theme-orange .chat-entry.new-message .chat-entry-text {
         color: #d8d8d8;
     }

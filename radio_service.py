@@ -9,6 +9,8 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Iterator
 
+from geo import GeoPosition, make_geo_position
+
 
 class RadioState(Enum):
     """Connection states that callers can display without knowing SDK details."""
@@ -92,6 +94,8 @@ class ReceivedMessage:
     snr: float | None
     packet_id: int | None
     radio_rx_at: float | None = None
+    local_position: GeoPosition | None = None
+    sender_position: GeoPosition | None = None
 
 
 @dataclass(frozen=True)
@@ -446,7 +450,12 @@ class RadioService:
                 else "unknown"
             )
 
-        user = self._lookup_sender_user(interface, sender_number, sender_id)
+        sender_record = self._lookup_node_record(
+            interface,
+            sender_number,
+            sender_id,
+        )
+        user = self._user_from_record(sender_record)
 
         channel_value = packet.get("channel", 0)
         return ReceivedMessage(
@@ -459,6 +468,8 @@ class RadioService:
             snr=self._optional_float(packet.get("rxSnr")),
             packet_id=self._optional_int(packet.get("id")),
             radio_rx_at=self._optional_float(packet.get("rxTime")),
+            local_position=self._local_position(interface),
+            sender_position=self._position_from_record(sender_record),
         )
 
     @staticmethod
@@ -479,24 +490,77 @@ class RadioService:
         sender_number: int | None,
         sender_id: str,
     ) -> dict[str, Any]:
+        record = RadioService._lookup_node_record(
+            interface,
+            sender_number,
+            sender_id,
+        )
+        return RadioService._user_from_record(record)
+
+    @staticmethod
+    def _lookup_node_record(
+        interface: Any,
+        node_number: int | None,
+        node_id: str,
+    ) -> dict[str, Any]:
         if interface is None:
             return {}
 
         record: Any = None
         nodes_by_number = getattr(interface, "nodesByNum", None)
-        if isinstance(nodes_by_number, dict) and sender_number is not None:
-            record = nodes_by_number.get(sender_number)
+        if isinstance(nodes_by_number, dict) and node_number is not None:
+            record = nodes_by_number.get(node_number)
 
         if not isinstance(record, dict):
             nodes_by_id = getattr(interface, "nodes", None)
             if isinstance(nodes_by_id, dict):
-                record = nodes_by_id.get(sender_id)
+                record = nodes_by_id.get(node_id)
 
-        if not isinstance(record, dict):
-            return {}
+        return record if isinstance(record, dict) else {}
 
+    @staticmethod
+    def _user_from_record(record: dict[str, Any]) -> dict[str, Any]:
         user = record.get("user")
         return user if isinstance(user, dict) else {}
+
+    @staticmethod
+    def _local_position(interface: Any) -> GeoPosition | None:
+        if interface is None:
+            return None
+        my_info = getattr(interface, "myInfo", None)
+        node_number = getattr(my_info, "my_node_num", None)
+        record = RadioService._lookup_node_record(interface, node_number, "")
+        return RadioService._position_from_record(record)
+
+    @staticmethod
+    def _position_from_record(record: Any) -> GeoPosition | None:
+        """Extract the node-position shape used by Meshtastic SDK 2.7.11."""
+        if not isinstance(record, dict):
+            return None
+        position = record.get("position")
+        if not isinstance(position, dict):
+            return None
+
+        latitude = position.get("latitude")
+        longitude = position.get("longitude")
+        if latitude is None and "latitudeI" in position:
+            value = RadioService._optional_float(position.get("latitudeI"))
+            latitude = value * 1e-7 if value is not None else None
+        if longitude is None and "longitudeI" in position:
+            value = RadioService._optional_float(position.get("longitudeI"))
+            longitude = value * 1e-7 if value is not None else None
+
+        updated_at = RadioService._optional_position_time(position)
+        return make_geo_position(latitude, longitude, updated_at)
+
+    @staticmethod
+    def _optional_position_time(position: dict[str, Any]) -> float | None:
+        """Prefer the GPS solution time, then the SDK's received-position time."""
+        for field in ("timestamp", "time"):
+            value = RadioService._optional_float(position.get(field))
+            if value is not None and value > 0:
+                return value
+        return None
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:

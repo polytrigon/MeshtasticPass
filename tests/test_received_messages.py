@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call
 
+from geo import GeoPosition
 from radio_service import ReceivedMessage, RadioService
 
 
@@ -108,6 +109,91 @@ class ReceivedMessageTests(unittest.TestCase):
         assert message is not None
         self.assertEqual(message.sender_long_name, "Some Node")
         self.assertEqual(message.sender_short_name, "NODE")
+
+    def test_extracts_actual_sdk_position_shapes_and_timestamps(self) -> None:
+        local_number = 0x51A00001
+        sender_number = 0xABC12345
+        interface = SimpleNamespace(
+            myInfo=SimpleNamespace(my_node_num=local_number),
+            nodesByNum={
+                local_number: {
+                    "position": {
+                        "latitude": 40.7128,
+                        "longitude": -74.0060,
+                        "timestamp": 1_700_000_000,
+                    }
+                },
+                sender_number: {
+                    "position": {
+                        "latitudeI": 407736000,
+                        "longitudeI": -739566000,
+                        "time": 1_700_000_100,
+                    }
+                },
+            },
+            nodes={},
+        )
+        packet = {
+            "from": sender_number,
+            "fromId": "!abc12345",
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hello"},
+        }
+
+        message = self.service._parse_text_packet(packet, interface)
+
+        self.assertEqual(
+            message.local_position,
+            GeoPosition(40.7128, -74.0060, 1_700_000_000.0),
+        )
+        self.assertAlmostEqual(message.sender_position.latitude, 40.7736)
+        self.assertAlmostEqual(message.sender_position.longitude, -73.9566)
+        self.assertEqual(message.sender_position.updated_at, 1_700_000_100.0)
+
+    def test_missing_or_malformed_node_positions_are_omitted(self) -> None:
+        sender_number = 0xABC12345
+        packet = {
+            "from": sender_number,
+            "fromId": "!abc12345",
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hello"},
+        }
+        cases = (
+            SimpleNamespace(
+                myInfo=None,
+                nodesByNum={sender_number: {"position": {"latitude": 40.0}}},
+                nodes={},
+            ),
+            SimpleNamespace(
+                myInfo=SimpleNamespace(my_node_num=1),
+                nodesByNum={
+                    1: {"position": {"latitude": 40.0, "longitude": -74.0}},
+                    sender_number: {"position": {"latitude": "bad", "longitude": -73.0}},
+                },
+                nodes={},
+            ),
+        )
+
+        for interface in cases:
+            with self.subTest(interface=interface):
+                message = self.service._parse_text_packet(packet, interface)
+                self.assertIsNone(message.sender_position)
+
+        self.assertIsNone(
+            self.service._parse_text_packet(packet, cases[0]).local_position
+        )
+
+    def test_position_time_falls_back_when_timestamp_is_malformed(self) -> None:
+        position = self.service._position_from_record(
+            {
+                "position": {
+                    "latitude": 40.0,
+                    "longitude": -74.0,
+                    "timestamp": "malformed",
+                    "time": 1_700_000_100,
+                }
+            }
+        )
+
+        self.assertEqual(position.updated_at, 1_700_000_100.0)
 
     def test_does_not_duplicate_subscriptions_across_reconnects(self) -> None:
         pub = Mock()
