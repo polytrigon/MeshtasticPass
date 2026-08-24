@@ -31,6 +31,10 @@ class RadioConnectionError(Exception):
         self.state = state
 
 
+class RadioSendError(Exception):
+    """Raised when an application text message cannot be accepted for sending."""
+
+
 @dataclass(frozen=True)
 class RadioInfo:
     """Small, UI-friendly summary of the connected radio."""
@@ -64,6 +68,40 @@ class ReceivedMessage:
     rssi: int | None
     snr: float | None
     packet_id: int | None
+
+
+@dataclass(frozen=True)
+class SentMessage:
+    """An application-level record of a text message accepted for sending."""
+
+    text: str
+    channel_index: int
+    destination_node_id: str | None
+
+
+def validate_send_request(
+    text: str,
+    channel_index: int,
+    destination_node_id: str | None,
+) -> SentMessage:
+    """Validate and normalize values shared by real and simulated radios."""
+    if not isinstance(text, str) or not text.strip():
+        raise RadioSendError("Message text cannot be empty or whitespace only.")
+    if (
+        isinstance(channel_index, bool)
+        or not isinstance(channel_index, int)
+        or not 0 <= channel_index <= 7
+    ):
+        raise RadioSendError("Channel index must be an integer from 0 through 7.")
+    if destination_node_id is not None:
+        if (
+            not isinstance(destination_node_id, str)
+            or not destination_node_id.strip()
+        ):
+            raise RadioSendError("Destination node ID cannot be empty.")
+        destination_node_id = destination_node_id.strip()
+
+    return SentMessage(text, channel_index, destination_node_id)
 
 
 class RadioService:
@@ -159,6 +197,36 @@ class RadioService:
         """Stop calling a previously registered message handler."""
         if handler in self._message_handlers:
             self._message_handlers.remove(handler)
+
+    def send_text(
+        self,
+        text: str,
+        channel_index: int = 0,
+        destination_node_id: str | None = None,
+    ) -> SentMessage:
+        """Send text through Meshtastic without exposing SDK details to callers."""
+        message = validate_send_request(
+            text,
+            channel_index,
+            destination_node_id,
+        )
+        if self._interface is None:
+            raise RadioSendError("The radio is not connected.")
+
+        sdk_arguments: dict[str, Any] = {
+            "text": message.text,
+            "channelIndex": message.channel_index,
+        }
+        if message.destination_node_id is not None:
+            sdk_arguments["destinationId"] = message.destination_node_id
+
+        try:
+            self._interface.sendText(**sdk_arguments)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            raise RadioSendError(f"Could not send text message: {detail}") from error
+
+        return message
 
     def close(self) -> None:
         """Close the serial connection if it is open."""

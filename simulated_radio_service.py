@@ -8,7 +8,15 @@ from threading import Event
 import time
 from typing import Callable, Iterator
 
-from radio_service import RadioEvent, RadioInfo, RadioState, ReceivedMessage
+from radio_service import (
+    RadioEvent,
+    RadioInfo,
+    RadioSendError,
+    RadioState,
+    ReceivedMessage,
+    SentMessage,
+    validate_send_request,
+)
 
 
 @dataclass(frozen=True)
@@ -87,10 +95,16 @@ class SimulatedRadioService:
         self._stop_event = Event()
         self._online = False
         self._closed = False
+        self._sent_messages: list[SentMessage] = []
 
     @property
     def is_closed(self) -> bool:
         return self._closed
+
+    @property
+    def sent_messages(self) -> tuple[SentMessage, ...]:
+        """Return an immutable snapshot of deterministic send history."""
+        return tuple(self._sent_messages)
 
     def connect(self) -> RadioInfo:
         """Bring the simulated radio online and return its local node info."""
@@ -153,6 +167,24 @@ class SimulatedRadioService:
     ) -> None:
         if handler in self._message_handlers:
             self._message_handlers.remove(handler)
+
+    def send_text(
+        self,
+        text: str,
+        channel_index: int = 0,
+        destination_node_id: str | None = None,
+    ) -> SentMessage:
+        """Record a simulated send without claiming delivery or an ACK."""
+        message = validate_send_request(
+            text,
+            channel_index,
+            destination_node_id,
+        )
+        if not self._online or self._stop_event.is_set():
+            raise RadioSendError("The simulated radio is not connected.")
+
+        self._sent_messages.append(message)
+        return message
 
     def emit_message(self, message: ReceivedMessage) -> None:
         """Deliver one fake message to every registered consumer."""
