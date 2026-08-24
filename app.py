@@ -642,6 +642,7 @@ class MeshtasticPassApp(App[None]):
         self._delivery_timer: Timer | None = None
         self._send_dot_count = 1
         self._has_older_history = False
+        self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
@@ -952,15 +953,56 @@ class MeshtasticPassApp(App[None]):
         transcript = self.query_one("#chat-log", ChatTranscript)
         if self.current_tab != "chat":
             transcript.mount(ChatEntryWidget(entry))
+            self._trim_mounted_chat_window(transcript)
             self._chat_open_scroll_pending = True
             return
         should_follow = self._is_near_chat_bottom()
         transcript.mount(ChatEntryWidget(entry))
+        self._trim_mounted_chat_window(transcript)
         if should_follow:
             self.call_after_refresh(self._jump_to_newest)
         else:
             self.transcript_new_count += 1
             self._update_transcript_indicator()
+
+    def _trim_mounted_chat_window(self, transcript: ChatTranscript) -> None:
+        """Bound the mounted window without hiding NEW/unread messages."""
+        trimmed = False
+        while len(self.chat_history) > self._mounted_chat_target:
+            removable_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(self.chat_history)
+                    if candidate.message_id is not None
+                    and not candidate.is_new
+                    and not candidate.unread
+                ),
+                None,
+            )
+            if removable_index is None:
+                break
+            removed = self.chat_history.pop(removable_index)
+            widget = next(
+                (
+                    candidate
+                    for candidate in self.query(ChatEntryWidget)
+                    if candidate.entry is removed
+                ),
+                None,
+            )
+            if widget is not None:
+                widget.remove()
+            trimmed = True
+
+        if trimmed:
+            self._has_older_history = True
+            self._ensure_load_older_control(transcript)
+
+    def _ensure_load_older_control(self, transcript: ChatTranscript) -> None:
+        if len(self.query(LoadOlderControl)):
+            return
+        first_widget = next(iter(self.query(ChatEntryWidget)), None)
+        transcript.mount(LoadOlderControl(), before=first_widget)
 
     def _refresh_chat_timestamps(self, now: float | None = None) -> None:
         current_time = monotonic() if now is None else now
@@ -1076,6 +1118,7 @@ class MeshtasticPassApp(App[None]):
         entries = [stored_chat_entry(stored) for stored in page.messages]
         widgets = [ChatEntryWidget(entry) for entry in entries]
         self.chat_history[0:0] = entries
+        self._mounted_chat_target += len(entries)
         await transcript.mount(*widgets, before=first_widget)
         self._has_older_history = page.has_older
         if not page.has_older:

@@ -979,7 +979,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             below_before = app.transcript_new_count
 
             await app.load_older_chat_history(LoadOlderControl.Activated())
-            await pilot.pause()
+            for _ in range(5):
+                await pilot.pause()
+                if abs(anchor.region.y - anchor_y) <= 1:
+                    break
             self.assertEqual(len(app.chat_history), 150)
             self.assertEqual(app.chat_history[0].text, "history 75")
             self.assertAlmostEqual(anchor.region.y, anchor_y, delta=1)
@@ -1004,12 +1007,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.query(LoadOlderControl)), 0)
 
     async def test_current_session_new_messages_are_not_capped(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
             scripted_messages=(),
         )
-        app = MeshtasticPassApp(radio, self.settings)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
 
         async with app.run_test(size=(80, 18)) as pilot:
             app.show_tab("profile")
@@ -1026,6 +1030,118 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app.query(ChatEntryWidget)), 105)
             self.assertEqual(app.unread_count, 105)
             self.assertTrue(all(entry.is_new for entry in app.chat_history))
+
+    async def test_one_new_message_keeps_default_window_at_100(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        for index in range(100):
+            store.add_incoming(
+                packet_id=90_000 + index,
+                node_id="!a11ce001",
+                sender_name="Alice Trail",
+                sender_short_name="ALCE",
+                channel_index=0,
+                text=f"history {index}",
+                radio_rx_at=1_700_000_000.0 + index,
+                received_at=1_700_000_002.0 + index,
+            )
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+            chat_store=store,
+        )
+
+        async with app.run_test(size=(80, 18)) as pilot:
+            app.show_tab("profile")
+            app._accept_received_message(
+                replace(
+                    SIMULATED_MESSAGES[0],
+                    packet_id=91_000,
+                    text="new arrival",
+                )
+            )
+            await pilot.pause()
+
+            self.assertEqual(len(app.chat_history), 100)
+            self.assertEqual(len(app.query(ChatEntryWidget)), 100)
+            self.assertEqual(app.chat_history[0].text, "history 1")
+            self.assertEqual(app.chat_history[-1].text, "new arrival")
+            self.assertTrue(app.chat_history[-1].is_new)
+            self.assertTrue(app.chat_history[-1].unread)
+            self.assertEqual(app.unread_count, 1)
+            self.assertEqual(len(store.load_recent(limit=200)), 101)
+            self.assertEqual(len(app.query(LoadOlderControl)), 1)
+
+    async def test_forty_new_messages_replace_oldest_mounted_history(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        for index in range(150):
+            store.add_incoming(
+                packet_id=92_000 + index,
+                node_id="!a11ce001",
+                sender_name="Alice Trail",
+                sender_short_name="ALCE",
+                channel_index=0,
+                text=f"history {index}",
+                radio_rx_at=1_700_000_000.0 + index,
+                received_at=1_700_000_002.0 + index,
+            )
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+            chat_store=store,
+        )
+
+        async with app.run_test(size=(80, 18)) as pilot:
+            app.show_tab("profile")
+            for index in range(40):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=93_000 + index,
+                        text=f"session new {index}",
+                    )
+                )
+            await pilot.pause()
+
+            self.assertEqual(len(app.chat_history), 100)
+            self.assertEqual(len(app.query(ChatEntryWidget)), 100)
+            self.assertEqual(
+                [entry.text for entry in app.chat_history[:60]],
+                [f"history {index}" for index in range(90, 150)],
+            )
+            self.assertEqual(
+                [entry.text for entry in app.chat_history[60:]],
+                [f"session new {index}" for index in range(40)],
+            )
+            self.assertTrue(all(entry.is_new for entry in app.chat_history[60:]))
+            self.assertTrue(all(entry.unread for entry in app.chat_history[60:]))
+            self.assertEqual(app.unread_count, 40)
+            self.assertEqual(len(store.load_recent(limit=250)), 190)
+
+            await app.load_older_chat_history(LoadOlderControl.Activated())
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), 150)
+            message_ids = [entry.message_id for entry in app.chat_history]
+            self.assertEqual(len(message_ids), len(set(message_ids)))
+            self.assertEqual(app.chat_history[0].text, "history 40")
+            self.assertEqual(len(app.query(LoadOlderControl)), 1)
+            self.assertEqual(app.unread_count, 40)
+            self.assertTrue(all(entry.is_new for entry in app.chat_history[-40:]))
+
+            await app.load_older_chat_history(LoadOlderControl.Activated())
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), 190)
+            message_ids = [entry.message_id for entry in app.chat_history]
+            self.assertEqual(len(message_ids), len(set(message_ids)))
+            self.assertEqual(app.chat_history[0].text, "history 0")
+            self.assertEqual(len(app.query(LoadOlderControl)), 0)
 
     async def test_smart_scroll_and_end_newest_indicator(self) -> None:
         radio = SimulatedRadioService(

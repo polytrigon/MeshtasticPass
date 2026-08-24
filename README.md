@@ -100,8 +100,12 @@ slicing, and removes the control after the final partial page. Prepending
 preserves the current visual reading position and does not affect `CHAT(n)` or
 the transcript's `↓ n NEW` counter. Historical messages load as read/normal;
 only messages received during the current process participate in NEW styling
-and `CHAT(n)`. Current-session NEW messages are never removed to enforce the
-100-row startup window.
+and `CHAT(n)`. The default mounted window remains at 100 as new traffic
+arrives by trimming its oldest persisted read entries; those rows stay in
+SQLite and return through `[ LOAD OLDER ]`. Current-session NEW/unread entries
+are never hidden, so the mounted window may exceed 100 when more than 100 such
+entries exist. Explicitly loading an older page expands the mounted target by
+that page's size.
 
 The `messages` table stores logical incoming/outgoing entries, packet and node
 identity, channel, text, receiver-side `radio_rx_at`, local acceptance/send
