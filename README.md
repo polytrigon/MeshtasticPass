@@ -163,8 +163,11 @@ variable is set. The app creates the parent directory and version-1 schema on
 first launch. Each channel transcript mounts only its newest 100 messages in
 chronological order. When older rows exist, focus `[ LOAD OLDER ]` at the top
 of CHAT and press Enter to prepend the next 50. SQLite uses the oldest loaded
-message ID as a stable cursor, never loads the whole archive for Python-side
-slicing, and removes the control after the final partial page. Prepending
+message ID as a stable cursor and never loads the whole archive for Python-side
+slicing. After the final page, the top control is replaced by a passive,
+non-focusable `END OF CHAT HISTORY` marker. The marker appears only when at
+least one message exists and SQLite confirms that no older row remains; it is
+not an action and arrow navigation skips it. Prepending
 preserves the current visual reading position and does not affect `CHAT(n)` or
 the transcript's `↓ n NEW` counter. Historical messages load as read/normal;
 only messages received during the current process participate in NEW styling
@@ -278,9 +281,14 @@ resolved states are `HEARD`, `UNCONFIRMED`, and `FAILED`.
 Delivery colors use the theme's semantic base/accent pairing: WHITE uses GREEN
 for `SENDING...` and `UNCONFIRMED`, GREEN uses ORANGE, and ORANGE uses WHITE.
 `HEARD` uses the selected base color, while `FAILED` always uses electric red
-`#FF1744`. The CHAT scrollbar follows the same live theme: its thumb uses the
-WHITE/GREEN/ORANGE base and its track uses the corresponding subdued gray,
-dark green, or dark orange.
+`#FF1744`. Ordinary read timestamps use the selected theme's semantic
+`DIM_BASE`, while NEW incoming timestamps retain the alternate accent. The
+single source of truth derives `DIM_BASE` as `BASE` at 35% opacity over the
+`#101010` application background using Textual's RGB blend, resolving to
+`#565656` (WHITE), `#1E6311` (GREEN), and `#633B0A` (ORANGE) for opaque terminal
+rendering. The old manually assigned dark theme colors are no longer semantic
+palette inputs. CHAT and CONNECTION/CONFIG scrollbars follow the same live
+theme: the thin `▕` thumb uses BASE and its thin `▕` track uses DIM_BASE.
 
 `SENDING` uses one shared UI animation timer. No state triggers an automatic
 application-level resend. To rebroadcast an `UNCONFIRMED` or `FAILED` entry,
@@ -309,7 +317,11 @@ milestone.
 The first tab is **CONNECTION/CONFIG**. Its CONNECTION section immediately shows
 CONNECTING, then CONNECTED and live radio metadata after the initial sync. If the
 radio disappears or a recoverable connection error occurs, the status clearly
-says that automatic retry is active and stale node metadata is hidden.
+says that automatic retry is active and stale node metadata is hidden. The full
+CONNECTION / IDENTITY / STYLE surface scrolls vertically on short terminals;
+keyboard controls, dropdown operation, Long Name editing, mouse-wheel scrolling,
+and the one-cell themed scrollbar remain available instead of compressing the
+sections.
 
 CONNECTION also has a USB DEVICE dropdown populated from currently discovered
 serial ports. Selecting a different port saves it, closes the old connection,
@@ -317,8 +329,12 @@ and immediately starts the normal reconnect flow. Simulation offers the stable
 fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
 
 The **IDENTITY** section shows the connected radio's Long Name, Short Name, and
-Node ID. Long Name is editable: focus the field and press Enter to apply it to
-the actual radio through Meshtastic Python SDK 2.7.11's supported
+Node ID. Long Name is a two-state keyboard control: use Up/Down to reach its
+bracketed value, press Enter to edit, then press Enter to validate/save or Escape
+to restore the value from before editing. Arrow keys belong to the text caret
+only while edit mode is active. The field follows its content without creating
+horizontal page scrolling. A saved name is applied to the actual radio through
+Meshtastic Python SDK 2.7.11's supported
 `interface.localNode.setOwner(long_name=...)` path. It is not a local app-only
 preference. The protobuf's 40-byte nanopb string buffer permits at most 39 UTF-8
 bytes plus its terminator; MeshtasticPass rejects empty or oversized names
@@ -326,7 +342,10 @@ instead of silently truncating them. Short Name and Node ID are read-only.
 Identity fields are unavailable while disconnected, and the simulator provides
 the same deterministic edit behavior without touching hardware. The supported
 SDK operation may cause the firmware's normal identity propagation; the app
-does not add a separate announcement packet.
+does not add a separate announcement packet. During an active CONNECTING state,
+the heading says `waiting for connection` and the three values use dimmed `...`.
+Offline/error retry intervals use unavailable dashes instead of leaking the
+previous radio identity; the next active attempt returns to the waiting state.
 
 The STYLE section has FONT SIZE and COLOR dropdowns. Focus a dropdown and press
 Enter, then use Up/Down and Enter to select or Escape to cancel. Font choices

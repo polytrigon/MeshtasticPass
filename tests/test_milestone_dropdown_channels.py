@@ -71,11 +71,11 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(device.options, ())
             self.assertIn("/dev/ttyUSB0", str(device.render()))
             self.assertIsInstance(color, KeyboardDropdown)
-            self.assertEqual(color._accent_color, "#39ff14")
+            self.assertEqual(color._accent_color, "#39FF14")
             app._apply_color_theme("green")
             self.assertTrue(
                 all(
-                    dropdown._accent_color == "#ff8c00"
+                    dropdown._accent_color == "#FF8C00"
                     for dropdown in app.query(KeyboardDropdown)
                 )
             )

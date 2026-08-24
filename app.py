@@ -7,9 +7,11 @@ import argparse
 from dataclasses import dataclass, field
 from time import monotonic, time
 
+from rich.cells import cell_len
 from rich.color import Color
 from rich.segment import Segment, Segments
 from rich.style import Style
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -48,10 +50,12 @@ from radio_service import (
     ReceivedMessage,
     SendStatus,
     SentMessage,
+    validate_long_name,
 )
 from relative_time import format_relative_age
 from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 from terminal_cursor import TerminalCursor
+from theme_palette import ERROR, THEME_PALETTES
 
 
 TAB_NAMES = {
@@ -262,6 +266,19 @@ class LoadOlderControl(Static):
             event.stop()
 
 
+class EndOfChatHistoryMarker(Static):
+    """Passive proof that the oldest stored row is currently mounted."""
+
+    can_focus = False
+
+    def __init__(self) -> None:
+        super().__init__(
+            "END OF CHAT HISTORY",
+            id="end-of-chat-history",
+            markup=False,
+        )
+
+
 class MessageActionControl(Static):
     """A contextual action beneath a message; ready for future action kinds."""
 
@@ -309,6 +326,135 @@ class ChatTranscript(VerticalScroll):
             event.stop()
         elif event.key == "end":
             app._jump_to_newest()
+            event.stop()
+
+
+class ConnectionPage(VerticalScroll):
+    """Scrollable settings surface for short uConsole terminal windows."""
+
+    def on_mount(self) -> None:
+        self.vertical_scrollbar.renderer = ThinScrollBarRender
+
+
+class LongNameControl(Horizontal):
+    """Two-state Long Name control for keyboard navigation and editing."""
+
+    can_focus = True
+    MIN_FIELD_WIDTH = 8
+    FIXED_ROW_WIDTH = 17  # 13-cell label plus the two bracket widgets.
+
+    def __init__(self) -> None:
+        super().__init__(id="identity-long-name")
+        self.editing = False
+        self._pre_edit_value = ""
+
+    def compose(self) -> ComposeResult:
+        yield Static("  LONG NAME", classes="identity-label", markup=False)
+        yield Static("[ ", classes="identity-bracket", markup=False)
+        yield Input(
+            id="long-name-input",
+            max_length=LONG_NAME_MAX_UTF8_BYTES,
+            disabled=True,
+        )
+        yield Static(" ]", classes="identity-bracket", markup=False)
+        yield Static(
+            "...",
+            id="identity-long-name-unavailable",
+            markup=False,
+        )
+
+    @property
+    def editor(self) -> Input:
+        return self.query_one("#long-name-input", Input)
+
+    def set_available(self, value: str, *, force_value: bool = False) -> None:
+        """Show a confirmed value while keeping navigation mode arrow-safe."""
+        self.disabled = False
+        self.editor.display = True
+        self.query_one("#identity-long-name-unavailable", Static).display = False
+        for bracket in self.query(".identity-bracket"):
+            bracket.display = True
+        if force_value or not self.editing:
+            self.editor.value = value
+        if not self.editing:
+            self.editor.disabled = True
+        self._resize_field()
+
+    def set_unavailable(self, placeholder: str) -> None:
+        """Leave editing and show a truthful unavailable value."""
+        if self.editing:
+            self.cancel_edit()
+        self.editor.value = ""
+        self.editor.disabled = True
+        self.editor.display = False
+        for bracket in self.query(".identity-bracket"):
+            bracket.display = False
+        unavailable = self.query_one("#identity-long-name-unavailable", Static)
+        unavailable.update(placeholder)
+        unavailable.display = True
+        self.disabled = True
+        self._update_label()
+
+    def begin_edit(self) -> None:
+        """Enable and focus the real text input for one edit session."""
+        if self.disabled or self.editing:
+            return
+        self._pre_edit_value = self.editor.value
+        self.editing = True
+        self.editor.disabled = False
+        self._update_label()
+        self.editor.focus()
+        self.editor.cursor_position = len(self.editor.value)
+        self._resize_field()
+
+    def finish_edit(self, value: str) -> None:
+        """Commit the displayed value and return to navigation mode."""
+        self.editor.value = value
+        self.editing = False
+        self.editor.disabled = True
+        self._update_label()
+        self.focus()
+        self._resize_field()
+
+    def cancel_edit(self) -> None:
+        """Restore the pre-edit value and return to navigation mode."""
+        if self.editing:
+            self.editor.value = self._pre_edit_value
+        self.editing = False
+        self.editor.disabled = True
+        self._update_label()
+        if not self.disabled:
+            self.focus()
+        self._resize_field()
+
+    def _update_label(self) -> None:
+        marker = ">" if (self.has_focus or self.editing) and not self.disabled else " "
+        self.query_one(".identity-label", Static).update(f"{marker} LONG NAME")
+
+    def _resize_field(self) -> None:
+        if not self.is_mounted:
+            return
+        desired = max(self.MIN_FIELD_WIDTH, cell_len(self.editor.value))
+        desired = min(desired, LONG_NAME_MAX_UTF8_BYTES)
+        available = max(1, self.size.width - self.FIXED_ROW_WIDTH)
+        self.editor.styles.width = min(desired, available)
+
+    def on_focus(self, _event: Focus) -> None:
+        self._update_label()
+
+    def on_blur(self) -> None:
+        self._update_label()
+
+    def on_resize(self) -> None:
+        self._resize_field()
+
+    @on(Input.Changed, "#long-name-input")
+    def resize_for_value(self) -> None:
+        self._resize_field()
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter" and not self.editing and not self.disabled:
+            self.begin_edit()
             event.stop()
 
 
@@ -425,7 +571,12 @@ class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
     TITLE = "MeshtasticPass"
-    CSS = """
+    CSS = f"""
+    $white_dim: {THEME_PALETTES["white"].dim_base};
+    $green_dim: {THEME_PALETTES["green"].dim_base};
+    $orange_dim: {THEME_PALETTES["orange"].dim_base};
+    $error: {ERROR};
+    """ + """
     Screen {
         background: #101010;
         color: #d8d8d8;
@@ -443,7 +594,7 @@ class MeshtasticPassApp(App[None]):
         height: 3;
         padding: 1 1 0 1;
         background: #101010;
-        color: #8a8a8a;
+        color: $white_dim;
     }
 
     #content {
@@ -453,6 +604,17 @@ class MeshtasticPassApp(App[None]):
 
     .tab-page {
         height: 1fr;
+    }
+
+    #connection {
+        overflow-x: hidden;
+        scrollbar-size: 1 1;
+        scrollbar-color: #d8d8d8;
+        scrollbar-color-hover: #d8d8d8;
+        scrollbar-color-active: #d8d8d8;
+        scrollbar-background: $white_dim;
+        scrollbar-background-hover: $white_dim;
+        scrollbar-background-active: $white_dim;
     }
 
     .page-title {
@@ -465,12 +627,31 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
-    #identity-title, #style-title {
+    #identity-heading, #style-title {
         margin-top: 1;
+    }
+
+    #identity-heading {
+        height: 2;
+    }
+
+    #identity-title, #identity-waiting {
+        width: auto;
+        height: 2;
+    }
+
+    #identity-title {
+        color: #d8d8d8;
+    }
+
+    #identity-waiting {
+        color: $white_dim;
     }
 
     #identity-long-name {
         height: 1;
+        width: 1fr;
+        overflow-x: hidden;
     }
 
     .identity-label {
@@ -483,8 +664,14 @@ class MeshtasticPassApp(App[None]):
         height: 1;
     }
 
+    #identity-long-name-unavailable {
+        width: auto;
+        height: 1;
+        color: $white_dim;
+    }
+
     #long-name-input {
-        width: 1fr;
+        width: 8;
         height: 1;
         border: none;
         padding: 0;
@@ -493,7 +680,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #long-name-input:disabled {
-        color: #8a8a8a;
+        color: $white_dim;
         opacity: 1;
     }
 
@@ -507,7 +694,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #identity-status.setting-error {
-        color: #ff1744;
+        color: $error;
     }
 
     Screen.theme-green #long-name-input {
@@ -561,7 +748,7 @@ class MeshtasticPassApp(App[None]):
     #connection-error, #send-error, #style-status.setting-error {
         height: auto;
         min-height: 1;
-        color: #ff1744;
+        color: $error;
     }
 
     #chat-log {
@@ -570,27 +757,45 @@ class MeshtasticPassApp(App[None]):
         scrollbar-color: #d8d8d8;
         scrollbar-color-hover: #d8d8d8;
         scrollbar-color-active: #d8d8d8;
-        scrollbar-background: #2c2c2c;
-        scrollbar-background-hover: #2c2c2c;
-        scrollbar-background-active: #2c2c2c;
+        scrollbar-background: $white_dim;
+        scrollbar-background-hover: $white_dim;
+        scrollbar-background-active: $white_dim;
     }
 
-    Screen.theme-green #chat-log {
+    Screen.theme-green #chat-log, Screen.theme-green #connection {
         scrollbar-color: #39ff14;
         scrollbar-color-hover: #39ff14;
         scrollbar-color-active: #39ff14;
-        scrollbar-background: #0e5f08;
-        scrollbar-background-hover: #0e5f08;
-        scrollbar-background-active: #0e5f08;
+        scrollbar-background: $green_dim;
+        scrollbar-background-hover: $green_dim;
+        scrollbar-background-active: $green_dim;
     }
 
-    Screen.theme-orange #chat-log {
+    Screen.theme-orange #chat-log, Screen.theme-orange #connection {
         scrollbar-color: #ff8c00;
         scrollbar-color-hover: #ff8c00;
         scrollbar-color-active: #ff8c00;
-        scrollbar-background: #6f3d00;
-        scrollbar-background-hover: #6f3d00;
-        scrollbar-background-active: #6f3d00;
+        scrollbar-background: $orange_dim;
+        scrollbar-background-hover: $orange_dim;
+        scrollbar-background-active: $orange_dim;
+    }
+
+    Screen.theme-green #identity-waiting,
+    Screen.theme-green #identity-long-name-unavailable {
+        color: $green_dim;
+    }
+
+    Screen.theme-green #identity-title {
+        color: #39ff14;
+    }
+
+    Screen.theme-orange #identity-waiting,
+    Screen.theme-orange #identity-long-name-unavailable {
+        color: $orange_dim;
+    }
+
+    Screen.theme-orange #identity-title {
+        color: #ff8c00;
     }
 
     #load-older, .message-action {
@@ -598,6 +803,22 @@ class MeshtasticPassApp(App[None]):
         height: 1;
         color: #d8d8d8;
         margin-bottom: 1;
+    }
+
+    #end-of-chat-history {
+        width: 1fr;
+        height: 1;
+        margin-bottom: 1;
+        color: $white_dim;
+        text-align: center;
+    }
+
+    Screen.theme-green #end-of-chat-history {
+        color: $green_dim;
+    }
+
+    Screen.theme-orange #end-of-chat-history {
+        color: $orange_dim;
     }
 
     #load-older:focus, .message-action:focus {
@@ -649,33 +870,33 @@ class MeshtasticPassApp(App[None]):
 
     .chat-entry-separator, .chat-entry-delivery {
         width: auto;
-        color: #8a8a8a;
+        color: $white_dim;
     }
 
     .chat-entry-timestamp, .chat-entry-distance {
         width: auto;
-        color: #8a8a8a;
+        color: $white_dim;
         text-style: dim;
     }
 
     Screen.theme-green .chat-entry-timestamp,
     Screen.theme-green .chat-entry-distance {
-        color: #168f0a;
+        color: $green_dim;
     }
 
     Screen.theme-orange .chat-entry-timestamp,
     Screen.theme-orange .chat-entry-distance {
-        color: #a85c00;
+        color: $orange_dim;
     }
 
     Screen.theme-green .chat-entry-separator,
     Screen.theme-green .chat-entry-delivery {
-        color: #168f0a;
+        color: $green_dim;
     }
 
     Screen.theme-orange .chat-entry-separator,
     Screen.theme-orange .chat-entry-delivery {
-        color: #a85c00;
+        color: $orange_dim;
     }
 
     .chat-entry.delivery-sending .chat-entry-delivery,
@@ -706,7 +927,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     .chat-entry.delivery-failed .chat-entry-delivery {
-        color: #ff1744;
+        color: $error;
     }
 
     .chat-entry-text {
@@ -755,26 +976,26 @@ class MeshtasticPassApp(App[None]):
     #footer {
         height: 2;
         padding: 0 1;
-        border-top: solid #4a4a4a;
-        color: #8a8a8a;
+        border-top: solid $white_dim;
+        color: $white_dim;
     }
 
     Screen.theme-green #tab-bar,
     Screen.theme-green #footer {
-        color: #168f0a;
+        color: $green_dim;
     }
 
     Screen.theme-orange #tab-bar,
     Screen.theme-orange #footer {
-        color: #a85c00;
+        color: $orange_dim;
     }
 
     Screen.theme-green #footer {
-        border-top: solid #0e5f08;
+        border-top: solid $green_dim;
     }
 
     Screen.theme-orange #footer {
-        border-top: solid #6f3d00;
+        border-top: solid $orange_dim;
     }
     """
 
@@ -789,6 +1010,7 @@ class MeshtasticPassApp(App[None]):
         super().__init__()
         self.radio = radio
         self.settings = settings or AppSettings.load()
+        self._current_theme = self.settings.color
         self.current_tab = "connection"
         self._channels: tuple[ChannelInfo, ...] = (ChannelInfo(0, "Channel 1"),)
         self.current_channel_index = 0
@@ -824,22 +1046,16 @@ class MeshtasticPassApp(App[None]):
             devices = ()
         yield Static(id="tab-bar")
         with ContentSwitcher(initial="connection", id="content"):
-            with Vertical(id="connection", classes="tab-page"):
+            with ConnectionPage(id="connection", classes="tab-page"):
                 yield Static("> CONNECTION", classes="page-title")
                 yield Static(id="connection-status")
                 yield DeviceSelector(self.settings.device_path, devices)
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
-                yield Static("> IDENTITY", id="identity-title", classes="page-title")
-                with Horizontal(id="identity-long-name"):
-                    yield Static("LONG NAME", classes="identity-label", markup=False)
-                    yield Static("[ ", classes="identity-bracket", markup=False)
-                    yield Input(
-                        id="long-name-input",
-                        max_length=LONG_NAME_MAX_UTF8_BYTES,
-                        disabled=True,
-                    )
-                    yield Static(" ]", classes="identity-bracket", markup=False)
+                with Horizontal(id="identity-heading"):
+                    yield Static("> IDENTITY", id="identity-title", classes="page-title")
+                    yield Static(id="identity-waiting", markup=False)
+                yield LongNameControl()
                 yield Static(id="identity-values", markup=False)
                 yield Static(id="identity-status", markup=False)
                 yield Static("> STYLE", id="style-title", classes="page-title")
@@ -911,7 +1127,7 @@ class MeshtasticPassApp(App[None]):
                 self.query_one("#chat-log", ChatTranscript).focus()
                 event.stop()
             elif self.focused.id == "long-name-input" and event.key == "escape":
-                self.query_one(DeviceSelector).focus()
+                self.query_one(LongNameControl).cancel_edit()
                 event.stop()
             return
 
@@ -942,15 +1158,21 @@ class MeshtasticPassApp(App[None]):
 
         if self.current_tab == "connection" and event.key in ("up", "down"):
             controls = [
-                self.query_one(DeviceSelector),
-                self.query_one("#long-name-input", Input),
-                self.query_one(FontSizeSelector),
-                self.query_one(ColorSelector),
+                control
+                for control in (
+                    self.query_one(DeviceSelector),
+                    self.query_one(LongNameControl),
+                    self.query_one(FontSizeSelector),
+                    self.query_one(ColorSelector),
+                )
+                if not getattr(control, "disabled", False)
             ]
             if self.focused in controls:
                 current = controls.index(self.focused)
                 step = -1 if event.key == "up" else 1
-                controls[(current + step) % len(controls)].focus()
+                target = controls[(current + step) % len(controls)]
+                target.focus()
+                target.scroll_visible(animate=False)
                 event.stop()
                 return
             if event.key.lower() == "r" and isinstance(
@@ -975,10 +1197,24 @@ class MeshtasticPassApp(App[None]):
     def save_long_name(self, event: Input.Submitted) -> None:
         """Apply an identity edit through the active radio service."""
         status = self.query_one("#identity-status", Static)
+        control = self.query_one(LongNameControl)
+        if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
+            control.cancel_edit()
+            status.add_class("setting-error")
+            status.update("LONG NAME UNAVAILABLE — RADIO NOT CONNECTED")
+            return
+        try:
+            long_name = validate_long_name(event.value)
+        except RadioIdentityError as error:
+            control.cancel_edit()
+            status.add_class("setting-error")
+            status.update(str(error))
+            return
+        control.finish_edit(long_name)
         status.remove_class("setting-error")
         status.update("SAVING NAME...")
         self.run_worker(
-            lambda: self._save_long_name_from_thread(event.value),
+            lambda: self._save_long_name_from_thread(long_name),
             thread=True,
             name="save-radio-long-name",
             exclusive=True,
@@ -1006,6 +1242,7 @@ class MeshtasticPassApp(App[None]):
 
     @on(IdentitySaveFailed)
     def identity_save_failed(self, event: IdentitySaveFailed) -> None:
+        self._render_identity(force_value=True)
         status = self.query_one("#identity-status", Static)
         status.add_class("setting-error")
         status.update(event.detail)
@@ -1094,16 +1331,19 @@ class MeshtasticPassApp(App[None]):
         )
 
     def _apply_color_theme(self, color: str) -> None:
+        self._current_theme = color
         for name, _value in COLOR_CHOICES:
             self.screen.remove_class(f"theme-{name.lower()}")
         self.screen.add_class(f"theme-{color}")
-        palettes = {
-            "white": ("#d8d8d8", "#39ff14", "#4a4a4a"),
-            "green": ("#39ff14", "#ff8c00", "#0e5f08"),
-            "orange": ("#ff8c00", "#d8d8d8", "#6f3d00"),
-        }
+        palette = THEME_PALETTES[color]
         for dropdown in self.query(KeyboardDropdown):
-            dropdown.set_palette(*palettes[color])
+            dropdown.set_palette(
+                palette.base,
+                palette.accent,
+                palette.dim_base,
+            )
+        if len(self.query("#identity-values")):
+            self._render_identity()
 
     @on(Input.Submitted, "#chat-input")
     def send_chat_message(self, event: Input.Submitted) -> None:
@@ -1311,6 +1551,8 @@ class MeshtasticPassApp(App[None]):
         widgets: list[Static | ChatEntryWidget] = []
         if state.has_older_history:
             widgets.append(LoadOlderControl())
+        elif state.entries and self.chat_store is not None:
+            widgets.append(EndOfChatHistoryMarker())
         widgets.extend(ChatEntryWidget(entry) for entry in state.entries)
         if widgets:
             await transcript.mount(*widgets)
@@ -1327,6 +1569,8 @@ class MeshtasticPassApp(App[None]):
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
+        if not self._has_older_history and self.chat_store is not None:
+            self._ensure_end_history_marker(transcript)
         if self.current_tab != "chat":
             transcript.mount(ChatEntryWidget(entry))
             self._trim_mounted_chat_window(transcript)
@@ -1378,13 +1622,31 @@ class MeshtasticPassApp(App[None]):
         self._capture_current_channel_state()
 
     def _ensure_load_older_control(self, transcript: ChatTranscript) -> None:
-        if len(self.query(LoadOlderControl)):
+        for marker in transcript.query(EndOfChatHistoryMarker):
+            marker.remove()
+        if len(transcript.query(LoadOlderControl)):
             return
         first_widget = next(iter(self.query(ChatEntryWidget)), None)
         if first_widget is None:
             transcript.mount(LoadOlderControl())
         else:
             transcript.mount(LoadOlderControl(), before=first_widget)
+
+    def _ensure_end_history_marker(self, transcript: ChatTranscript) -> None:
+        """Show the passive boundary only when at least one entry exists."""
+        if (
+            self.chat_store is None
+            or not self.chat_history
+            or self._has_older_history
+        ):
+            return
+        if len(transcript.query(EndOfChatHistoryMarker)):
+            return
+        first_widget = next(iter(transcript.query(ChatEntryWidget)), None)
+        if first_widget is None:
+            transcript.mount(EndOfChatHistoryMarker())
+        else:
+            transcript.mount(EndOfChatHistoryMarker(), before=first_widget)
 
     def _refresh_chat_timestamps(
         self,
@@ -1519,6 +1781,8 @@ class MeshtasticPassApp(App[None]):
         widgets: list[Static | ChatEntryWidget] = []
         if state.has_older_history:
             widgets.append(LoadOlderControl())
+        elif state.entries and self.chat_store is not None:
+            widgets.append(EndOfChatHistoryMarker())
         for entry in state.entries:
             widgets.append(ChatEntryWidget(entry))
         if widgets:
@@ -1547,6 +1811,10 @@ class MeshtasticPassApp(App[None]):
             self._has_older_history = False
             control = self.query_one("#load-older", LoadOlderControl)
             await control.remove()
+            transcript = self.query_one("#chat-log", ChatTranscript)
+            first_widget = next(iter(transcript.query(ChatEntryWidget)), None)
+            if first_widget is not None:
+                await transcript.mount(EndOfChatHistoryMarker(), before=first_widget)
             self._capture_current_channel_state()
             return
 
@@ -1560,10 +1828,15 @@ class MeshtasticPassApp(App[None]):
         self._mounted_chat_target += len(entries)
         await transcript.mount(*widgets, before=first_widget)
         self._has_older_history = page.has_older
-        self._capture_current_channel_state()
         if not page.has_older:
             control = self.query_one("#load-older", LoadOlderControl)
             await control.remove()
+            first_loaded_widget = widgets[0]
+            await transcript.mount(
+                EndOfChatHistoryMarker(),
+                before=first_loaded_widget,
+            )
+        self._capture_current_channel_state()
         self.call_after_refresh(
             self._restore_scroll_after_prepend,
             transcript,
@@ -1774,14 +2047,17 @@ class MeshtasticPassApp(App[None]):
         self._render_connection_details()
 
     def _render_connection_details(self) -> None:
+        statuses = list(self.query("#connection-status"))
+        detail_widgets = list(self.query("#connection-details"))
+        if not statuses or not detail_widgets:
+            # A final timer tick may race with Textual dismantling the screen.
+            return
         status = (
             "CONNECTED"
             if self._radio_state is RadioState.ONLINE
             else ANIMATED_STATUS[self._radio_state] + "." * self._status_dot_count
         )
-        self.query_one("#connection-status", Static).update(
-            f"{'STATUS':<12} {status}"
-        )
+        statuses[0].update(f"{'STATUS':<12} {status}")
         values = []
         if self._radio_state is RadioState.ONLINE and self._radio_info is not None:
             info = self._radio_info
@@ -1791,28 +2067,34 @@ class MeshtasticPassApp(App[None]):
                 ]
             )
         details = "\n".join(f"{label:<10} {value}" for label, value in values)
-        self.query_one("#connection-details", Static).update(details)
+        detail_widgets[0].update(details)
 
     def _render_identity(self, force_value: bool = False) -> None:
-        editor = self.query_one("#long-name-input", Input)
+        control = self.query_one(LongNameControl)
         values = self.query_one("#identity-values", Static)
+        waiting = self.query_one("#identity-waiting", Static)
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
-        editor.disabled = not online
         if online:
             info = self._radio_info
             assert info is not None
-            if force_value or not editor.has_focus:
-                editor.value = info.long_name
+            waiting.update("")
+            control.set_available(info.long_name, force_value=force_value)
             values.update(
                 f"{'SHORT NAME':<12} {info.short_name}\n"
                 f"{'NODE ID':<12} {info.node_id}"
             )
         else:
-            editor.value = ""
-            values.update(
-                f"{'SHORT NAME':<12} —\n"
-                f"{'NODE ID':<12} —"
-            )
+            connecting = self._radio_state is RadioState.CONNECTING
+            placeholder = "..." if connecting else "—"
+            control.set_unavailable(placeholder)
+            waiting.update("  waiting for connection" if connecting else "")
+            palette = THEME_PALETTES[self._current_theme]
+            identity_text = Text()
+            identity_text.append(f"{'SHORT NAME':<12} ")
+            identity_text.append(placeholder, style=palette.dim_base)
+            identity_text.append(f"\n{'NODE ID':<12} ")
+            identity_text.append(placeholder, style=palette.dim_base)
+            values.update(identity_text)
 
     def _show_send_error(self, message: str) -> None:
         self.query_one("#send-error", Static).update(message)
