@@ -10,6 +10,8 @@ from textual.events import Blur, Focus, Key
 from textual.message import Message
 from textual.widgets import Static
 
+from theme_palette import THEME_PALETTES
+
 
 @dataclass(frozen=True)
 class DropdownOption:
@@ -52,9 +54,10 @@ class KeyboardDropdown(Static):
         self.is_open = False
         self._highlighted_index = self._selected_index()
         self._focused = False
-        self._base_color = "#d8d8d8"
-        self._accent_color = "#39ff14"
-        self._subdued_color = "#4a4a4a"
+        default_palette = THEME_PALETTES["white"]
+        self._base_color = default_palette.base
+        self._accent_color = default_palette.accent
+        self._subdued_color = default_palette.dim_base
 
     @property
     def selected_label(self) -> str:
