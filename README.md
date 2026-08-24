@@ -1,7 +1,7 @@
 # MeshtasticPass
 
-A Nintendo StreetPass-inspired app for the ClockworkPi uConsole. The first
-milestone verifies reliable USB serial communication with a Meshtastic ESP32.
+A Nintendo StreetPass-inspired app for the ClockworkPi uConsole. The current
+milestone maintains a resilient USB serial connection to a Meshtastic ESP32.
 
 ## Milestone 1: connect to the radio
 
@@ -27,7 +27,7 @@ If that command shows the device but Python reports permission denied, add the
 sudo usermod -aG dialout mt
 ```
 
-With the virtual environment active, run:
+With the virtual environment active, start the radio monitor:
 
 ```bash
 python check_radio.py
@@ -36,13 +36,25 @@ python check_radio.py
 A successful initial connection and node/config sync prints:
 
 ```text
-CONNECTING: /dev/ttyUSB0
+RADIO CONNECTING: /dev/ttyUSB0
 RADIO ONLINE
 Device:   /dev/ttyUSB0
 Node ID:  !12345678
 Name:     Example Node (EXMP)
 Firmware: 2.x.x
 Nodes:    1 known
+```
+
+Leave the monitor running and unplug the radio. It will report `RADIO OFFLINE`
+and retry every five seconds. After the radio is plugged back in and its initial
+sync completes, the monitor reports `RADIO ONLINE` again. Press `Ctrl+C` to
+stop it. Setup or SDK failures are reported separately as `RADIO ERROR`, and
+the monitor continues retrying instead of crashing.
+
+Change the retry interval when needed:
+
+```bash
+python check_radio.py --retry-delay 3
 ```
 
 Use a different serial device when needed:
@@ -57,6 +69,7 @@ python check_radio.py --device /dev/ttyACM0
 check_radio.py     Small command-line connection check
 radio_service.py   All Meshtastic connection and device-info logic
 requirements.txt   Python dependency
+tests/             Hardware-free connection resilience tests
 ```
 
 Future UI code should call `RadioService`; it should not import or manage the
