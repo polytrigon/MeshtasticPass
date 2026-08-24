@@ -9,6 +9,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Key
+from textual.message import Message
 from textual.widgets import ContentSwitcher, Input, Static
 
 from app_controller import (
@@ -18,15 +19,55 @@ from app_controller import (
     outgoing_chat_entry,
     received_chat_entry,
 )
+from app_settings import AppSettings, FONT_SIZE_CHOICES
 from radio_service import RadioEvent, RadioInfo, RadioSendError, RadioState, ReceivedMessage
 
 
 TAB_NAMES = {
-    "connection": "CONNECTION",
+    "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
     "profile": "PROFILE",
     "pass-map": "PASS MAP",
 }
+
+
+class FontSizeSelector(Static):
+    """Focusable keyboard control for the four supported terminal font sizes."""
+
+    can_focus = True
+
+    class Changed(Message):
+        def __init__(self, font_size: int) -> None:
+            super().__init__()
+            self.font_size = font_size
+
+    def __init__(self, font_size: int) -> None:
+        super().__init__(id="font-size-selector")
+        self.font_size = font_size
+
+    def on_mount(self) -> None:
+        self._update_display()
+
+    def on_key(self, event: Key) -> None:
+        if event.key not in ("left", "right"):
+            return
+
+        sizes = [size for _name, size in FONT_SIZE_CHOICES]
+        current_index = sizes.index(self.font_size)
+        direction = -1 if event.key == "left" else 1
+        self.font_size = sizes[(current_index + direction) % len(sizes)]
+        self._update_display()
+        self.post_message(self.Changed(self.font_size))
+        event.stop()
+
+    def _update_display(self) -> None:
+        options = []
+        for name, size in FONT_SIZE_CHOICES:
+            label = f"\\[ {name} {size} ]"
+            if size == self.font_size:
+                label = f"[reverse][b]{label}[/b][/reverse]"
+            options.append(label)
+        self.update("FONT SIZE   " + " ".join(options))
 
 
 class MeshtasticPassApp(App[None]):
@@ -65,6 +106,24 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
+    #style-title {
+        margin-top: 1;
+    }
+
+    #font-size-selector {
+        height: 2;
+        color: #d8d8d8;
+    }
+
+    #font-size-selector:focus {
+        color: #f2f2f2;
+    }
+
+    #style-status {
+        height: 2;
+        color: #8fcf8f;
+    }
+
     #connection-error, #send-error {
         height: auto;
         min-height: 1;
@@ -101,9 +160,10 @@ class MeshtasticPassApp(App[None]):
     }
     """
 
-    def __init__(self, radio: object) -> None:
+    def __init__(self, radio: object, settings: AppSettings | None = None) -> None:
         super().__init__()
         self.radio = radio
+        self.settings = settings or AppSettings.load()
         self.current_tab = "connection"
         self.chat_history: list[ChatEntry] = []
         self._monitor = RadioMonitor(
@@ -119,6 +179,9 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> CONNECTION", classes="page-title")
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
+                yield Static("> STYLE", id="style-title", classes="page-title")
+                yield FontSizeSelector(self.settings.font_size)
+                yield Static(id="style-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield Static("> CHAT", classes="page-title")
                 yield VerticalScroll(id="chat-log")
@@ -135,6 +198,7 @@ class MeshtasticPassApp(App[None]):
     def on_mount(self) -> None:
         self._update_tab_bar()
         self._show_connection(RadioState.CONNECTING)
+        self.query_one(FontSizeSelector).focus()
         self._monitor.start()
 
     def on_unmount(self) -> None:
@@ -167,6 +231,22 @@ class MeshtasticPassApp(App[None]):
         self._update_tab_bar()
         if tab_id == "chat":
             self.query_one("#chat-input", Input).focus()
+        elif tab_id == "connection":
+            self.query_one(FontSizeSelector).focus()
+        else:
+            self.set_focus(None)
+
+    @on(FontSizeSelector.Changed)
+    def save_font_size(self, event: FontSizeSelector.Changed) -> None:
+        status = self.query_one("#style-status", Static)
+        try:
+            self.settings.set_font_size(event.font_size)
+            self.settings.save()
+            self.settings.update_lxterminal_profile()
+        except (OSError, ValueError) as error:
+            status.update(f"FONT SIZE NOT SAVED — {error}")
+        else:
+            status.update("FONT SIZE SAVED — APPLIES ON NEXT LAUNCH")
 
     @on(Input.Submitted, "#chat-input")
     def send_chat_message(self, event: Input.Submitted) -> None:
@@ -279,7 +359,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     radio = create_radio_service(args.simulate, args.device)
-    MeshtasticPassApp(radio).run()
+    MeshtasticPassApp(radio, AppSettings.load()).run()
     return 0
 
 
