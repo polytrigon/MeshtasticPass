@@ -84,6 +84,13 @@ this marker does not imply delivery. While the chat input is focused, normal
 text and number keys remain input. Press `Escape` to leave the input, then `q`
 to quit. Radio monitoring stops and the service closes during shutdown.
 
+The first tab is **CONNECTION/CONFIG**. Its CONNECTION section still shows live
+radio status. In the STYLE section, use Left/Right to choose a terminal font
+size: SMALL (11), MEDIUM (13), LARGE (16), or XL (18). The selected value is
+saved immediately to `~/.config/meshtasticpass/config.json` and written only to
+the dedicated MeshtasticPass LXTerminal profile. The running terminal cannot
+reliably change its own font, so the new size applies on the next menu launch.
+
 ### Install the uConsole menu launcher
 
 From the project directory on the uConsole, run:
@@ -97,9 +104,11 @@ Running the installer again safely updates the same launcher. The menu entry
 remains at **Startup / Accessories / MeshtasticPass** and starts the real-radio
 path (`python app.py`), not simulation mode.
 
-The installer creates a dedicated lxterminal profile with generic
-`Monospace 13`, hides lxterminal's menu and scrollbar, and uses `--no-remote`
-so these settings do not alter or inherit from ordinary terminal windows.
+The installer creates a dedicated lxterminal profile with a generic
+monospaced font, hides lxterminal's menu and scrollbar, and uses `--no-remote`
+so these settings do not alter or inherit from ordinary terminal windows. It
+uses the saved MeshtasticPass font size, or the default size 13 when no setting
+exists, and never resets an existing selection.
 Because lxterminal has no fullscreen command-line option, the installer adds a
 title-specific MeshtasticPass window rule to the user's labwc `rc.xml` and
 reloads labwc when it is running. Existing labwc settings are preserved. This
@@ -122,6 +131,7 @@ receive_messages.py  Text-message receive monitor
 send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
+app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup
 radio_service.py   All Meshtastic connection and device-info logic
 simulated_radio_service.py  Deterministic radio simulator

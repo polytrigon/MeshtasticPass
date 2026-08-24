@@ -1,6 +1,7 @@
 """Tests for the reproducible uConsole launcher installer."""
 
 from pathlib import Path
+import json
 import os
 import subprocess
 import tempfile
@@ -27,6 +28,12 @@ class LauncherInstallerTests(unittest.TestCase):
                 "</labwc_config>\n",
                 encoding="utf-8",
             )
+            settings_dir = config_home / "meshtasticpass"
+            settings_dir.mkdir(parents=True)
+            (settings_dir / "config.json").write_text(
+                json.dumps({"font_size": 18}),
+                encoding="utf-8",
+            )
 
             environment = os.environ.copy()
             environment.update(
@@ -51,7 +58,7 @@ class LauncherInstallerTests(unittest.TestCase):
             profile = (
                 config_home / "lxterminal" / "lxterminal-meshtasticpass.conf"
             ).read_text(encoding="utf-8")
-            self.assertIn("fontname=Monospace 13", profile)
+            self.assertIn("fontname=Monospace 18", profile)
             self.assertIn("hidemenubar=true", profile)
 
             labwc = labwc_config.read_text(encoding="utf-8")

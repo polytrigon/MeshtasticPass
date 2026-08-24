@@ -13,7 +13,6 @@ LXTERMINAL_DIR="$CONFIG_HOME/lxterminal"
 LABWC_DIR="$CONFIG_HOME/labwc"
 APPLICATIONS_DIR="$DATA_HOME/applications"
 
-PROFILE_FILE="$LXTERMINAL_DIR/lxterminal-meshtasticpass.conf"
 LABWC_CONFIG="$LABWC_DIR/rc.xml"
 PROJECT_FILE="$APP_CONFIG_DIR/project-dir"
 RUNNER="$BIN_DIR/meshtasticpass-run"
@@ -30,12 +29,15 @@ mkdir -p \
 # The runner reads this file so paths remain safe even if the repository moves.
 printf '%s\n' "$SCRIPT_DIR" > "$PROJECT_FILE"
 
-cat > "$PROFILE_FILE" <<'EOF'
-[general]
-fontname=Monospace 13
-hidemenubar=true
-hidescrollbar=true
-EOF
+if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    SETTINGS_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+else
+    SETTINGS_PYTHON=python3
+fi
+
+PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    "$SETTINGS_PYTHON" -c \
+    'from app_settings import AppSettings; AppSettings.load().update_lxterminal_profile()'
 
 cat > "$RUNNER" <<'EOF'
 #!/bin/sh
