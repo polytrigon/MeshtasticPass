@@ -10,6 +10,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Blur, Focus, Key
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Input, Static
 
 from app_controller import (
@@ -28,6 +29,12 @@ TAB_NAMES = {
     "chat": "CHAT",
     "profile": "PROFILE",
     "pass-map": "PASS MAP",
+}
+
+ANIMATED_STATUS = {
+    RadioState.CONNECTING: "CONNECTING",
+    RadioState.OFFLINE: "OFFLINE — RETRYING",
+    RadioState.ERROR: "CONNECTION ERROR — RETRYING",
 }
 
 
@@ -265,6 +272,10 @@ class MeshtasticPassApp(App[None]):
         self.settings = settings or AppSettings.load()
         self.current_tab = "connection"
         self.chat_history: list[ChatEntry] = []
+        self._radio_state = RadioState.CONNECTING
+        self._radio_info: RadioInfo | None = None
+        self._status_dot_count = 1
+        self._connection_animation_timer: Timer | None = None
         self._monitor = RadioMonitor(
             radio,
             self._radio_event_from_thread,
@@ -299,10 +310,17 @@ class MeshtasticPassApp(App[None]):
         self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
         self._show_connection(RadioState.CONNECTING)
+        self._connection_animation_timer = self.set_interval(
+            0.45,
+            self._advance_connection_animation,
+            name="connection-status-animation",
+        )
         self.query_one(FontSizeSelector).focus()
         self._monitor.start()
 
     def on_unmount(self) -> None:
+        if self._connection_animation_timer is not None:
+            self._connection_animation_timer.stop()
         self._monitor.stop()
 
     def on_key(self, event: Key) -> None:
@@ -429,17 +447,35 @@ class MeshtasticPassApp(App[None]):
         info: RadioInfo | None = None,
         message: str = "",
     ) -> None:
-        status_by_state = {
-            RadioState.CONNECTING: "CONNECTING...",
-            RadioState.ONLINE: "ONLINE",
-            RadioState.OFFLINE: "OFFLINE — RETRYING...",
-            RadioState.ERROR: "CONNECTION ERROR — RETRYING...",
-        }
+        self._radio_state = state
+        self._radio_info = info if state is RadioState.ONLINE else None
+        self._status_dot_count = 1
+        if self._connection_animation_timer is not None:
+            if state is RadioState.ONLINE:
+                self._connection_animation_timer.pause()
+            else:
+                self._connection_animation_timer.resume()
+        self._render_connection_details()
+        self.query_one("#connection-error", Static).update("")
+
+    def _advance_connection_animation(self) -> None:
+        if self._radio_state is RadioState.ONLINE:
+            return
+        self._status_dot_count = self._status_dot_count % 3 + 1
+        self._render_connection_details()
+
+    def _render_connection_details(self) -> None:
+        status = (
+            "ONLINE"
+            if self._radio_state is RadioState.ONLINE
+            else ANIMATED_STATUS[self._radio_state] + "." * self._status_dot_count
+        )
         values = [
-            ("STATUS", status_by_state[state]),
+            ("STATUS", status),
             ("DEVICE", getattr(self.radio, "device_path", "unknown")),
         ]
-        if state is RadioState.ONLINE and info is not None:
+        if self._radio_state is RadioState.ONLINE and self._radio_info is not None:
+            info = self._radio_info
             values.extend(
                 [
                     ("NODE", info.node_id),
@@ -450,7 +486,6 @@ class MeshtasticPassApp(App[None]):
             )
         details = "\n".join(f"{label:<10} {value}" for label, value in values)
         self.query_one("#connection-details", Static).update(details)
-        self.query_one("#connection-error", Static).update("")
 
     def _show_send_error(self, message: str) -> None:
         self.query_one("#send-error", Static).update(message)
