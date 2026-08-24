@@ -1,8 +1,13 @@
 """Hardware-free tests for application-level text sending."""
 
+from __future__ import annotations
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+from google.protobuf.json_format import MessageToDict
+from meshtastic.protobuf import mesh_pb2
 
 from radio_service import (
     DeliveryState,
@@ -90,6 +95,25 @@ class RealRadioSendTests(unittest.TestCase):
         self.interface = Mock()
         self.service._interface = self.interface
 
+    @staticmethod
+    def routing_response(
+        request_id: int,
+        error_reason: int | None = None,
+    ) -> dict:
+        """Build the callback shape produced by SDK 2.7.11 conversion."""
+        routing_message = mesh_pb2.Routing()
+        if error_reason is not None:
+            routing_message.error_reason = error_reason
+        routing = MessageToDict(routing_message)
+        routing["raw"] = routing_message
+        return {
+            "decoded": {
+                "portnum": "ROUTING_APP",
+                "requestId": request_id,
+                "routing": routing,
+            }
+        }
+
     def test_broadcast_calls_sdk_without_destination_override(self) -> None:
         sent = self.service.send_text("mesh hello", channel_index=1)
 
@@ -129,7 +153,7 @@ class RealRadioSendTests(unittest.TestCase):
         with self.assertRaisesRegex(RadioSendError, "not connected"):
             self.service.send_text("hello")
 
-    def test_sdk_ack_callback_uses_real_2711_signature(self) -> None:
+    def test_sdk_ack_callback_accepts_omitted_none_from_real_conversion(self) -> None:
         statuses = []
         self.interface.sendText.return_value = SimpleNamespace(id=123456)
 
@@ -142,17 +166,20 @@ class RealRadioSendTests(unittest.TestCase):
         self.assertEqual(kwargs["onResponse"].__name__, "onAckNak")
         self.assertEqual(sent.packet_id, 123456)
 
-        kwargs["onResponse"](
-            {
-                "decoded": {
-                    "portnum": "ROUTING_APP",
-                    "requestId": 123456,
-                    "routing": {"errorReason": "NONE"},
-                }
-            }
-        )
+        response = self.routing_response(123456)
+        self.assertNotIn("errorReason", response["decoded"]["routing"])
+        kwargs["onResponse"](response)
         self.assertEqual(statuses[0].state, DeliveryState.HEARD)
         self.assertEqual(statuses[0].packet_id, 123456)
+
+    def test_sdk_ack_callback_accepts_explicit_symbolic_none(self) -> None:
+        response = self.routing_response(7, mesh_pb2.Routing.Error.NONE)
+
+        self.assertEqual(response["decoded"]["routing"]["errorReason"], "NONE")
+        status = self.service._parse_send_response(response)
+
+        self.assertEqual(status.state, DeliveryState.HEARD)
+        self.assertEqual(status.packet_id, 7)
 
     def test_sdk_routing_nak_is_definite_failure(self) -> None:
         statuses = []
@@ -160,18 +187,31 @@ class RealRadioSendTests(unittest.TestCase):
         self.service.send_text("hello", status_handler=statuses.append)
         callback = self.interface.sendText.call_args.kwargs["onResponse"]
 
-        callback(
-            {
-                "decoded": {
-                    "portnum": "ROUTING_APP",
-                    "requestId": 99,
-                    "routing": {"errorReason": "MAX_RETRANSMIT"},
-                }
-            }
+        response = self.routing_response(
+            99,
+            mesh_pb2.Routing.Error.MAX_RETRANSMIT,
         )
+        self.assertEqual(
+            response["decoded"]["routing"]["errorReason"],
+            "MAX_RETRANSMIT",
+        )
+        callback(response)
 
         self.assertEqual(statuses[0].state, DeliveryState.FAILED)
         self.assertIn("MAX_RETRANSMIT", statuses[0].detail)
+
+    def test_unknown_numeric_or_symbolic_routing_errors_are_ignored(self) -> None:
+        numeric_response = self.routing_response(20, 123)
+        self.assertEqual(
+            numeric_response["decoded"]["routing"]["errorReason"],
+            123,
+        )
+
+        symbolic_response = self.routing_response(21)
+        symbolic_response["decoded"]["routing"]["errorReason"] = "FUTURE_ERROR"
+
+        self.assertIsNone(self.service._parse_send_response(numeric_response))
+        self.assertIsNone(self.service._parse_send_response(symbolic_response))
 
 
 if __name__ == "__main__":

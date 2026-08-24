@@ -285,8 +285,8 @@ class RadioService:
         routing = decoded.get("routing")
         if not isinstance(routing, dict):
             return None
-        reason = routing.get("errorReason", "NONE")
-        if not isinstance(reason, str):
+        reason = self._normalize_routing_error(routing)
+        if reason is None:
             return None
         packet_id = self._optional_int(decoded.get("requestId"))
         if reason == "NONE":
@@ -296,6 +296,30 @@ class RadioService:
             packet_id,
             detail=f"Meshtastic routing failure: {reason}",
         )
+
+    @staticmethod
+    def _normalize_routing_error(routing: dict[str, Any]) -> str | None:
+        """Normalize the enum shape emitted by Meshtastic SDK 2.7.11.
+
+        The SDK uses protobuf ``MessageToDict`` with its default enum behavior:
+        known values are symbolic strings, while an unset optional NONE field
+        is omitted. Unknown future enum numbers remain integers and must not be
+        interpreted as a definite ACK or NAK.
+        """
+        if "errorReason" not in routing:
+            return "NONE"
+
+        reason = routing["errorReason"]
+        if not isinstance(reason, str):
+            return None
+
+        try:
+            from meshtastic.protobuf import mesh_pb2
+
+            mesh_pb2.Routing.Error.Value(reason)
+        except (AttributeError, ImportError, ValueError):
+            return None
+        return reason
 
     def close(self) -> None:
         """Close the serial connection if it is open."""

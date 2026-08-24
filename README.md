@@ -115,7 +115,12 @@ MeshtasticPass is tested against the pinned Meshtastic Python SDK 2.7.11.
 That SDK's `sendText` returns a packet with an ID after the packet is accepted
 for local submission. With `wantAck=True`, its response handler receives a
 matching `ROUTING_APP` packet whose `requestId` is the outbound packet ID.
-`errorReason=NONE` is an ACK; any other routing reason is a definite NAK.
+SDK 2.7.11 converts the routing protobuf with default `MessageToDict` behavior:
+known enum values are symbolic strings, while the optional `NONE` field may be
+omitted entirely or appear as the string `NONE` when explicitly present. Both
+forms are ACK evidence. Known symbolic routing errors are definite NAKs.
+Unknown future enum numbers remain numeric and are ignored rather than being
+misreported as success or failure.
 The SDK describes a broadcast ACK from the local node as an implicit ACK:
 the packet likely propagated, but delivery cannot be guaranteed. The Python
 SDK does not expose a human read receipt, and its response-handler table does
