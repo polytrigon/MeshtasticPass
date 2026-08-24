@@ -24,6 +24,7 @@ from app_controller import (
 from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
 from radio_service import RadioEvent, RadioInfo, RadioSendError, RadioState, ReceivedMessage
 from relative_time import format_relative_age
+from terminal_cursor import TerminalCursor
 
 
 TAB_NAMES = {
@@ -38,9 +39,6 @@ ANIMATED_STATUS = {
     RadioState.OFFLINE: "OFFLINE — RETRYING",
     RadioState.ERROR: "CONNECTION ERROR — RETRYING",
 }
-
-NEW_MESSAGE_HIGHLIGHT_SECONDS = 3.0
-
 
 class StyleSelector(Static):
     """One focusable row in the keyboard-driven STYLE section."""
@@ -140,7 +138,7 @@ class ChatEntryWidget(Vertical):
     def __init__(self, entry: ChatEntry, now: float | None = None) -> None:
         self.entry = entry
         initial_now = monotonic() if now is None else now
-        is_highlighted = self._is_highlighted(initial_now)
+        is_new = self.entry.is_new and not self.entry.outgoing
         self.timestamp_label = Static(
             format_relative_age(initial_now - entry.accepted_at),
             classes="chat-entry-timestamp",
@@ -163,7 +161,7 @@ class ChatEntryWidget(Vertical):
         super().__init__(
             header,
             self.message_label,
-            classes="chat-entry new-message" if is_highlighted else "chat-entry",
+            classes="chat-entry new-message" if is_new else "chat-entry",
         )
 
     def refresh_timestamp(self, now: float) -> None:
@@ -173,21 +171,9 @@ class ChatEntryWidget(Vertical):
             layout=False,
         )
 
-    def refresh_new_message_state(self, now: float) -> bool:
-        """Refresh highlight styling and report whether it remains active."""
-        is_highlighted = self._is_highlighted(now)
-        if not is_highlighted and self.entry.new_highlight_until is not None:
-            self.entry.new_highlight_until = None
-        self.set_class(is_highlighted, "new-message")
-        return is_highlighted
-
-    def _is_highlighted(self, now: float) -> bool:
-        highlight_until = self.entry.new_highlight_until
-        return (
-            not self.entry.outgoing
-            and highlight_until is not None
-            and now < highlight_until
-        )
+    def refresh_new_message_state(self) -> None:
+        """Apply the entry's persistent new/read presentation state."""
+        self.set_class(self.entry.is_new and not self.entry.outgoing, "new-message")
 
 
 class MeshtasticPassApp(App[None]):
@@ -315,14 +301,20 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
+    Screen.theme-white .chat-entry.new-message .chat-entry-author,
+    Screen.theme-white .chat-entry.new-message .chat-entry-timestamp,
     Screen.theme-white .chat-entry.new-message .chat-entry-text {
         color: #39ff14;
     }
 
+    Screen.theme-green .chat-entry.new-message .chat-entry-author,
+    Screen.theme-green .chat-entry.new-message .chat-entry-timestamp,
     Screen.theme-green .chat-entry.new-message .chat-entry-text {
         color: #ff8c00;
     }
 
+    Screen.theme-orange .chat-entry.new-message .chat-entry-author,
+    Screen.theme-orange .chat-entry.new-message .chat-entry-timestamp,
     Screen.theme-orange .chat-entry.new-message .chat-entry-text {
         color: #d8d8d8;
     }
@@ -365,7 +357,12 @@ class MeshtasticPassApp(App[None]):
     }
     """
 
-    def __init__(self, radio: object, settings: AppSettings | None = None) -> None:
+    def __init__(
+        self,
+        radio: object,
+        settings: AppSettings | None = None,
+        terminal_cursor: TerminalCursor | None = None,
+    ) -> None:
         super().__init__()
         self.radio = radio
         self.settings = settings or AppSettings.load()
@@ -377,7 +374,7 @@ class MeshtasticPassApp(App[None]):
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
-        self._new_message_timer: Timer | None = None
+        self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
             self._radio_event_from_thread,
@@ -409,6 +406,7 @@ class MeshtasticPassApp(App[None]):
         yield Static("1-4 switch tabs    Q quit", id="footer")
 
     def on_mount(self) -> None:
+        self._terminal_cursor.hide()
         self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
         self._show_connection(RadioState.CONNECTING)
@@ -422,12 +420,6 @@ class MeshtasticPassApp(App[None]):
             self._refresh_chat_timestamps,
             name="chat-relative-timestamps",
         )
-        self._new_message_timer = self.set_interval(
-            0.5,
-            self._refresh_new_message_highlights,
-            name="chat-new-message-highlights",
-        )
-        self._new_message_timer.pause()
         self.query_one(FontSizeSelector).focus()
         self._monitor.start()
 
@@ -436,8 +428,7 @@ class MeshtasticPassApp(App[None]):
             self._connection_animation_timer.stop()
         if self._chat_timestamp_timer is not None:
             self._chat_timestamp_timer.stop()
-        if self._new_message_timer is not None:
-            self._new_message_timer.stop()
+        self.restore_terminal_cursor()
         self._monitor.stop()
 
     def on_key(self, event: Key) -> None:
@@ -462,9 +453,11 @@ class MeshtasticPassApp(App[None]):
             event.stop()
 
     def show_tab(self, tab_id: str) -> None:
+        if self.current_tab == "chat" and tab_id != "chat":
+            self._mark_new_messages_read()
         self.current_tab = tab_id
         if tab_id == "chat":
-            self._mark_unread_messages_seen()
+            self._mark_unread_messages_viewed()
             self.unread_count = 0
             self._refresh_chat_timestamps()
         self.query_one("#content", ContentSwitcher).current = tab_id
@@ -556,17 +549,11 @@ class MeshtasticPassApp(App[None]):
             message,
             accepted_at=accepted_at,
             unread=not chat_is_visible,
-            new_highlight_until=(
-                accepted_at + NEW_MESSAGE_HIGHLIGHT_SECONDS
-                if chat_is_visible
-                else None
-            ),
+            is_new=True,
         )
         self.chat_history.append(entry)
         self._append_chat_widget(entry)
-        if chat_is_visible:
-            self._start_new_message_timer()
-        else:
+        if not chat_is_visible:
             self.unread_count += 1
             self._update_tab_bar()
 
@@ -580,30 +567,25 @@ class MeshtasticPassApp(App[None]):
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
 
-    def _mark_unread_messages_seen(self, now: float | None = None) -> None:
-        current_time = monotonic() if now is None else now
-        highlight_until = current_time + NEW_MESSAGE_HIGHLIGHT_SECONDS
-        found_unread = False
+    def _mark_unread_messages_viewed(self) -> None:
         for entry in self.chat_history:
             if entry.unread:
                 entry.unread = False
-                entry.new_highlight_until = highlight_until
-                found_unread = True
-        if found_unread:
-            self._refresh_new_message_highlights(current_time)
-            self._start_new_message_timer()
 
-    def _start_new_message_timer(self) -> None:
-        if self._new_message_timer is not None:
-            self._new_message_timer.resume()
-
-    def _refresh_new_message_highlights(self, now: float | None = None) -> None:
-        current_time = monotonic() if now is None else now
-        any_highlighted = False
+    def _mark_new_messages_read(self) -> None:
+        found_new = False
+        for entry in self.chat_history:
+            if entry.is_new:
+                entry.is_new = False
+                found_new = True
+        if not found_new:
+            return
         for widget in self.query(ChatEntryWidget):
-            any_highlighted |= widget.refresh_new_message_state(current_time)
-        if not any_highlighted and self._new_message_timer is not None:
-            self._new_message_timer.pause()
+            widget.refresh_new_message_state()
+
+    def restore_terminal_cursor(self) -> None:
+        """Restore the host terminal cursor; safe to call repeatedly."""
+        self._terminal_cursor.restore()
 
     def _show_connection(
         self,
@@ -682,7 +664,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     radio = create_radio_service(args.simulate, args.device)
-    MeshtasticPassApp(radio, AppSettings.load()).run()
+    app = MeshtasticPassApp(radio, AppSettings.load())
+    try:
+        app.run()
+    finally:
+        app.restore_terminal_cursor()
     return 0
 
 

@@ -20,14 +20,14 @@ class ChatEntry:
     accepted_at: float
     outgoing: bool = False
     unread: bool = False
-    new_highlight_until: float | None = None
+    is_new: bool = False
 
 
 def received_chat_entry(
     message: ReceivedMessage,
     accepted_at: float | None = None,
     unread: bool = False,
-    new_highlight_until: float | None = None,
+    is_new: bool = False,
 ) -> ChatEntry:
     """Convert an application message to display state without SDK details."""
     author = (
@@ -40,7 +40,7 @@ def received_chat_entry(
         text=message.text,
         accepted_at=monotonic() if accepted_at is None else accepted_at,
         unread=unread,
-        new_highlight_until=new_highlight_until,
+        is_new=is_new,
     )
 
 
