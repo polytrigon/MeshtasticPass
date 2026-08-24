@@ -67,6 +67,14 @@ ANIMATED_STATUS = {
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
+MANUAL_RESEND_STATES = frozenset(
+    (DeliveryState.UNCONFIRMED, DeliveryState.FAILED)
+)
+
+
+def can_manual_resend(entry: ChatEntry) -> bool:
+    """Return whether the existing explicit rebroadcast action is valid."""
+    return entry.outgoing and entry.delivery_state in MANUAL_RESEND_STATES
 
 
 class ThinScrollBarRender(ScrollBarRender):
@@ -404,7 +412,7 @@ class ChatEntryWidget(Vertical):
                 name is visible_state,
                 f"delivery-{name.value.lower()}",
             )
-        self.action_control.display = internal_state is DeliveryState.UNCONFIRMED
+        self.action_control.display = can_manual_resend(self.entry)
 
     def on_focus(self, _event: Focus) -> None:
         self.selection_marker.update(">")
@@ -883,7 +891,7 @@ class MeshtasticPassApp(App[None]):
             if event.key.lower() == "r" and isinstance(
                 self.focused, ChatEntryWidget
             ):
-                if self.focused.entry.delivery_state is DeliveryState.UNCONFIRMED:
+                if can_manual_resend(self.focused.entry):
                     self._rebroadcast(self.focused.entry)
                     event.stop()
                 return
@@ -1582,7 +1590,7 @@ class MeshtasticPassApp(App[None]):
         self._update_footer()
 
     def _rebroadcast(self, entry: ChatEntry) -> None:
-        if entry.delivery_state is not DeliveryState.UNCONFIRMED:
+        if not can_manual_resend(entry):
             return
         entry.delivery_state = DeliveryState.SENDING
         entry.send_generation += 1

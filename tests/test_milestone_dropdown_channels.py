@@ -19,7 +19,9 @@ from app import (
     FontSizeSelector,
     MessageActionControl,
     MeshtasticPassApp,
+    can_manual_resend,
 )
+from app_controller import received_chat_entry
 from app_settings import AppSettings
 from chat_store import ChatStore
 from keyboard_dropdown import KeyboardDropdown
@@ -174,6 +176,42 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             footer = str(app.query_one("#footer", Static).render())
             self.assertIn("C channel", footer)
             self.assertNotIn("ESC scroll", footer)
+
+    async def test_resend_visibility_matches_manual_retry_states(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 28)) as pilot:
+            app.show_tab("chat")
+            app._accepted_send("retry policy")
+            entry = app.chat_history[-1]
+            widget = app.query_one(ChatEntryWidget)
+
+            for state, expected in (
+                (DeliveryState.SENDING, False),
+                (DeliveryState.SENT, False),
+                (DeliveryState.HEARD, False),
+                (DeliveryState.UNCONFIRMED, True),
+                (DeliveryState.FAILED, True),
+            ):
+                with self.subTest(state=state):
+                    app._set_delivery_state(entry, state)
+                    self.assertEqual(widget.action_control.display, expected)
+                    self.assertEqual(can_manual_resend(entry), expected)
+
+            incoming_entry = received_chat_entry(SIMULATED_MESSAGES[0])
+            incoming_entry.delivery_state = DeliveryState.FAILED
+            incoming_widget = ChatEntryWidget(incoming_entry)
+            self.assertFalse(incoming_widget.action_control.display)
+            self.assertFalse(can_manual_resend(incoming_entry))
+
+            app._rebroadcast = Mock()
+            for state in (DeliveryState.UNCONFIRMED, DeliveryState.FAILED):
+                app._set_delivery_state(entry, state)
+                await pilot.pause()
+                widget.action_control.focus()
+                await pilot.press("enter")
+                await pilot.pause()
+                app._rebroadcast.assert_called_with(entry)
+            self.assertEqual(app._rebroadcast.call_count, 2)
 
     async def test_channel_switch_uses_indexed_sqlite_history_without_duplicates(self) -> None:
         store = ChatStore.open(Path(self.directory.name) / "chat.db")

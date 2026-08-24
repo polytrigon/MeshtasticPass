@@ -274,8 +274,8 @@ WHITE/GREEN/ORANGE base and its track uses the corresponding subdued gray,
 dark green, or dark orange.
 
 `SENDING` uses one shared UI animation timer. No state triggers an automatic
-application-level resend. To rebroadcast an `UNCONFIRMED` entry, select it
-with Up/Down, move to its `[ RESEND ]` action, and press Enter. This records
+application-level resend. To rebroadcast an `UNCONFIRMED` or `FAILED` entry,
+select it with Up/Down, move to its `[ RESEND ]` action, and press Enter. This records
 another send attempt against the same visible message rather than duplicating
 the transcript entry.
 
