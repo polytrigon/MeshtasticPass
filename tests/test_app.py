@@ -8,8 +8,9 @@ import unittest
 
 from textual.widgets import Input, Static
 
-from app import FontSizeSelector, MeshtasticPassApp
+from app import ColorSelector, FontSizeSelector, MeshtasticPassApp
 from app_settings import AppSettings
+from radio_service import RadioInfo, RadioState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 
 
@@ -110,6 +111,91 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             "fontname=Monospace 16",
             self.settings.profile_path.read_text(encoding="utf-8"),
         )
+
+    async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=10,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        info = RadioInfo(
+            device_path=radio.device_path,
+            node_id="!433a9a3c",
+            long_name="@Polytrigon",
+            short_name="9a3c",
+            firmware_version="2.5.3.a70d5ee",
+            known_nodes=100,
+        )
+
+        async with app.run_test(size=(100, 30)):
+            details = app.query_one("#connection-details", Static)
+            connecting = str(details.render())
+            self.assertIn("STATUS     CONNECTING...", connecting)
+            self.assertIn("DEVICE     simulated://meshtastic", connecting)
+
+            app._show_connection(RadioState.ONLINE, info)
+            online = str(details.render())
+            self.assertIn("STATUS     ONLINE", online)
+            self.assertIn("NODE       !433a9a3c", online)
+            self.assertIn("NAME       @Polytrigon (9a3c)", online)
+
+            app._show_connection(RadioState.OFFLINE, info)
+            offline = str(details.render())
+            self.assertIn("STATUS     OFFLINE — RETRYING...", offline)
+            self.assertNotIn("!433a9a3c", offline)
+            self.assertNotIn("FIRMWARE", offline)
+
+            app._show_connection(RadioState.ERROR, info, "raw SDK exception")
+            error = str(details.render())
+            self.assertIn("STATUS     CONNECTION ERROR — RETRYING...", error)
+            self.assertNotIn("!433a9a3c", error)
+            self.assertNotIn(
+                "raw SDK exception",
+                str(app.query_one("#connection-error", Static).render()),
+            )
+
+    async def test_style_keyboard_navigation_and_live_color(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            font_selector = app.query_one(FontSizeSelector)
+            color_selector = app.query_one(ColorSelector)
+            self.assertTrue(font_selector.has_focus)
+            self.assertEqual(color_selector.color, "white")
+            self.assertTrue(app.screen.has_class("theme-white"))
+
+            await pilot.press("down")
+            self.assertTrue(color_selector.has_focus)
+            self.assertTrue(str(color_selector.render()).startswith("> COLOR"))
+            self.assertTrue(str(font_selector.render()).startswith("  FONT SIZE"))
+            await pilot.press("right")
+            await pilot.pause()
+
+            self.assertEqual(color_selector.color, "green")
+            self.assertEqual(self.settings.color, "green")
+            self.assertTrue(app.screen.has_class("theme-green"))
+            self.assertFalse(app.screen.has_class("theme-white"))
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(color_selector.color, "orange")
+            self.assertTrue(app.screen.has_class("theme-orange"))
+
+            await pilot.press("up", "right")
+            await pilot.pause()
+            self.assertTrue(font_selector.has_focus)
+            self.assertEqual(font_selector.font_size, 16)
+            self.assertEqual(color_selector.color, "orange")
+
+        reloaded = AppSettings.load(config_path=self.settings.config_path)
+        self.assertEqual(reloaded.color, "orange")
 
 
 if __name__ == "__main__":

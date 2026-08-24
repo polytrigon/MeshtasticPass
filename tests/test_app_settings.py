@@ -7,7 +7,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from app_settings import AppSettings, DEFAULT_FONT_SIZE, VALID_FONT_SIZES
+from app_settings import (
+    AppSettings,
+    DEFAULT_COLOR,
+    DEFAULT_FONT_SIZE,
+    VALID_COLORS,
+    VALID_FONT_SIZES,
+)
 
 
 class AppSettingsTests(unittest.TestCase):
@@ -18,13 +24,20 @@ class AppSettingsTests(unittest.TestCase):
             settings = AppSettings.load(config_path=config)
 
             self.assertEqual(settings.font_size, DEFAULT_FONT_SIZE)
+            self.assertEqual(settings.color, DEFAULT_COLOR)
 
     def test_persists_font_size_and_unknown_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config = root / "config.json"
             config.write_text(
-                json.dumps({"font_size": 11, "future_setting": {"value": 7}}),
+                json.dumps(
+                    {
+                        "font_size": 11,
+                        "color": "white",
+                        "future_setting": {"value": 7},
+                    }
+                ),
                 encoding="utf-8",
             )
             settings = AppSettings.load(config_path=config)
@@ -36,6 +49,52 @@ class AppSettingsTests(unittest.TestCase):
 
             self.assertEqual(reloaded.font_size, 18)
             self.assertEqual(saved["future_setting"], {"value": 7})
+
+    def test_persists_supported_colors(self) -> None:
+        for color in ("green", "orange"):
+            with self.subTest(color=color), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.json"
+                settings = AppSettings.load(config_path=config)
+
+                settings.set_color(color)
+                settings.save()
+
+                self.assertEqual(AppSettings.load(config_path=config).color, color)
+
+    def test_existing_config_without_color_uses_white(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = Path(temporary_directory) / "config.json"
+            config.write_text(json.dumps({"font_size": 16}), encoding="utf-8")
+
+            settings = AppSettings.load(config_path=config)
+
+            self.assertEqual(settings.color, DEFAULT_COLOR)
+
+    def test_invalid_color_falls_back_to_white(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = Path(temporary_directory) / "config.json"
+            config.write_text(
+                json.dumps({"font_size": 16, "color": "purple"}),
+                encoding="utf-8",
+            )
+
+            settings = AppSettings.load(config_path=config)
+
+            self.assertEqual(settings.color, DEFAULT_COLOR)
+            self.assertEqual(settings.font_size, 16)
+
+    def test_validates_supported_colors(self) -> None:
+        settings = AppSettings()
+
+        for color in VALID_COLORS:
+            with self.subTest(color=color):
+                settings.set_color(color)
+                self.assertEqual(settings.color, color)
+
+        for invalid in ("purple", "GREEN", "", None, 1):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    settings.set_color(invalid)  # type: ignore[arg-type]
 
     def test_malformed_file_falls_back_safely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
