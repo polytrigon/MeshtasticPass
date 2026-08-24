@@ -10,6 +10,7 @@ import time
 from typing import Callable, Iterator
 
 from geo import GeoPosition
+from node_activity import count_active_other_nodes
 from radio_service import (
     RadioEvent,
     DeliveryState,
@@ -40,6 +41,7 @@ class SimulatedNode:
     long_name: str
     short_name: str
     position: GeoPosition | None
+    last_heard_age_seconds: object | None
 
 
 SIMULATED_LOCAL_POSITION = GeoPosition(40.7128, -74.0060, 1_700_000_000.0)
@@ -50,14 +52,18 @@ SIMULATED_NODES = (
         "Alice Trail",
         "ALCE",
         GeoPosition(40.7736, -73.9566, 1_700_000_100.0),
+        30.0,
     ),
-    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None),
+    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None, 299.0),
     SimulatedNode(
         "!cafe0003",
         "Cafe Relay",
         "CAFE",
         GeoPosition(40.6501, -73.9496, 1_700_000_200.0),
+        400.0,
     ),
+    SimulatedNode("!bad00004", "Malformed Clock", "BAD", None, "recent"),
+    SimulatedNode("!none0005", "Missing Clock", "NONE", None, None),
 )
 
 _SIMULATED_REFERENCE_TIME = time.time()
@@ -136,6 +142,7 @@ class SimulatedRadioService:
         self._closed = False
         self._sent_messages: list[SentMessage] = []
         self._send_count = 0
+        self._activity_reference_time: float | None = None
 
     @property
     def is_closed(self) -> bool:
@@ -151,7 +158,40 @@ class SimulatedRadioService:
         self._stop_event.clear()
         self._closed = False
         self._online = True
+        self._activity_reference_time = time.time()
         return self.info
+
+    def active_node_count(self, now: float | None = None) -> int | None:
+        """Return deterministic passive node activity while connected."""
+        if not self._online or self._activity_reference_time is None:
+            return None
+        current_time = time.time() if now is None else now
+        local_number = int(self.info.node_id[1:], 16)
+        nodes: list[tuple[int, dict[str, object]]] = [
+            (
+                local_number,
+                {
+                    "user": {"id": self.info.node_id},
+                    "lastHeard": self._activity_reference_time,
+                },
+            )
+        ]
+        for index, node in enumerate(SIMULATED_NODES, start=1):
+            record: dict[str, object] = {"user": {"id": node.node_id}}
+            if node.last_heard_age_seconds is not None:
+                age = node.last_heard_age_seconds
+                record["lastHeard"] = (
+                    self._activity_reference_time - age
+                    if isinstance(age, (int, float))
+                    else age
+                )
+            nodes.append((index, record))
+        return count_active_other_nodes(
+            nodes,
+            local_node_number=local_number,
+            local_node_id=self.info.node_id,
+            now=current_time,
+        )
 
     def connection_events(
         self,

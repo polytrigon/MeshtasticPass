@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
+from rich.color import Color
 from textual.containers import Horizontal
 from textual.widgets import Input, Static
 
@@ -21,6 +22,7 @@ from app import (
     FontSizeSelector,
     LoadOlderControl,
     MeshtasticPassApp,
+    ThinScrollBarRender,
 )
 from app_controller import received_chat_entry
 from app_settings import AppSettings
@@ -558,11 +560,79 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             for theme, (thumb, track) in palettes.items():
                 app._apply_color_theme(theme)
                 await pilot.pause()
+                self.assertEqual(transcript.styles.scrollbar_size_vertical, 1)
                 self.assertEqual(transcript.styles.scrollbar_color.hex, thumb)
                 self.assertEqual(
                     transcript.styles.scrollbar_background.hex,
                     track,
                 )
+            self.assertIs(transcript.vertical_scrollbar.renderer, ThinScrollBarRender)
+
+    def test_thin_scrollbar_uses_one_cell_mouse_draggable_thumb(self) -> None:
+        rendered = ThinScrollBarRender.render_bar(
+            size=10,
+            virtual_size=30,
+            window_size=10,
+            position=5,
+            thickness=1,
+            vertical=True,
+            back_color=Color.parse("#2c2c2c"),
+            bar_color=Color.parse("#39ff14"),
+        )
+        thumb_segments = [
+            segment
+            for segment in rendered.segments
+            if segment.style is not None
+            and segment.style.meta.get("@mouse.down") == "grab"
+        ]
+
+        self.assertTrue(thumb_segments)
+        self.assertTrue(all(segment.text == "▕" for segment in thumb_segments))
+        self.assertTrue(all(segment.cell_length == 1 for segment in thumb_segments))
+        self.assertTrue(
+            all(segment.style.color.name == "#39ff14" for segment in thumb_segments)
+        )
+
+    async def test_active_heading_ages_and_nodes_remain_total_database_count(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            reference = radio._activity_reference_time
+            self.assertIsNotNone(reference)
+            app._refresh_chat_timestamps(wall_now=reference)
+            self.assertIn(
+                "CHAT — PRIMARY — ACTIVE 2",
+                str(app.query_one("#chat-title", Static).render()),
+            )
+            self.assertIn(
+                "NODES      6",
+                str(app.query_one("#connection-details", Static).render()),
+            )
+
+            app._refresh_chat_timestamps(wall_now=reference + 1)
+            self.assertIn(
+                "ACTIVE 1",
+                str(app.query_one("#chat-title", Static).render()),
+            )
+            self.assertEqual(radio.sent_messages, ())
+
+            app._refresh_chat_timestamps(wall_now=reference + 400)
+            self.assertIn(
+                "ACTIVE 0",
+                str(app.query_one("#chat-title", Static).render()),
+            )
+
+            app._show_connection(RadioState.OFFLINE)
+            self.assertIn(
+                "ACTIVE —",
+                str(app.query_one("#chat-title", Static).render()),
+            )
 
     async def test_chat_primary_heading_and_timestamp_hierarchy(self) -> None:
         radio = SimulatedRadioService(
