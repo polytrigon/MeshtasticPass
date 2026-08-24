@@ -685,6 +685,44 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(widget.distance_label)
 
+    async def test_delivery_label_reflows_between_visible_states(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.show_tab("chat")
+            app._accepted_send("delivery layout")
+            entry = app.chat_history[-1]
+            widget = list(app.query(ChatEntryWidget))[-1]
+            label = widget.delivery_label
+            self.assertIsNotNone(label)
+
+            transitions = (
+                (DeliveryState.SENDING, 3, "SENDING..."),
+                (DeliveryState.HEARD, 1, "HEARD"),
+                (DeliveryState.FAILED, 1, "FAILED"),
+                (DeliveryState.UNCONFIRMED, 1, "UNCONFIRMED"),
+            )
+            widths = []
+            for state, dot_count, expected in transitions:
+                entry.delivery_state = state
+                widget.refresh_delivery_state(dot_count)
+                await pilot.pause()
+
+                rendered = str(label.render())
+                self.assertEqual(rendered, expected)
+                self.assertEqual(label.region.width, len(expected))
+                self.assertNotIn(" ", rendered)
+                widths.append(label.region.width)
+
+            self.assertLess(widths[1], widths[0])
+            self.assertGreater(widths[2], widths[1])
+            self.assertGreater(widths[3], widths[2])
+
     async def test_terminal_cursor_guard_runs_for_app_lifecycle(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,

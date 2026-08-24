@@ -295,7 +295,7 @@ class ChatEntryWidget(Vertical):
         text = visible_state.value
         if visible_state is DeliveryState.SENDING:
             text += "." * dot_count
-        self.delivery_label.update(text, layout=False)
+        self.delivery_label.update(text)
         for name in DeliveryState:
             self.set_class(
                 name is visible_state,
