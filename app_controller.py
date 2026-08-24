@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Event, Thread
+from time import monotonic
 from typing import Any, Callable
 
 from radio_service import RadioEvent, ReceivedMessage, RadioService
@@ -16,22 +17,35 @@ class ChatEntry:
 
     author: str
     text: str
+    accepted_at: float
     outgoing: bool = False
 
 
-def received_chat_entry(message: ReceivedMessage) -> ChatEntry:
+def received_chat_entry(
+    message: ReceivedMessage,
+    accepted_at: float | None = None,
+) -> ChatEntry:
     """Convert an application message to display state without SDK details."""
     author = (
         message.sender_long_name
         or message.sender_short_name
         or message.sender_node_id
     )
-    return ChatEntry(author=author, text=message.text)
+    return ChatEntry(
+        author=author,
+        text=message.text,
+        accepted_at=monotonic() if accepted_at is None else accepted_at,
+    )
 
 
-def outgoing_chat_entry(text: str) -> ChatEntry:
+def outgoing_chat_entry(text: str, accepted_at: float | None = None) -> ChatEntry:
     """Create a local-only transcript entry for an accepted send."""
-    return ChatEntry(author="YOU", text=text, outgoing=True)
+    return ChatEntry(
+        author="YOU",
+        text=text,
+        accepted_at=monotonic() if accepted_at is None else accepted_at,
+        outgoing=True,
+    )
 
 
 def create_radio_service(

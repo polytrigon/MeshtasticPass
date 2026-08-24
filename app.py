@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from time import monotonic
 
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Blur, Focus, Key
 from textual.message import Message
 from textual.timer import Timer
@@ -22,6 +23,7 @@ from app_controller import (
 )
 from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
 from radio_service import RadioEvent, RadioInfo, RadioSendError, RadioState, ReceivedMessage
+from relative_time import format_relative_age
 
 
 TAB_NAMES = {
@@ -130,6 +132,40 @@ class ColorSelector(StyleSelector):
         return str(self.value)
 
 
+class ChatEntryWidget(Vertical):
+    """One chat message whose relative timestamp can refresh in place."""
+
+    def __init__(self, entry: ChatEntry, now: float | None = None) -> None:
+        self.entry = entry
+        initial_now = monotonic() if now is None else now
+        self.timestamp_label = Static(
+            format_relative_age(initial_now - entry.accepted_at),
+            classes="chat-entry-timestamp",
+            markup=False,
+        )
+        header = Horizontal(
+            Static(
+                self.entry.author,
+                classes="chat-entry-author",
+                markup=False,
+            ),
+            self.timestamp_label,
+            classes="chat-entry-header",
+        )
+        super().__init__(
+            header,
+            Static(self.entry.text, classes="chat-entry-text", markup=False),
+            classes="chat-entry",
+        )
+
+    def refresh_timestamp(self, now: float) -> None:
+        """Update only the existing timestamp child for this entry."""
+        self.timestamp_label.update(
+            format_relative_age(now - self.entry.accepted_at),
+            layout=False,
+        )
+
+
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
@@ -214,7 +250,7 @@ class MeshtasticPassApp(App[None]):
     #connection-error, #send-error, #style-status.setting-error {
         height: auto;
         min-height: 1;
-        color: #ff6b6b;
+        color: #ff1744;
     }
 
     #chat-log {
@@ -225,6 +261,33 @@ class MeshtasticPassApp(App[None]):
     .chat-entry {
         height: auto;
         margin-bottom: 1;
+    }
+
+    .chat-entry-header {
+        height: 1;
+    }
+
+    .chat-entry-author {
+        width: auto;
+        margin-right: 2;
+        text-style: bold;
+    }
+
+    .chat-entry-timestamp {
+        width: auto;
+        color: #8a8a8a;
+    }
+
+    Screen.theme-green .chat-entry-timestamp {
+        color: #168f0a;
+    }
+
+    Screen.theme-orange .chat-entry-timestamp {
+        color: #a85c00;
+    }
+
+    .chat-entry-text {
+        height: auto;
     }
 
     #chat-input {
@@ -276,6 +339,7 @@ class MeshtasticPassApp(App[None]):
         self._radio_info: RadioInfo | None = None
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
+        self._chat_timestamp_timer: Timer | None = None
         self._monitor = RadioMonitor(
             radio,
             self._radio_event_from_thread,
@@ -315,12 +379,19 @@ class MeshtasticPassApp(App[None]):
             self._advance_connection_animation,
             name="connection-status-animation",
         )
+        self._chat_timestamp_timer = self.set_interval(
+            12.0,
+            self._refresh_chat_timestamps,
+            name="chat-relative-timestamps",
+        )
         self.query_one(FontSizeSelector).focus()
         self._monitor.start()
 
     def on_unmount(self) -> None:
         if self._connection_animation_timer is not None:
             self._connection_animation_timer.stop()
+        if self._chat_timestamp_timer is not None:
+            self._chat_timestamp_timer.stop()
         self._monitor.stop()
 
     def on_key(self, event: Key) -> None:
@@ -348,6 +419,7 @@ class MeshtasticPassApp(App[None]):
         self.current_tab = tab_id
         if tab_id == "chat":
             self.unread_count = 0
+            self._refresh_chat_timestamps()
         self.query_one("#content", ContentSwitcher).current = tab_id
         self._update_tab_bar()
         if tab_id == "chat":
@@ -440,13 +512,13 @@ class MeshtasticPassApp(App[None]):
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         transcript = self.query_one("#chat-log", VerticalScroll)
-        transcript.mount(
-            Static(
-                f"[b]{self._escape(entry.author)}[/b]\n  {self._escape(entry.text)}",
-                classes="chat-entry",
-            )
-        )
+        transcript.mount(ChatEntryWidget(entry))
         transcript.scroll_end(animate=False)
+
+    def _refresh_chat_timestamps(self, now: float | None = None) -> None:
+        current_time = monotonic() if now is None else now
+        for widget in self.query(ChatEntryWidget):
+            widget.refresh_timestamp(current_time)
 
     def _show_connection(
         self,
