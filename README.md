@@ -84,6 +84,36 @@ this marker does not imply delivery. While the chat input is focused, normal
 text and number keys remain input. Press `Escape` to leave the input, then `q`
 to quit. Radio monitoring stops and the service closes during shutdown.
 
+### Install the uConsole menu launcher
+
+From the project directory on the uConsole, run:
+
+```bash
+chmod +x install-launcher.sh
+./install-launcher.sh
+```
+
+Running the installer again safely updates the same launcher. The menu entry
+remains at **Startup / Accessories / MeshtasticPass** and starts the real-radio
+path (`python app.py`), not simulation mode.
+
+The installer creates a dedicated lxterminal profile with generic
+`Monospace 13`, hides lxterminal's menu and scrollbar, and uses `--no-remote`
+so these settings do not alter or inherit from ordinary terminal windows.
+Because lxterminal has no fullscreen command-line option, the installer adds a
+title-specific MeshtasticPass window rule to the user's labwc `rc.xml` and
+reloads labwc when it is running. Existing labwc settings are preserved. This
+assumes the uConsole session uses labwc and lxterminal; on another window
+manager the app will still launch, but fullscreen behavior is not guaranteed.
+
+To launch manually without the menu or launcher-specific presentation:
+
+```bash
+cd /home/mt/meshtasticPass
+source .venv/bin/activate
+python app.py
+```
+
 ## Current structure
 
 ```text
@@ -92,6 +122,7 @@ receive_messages.py  Text-message receive monitor
 send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
+install-launcher.sh  Reproducible uConsole menu/fullscreen setup
 radio_service.py   All Meshtastic connection and device-info logic
 simulated_radio_service.py  Deterministic radio simulator
 requirements.txt   Python dependency
