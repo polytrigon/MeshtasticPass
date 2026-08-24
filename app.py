@@ -8,7 +8,7 @@ import argparse
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.events import Key
+from textual.events import Blur, Focus, Key
 from textual.message import Message
 from textual.widgets import ContentSwitcher, Input, Static
 
@@ -19,7 +19,7 @@ from app_controller import (
     outgoing_chat_entry,
     received_chat_entry,
 )
-from app_settings import AppSettings, FONT_SIZE_CHOICES
+from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
 from radio_service import RadioEvent, RadioInfo, RadioSendError, RadioState, ReceivedMessage
 
 
@@ -31,43 +31,96 @@ TAB_NAMES = {
 }
 
 
-class FontSizeSelector(Static):
-    """Focusable keyboard control for the four supported terminal font sizes."""
+class StyleSelector(Static):
+    """One focusable row in the keyboard-driven STYLE section."""
 
     can_focus = True
 
     class Changed(Message):
-        def __init__(self, font_size: int) -> None:
+        def __init__(self, setting: str, value: object) -> None:
             super().__init__()
-            self.font_size = font_size
+            self.setting = setting
+            self.value = value
 
-    def __init__(self, font_size: int) -> None:
-        super().__init__(id="font-size-selector")
-        self.font_size = font_size
+    def __init__(
+        self,
+        setting: str,
+        label: str,
+        choices: tuple[tuple[str, object], ...],
+        value: object,
+        widget_id: str,
+    ) -> None:
+        super().__init__(id=widget_id, classes="style-selector")
+        self.setting = setting
+        self.label = label
+        self.choices = choices
+        self.value = value
+        self._active = False
 
     def on_mount(self) -> None:
         self._update_display()
 
     def on_key(self, event: Key) -> None:
+        if event.key in ("up", "down"):
+            selectors = list(self.screen.query(StyleSelector))
+            current_index = selectors.index(self)
+            direction = -1 if event.key == "up" else 1
+            selectors[(current_index + direction) % len(selectors)].focus()
+            event.stop()
+            return
         if event.key not in ("left", "right"):
             return
 
-        sizes = [size for _name, size in FONT_SIZE_CHOICES]
-        current_index = sizes.index(self.font_size)
+        values = [value for _name, value in self.choices]
+        current_index = values.index(self.value)
         direction = -1 if event.key == "left" else 1
-        self.font_size = sizes[(current_index + direction) % len(sizes)]
+        self.value = values[(current_index + direction) % len(values)]
         self._update_display()
-        self.post_message(self.Changed(self.font_size))
+        self.post_message(self.Changed(self.setting, self.value))
         event.stop()
+
+    def on_focus(self, _event: Focus) -> None:
+        self._active = True
+        self._update_display()
+
+    def on_blur(self, _event: Blur) -> None:
+        self._active = False
+        self._update_display()
 
     def _update_display(self) -> None:
         options = []
-        for name, size in FONT_SIZE_CHOICES:
-            label = f"\\[ {name} {size} ]"
-            if size == self.font_size:
+        for name, value in self.choices:
+            suffix = f" {value}" if self.setting == "font_size" else ""
+            label = f"\\[ {name}{suffix} ]"
+            if value == self.value:
                 label = f"[reverse][b]{label}[/b][/reverse]"
             options.append(label)
-        self.update("FONT SIZE   " + " ".join(options))
+        focus_marker = ">" if self._active else " "
+        self.update(f"{focus_marker} {self.label:<10}" + " ".join(options))
+
+
+class FontSizeSelector(StyleSelector):
+    def __init__(self, font_size: int) -> None:
+        super().__init__(
+            "font_size",
+            "FONT SIZE",
+            FONT_SIZE_CHOICES,
+            font_size,
+            "font-size-selector",
+        )
+
+    @property
+    def font_size(self) -> int:
+        return int(self.value)
+
+
+class ColorSelector(StyleSelector):
+    def __init__(self, color: str) -> None:
+        super().__init__("color", "COLOR", COLOR_CHOICES, color, "color-selector")
+
+    @property
+    def color(self) -> str:
+        return str(self.value)
 
 
 class MeshtasticPassApp(App[None]):
@@ -78,6 +131,14 @@ class MeshtasticPassApp(App[None]):
     Screen {
         background: #101010;
         color: #d8d8d8;
+    }
+
+    Screen.theme-green {
+        color: #5eea76;
+    }
+
+    Screen.theme-orange {
+        color: #f0a64a;
     }
 
     #tab-bar {
@@ -110,13 +171,33 @@ class MeshtasticPassApp(App[None]):
         margin-top: 1;
     }
 
-    #font-size-selector {
+    .style-selector {
         height: 2;
         color: #d8d8d8;
     }
 
-    #font-size-selector:focus {
+    .style-selector:focus {
         color: #f2f2f2;
+    }
+
+    Screen.theme-green .style-selector,
+    Screen.theme-green #chat-input {
+        color: #5eea76;
+    }
+
+    Screen.theme-orange .style-selector,
+    Screen.theme-orange #chat-input {
+        color: #f0a64a;
+    }
+
+    Screen.theme-green .style-selector:focus,
+    Screen.theme-green .page-title {
+        color: #9cffab;
+    }
+
+    Screen.theme-orange .style-selector:focus,
+    Screen.theme-orange .page-title {
+        color: #ffc56f;
     }
 
     #style-status {
@@ -158,6 +239,24 @@ class MeshtasticPassApp(App[None]):
         border-top: solid #4a4a4a;
         color: #8a8a8a;
     }
+
+    Screen.theme-green #tab-bar,
+    Screen.theme-green #footer {
+        color: #367f45;
+    }
+
+    Screen.theme-orange #tab-bar,
+    Screen.theme-orange #footer {
+        color: #96652f;
+    }
+
+    Screen.theme-green #footer {
+        border-top: solid #285c33;
+    }
+
+    Screen.theme-orange #footer {
+        border-top: solid #6d471f;
+    }
     """
 
     def __init__(self, radio: object, settings: AppSettings | None = None) -> None:
@@ -181,6 +280,7 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="connection-error")
                 yield Static("> STYLE", id="style-title", classes="page-title")
                 yield FontSizeSelector(self.settings.font_size)
+                yield ColorSelector(self.settings.color)
                 yield Static(id="style-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield Static("> CHAT", classes="page-title")
@@ -196,6 +296,7 @@ class MeshtasticPassApp(App[None]):
         yield Static("1-4 switch tabs    Q quit", id="footer")
 
     def on_mount(self) -> None:
+        self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
         self._show_connection(RadioState.CONNECTING)
         self.query_one(FontSizeSelector).focus()
@@ -236,17 +337,32 @@ class MeshtasticPassApp(App[None]):
         else:
             self.set_focus(None)
 
-    @on(FontSizeSelector.Changed)
-    def save_font_size(self, event: FontSizeSelector.Changed) -> None:
+    @on(StyleSelector.Changed)
+    def save_style_setting(self, event: StyleSelector.Changed) -> None:
         status = self.query_one("#style-status", Static)
         try:
-            self.settings.set_font_size(event.font_size)
-            self.settings.save()
-            self.settings.update_lxterminal_profile()
+            if event.setting == "font_size":
+                self.settings.set_font_size(int(event.value))
+                self.settings.save()
+                self.settings.update_lxterminal_profile()
+            elif event.setting == "color":
+                self.settings.set_color(str(event.value))
+                self.settings.save()
+                self._apply_color_theme(self.settings.color)
         except (OSError, ValueError) as error:
-            status.update(f"FONT SIZE NOT SAVED — {error}")
+            status.update(f"SETTING NOT SAVED — {error}")
         else:
-            status.update("FONT SIZE SAVED — APPLIES ON NEXT LAUNCH")
+            message = (
+                "FONT SIZE SAVED — APPLIES ON NEXT LAUNCH"
+                if event.setting == "font_size"
+                else "COLOR SAVED"
+            )
+            status.update(message)
+
+    def _apply_color_theme(self, color: str) -> None:
+        for name, _value in COLOR_CHOICES:
+            self.screen.remove_class(f"theme-{name.lower()}")
+        self.screen.add_class(f"theme-{color}")
 
     @on(Input.Submitted, "#chat-input")
     def send_chat_message(self, event: Input.Submitted) -> None:
@@ -313,11 +429,17 @@ class MeshtasticPassApp(App[None]):
         info: RadioInfo | None = None,
         message: str = "",
     ) -> None:
+        status_by_state = {
+            RadioState.CONNECTING: "CONNECTING...",
+            RadioState.ONLINE: "ONLINE",
+            RadioState.OFFLINE: "OFFLINE — RETRYING...",
+            RadioState.ERROR: "CONNECTION ERROR — RETRYING...",
+        }
         values = [
-            ("RADIO", state.value),
+            ("STATUS", status_by_state[state]),
             ("DEVICE", getattr(self.radio, "device_path", "unknown")),
         ]
-        if info is not None:
+        if state is RadioState.ONLINE and info is not None:
             values.extend(
                 [
                     ("NODE", info.node_id),
@@ -328,7 +450,7 @@ class MeshtasticPassApp(App[None]):
             )
         details = "\n".join(f"{label:<10} {value}" for label, value in values)
         self.query_one("#connection-details", Static).update(details)
-        self.query_one("#connection-error", Static).update(message)
+        self.query_one("#connection-error", Static).update("")
 
     def _show_send_error(self, message: str) -> None:
         self.query_one("#send-error", Static).update(message)

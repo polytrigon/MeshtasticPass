@@ -84,12 +84,18 @@ this marker does not imply delivery. While the chat input is focused, normal
 text and number keys remain input. Press `Escape` to leave the input, then `q`
 to quit. Radio monitoring stops and the service closes during shutdown.
 
-The first tab is **CONNECTION/CONFIG**. Its CONNECTION section still shows live
-radio status. In the STYLE section, use Left/Right to choose a terminal font
-size: SMALL (11), MEDIUM (13), LARGE (16), or XL (18). The selected value is
-saved immediately to `~/.config/meshtasticpass/config.json` and written only to
-the dedicated MeshtasticPass LXTerminal profile. The running terminal cannot
-reliably change its own font, so the new size applies on the next menu launch.
+The first tab is **CONNECTION/CONFIG**. Its CONNECTION section immediately shows
+CONNECTING, then ONLINE and live radio metadata after the initial sync. If the
+radio disappears or a recoverable connection error occurs, the status clearly
+says that automatic retry is active and stale node metadata is hidden.
+
+The STYLE section has FONT SIZE and COLOR rows. Use Up/Down to move between the
+rows and Left/Right to select a value. Font choices are SMALL (11), MEDIUM (13),
+LARGE (16), and XL (18). Color choices are WHITE (the default), GREEN, and
+ORANGE. Both values save immediately to
+`~/.config/meshtasticpass/config.json`. Color changes the running Textual app
+immediately. Font size is also written only to the dedicated MeshtasticPass
+LXTerminal profile and applies on the next menu launch.
 
 ### Install the uConsole menu launcher
 

@@ -18,6 +18,13 @@ FONT_SIZE_CHOICES = (
 )
 VALID_FONT_SIZES = tuple(size for _name, size in FONT_SIZE_CHOICES)
 DEFAULT_FONT_SIZE = 13
+COLOR_CHOICES = (
+    ("WHITE", "white"),
+    ("GREEN", "green"),
+    ("ORANGE", "orange"),
+)
+VALID_COLORS = tuple(value for _name, value in COLOR_CHOICES)
+DEFAULT_COLOR = "white"
 
 
 def default_config_home() -> Path:
@@ -29,6 +36,7 @@ class AppSettings:
     """Load, validate, and save the small user-facing settings file."""
 
     font_size: int = DEFAULT_FONT_SIZE
+    color: str = DEFAULT_COLOR
     config_path: Path = field(
         default_factory=lambda: default_config_home()
         / "meshtasticpass"
@@ -63,11 +71,16 @@ class AppSettings:
             return settings
 
         settings._unknown = {
-            key: value for key, value in raw.items() if key != "font_size"
+            key: value
+            for key, value in raw.items()
+            if key not in ("font_size", "color")
         }
         candidate = raw.get("font_size")
         if cls.is_valid_font_size(candidate):
             settings.font_size = candidate
+        color_candidate = raw.get("color")
+        if cls.is_valid_color(color_candidate):
+            settings.color = color_candidate
         return settings
 
     @staticmethod
@@ -84,10 +97,21 @@ class AppSettings:
             raise ValueError(f"Font size must be one of: {choices}")
         self.font_size = font_size
 
+    @staticmethod
+    def is_valid_color(value: Any) -> bool:
+        return isinstance(value, str) and value in VALID_COLORS
+
+    def set_color(self, color: str) -> None:
+        if not self.is_valid_color(color):
+            choices = ", ".join(VALID_COLORS)
+            raise ValueError(f"Color must be one of: {choices}")
+        self.color = color
+
     def save(self) -> None:
         """Atomically save known settings while retaining unknown future keys."""
         data = dict(self._unknown)
         data["font_size"] = self.font_size
+        data["color"] = self.color
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         self._atomic_write(self.config_path, content)
 
