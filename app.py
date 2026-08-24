@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from time import monotonic
+from time import monotonic, time
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -132,6 +132,14 @@ class ColorSelector(StyleSelector):
         return str(self.value)
 
 
+class RadioMessageReceived(Message):
+    """Thread-safe bridge from either radio service into the UI queue."""
+
+    def __init__(self, message: ReceivedMessage) -> None:
+        super().__init__()
+        self.message = message
+
+
 class ChatEntryWidget(Vertical):
     """One chat message whose relative timestamp can refresh in place."""
 
@@ -140,7 +148,7 @@ class ChatEntryWidget(Vertical):
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
         self.timestamp_label = Static(
-            format_relative_age(initial_now - entry.accepted_at),
+            format_relative_age(initial_now - entry.age_reference),
             classes="chat-entry-timestamp",
             markup=False,
         )
@@ -167,7 +175,7 @@ class ChatEntryWidget(Vertical):
     def refresh_timestamp(self, now: float) -> None:
         """Update only the existing timestamp child for this entry."""
         self.timestamp_label.update(
-            format_relative_age(now - self.entry.accepted_at),
+            format_relative_age(now - self.entry.age_reference),
             layout=False,
         )
 
@@ -534,20 +542,23 @@ class MeshtasticPassApp(App[None]):
             pass
 
     def _message_from_thread(self, message: ReceivedMessage) -> None:
-        try:
-            self.call_from_thread(self._accept_received_message, message)
-        except RuntimeError:
-            pass
+        self.post_message(RadioMessageReceived(message))
+
+    @on(RadioMessageReceived)
+    def accept_radio_message(self, event: RadioMessageReceived) -> None:
+        self._accept_received_message(event.message)
 
     def _apply_radio_event(self, event: RadioEvent) -> None:
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
-        accepted_at = monotonic()
+        received_at = time()
+        monotonic_now = monotonic()
         chat_is_visible = self.current_tab == "chat"
         entry = received_chat_entry(
             message,
-            accepted_at=accepted_at,
+            received_at=received_at,
+            monotonic_now=monotonic_now,
             unread=not chat_is_visible,
             is_new=True,
         )
