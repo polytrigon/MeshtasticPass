@@ -40,6 +40,7 @@ class AppSettings:
     font_size: int = DEFAULT_FONT_SIZE
     color: str = DEFAULT_COLOR
     device_path: str = DEFAULT_DEVICE_PATH
+    favorite_node_ids: set[str] = field(default_factory=set)
     config_path: Path = field(
         default_factory=lambda: default_config_home()
         / "meshtasticpass"
@@ -76,7 +77,7 @@ class AppSettings:
         settings._unknown = {
             key: value
             for key, value in raw.items()
-            if key not in ("font_size", "color", "device_path")
+            if key not in ("font_size", "color", "device_path", "favorite_node_ids")
         }
         candidate = raw.get("font_size")
         if cls.is_valid_font_size(candidate):
@@ -87,6 +88,13 @@ class AppSettings:
         device_candidate = raw.get("device_path")
         if cls.is_valid_device_path(device_candidate):
             settings.device_path = device_candidate
+        favorites = raw.get("favorite_node_ids")
+        if isinstance(favorites, list):
+            settings.favorite_node_ids = {
+                value.strip().lower()
+                for value in favorites
+                if isinstance(value, str) and value.strip()
+            }
         return settings
 
     @staticmethod
@@ -122,12 +130,29 @@ class AppSettings:
             raise ValueError("USB device path cannot be empty.")
         self.device_path = device_path.strip()
 
+    def is_favorite(self, node_id: str | None) -> bool:
+        return (
+            isinstance(node_id, str)
+            and node_id.strip().lower() in self.favorite_node_ids
+        )
+
+    def set_favorite(self, node_id: str, favorite: bool) -> None:
+        """Persist favorite identity by stable Meshtastic Node ID."""
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise ValueError("Favorite Node ID cannot be empty.")
+        normalized = node_id.strip().lower()
+        if favorite:
+            self.favorite_node_ids.add(normalized)
+        else:
+            self.favorite_node_ids.discard(normalized)
+
     def save(self) -> None:
         """Atomically save known settings while retaining unknown future keys."""
         data = dict(self._unknown)
         data["font_size"] = self.font_size
         data["color"] = self.color
         data["device_path"] = self.device_path
+        data["favorite_node_ids"] = sorted(self.favorite_node_ids)
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         self._atomic_write(self.config_path, content)
 

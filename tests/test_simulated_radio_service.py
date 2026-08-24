@@ -170,7 +170,7 @@ class SimulatedRadioServiceTests(unittest.TestCase):
 
         self.assertEqual(service.active_node_count(now=1_000), 2)
         self.assertEqual(service.active_node_count(now=1_001), 1)
-        self.assertEqual(service.info.known_nodes, 6)
+        self.assertEqual(service.info.known_nodes, 8)
         self.assertEqual(service.sent_messages, ())
 
         service.close()

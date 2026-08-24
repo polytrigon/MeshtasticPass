@@ -19,6 +19,7 @@ from radio_service import (
     RadioIdentityError,
     RadioSendError,
     RadioState,
+    NodeMetadata,
     ReceivedMessage,
     SentMessage,
     SendStatus,
@@ -48,10 +49,11 @@ class SimulatedNode:
     """Stable fake node information for repeatable development and tests."""
 
     node_id: str
-    long_name: str
-    short_name: str
+    long_name: str | None
+    short_name: str | None
     position: GeoPosition | None
     last_heard_age_seconds: object | None
+    hops_away: int | None = None
 
 
 SIMULATED_LOCAL_POSITION = GeoPosition(40.7128, -74.0060, 1_700_000_000.0)
@@ -63,17 +65,21 @@ SIMULATED_NODES = (
         "ALCE",
         GeoPosition(40.7736, -73.9566, 1_700_000_100.0),
         30.0,
+        1,
     ),
-    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None, 299.0),
+    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None, 299.0, 5),
     SimulatedNode(
         "!cafe0003",
         "Cafe Relay",
         "CAFE",
         GeoPosition(40.6501, -73.9496, 1_700_000_200.0),
         400.0,
+        None,
     ),
     SimulatedNode("!bad00004", "Malformed Clock", "BAD", None, "recent"),
     SimulatedNode("!none0005", "Missing Clock", "NONE", None, None),
+    SimulatedNode("!10a60006", None, "NOLN", None, 600.0, 2),
+    SimulatedNode("!5a070007", "No Short Name", None, None, 600.0, None),
 )
 
 _SIMULATED_REFERENCE_TIME = time.time()
@@ -229,6 +235,19 @@ class SimulatedRadioService:
             now=current_time,
             direct_observations=self._direct_observations,
         )
+
+    def get_node_metadata(self, node_id: str) -> NodeMetadata:
+        """Return deterministic node details without radio side effects."""
+        normalized = node_id.strip().lower()
+        for node in SIMULATED_NODES:
+            if node.node_id.lower() == normalized:
+                return NodeMetadata(
+                    node.node_id,
+                    node.long_name,
+                    node.short_name,
+                    node.hops_away,
+                )
+        return NodeMetadata(node_id.strip())
 
     def set_long_name(self, long_name: str) -> RadioInfo:
         """Update the deterministic local identity while simulated online."""

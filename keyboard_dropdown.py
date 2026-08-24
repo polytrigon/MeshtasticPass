@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from typing import Hashable, Iterable
 
 from rich.text import Text
-from textual.events import Blur, Focus, Key
+from textual import on
+from textual.events import Blur, Click, Focus, Key
 from textual.message import Message
 from textual.widgets import Static
 
 from theme_palette import THEME_PALETTES
+from viewport_menu import PopupItem, ViewportMenu
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class KeyboardDropdown(Static):
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
         self._subdued_color = default_palette.dim_base
+        self.popup: ViewportMenu | None = None
 
     @property
     def selected_label(self) -> str:
@@ -98,12 +101,31 @@ class KeyboardDropdown(Static):
         self.is_open = True
         self._highlighted_index = self._selected_index()
         self.add_class("open")
+        items = tuple(PopupItem(option.label, option.value) for option in self.options)
+        self.popup = ViewportMenu(
+            items,
+            highlighted_index=self._highlighted_index,
+            on_activate=self._activate_popup_item,
+        )
+        width = max(len(option.label) for option in self.options) + 4
+        self.screen.mount(self.popup)
+        self.popup.place(self.region, self.screen.region, width)
         self._render_dropdown()
 
     def close_menu(self) -> None:
         self.is_open = False
         self.remove_class("open")
+        if self.popup is not None:
+            self.popup.remove()
+            self.popup = None
         self._render_dropdown()
+
+    def _activate_popup_item(self, index: int, _item: PopupItem) -> None:
+        self._highlighted_index = index
+        option = self.options[index]
+        self.value = option.value
+        self.close_menu()
+        self.post_message(self.Selected(self, option.value))
 
     def on_key(self, event: Key) -> None:
         if not self.is_open:
@@ -117,13 +139,15 @@ class KeyboardDropdown(Static):
             self._highlighted_index = (
                 self._highlighted_index + direction
             ) % len(self.options)
+            if self.popup is not None:
+                self.popup.set_highlight(self._highlighted_index)
             self._render_dropdown()
             event.stop()
         elif event.key == "enter":
-            option = self.options[self._highlighted_index]
-            self.value = option.value
-            self.close_menu()
-            self.post_message(self.Selected(self, option.value))
+            self._activate_popup_item(
+                self._highlighted_index,
+                PopupItem(self.options[self._highlighted_index].label),
+            )
             event.stop()
         elif event.key == "escape":
             self.close_menu()
@@ -139,6 +163,13 @@ class KeyboardDropdown(Static):
             self.close_menu()
         else:
             self._render_dropdown()
+
+    @on(Click)
+    def clicked(self) -> None:
+        if self.is_open:
+            self.close_menu()
+        else:
+            self.open_menu()
 
     def _selected_index(self) -> int:
         return next(
@@ -160,22 +191,4 @@ class KeyboardDropdown(Static):
             self.update(text)
             return
 
-        width = max(len(option.label) for option in self.options) + 5
-        text.append(f"\n  ┌{'─' * width}┐", style=self._subdued_color)
-        for index, option in enumerate(self.options):
-            current = "◀" if option.value == self.value else " "
-            line_start = len(text)
-            text.append(
-                f"\n  │ {option.label:<{width - 3}} {current} │",
-                style=self._base_color,
-            )
-            if current.strip():
-                text.stylize(self._accent_color, len(text) - 3, len(text) - 2)
-            if index == self._highlighted_index:
-                text.stylize(
-                    f"bold {self._accent_color}",
-                    line_start + 4,
-                    len(text) - 2,
-                )
-        text.append(f"\n  └{'─' * width}┘", style=self._subdued_color)
         self.update(text)

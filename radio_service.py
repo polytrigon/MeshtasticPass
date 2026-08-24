@@ -89,6 +89,16 @@ class ChannelInfo:
 
 
 @dataclass(frozen=True)
+class NodeMetadata:
+    """Trustworthy application-level node details from the synced database."""
+
+    node_id: str
+    long_name: str | None = None
+    short_name: str | None = None
+    hops_away: int | None = None
+
+
+@dataclass(frozen=True)
 class RadioInfo:
     """Small, UI-friendly summary of the connected radio."""
 
@@ -316,6 +326,31 @@ class RadioService:
             local_node_id=local_id,
             now=time.time() if now is None else now,
             direct_observations=observations,
+        )
+
+    def get_node_metadata(self, node_id: str) -> NodeMetadata:
+        """Read normalized node metadata without transmitting radio traffic."""
+        normalized = node_id.strip() if isinstance(node_id, str) else ""
+        if not normalized:
+            return NodeMetadata("")
+        try:
+            node_number = int(normalized.removeprefix("!"), 16)
+        except ValueError:
+            node_number = None
+        record = self._lookup_node_record(
+            self._interface,
+            node_number,
+            normalized,
+        )
+        user = self._user_from_record(record)
+        hops = self._optional_int(record.get("hopsAway"))
+        if hops is not None and hops < 0:
+            hops = None
+        return NodeMetadata(
+            node_id=normalized,
+            long_name=self._optional_string(user.get("longName")),
+            short_name=self._optional_string(user.get("shortName")),
+            hops_away=hops,
         )
 
     def set_long_name(self, long_name: str) -> RadioInfo:
