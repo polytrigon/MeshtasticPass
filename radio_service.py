@@ -81,8 +81,9 @@ class RadioEvent:
 class ReceivedMessage:
     """A decoded text message with no Meshtastic SDK-specific structures.
 
-    ``radio_rx_at`` carries Meshtastic's receiver-stamped ``rxTime`` when present.
-    Ordinary text packets do not carry a true sender-origin timestamp.
+    ``origin_sent_at`` is reserved for a trustworthy protocol-provided origin
+    time. Ordinary Meshtastic text packets do not have one, so RadioService
+    leaves it unset. ``radio_rx_at`` carries the connected receiver's ``rxTime``.
     """
 
     sender_node_id: str
@@ -93,6 +94,7 @@ class ReceivedMessage:
     rssi: int | None
     snr: float | None
     packet_id: int | None
+    origin_sent_at: float | None = None
     radio_rx_at: float | None = None
     local_position: GeoPosition | None = None
     sender_position: GeoPosition | None = None
@@ -467,6 +469,9 @@ class RadioService:
             rssi=self._optional_int(packet.get("rxRssi")),
             snr=self._optional_float(packet.get("rxSnr")),
             packet_id=self._optional_int(packet.get("id")),
+            # Ordinary TEXT_MESSAGE_APP packets do not carry a trustworthy
+            # sender-origin timestamp. Meshtastic rxTime is receiver-side.
+            origin_sent_at=None,
             radio_rx_at=self._optional_float(packet.get("rxTime")),
             local_position=self._local_position(interface),
             sender_position=self._position_from_record(sender_record),

@@ -25,6 +25,10 @@ class ReceivedMessageTests(unittest.TestCase):
             "rxSnr": 6.5,
             "id": 123456789,
             "rxTime": 1_700_000_000,
+            # Neither an arbitrary wall-clock-looking key nor the deprecated
+            # delayed enum is a trustworthy text origin timestamp.
+            "timestamp": 1_600_000_000,
+            "delayed": "DELAYED_BROADCAST",
         }
 
         message = self.service._parse_text_packet(packet, None)
@@ -40,6 +44,7 @@ class ReceivedMessageTests(unittest.TestCase):
                 rssi=-87,
                 snr=6.5,
                 packet_id=123456789,
+                origin_sent_at=None,
                 radio_rx_at=1_700_000_000.0,
             ),
         )
@@ -78,6 +83,7 @@ class ReceivedMessageTests(unittest.TestCase):
         self.assertIsNone(message.rssi)
         self.assertIsNone(message.snr)
         self.assertIsNone(message.packet_id)
+        self.assertIsNone(message.origin_sent_at)
         self.assertIsNone(message.radio_rx_at)
         self.assertIsNone(self.service._parse_text_packet({}, None))
         self.assertIsNone(self.service._parse_text_packet(None, None))

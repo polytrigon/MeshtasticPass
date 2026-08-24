@@ -69,6 +69,40 @@ class ChatStoreTests(unittest.TestCase):
             ["message 2", "message 3", "message 4"],
         )
 
+    def test_cursor_pages_are_bounded_and_chronological(self) -> None:
+        for index in range(175):
+            self.add_incoming(index + 1, f"message {index}", 100.0 + index)
+
+        statements = []
+        self.store._connection.set_trace_callback(statements.append)
+        recent = self.store.load_recent_page(limit=100)
+        first_older = self.store.load_older_page(recent.messages[0].id, limit=50)
+        final_older = self.store.load_older_page(
+            first_older.messages[0].id,
+            limit=50,
+        )
+
+        self.assertEqual(len(recent.messages), 100)
+        self.assertTrue(recent.has_older)
+        self.assertEqual(recent.messages[0].text, "message 75")
+        self.assertEqual(recent.messages[-1].text, "message 174")
+        self.assertEqual(len(first_older.messages), 50)
+        self.assertTrue(first_older.has_older)
+        self.assertEqual(first_older.messages[0].text, "message 25")
+        self.assertEqual(first_older.messages[-1].text, "message 74")
+        self.assertEqual(len(final_older.messages), 25)
+        self.assertFalse(final_older.has_older)
+        self.assertEqual(final_older.messages[0].text, "message 0")
+        self.assertEqual(final_older.messages[-1].text, "message 24")
+        page_queries = [
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith("SELECT")
+        ]
+        self.assertTrue(page_queries)
+        self.assertTrue(all("LIMIT" in statement.upper() for statement in page_queries))
+        self.assertTrue(all("OFFSET" not in statement.upper() for statement in page_queries))
+
     def test_outgoing_attempt_and_delivery_state_persist(self) -> None:
         message_id = self.store.add_outgoing(
             text="mesh hello",

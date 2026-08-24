@@ -23,7 +23,12 @@ from app_controller import (
     stored_chat_entry,
 )
 from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
-from chat_store import ChatStore, ChatStoreError
+from chat_store import (
+    DEFAULT_HISTORY_LIMIT,
+    OLDER_HISTORY_PAGE_SIZE,
+    ChatStore,
+    ChatStoreError,
+)
 from geo import format_distance_miles
 from radio_service import (
     DeliveryState,
@@ -190,6 +195,23 @@ class DeliveryStatusReceived(Message):
         self.generation = generation
 
 
+class LoadOlderControl(Static):
+    """Focusable, keyboard-only control for one bounded history page."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__("[ LOAD OLDER ]", id="load-older", markup=False)
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            self.post_message(self.Activated())
+            event.stop()
+
+
 class ChatTranscript(VerticalScroll):
     """Focusable transcript so navigation never types into the message box."""
 
@@ -225,7 +247,7 @@ class ChatEntryWidget(Vertical):
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
         self.timestamp_label = Static(
-            format_relative_age(initial_now - entry.age_reference),
+            self._timestamp_text(initial_now),
             classes="chat-entry-timestamp",
             markup=False,
         )
@@ -275,9 +297,11 @@ class ChatEntryWidget(Vertical):
 
     def refresh_timestamp(self, now: float) -> None:
         """Update only the existing timestamp child for this entry."""
-        self.timestamp_label.update(
-            format_relative_age(now - self.entry.age_reference),
-        )
+        self.timestamp_label.update(self._timestamp_text(now))
+
+    def _timestamp_text(self, now: float) -> str:
+        age = format_relative_age(now - self.entry.age_reference)
+        return f"RX {age}" if self.entry.age_is_receive_time else age
 
     def refresh_new_message_state(self) -> None:
         """Apply the entry's persistent new/read presentation state."""
@@ -399,6 +423,49 @@ class MeshtasticPassApp(App[None]):
     #chat-log {
         height: 1fr;
         scrollbar-size: 1 1;
+        scrollbar-color: #d8d8d8;
+        scrollbar-color-hover: #d8d8d8;
+        scrollbar-color-active: #d8d8d8;
+        scrollbar-background: #2c2c2c;
+        scrollbar-background-hover: #2c2c2c;
+        scrollbar-background-active: #2c2c2c;
+    }
+
+    Screen.theme-green #chat-log {
+        scrollbar-color: #39ff14;
+        scrollbar-color-hover: #39ff14;
+        scrollbar-color-active: #39ff14;
+        scrollbar-background: #0e5f08;
+        scrollbar-background-hover: #0e5f08;
+        scrollbar-background-active: #0e5f08;
+    }
+
+    Screen.theme-orange #chat-log {
+        scrollbar-color: #ff8c00;
+        scrollbar-color-hover: #ff8c00;
+        scrollbar-color-active: #ff8c00;
+        scrollbar-background: #6f3d00;
+        scrollbar-background-hover: #6f3d00;
+        scrollbar-background-active: #6f3d00;
+    }
+
+    #load-older {
+        width: auto;
+        height: 1;
+        color: #d8d8d8;
+        margin-bottom: 1;
+    }
+
+    #load-older:focus {
+        text-style: reverse;
+    }
+
+    Screen.theme-green #load-older {
+        color: #39ff14;
+    }
+
+    Screen.theme-orange #load-older {
+        color: #ff8c00;
     }
 
     .chat-entry {
@@ -452,17 +519,17 @@ class MeshtasticPassApp(App[None]):
 
     .chat-entry.delivery-sending .chat-entry-delivery,
     .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #f2f2f2;
+        color: #39ff14;
     }
 
     Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery,
     Screen.theme-green .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #7cff6b;
+        color: #ff8c00;
     }
 
     Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery,
     Screen.theme-orange .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #ffb000;
+        color: #d8d8d8;
     }
 
     .chat-entry.delivery-heard .chat-entry-delivery {
@@ -574,6 +641,8 @@ class MeshtasticPassApp(App[None]):
         self._chat_timestamp_timer: Timer | None = None
         self._delivery_timer: Timer | None = None
         self._send_dot_count = 1
+        self._has_older_history = False
+        self._chat_open_scroll_pending = False
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -617,7 +686,7 @@ class MeshtasticPassApp(App[None]):
             name="connection-status-animation",
         )
         self._chat_timestamp_timer = self.set_interval(
-            12.0,
+            1.0,
             self._refresh_chat_timestamps,
             name="chat-relative-timestamps",
         )
@@ -704,6 +773,9 @@ class MeshtasticPassApp(App[None]):
         self._update_tab_bar()
         if tab_id == "chat":
             self.query_one("#chat-input", Input).focus()
+            if self._chat_open_scroll_pending:
+                self._chat_open_scroll_pending = False
+                self.call_after_refresh(self._jump_to_newest)
         elif tab_id == "connection":
             self.query_one(FontSizeSelector).focus()
         else:
@@ -858,12 +930,12 @@ class MeshtasticPassApp(App[None]):
     def _accept_received_message(self, message: ReceivedMessage) -> None:
         if (message.channel_index or 0) != 0:
             return
-        received_at = time()
+        app_received_at = time()
         monotonic_now = monotonic()
         chat_is_visible = self.current_tab == "chat"
         entry = received_chat_entry(
             message,
-            received_at=received_at,
+            app_received_at=app_received_at,
             monotonic_now=monotonic_now,
             unread=not chat_is_visible,
             is_new=True,
@@ -878,6 +950,10 @@ class MeshtasticPassApp(App[None]):
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
+        if self.current_tab != "chat":
+            transcript.mount(ChatEntryWidget(entry))
+            self._chat_open_scroll_pending = True
+            return
         should_follow = self._is_near_chat_bottom()
         transcript.mount(ChatEntryWidget(entry))
         if should_follow:
@@ -947,17 +1023,93 @@ class MeshtasticPassApp(App[None]):
         if self.chat_store is None:
             return
         try:
-            stored_messages = self.chat_store.load_recent(channel_index=0)
+            page = self.chat_store.load_recent_page(
+                channel_index=0,
+                limit=DEFAULT_HISTORY_LIMIT,
+            )
         except ChatStoreError as error:
             self._show_send_error(str(error))
             return
         transcript = self.query_one("#chat-log", ChatTranscript)
-        for stored in stored_messages:
+        self._has_older_history = page.has_older
+        widgets: list[Static | ChatEntryWidget] = []
+        if page.has_older:
+            widgets.append(LoadOlderControl())
+        for stored in page.messages:
             entry = stored_chat_entry(stored)
             self.chat_history.append(entry)
-            transcript.mount(ChatEntryWidget(entry))
-        if stored_messages:
-            self.call_after_refresh(self._jump_to_newest)
+            widgets.append(ChatEntryWidget(entry))
+        if widgets:
+            transcript.mount(*widgets)
+        if page.messages:
+            self._chat_open_scroll_pending = True
+
+    @on(LoadOlderControl.Activated)
+    async def load_older_chat_history(
+        self,
+        _event: LoadOlderControl.Activated,
+    ) -> None:
+        if self.chat_store is None or not self._has_older_history:
+            return
+        oldest_id = self._oldest_persisted_message_id()
+        if oldest_id is None:
+            return
+        try:
+            page = self.chat_store.load_older_page(
+                oldest_id,
+                channel_index=0,
+                limit=OLDER_HISTORY_PAGE_SIZE,
+            )
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+            return
+        if not page.messages:
+            self._has_older_history = False
+            control = self.query_one("#load-older", LoadOlderControl)
+            await control.remove()
+            return
+
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        old_scroll_y = transcript.scroll_y
+        old_virtual_height = transcript.virtual_size.height
+        first_widget = next(iter(self.query(ChatEntryWidget)), None)
+        entries = [stored_chat_entry(stored) for stored in page.messages]
+        widgets = [ChatEntryWidget(entry) for entry in entries]
+        self.chat_history[0:0] = entries
+        await transcript.mount(*widgets, before=first_widget)
+        self._has_older_history = page.has_older
+        if not page.has_older:
+            control = self.query_one("#load-older", LoadOlderControl)
+            await control.remove()
+        self.call_after_refresh(
+            self._restore_scroll_after_prepend,
+            transcript,
+            old_scroll_y,
+            old_virtual_height,
+        )
+
+    @staticmethod
+    def _restore_scroll_after_prepend(
+        transcript: ChatTranscript,
+        old_scroll_y: float,
+        old_virtual_height: int,
+    ) -> None:
+        added_height = transcript.virtual_size.height - old_virtual_height
+        transcript.scroll_to(
+            y=max(0, old_scroll_y + added_height),
+            animate=False,
+            force=True,
+        )
+
+    def _oldest_persisted_message_id(self) -> int | None:
+        return next(
+            (
+                entry.message_id
+                for entry in self.chat_history
+                if entry.message_id is not None
+            ),
+            None,
+        )
 
     def _persist_incoming(self, entry: ChatEntry) -> bool:
         if self.chat_store is None:
@@ -971,7 +1123,7 @@ class MeshtasticPassApp(App[None]):
                 channel_index=entry.channel_index,
                 text=entry.text,
                 radio_rx_at=entry.radio_rx_at,
-                received_at=entry.received_at,
+                received_at=entry.app_received_at,
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -986,7 +1138,7 @@ class MeshtasticPassApp(App[None]):
             entry.message_id = self.chat_store.add_outgoing(
                 text=entry.text,
                 channel_index=entry.channel_index,
-                local_sent_at=entry.local_sent_at or entry.received_at,
+                local_sent_at=entry.local_sent_at or entry.app_received_at,
                 delivery_state=(entry.delivery_state or DeliveryState.SENDING).value,
             )
             entry.active_attempt_id = self.chat_store.add_send_attempt(

@@ -19,8 +19,10 @@ from app import (
     ChatEntryWidget,
     ColorSelector,
     FontSizeSelector,
+    LoadOlderControl,
     MeshtasticPassApp,
 )
+from app_controller import received_chat_entry
 from app_settings import AppSettings
 from chat_store import ChatStore
 from geo import format_distance_miles
@@ -145,7 +147,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(
                 all(
-                    entry.radio_rx_at != entry.received_at
+                    entry.radio_rx_at != entry.app_received_at
                     for entry in app.chat_history
                 )
             )
@@ -410,11 +412,15 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app.show_tab("chat")
             timestamp_timer = app._chat_timestamp_timer
             self.assertIsNotNone(timestamp_timer)
+            self.assertEqual(timestamp_timer._interval, 1.0)
 
             before_incoming = time()
             app._accept_received_message(incoming)
             incoming_entry = app.chat_history[-1]
-            self.assertGreaterEqual(incoming_entry.received_at, before_incoming)
+            self.assertGreaterEqual(
+                incoming_entry.app_received_at,
+                before_incoming,
+            )
             self.assertEqual(
                 incoming_entry.radio_rx_at,
                 incoming.radio_rx_at,
@@ -424,11 +430,14 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             before_outgoing = time()
             app._accepted_send("local timestamp")
             outgoing_entry = app.chat_history[-1]
-            self.assertGreaterEqual(outgoing_entry.received_at, before_outgoing)
+            self.assertGreaterEqual(
+                outgoing_entry.app_received_at,
+                before_outgoing,
+            )
             self.assertIsNone(outgoing_entry.radio_rx_at)
             self.assertEqual(
                 outgoing_entry.local_sent_at,
-                outgoing_entry.received_at,
+                outgoing_entry.app_received_at,
             )
             self.assertTrue(outgoing_entry.outgoing)
 
@@ -437,13 +446,28 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(widgets), 2)
             self.assertIs(app._chat_timestamp_timer, timestamp_timer)
 
+            incoming_entry.age_reference = 1_000.0 - 8
+            original_widget = widgets[0]
+            for now, expected in (
+                (1_000.0, "RX 8s"),
+                (1_001.0, "RX 9s"),
+                (1_002.0, "RX 10s"),
+            ):
+                app._refresh_chat_timestamps(now)
+                await pilot.pause()
+                self.assertEqual(
+                    str(original_widget.timestamp_label.render()),
+                    expected,
+                )
+                self.assertIs(list(app.query(ChatEntryWidget))[0], original_widget)
+
             app._refresh_chat_timestamps(incoming_entry.age_reference + 63 * 60)
             await pilot.pause()
             incoming_timestamp = widgets[0].query_one(
                 ".chat-entry-timestamp", Static
             )
-            self.assertEqual(str(incoming_timestamp.render()), "1h 3min")
-            self.assertGreaterEqual(incoming_timestamp.region.width, len("1h 3min"))
+            self.assertEqual(str(incoming_timestamp.render()), "RX 1h 3m")
+            self.assertGreaterEqual(incoming_timestamp.region.width, len("RX 1h 3m"))
 
         self.assertIsNone(timestamp_timer._task)
 
@@ -473,6 +497,72 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(timestamp.visual_style.foreground.hex6, expected)
                 self.assertEqual(error.visual_style.foreground.hex6, "#FF1744")
+
+    async def test_truthful_origin_and_receive_age_labels(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.show_tab("chat")
+            receive_only = replace(
+                SIMULATED_MESSAGES[0],
+                origin_sent_at=None,
+                radio_rx_at=1_700_000_000.0 - 8,
+            )
+            receive_entry = received_chat_entry(
+                receive_only,
+                app_received_at=1_700_000_000.0,
+                monotonic_now=1_000.0,
+            )
+            receive_widget = ChatEntryWidget(receive_entry, now=1_000.0)
+            self.assertEqual(str(receive_widget.timestamp_label.render()), "RX 8s")
+            self.assertNotIn("DELAYED", str(receive_widget.timestamp_label.render()))
+
+            origin_entry = received_chat_entry(
+                replace(
+                    receive_only,
+                    origin_sent_at=1_700_000_000.0 - 24 * 60 * 60,
+                    radio_rx_at=1_700_000_000.0 - 2,
+                ),
+                app_received_at=1_700_000_000.0,
+                monotonic_now=1_000.0,
+            )
+            origin_widget = ChatEntryWidget(origin_entry, now=1_000.0)
+            self.assertEqual(str(origin_widget.timestamp_label.render()), "1d")
+            self.assertNotIn("RX", str(origin_widget.timestamp_label.render()))
+
+            app._accepted_send("outgoing age")
+            await pilot.pause()
+            outgoing = list(app.query(ChatEntryWidget))[-1]
+            self.assertEqual(str(outgoing.timestamp_label.render()), "0s")
+
+    async def test_scrollbar_follows_active_theme(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(80, 18)) as pilot:
+            transcript = app.query_one("#chat-log", ChatTranscript)
+            palettes = {
+                "white": ("#D8D8D8", "#2C2C2C"),
+                "green": ("#39FF14", "#0E5F08"),
+                "orange": ("#FF8C00", "#6F3D00"),
+            }
+            for theme, (thumb, track) in palettes.items():
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                self.assertEqual(transcript.styles.scrollbar_color.hex, thumb)
+                self.assertEqual(
+                    transcript.styles.scrollbar_background.hex,
+                    track,
+                )
 
     async def test_chat_primary_heading_and_timestamp_hierarchy(self) -> None:
         radio = SimulatedRadioService(
@@ -625,9 +715,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(DeliveryState.SENT, DeliveryState)
 
             palettes = {
-                "white": ("#F2F2F2", "#D8D8D8"),
-                "green": ("#7CFF6B", "#39FF14"),
-                "orange": ("#FFB000", "#FF8C00"),
+                "white": ("#39FF14", "#D8D8D8"),
+                "green": ("#FF8C00", "#39FF14"),
+                "orange": ("#D8D8D8", "#FF8C00"),
             }
             for theme, (accent, base) in palettes.items():
                 app._apply_color_theme(theme)
@@ -775,9 +865,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(entry.is_new)
             self.assertFalse(entry.unread)
             self.assertEqual(app.unread_count, 0)
-            self.assertNotEqual(entry.radio_rx_at, entry.received_at)
+            self.assertNotEqual(entry.radio_rx_at, entry.app_received_at)
+            self.assertIsNone(entry.origin_sent_at)
             self.assertIsNone(entry.local_sent_at)
-            self.assertEqual(str(widget.timestamp_label.render()), "2h")
+            self.assertEqual(str(widget.timestamp_label.render()), "RX 2h")
+            self.assertNotIn("DELAYED", str(widget.timestamp_label.render()))
             for part in parts:
                 self.assertEqual(part.visual_style.foreground.hex6, "#FF8C00")
 
@@ -847,6 +939,93 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 DeliveryState.SENT,
             )
             self.assertEqual(second_app.unread_count, 0)
+
+    async def test_history_pagination_is_bounded_and_preserves_ui_state(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        for index in range(225):
+            store.add_incoming(
+                packet_id=50_000 + index,
+                node_id="!a11ce001",
+                sender_name="Alice Trail",
+                sender_short_name="ALCE",
+                channel_index=0,
+                text=f"history {index}",
+                radio_rx_at=1_700_000_000.0 + index,
+                received_at=1_700_000_002.0 + index,
+            )
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(80, 18)) as pilot:
+            app.show_tab("chat")
+            await pilot.pause()
+            transcript = app.query_one("#chat-log", ChatTranscript)
+            control = app.query_one("#load-older", LoadOlderControl)
+            self.assertTrue(control.can_focus)
+            self.assertEqual(len(app.chat_history), 100)
+            self.assertEqual(app.chat_history[0].text, "history 125")
+            self.assertEqual(app.chat_history[-1].text, "history 224")
+            self.assertEqual(transcript.scroll_y, transcript.max_scroll_y)
+
+            transcript.scroll_to(y=20, animate=False)
+            await pilot.pause()
+            anchor = list(app.query(ChatEntryWidget))[20]
+            anchor_y = anchor.region.y
+            unread_before = app.unread_count
+            below_before = app.transcript_new_count
+
+            await app.load_older_chat_history(LoadOlderControl.Activated())
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), 150)
+            self.assertEqual(app.chat_history[0].text, "history 75")
+            self.assertAlmostEqual(anchor.region.y, anchor_y, delta=1)
+            self.assertTrue(all(not entry.unread and not entry.is_new for entry in app.chat_history[:50]))
+            self.assertEqual(app.unread_count, unread_before)
+            self.assertEqual(app.transcript_new_count, below_before)
+
+            control.focus()
+            await pilot.press("enter")
+            for _ in range(5):
+                await pilot.pause()
+                if len(app.chat_history) == 200:
+                    break
+            self.assertEqual(len(app.chat_history), 200)
+            self.assertEqual(app.chat_history[0].text, "history 25")
+            self.assertIs(app.query_one("#load-older", LoadOlderControl), control)
+
+            await app.load_older_chat_history(LoadOlderControl.Activated())
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), 225)
+            self.assertEqual(app.chat_history[0].text, "history 0")
+            self.assertEqual(len(app.query(LoadOlderControl)), 0)
+
+    async def test_current_session_new_messages_are_not_capped(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(80, 18)) as pilot:
+            app.show_tab("profile")
+            for index in range(105):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=80_000 + index,
+                        text=f"session new {index}",
+                    )
+                )
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), 105)
+            self.assertEqual(len(app.query(ChatEntryWidget)), 105)
+            self.assertEqual(app.unread_count, 105)
+            self.assertTrue(all(entry.is_new for entry in app.chat_history))
 
     async def test_smart_scroll_and_end_newest_indicator(self) -> None:
         radio = SimulatedRadioService(

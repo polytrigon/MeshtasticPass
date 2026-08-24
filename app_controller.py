@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from chat_store import StoredMessage
 from geo import distance_between
-from message_time import make_age_reference
+from message_time import make_incoming_age_reference
 from radio_service import (
     DeliveryState,
     RadioEvent,
@@ -25,10 +25,12 @@ class ChatEntry:
 
     author: str
     text: str
+    origin_sent_at: float | None
     radio_rx_at: float | None
     local_sent_at: float | None
-    received_at: float
+    app_received_at: float
     age_reference: float
+    age_is_receive_time: bool
     distance_miles: float | None = None
     outgoing: bool = False
     unread: bool = False
@@ -47,15 +49,21 @@ class ChatEntry:
 
 def received_chat_entry(
     message: ReceivedMessage,
-    received_at: float | None = None,
+    app_received_at: float | None = None,
     monotonic_now: float | None = None,
     unread: bool = False,
     is_new: bool = False,
 ) -> ChatEntry:
     """Convert an application message to display state without SDK details."""
-    local_received_at = time() if received_at is None else received_at
+    local_received_at = time() if app_received_at is None else app_received_at
     local_monotonic = monotonic() if monotonic_now is None else monotonic_now
-    valid_radio_rx_at, age_reference = make_age_reference(
+    (
+        valid_origin_sent_at,
+        valid_radio_rx_at,
+        age_reference,
+        age_is_receive_time,
+    ) = make_incoming_age_reference(
+        message.origin_sent_at,
         message.radio_rx_at,
         local_received_at,
         local_monotonic,
@@ -68,10 +76,12 @@ def received_chat_entry(
     return ChatEntry(
         author=author,
         text=message.text,
+        origin_sent_at=valid_origin_sent_at,
         radio_rx_at=valid_radio_rx_at,
         local_sent_at=None,
-        received_at=local_received_at,
+        app_received_at=local_received_at,
         age_reference=age_reference,
+        age_is_receive_time=age_is_receive_time,
         distance_miles=distance_between(
             message.local_position,
             message.sender_position,
@@ -88,21 +98,23 @@ def received_chat_entry(
 
 def outgoing_chat_entry(
     text: str,
-    received_at: float | None = None,
+    app_received_at: float | None = None,
     monotonic_now: float | None = None,
     channel_index: int = 0,
     delivery_state: DeliveryState = DeliveryState.SENDING,
 ) -> ChatEntry:
     """Create a local outgoing transcript entry before SDK completion."""
-    local_received_at = time() if received_at is None else received_at
+    local_received_at = time() if app_received_at is None else app_received_at
     local_monotonic = monotonic() if monotonic_now is None else monotonic_now
     return ChatEntry(
         author="YOU",
         text=text,
+        origin_sent_at=None,
         radio_rx_at=None,
         local_sent_at=local_received_at,
-        received_at=local_received_at,
+        app_received_at=local_received_at,
         age_reference=local_monotonic,
+        age_is_receive_time=False,
         outgoing=True,
         channel_index=channel_index,
         delivery_state=delivery_state,
@@ -139,10 +151,12 @@ def stored_chat_entry(
             or "unknown"
         ),
         text=stored.text,
+        origin_sent_at=None,
         radio_rx_at=stored.radio_rx_at,
         local_sent_at=stored.local_sent_at,
-        received_at=stored.received_at,
+        app_received_at=stored.received_at,
         age_reference=current_monotonic - initial_age,
+        age_is_receive_time=not outgoing,
         outgoing=outgoing,
         unread=False,
         is_new=False,

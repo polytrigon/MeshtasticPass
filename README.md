@@ -92,9 +92,16 @@ monitoring, CHAT storage, and the radio service close during shutdown.
 CHAT history is stored in SQLite at
 `~/.local/share/meshtasticpass/chat.db`, or under `$XDG_DATA_HOME` when that
 variable is set. The app creates the parent directory and version-1 schema on
-first launch, then loads the newest 200 PRIMARY-channel messages in
-chronological order. Historical messages load as read/normal; only messages
-received during the current process participate in NEW styling and `CHAT(n)`.
+first launch. The TUI mounts only the newest 100 PRIMARY-channel messages in
+chronological order. When older rows exist, focus `[ LOAD OLDER ]` at the top
+of CHAT and press Enter to prepend the next 50. SQLite uses the oldest loaded
+message ID as a stable cursor, never loads the whole archive for Python-side
+slicing, and removes the control after the final partial page. Prepending
+preserves the current visual reading position and does not affect `CHAT(n)` or
+the transcript's `↓ n NEW` counter. Historical messages load as read/normal;
+only messages received during the current process participate in NEW styling
+and `CHAT(n)`. Current-session NEW messages are never removed to enforce the
+100-row startup window.
 
 The `messages` table stores logical incoming/outgoing entries, packet and node
 identity, channel, text, receiver-side `radio_rx_at`, local acceptance/send
@@ -111,16 +118,39 @@ replaces a malformed database.
 
 ### CHAT age and distance metadata
 
-Relative time uses `s`, `min`, `h`, and `d`. Textual now recalculates the
-timestamp widget's layout when a value grows (for example, from `5s` to
-`5min`). Previously the formatter produced `5min`, but the old shorter widget
-width clipped the final `n` and made the screen appear to say `5mi`.
+Relative time uses compact `s`, `m`, `h`, and `d` units and refreshes in place
+once per second through one shared Textual timer. There is no per-message
+timer or widget remount. Outgoing entries show local acceptance age, such as
+`8s` or `1h 3m`.
+
+Meshtastic Python SDK 2.7.11 and its generated `MeshPacket` protobuf define
+`rxTime` as the time the connected ESP32 received the packet. The protobuf
+explicitly says this field is never sent over the radio link; the receiving
+device adds it for its phone/API client. Ordinary `TEXT_MESSAGE_APP` data is
+only the text payload and has no trustworthy sender-origin wall-clock field.
+Forwarding therefore cannot turn `rxTime` into original send time. The
+Store-and-Forward protocol is a separate `STORE_FORWARD_APP` payload and its
+replayed text field likewise supplies no sender-origin timestamp to the
+ordinary text callback used here.
+
+MeshtasticPass keeps `origin_sent_at`, `radio_rx_at`, and local application
+acceptance time (`app_received_at`) as separate concepts. `origin_sent_at` remains unset for
+ordinary text, so incoming age is labeled honestly as receiver age:
+
+```text
+Alice Trail / RX 5m / 5.1miles
+```
+
+If a future protocol provides a trustworthy origin time, the application
+model can display that age without `RX`; no current packet field is promoted
+to origin time. No speculative `DELAYED` marker is shown, and no SQLite schema
+migration was added because there is no real origin timestamp to persist.
 
 When both nodes have usable positions, an incoming header also shows the
 straight-line Haversine distance in miles:
 
 ```text
-Alice Trail / 5min / 5.1miles
+Alice Trail / RX 5m / 5.1miles
 ```
 
 `RadioService` reads the latest local and sender positions from the SDK 2.7.11
@@ -172,6 +202,13 @@ animated `SENDING...` state. `SENT` remains internal because it drives the
 ACK timeout, SQLite history, send attempts, and diagnostics, but local SDK
 acceptance is not useful as a separate user-facing delivery claim. The visible
 resolved states are `HEARD`, `UNCONFIRMED`, and `FAILED`.
+
+Delivery colors use the theme's semantic base/accent pairing: WHITE uses GREEN
+for `SENDING...` and `UNCONFIRMED`, GREEN uses ORANGE, and ORANGE uses WHITE.
+`HEARD` uses the selected base color, while `FAILED` always uses electric red
+`#FF1744`. The CHAT scrollbar follows the same live theme: its thumb uses the
+WHITE/GREEN/ORANGE base and its track uses the corresponding subdued gray,
+dark green, or dark orange.
 
 `SENDING` uses one shared UI animation timer. No state triggers an automatic
 application-level resend. To rebroadcast an `UNCONFIRMED` entry, press Escape,

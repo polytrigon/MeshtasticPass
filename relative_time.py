@@ -11,12 +11,12 @@ def format_relative_age(age_seconds: float) -> str:
 
     minutes = seconds // 60
     if minutes < 60:
-        return f"{minutes}min"
+        return f"{minutes}m"
 
     hours = minutes // 60
     remaining_minutes = minutes % 60
     if hours < 24:
-        suffix = f" {remaining_minutes}min" if remaining_minutes else ""
+        suffix = f" {remaining_minutes}m" if remaining_minutes else ""
         return f"{hours}h{suffix}"
 
     days = hours // 24

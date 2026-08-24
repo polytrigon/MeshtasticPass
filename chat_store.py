@@ -10,7 +10,8 @@ from threading import RLock
 
 
 SCHEMA_VERSION = 1
-DEFAULT_HISTORY_LIMIT = 200
+DEFAULT_HISTORY_LIMIT = 100
+OLDER_HISTORY_PAGE_SIZE = 50
 
 
 class ChatStoreError(Exception):
@@ -38,6 +39,14 @@ class StoredMessage:
 class InsertResult:
     message_id: int
     inserted: bool
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    """One bounded chronological page plus whether older rows remain."""
+
+    messages: tuple[StoredMessage, ...]
+    has_older: bool
 
 
 @dataclass(frozen=True)
@@ -222,8 +231,15 @@ class ChatStore:
         channel_index: int = 0,
         limit: int = DEFAULT_HISTORY_LIMIT,
     ) -> list[StoredMessage]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-            raise ValueError("History limit must be a positive integer.")
+        return list(self.load_recent_page(channel_index, limit).messages)
+
+    def load_recent_page(
+        self,
+        channel_index: int = 0,
+        limit: int = DEFAULT_HISTORY_LIMIT,
+    ) -> HistoryPage:
+        """Load only the newest bounded page, in chronological order."""
+        self._validate_history_limit(limit)
         try:
             with self._lock:
                 self._ensure_open()
@@ -240,11 +256,54 @@ class ChatStore:
                     )
                     ORDER BY id ASC
                     """,
-                    (channel_index, limit),
+                    (channel_index, limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load CHAT history: {error}") from error
-        return [StoredMessage(**dict(row)) for row in rows]
+        has_older = len(rows) > limit
+        selected = rows[-limit:]
+        return HistoryPage(
+            tuple(StoredMessage(**dict(row)) for row in selected),
+            has_older,
+        )
+
+    def load_older_page(
+        self,
+        before_message_id: int,
+        channel_index: int = 0,
+        limit: int = OLDER_HISTORY_PAGE_SIZE,
+    ) -> HistoryPage:
+        """Load a bounded page immediately older than a stable message ID."""
+        if (
+            isinstance(before_message_id, bool)
+            or not isinstance(before_message_id, int)
+            or before_message_id <= 0
+        ):
+            raise ValueError("Message cursor must be a positive integer.")
+        self._validate_history_limit(limit)
+        try:
+            with self._lock:
+                self._ensure_open()
+                rows = self._connection.execute(
+                    """
+                    SELECT id, direction, packet_id, node_id, sender_name,
+                        sender_short_name, channel_index, text, radio_rx_at,
+                        received_at, local_sent_at, delivery_state, created_at
+                    FROM messages
+                    WHERE channel_index = ? AND id < ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (channel_index, before_message_id, limit + 1),
+                ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(f"Could not load older CHAT history: {error}") from error
+        has_older = len(rows) > limit
+        selected = list(reversed(rows[:limit]))
+        return HistoryPage(
+            tuple(StoredMessage(**dict(row)) for row in selected),
+            has_older,
+        )
 
     def load_send_attempts(self, message_id: int) -> list[StoredSendAttempt]:
         """Return transmission attempts for one logical outgoing message."""
@@ -335,6 +394,11 @@ class ChatStore:
     def _ensure_open(self) -> None:
         if self._closed:
             raise ChatStoreError("CHAT history is closed.")
+
+    @staticmethod
+    def _validate_history_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("History limit must be a positive integer.")
 
 
 class _StoreTransaction:

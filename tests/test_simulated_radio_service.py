@@ -54,6 +54,9 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         self.assertTrue(
             all(message.radio_rx_at is not None for message in received)
         )
+        self.assertTrue(
+            all(message.origin_sent_at is None for message in received)
+        )
         self.assertEqual(received[0].local_position, SIMULATED_LOCAL_POSITION)
         self.assertIsNotNone(received[0].sender_position)
         self.assertIsNone(received[1].sender_position)
