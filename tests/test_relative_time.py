@@ -13,12 +13,13 @@ class RelativeTimeTests(unittest.TestCase):
             (0, "0s"),
             (12, "12s"),
             (59, "59s"),
-            (60, "1min"),
-            (5 * 60, "5min"),
-            (27 * 60, "27min"),
+            (60, "1m"),
+            (5 * 60, "5m"),
+            (27 * 60, "27m"),
             (60 * 60, "1h"),
-            (63 * 60, "1h 3min"),
-            ((23 * 60 + 59) * 60, "23h 59min"),
+            (63 * 60, "1h 3m"),
+            ((2 * 60 + 12) * 60, "2h 12m"),
+            ((23 * 60 + 59) * 60, "23h 59m"),
             (24 * 60 * 60, "1d"),
             ((2 * 24 + 4) * 60 * 60, "2d 4h"),
         )
@@ -30,10 +31,10 @@ class RelativeTimeTests(unittest.TestCase):
     def test_negative_age_clamps_to_zero(self) -> None:
         self.assertEqual(format_relative_age(-10), "0s")
 
-    def test_minutes_never_use_clipped_mi_abbreviation(self) -> None:
+    def test_minutes_use_single_letter_unit(self) -> None:
         for minutes in range(1, 60):
             rendered = format_relative_age(minutes * 60)
-            self.assertEqual(rendered, f"{minutes}min")
-            self.assertFalse(rendered.endswith("mi"))
+            self.assertEqual(rendered, f"{minutes}m")
+            self.assertNotIn("min", rendered)
 
-        self.assertEqual(format_relative_age(63 * 60), "1h 3min")
+        self.assertEqual(format_relative_age(63 * 60), "1h 3m")
