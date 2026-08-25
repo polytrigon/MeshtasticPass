@@ -111,6 +111,11 @@ any normal app context;
 `q` is ordinary input and is not a quit shortcut. Radio
 monitoring, CHAT storage, and the radio service close during shutdown.
 
+Incoming NEW messages stay accented until they are read. Selecting one message
+with Up/Down or the mouse acknowledges only that entry; scrolling, mounting,
+and LOAD OLDER do not. A Favorite sender keeps its Favorite author accent after
+the message's NEW-only styling is removed.
+
 The selected channel heading uses the format
 `CHAT · [ configured channel ▾ ] · ACTIVE N`. ACTIVE is a passive count of
 unique *other* nodes whose freshest trustworthy node-database `lastHeard` or
@@ -131,7 +136,7 @@ with malformed or missing activity timestamps. It initially displays
 leaving `ACTIVE 1`. This deterministic transition makes activity aging testable
 without a second radio. The primary-channel message script also deliberately
 delivers a newer receiver-timestamped packet before an older one. CHAT inserts
-the second packet into chronological position and briefly shows
+the second packet into chronological position and shows
 `1 OLDER MESSAGE RECEIVED`, so delayed ordering is visible without hardware.
 
 CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
@@ -238,10 +243,15 @@ arrival-order fallback and is not presented as an invented send time. Equal
 timestamps therefore remain stable across restarts.
 
 When a newly received timed packet sorts before the current chronological tail,
-CHAT inserts it in place and briefly shows `1 OLDER MESSAGE RECEIVED` (or the
-plural count when several arrive). The notice is per channel, uses one shared
-timer, and yields to send/history errors. Startup loading, LOAD OLDER paging,
-channel switching, duplicates, and normally ordered packets do not trigger it.
+CHAT inserts it in place and shows `1 OLDER MESSAGE RECEIVED` (or the plural
+count when several arrive). The session-only count tracks those specific older
+arrivals until each is explicitly reviewed, decrementing one-by-one as they are
+selected. It is isolated per channel, remains visible until its count reaches
+zero, and yields to send/history errors without losing pending review state.
+Startup loading, LOAD OLDER paging, duplicates, and normally ordered packets do
+not create pending older-review state; channel switching preserves each
+channel's live count. Existing broader read actions, such as leaving CHAT or
+sending, clear the affected pending entries too.
 Delayed entries keep normal NEW/unread semantics. An entry older than the
 mounted window remains safely in SQLite until LOAD OLDER reaches it; the app
 does not expand the whole archive or jump away from the user's reading position.

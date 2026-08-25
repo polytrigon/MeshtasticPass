@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from time import monotonic, time
 
@@ -15,7 +16,7 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Focus, Key
+from textual.events import Click, Focus, Key
 from textual.message import Message
 from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
@@ -74,7 +75,6 @@ ANIMATED_STATUS = {
 }
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
-OLDER_MESSAGE_NOTICE_SECONDS = 4.0
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED)
@@ -192,9 +192,10 @@ class ChannelChatState:
     mounted_target: int = DEFAULT_HISTORY_LIMIT
     open_scroll_pending: bool = False
     loaded: bool = False
-    older_message_count: int = 0
     new_message_ids: set[int] = field(default_factory=set)
     unread_message_ids: set[int] = field(default_factory=set)
+    pending_older_ids: set[tuple[str, int]] = field(default_factory=set)
+    new_below_ids: set[tuple[str, int]] = field(default_factory=set)
 
 
 class RadioMessageReceived(Message):
@@ -470,7 +471,10 @@ class ChatEntryWidget(Vertical):
     can_focus = True
 
     class SelectionChanged(Message):
-        pass
+        def __init__(self, widget: "ChatEntryWidget", selected: bool) -> None:
+            super().__init__()
+            self.widget = widget
+            self.selected = selected
 
     class UserMenuRequested(Message):
         def __init__(self, widget: "ChatEntryWidget") -> None:
@@ -584,11 +588,15 @@ class ChatEntryWidget(Vertical):
 
     def on_focus(self, _event: Focus) -> None:
         self.selection_marker.update(">")
-        self.post_message(self.SelectionChanged())
+        self.post_message(self.SelectionChanged(self, True))
 
     def on_blur(self, _event: object) -> None:
         self.selection_marker.update(" ")
-        self.post_message(self.SelectionChanged())
+        self.post_message(self.SelectionChanged(self, False))
+
+    def on_click(self, _event: Click) -> None:
+        """Give mouse selection the same acknowledgement semantics as focus."""
+        self.focus()
 
     def on_key(self, event: Key) -> None:
         if event.key == "enter" and not self.entry.outgoing:
@@ -1118,8 +1126,6 @@ class MeshtasticPassApp(App[None]):
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
         self._delivery_timer: Timer | None = None
-        self._older_notice_timer: Timer | None = None
-        self._older_notice_channel: int | None = None
         self._send_error_message = ""
         self._arrival_sequence = 0
         self._send_dot_count = 1
@@ -1203,8 +1209,6 @@ class MeshtasticPassApp(App[None]):
             self._chat_timestamp_timer.stop()
         if self._delivery_timer is not None:
             self._delivery_timer.stop()
-        if self._older_notice_timer is not None:
-            self._older_notice_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
         if self.chat_store is not None:
@@ -1632,7 +1636,7 @@ class MeshtasticPassApp(App[None]):
                 )
                 self._capture_current_channel_state()
         if is_older:
-            self._show_older_message_notice(channel_index)
+            self._show_older_message_notice(channel_index, entry)
         if not chat_is_visible:
             state.unread_count += 1
             self._recount_unread()
@@ -1675,7 +1679,8 @@ class MeshtasticPassApp(App[None]):
         state = self._ensure_channel_loaded(channel_index)
         self.current_channel_index = channel_index
         self.chat_history = state.entries
-        self.transcript_new_count = state.transcript_new_count
+        self.transcript_new_count = len(state.new_below_ids)
+        state.transcript_new_count = self.transcript_new_count
         self._has_older_history = state.has_older_history
         self._mounted_chat_target = state.mounted_target
         self._chat_open_scroll_pending = state.open_scroll_pending
@@ -1704,8 +1709,6 @@ class MeshtasticPassApp(App[None]):
     async def _switch_channel(self, channel_index: int) -> None:
         if channel_index == self.current_channel_index:
             return
-        if self._older_notice_channel == self.current_channel_index:
-            self._clear_older_message_notice(self.current_channel_index)
         if self.current_tab == "chat":
             self._mark_new_messages_read()
         self._capture_current_channel_state()
@@ -1731,7 +1734,7 @@ class MeshtasticPassApp(App[None]):
         self._update_transcript_indicator()
         self.call_after_refresh(self._jump_to_newest)
 
-        self._activate_older_notice(channel_index)
+        self._render_chat_status()
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         """Compatibility wrapper for callers that already appended an entry."""
@@ -1780,8 +1783,10 @@ class MeshtasticPassApp(App[None]):
                 old_scroll_y,
                 old_virtual_height,
             )
-        elif not older or inserted_below_view:
-            self.transcript_new_count += 1
+        elif (not older or inserted_below_view) and entry.is_new and not entry.outgoing:
+            state = self._state_for(self.current_channel_index)
+            state.new_below_ids.add(self._entry_review_identity(entry))
+            self.transcript_new_count = len(state.new_below_ids)
             self._update_transcript_indicator()
 
     def _following_chat_widget(self, insert_index: int) -> ChatEntryWidget | None:
@@ -1903,6 +1908,7 @@ class MeshtasticPassApp(App[None]):
         transcript = self.query_one("#chat-log", ChatTranscript)
         transcript.anchor()
         transcript.scroll_end(animate=False)
+        self._state_for(self.current_channel_index).new_below_ids.clear()
         self.transcript_new_count = 0
         self._update_transcript_indicator()
 
@@ -2048,6 +2054,7 @@ class MeshtasticPassApp(App[None]):
 
     def _clear_indicator_if_at_bottom(self) -> None:
         if self._is_near_chat_bottom() and self.transcript_new_count:
+            self._state_for(self.current_channel_index).new_below_ids.clear()
             self.transcript_new_count = 0
             self._update_transcript_indicator()
 
@@ -2069,18 +2076,66 @@ class MeshtasticPassApp(App[None]):
         state.unread_count = 0
 
     def _mark_new_messages_read(self) -> None:
-        state = self._state_for(self.current_channel_index)
-        found_new = False
-        for entry in self.chat_history:
-            if entry.is_new:
-                entry.is_new = False
-                if entry.message_id is not None:
-                    state.new_message_ids.discard(entry.message_id)
-                found_new = True
-        if not found_new:
+        self._mark_messages_read(
+            entry for entry in self.chat_history if entry.is_new
+        )
+
+    @staticmethod
+    def _entry_review_identity(entry: ChatEntry) -> tuple[str, int]:
+        """Return a stable session identity, preferring the persisted row ID."""
+        if entry.message_id is not None:
+            return ("message", entry.message_id)
+        return ("arrival", entry.arrival_order)
+
+    def _clear_message_read_state(self, entry: ChatEntry) -> bool:
+        """Apply the model portion of one read transition without rendering."""
+        state = self._state_for(entry.channel_index)
+        identity = self._entry_review_identity(entry)
+        changed = entry.is_new or entry.unread or identity in state.pending_older_ids
+        was_unread = entry.unread
+        entry.is_new = False
+        entry.unread = False
+        if entry.message_id is not None:
+            state.new_message_ids.discard(entry.message_id)
+            state.unread_message_ids.discard(entry.message_id)
+        state.pending_older_ids.discard(identity)
+        state.new_below_ids.discard(identity)
+        if was_unread and state.unread_count:
+            state.unread_count -= 1
+        return changed
+
+    def _finish_read_transition(self, changed_entries: list[ChatEntry]) -> None:
+        if not changed_entries:
             return
-        for widget in self.query(ChatEntryWidget):
-            widget.refresh_new_message_state()
+        changed_identity = {id(entry) for entry in changed_entries}
+        if any(
+            entry.channel_index == self.current_channel_index
+            for entry in changed_entries
+        ):
+            for widget in self.query(ChatEntryWidget):
+                if id(widget.entry) in changed_identity:
+                    widget.refresh_new_message_state()
+            state = self._state_for(self.current_channel_index)
+            self.transcript_new_count = len(state.new_below_ids)
+            state.transcript_new_count = self.transcript_new_count
+            self._update_transcript_indicator()
+            self._render_chat_status()
+        self._recount_unread()
+        self._update_tab_bar()
+
+    def _mark_message_read(self, entry: ChatEntry) -> None:
+        """Acknowledge exactly one entry selected by the user."""
+        changed = self._clear_message_read_state(entry)
+        self._finish_read_transition([entry] if changed else [])
+
+    def _mark_messages_read(self, entries: Iterable[ChatEntry]) -> None:
+        """Apply the same read transition to an existing broader read flow."""
+        changed = [
+            entry
+            for entry in entries
+            if self._clear_message_read_state(entry)
+        ]
+        self._finish_read_transition(changed)
 
     def _mark_current_channel_read_for_send(self) -> None:
         """Sending proves the current conversation was actively viewed."""
@@ -2307,8 +2362,10 @@ class MeshtasticPassApp(App[None]):
     @on(ChatEntryWidget.SelectionChanged)
     def chat_selection_changed(
         self,
-        _event: ChatEntryWidget.SelectionChanged,
+        event: ChatEntryWidget.SelectionChanged,
     ) -> None:
+        if event.selected:
+            self._mark_message_read(event.widget.entry)
         self._update_footer()
 
     def _update_footer(self) -> None:
@@ -2431,39 +2488,18 @@ class MeshtasticPassApp(App[None]):
         self._send_error_message = message
         self._render_chat_status()
 
-    def _show_older_message_notice(self, channel_index: int) -> None:
-        if channel_index != self.current_channel_index:
-            return
+    def _show_older_message_notice(
+        self,
+        channel_index: int,
+        entry: ChatEntry,
+    ) -> None:
         state = self._state_for(channel_index)
-        state.older_message_count += 1
-        self._activate_older_notice(channel_index)
-
-    def _activate_older_notice(self, channel_index: int) -> None:
-        if self._state_for(channel_index).older_message_count:
-            self._older_notice_channel = channel_index
-            if self._older_notice_timer is None:
-                self._older_notice_timer = self.set_timer(
-                    OLDER_MESSAGE_NOTICE_SECONDS,
-                    self._expire_active_older_notice,
-                    name="chat-older-message-notice",
-                )
-            else:
-                self._older_notice_timer.reset()
-                self._older_notice_timer.resume()
-        elif self._older_notice_timer is not None:
-            self._older_notice_channel = None
-            self._older_notice_timer.pause()
-        self._render_chat_status()
-
-    def _expire_active_older_notice(self) -> None:
-        channel_index = self._older_notice_channel
-        if channel_index is not None:
-            self._clear_older_message_notice(channel_index)
+        state.pending_older_ids.add(self._entry_review_identity(entry))
+        if channel_index == self.current_channel_index:
+            self._render_chat_status()
 
     def _clear_older_message_notice(self, channel_index: int) -> None:
-        self._state_for(channel_index).older_message_count = 0
-        if self._older_notice_channel == channel_index:
-            self._older_notice_channel = None
+        self._state_for(channel_index).pending_older_ids.clear()
         self._render_chat_status()
 
     def _render_chat_status(self) -> None:
@@ -2472,7 +2508,7 @@ class MeshtasticPassApp(App[None]):
             return
         widget = widgets[0]
         state = self._state_for(self.current_channel_index)
-        count = state.older_message_count
+        count = len(state.pending_older_ids)
         show_notice = not self._send_error_message and count > 0
         widget.set_class(show_notice, "older-message-notice")
         if self._send_error_message:
