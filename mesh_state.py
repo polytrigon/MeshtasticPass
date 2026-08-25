@@ -82,7 +82,7 @@ def build_display_nodes(
     *,
     now: float,
     is_favorite: Callable[[str], bool],
-    last_message_at: Mapping[str, float] = {},
+    last_message_at: Mapping[str, float] | None = None,
     max_remote_nodes: int = DEFAULT_MAX_REMOTE_NODES,
 ) -> tuple[MeshDisplayNode, ...]:
     """Rank all known nodes and return YOU plus the top `max_remote_nodes`.
@@ -101,6 +101,7 @@ def build_display_nodes(
     only via the node database) today; "relay" is reserved so a future
     trustworthy data source can populate it without a model change.
     """
+    last_message_at = last_message_at or {}
     local: NodeMetadata | None = None
     displays: list[MeshDisplayNode] = []
     seen: set[str] = set()

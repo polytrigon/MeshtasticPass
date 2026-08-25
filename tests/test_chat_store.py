@@ -283,6 +283,171 @@ class ChatStoreTests(unittest.TestCase):
 
         self.assertEqual(self.path.read_bytes(), original)
 
+    def test_latest_incoming_message_at_picks_newest_across_channels(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="early",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=1,
+            text="later, different channel",
+            radio_rx_at=500.0,
+            received_at=500.0,
+        )
+        result = self.store.latest_incoming_message_at()
+        self.assertEqual(result["!a11ce001"], 500.0)
+
+    def test_latest_incoming_message_at_excludes_outgoing(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        self.store.add_outgoing(
+            text="a much later reply",
+            channel_index=0,
+            local_sent_at=9_999.0,
+            delivery_state="SENDING",
+        )
+        result = self.store.latest_incoming_message_at()
+        self.assertEqual(result, {"!a11ce001": 100.0})
+
+    def test_delayed_out_of_order_insertion_resolves_by_truthful_timestamp(
+        self,
+    ) -> None:
+        """A message inserted LAST can still carry the OLDEST timestamp, and
+
+        vice versa; the result must reflect true timestamp order, not
+        insertion/row order.
+        """
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="arrives first, timestamped later",
+            radio_rx_at=900.0,
+            received_at=900.0,
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="arrives second, but an older delayed packet",
+            radio_rx_at=200.0,
+            received_at=950.0,
+        )
+        result = self.store.latest_incoming_message_at()
+        self.assertEqual(result["!a11ce001"], 900.0)
+
+    def test_origin_sent_at_takes_precedence_over_radio_rx_at(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            origin_sent_at=50.0,
+        )
+        result = self.store.latest_incoming_message_at()
+        self.assertEqual(result["!a11ce001"], 50.0)
+
+    def test_untimed_incoming_messages_are_excluded_not_guessed(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!untimed001",
+            sender_name="Untimed",
+            sender_short_name="UT",
+            channel_index=0,
+            text="no trustworthy timestamp",
+            radio_rx_at=None,
+            received_at=100.0,
+        )
+        result = self.store.latest_incoming_message_at()
+        self.assertNotIn("!untimed001", result)
+
+    def test_node_id_lookup_is_case_insensitive(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!A11CE001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        result = self.store.latest_incoming_message_at()
+        self.assertEqual(result, {"!a11ce001": 100.0})
+
+    def test_latest_incoming_message_at_survives_reopening_the_store(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="a week ago",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        self.store.close()
+        self.store = ChatStore.open(self.path)
+        result = self.store.latest_incoming_message_at()
+        self.assertEqual(result, {"!a11ce001": 100.0})
+
+    def test_latest_incoming_message_at_query_uses_index_not_a_full_scan(
+        self,
+    ) -> None:
+        for index in range(50):
+            self.store.add_incoming(
+                packet_id=index,
+                node_id=f"!n{index % 5:07x}",
+                sender_name="X",
+                sender_short_name="X",
+                channel_index=index % 3,
+                text="m",
+                radio_rx_at=float(index),
+                received_at=float(index),
+            )
+        # pylint: disable=protected-access
+        plan = self.store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT LOWER(node_id) AS node_id,
+                   MAX(COALESCE(origin_sent_at, radio_rx_at)) AS message_time
+            FROM messages
+            WHERE direction = 'incoming'
+                AND node_id IS NOT NULL
+                AND COALESCE(origin_sent_at, radio_rx_at) IS NOT NULL
+            GROUP BY LOWER(node_id)
+            """
+        ).fetchall()
+        detail = " ".join(str(row["detail"]) for row in plan)
+        self.assertIn("USING INDEX incoming_node_message_time", detail)
+        self.assertNotIn("SCAN messages", detail)
+
 
 if __name__ == "__main__":
     unittest.main()

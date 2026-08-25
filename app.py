@@ -2475,13 +2475,28 @@ class MeshtasticPassApp(App[None]):
         selectors[0].set_suffix(f"· ACTIVE {value}")
 
     def _mesh_last_message_activity(self) -> dict[str, float]:
-        """Most recent received-message timestamp per node, across all channels.
+        """Most recent trustworthy incoming-message timestamp per node.
 
         Distinct from RadioService's `lastHeard` (passive node-database
-        sync): this is specifically trustworthy CHAT receive activity, used
-        for MESH's 24h/48h freshness classification and working-set ranking.
+        sync): this is specifically CHAT receive activity, used for MESH's
+        24h/48h freshness classification and working-set ranking.
+
+        Persisted CHAT history is authoritative, not whatever bounded page
+        happens to be mounted in memory: a node's last message may be far
+        older than the currently loaded window, or from before the app was
+        last restarted, and must still count. In-memory channel state is
+        merged on top of the persisted baseline -- both sources only ever
+        contribute a per-node maximum, never a sum, so merging cannot
+        double-count -- because a just-received message reaches this method
+        (via _refresh_mesh) before its own persistence write completes; see
+        _accept_received_message, which refreshes MESH before persisting.
         """
         activity: dict[str, float] = {}
+        if self.chat_store is not None:
+            try:
+                activity.update(self.chat_store.latest_incoming_message_at())
+            except ChatStoreError:
+                pass
         for state in self._channel_states.values():
             for entry in state.entries:
                 if entry.outgoing or not entry.node_id:
@@ -2489,13 +2504,10 @@ class MeshtasticPassApp(App[None]):
                 key = entry.node_id.strip().lower()
                 if not key:
                     continue
-                # entry.age_reference is on the monotonic clock (CHAT's own
-                # relative-age math); MESH needs a wall-clock timestamp to
-                # compare against time.time(), so use the same trustworthy
-                # wall-clock precedence make_incoming_age_reference() used.
-                timestamp = (
-                    entry.origin_sent_at or entry.radio_rx_at or entry.app_received_at
-                )
+                # Matches StoredMessage.message_time's incoming precedence:
+                # no receipt-time fallback, so in-memory and persisted
+                # activity resolve by the same truthful message clock.
+                timestamp = entry.origin_sent_at or entry.radio_rx_at
                 if timestamp is None:
                     continue
                 if key not in activity or timestamp > activity[key]:

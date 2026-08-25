@@ -27,6 +27,7 @@ from app import (
     _render_mesh_canvas,
 )
 from app_settings import AppSettings
+from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
 from geo import GeoPosition
 from mesh_state import DEFAULT_MAX_REMOTE_NODES
 from mesh_topology import (
@@ -475,6 +476,162 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             config_path=root / "config.json",
             profile_path=root / "terminal.conf",
         )
+
+    async def test_message_older_than_mounted_chat_window_still_influences_mesh(
+        self,
+    ) -> None:
+        """A node's true last-message time must count even when CHAT's
+
+        bounded history window never loaded that old message into memory.
+        """
+        root = Path(self.temporary_directory.name)
+        db_path = root / "chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 30 * 24 * 60 * 60  # a month ago
+
+        store = ChatStore.open(db_path)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="a message from a month ago",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        for index in range(DEFAULT_HISTORY_LIMIT):
+            store.add_incoming(
+                packet_id=1000 + index,
+                node_id="!f177e001",
+                sender_name="Filler",
+                sender_short_name="FIL",
+                channel_index=0,
+                text=f"filler {index}",
+                radio_rx_at=now - index,
+                received_at=now - index,
+            )
+        store.close()
+
+        store = ChatStore.open(db_path)
+        self.addCleanup(store.close)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            # Confirm the old message genuinely fell outside CHAT's mounted
+            # window -- otherwise this test would not be exercising anything.
+            mounted_ids = {
+                entry.node_id for entry in app.chat_history if entry.node_id
+            }
+            self.assertNotIn("!a11ce001", mounted_ids)
+
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity["!a11ce001"], old_timestamp)
+
+            await pilot.press("4")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            alice = next(
+                widget
+                for widget in app.query(MeshNodeWidget)
+                if widget.node.node_id == "!a11ce001"
+            )
+            self.assertEqual(alice.display_node.last_message_at, old_timestamp)
+            self.assertEqual(alice.display_node.recency_bucket, "very_stale")
+
+    async def test_message_activity_survives_a_fresh_app_instance(self) -> None:
+        """Simulates a process restart: a new ChatStore/App reading the same
+
+        database file must still see message activity from "before".
+        """
+        root = Path(self.temporary_directory.name)
+        db_path = root / "restart_chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 10 * 24 * 60 * 60
+
+        first_process_store = ChatStore.open(db_path)
+        first_process_store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="before restart",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        first_process_store.close()
+
+        second_process_store = ChatStore.open(db_path)
+        self.addCleanup(second_process_store.close)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=second_process_store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity["!a11ce001"], old_timestamp)
+
+    async def test_mesh_query_does_not_mass_load_chat_history(self) -> None:
+        root = Path(self.temporary_directory.name)
+        db_path = root / "bounded_chat.db"
+        store = ChatStore.open(db_path)
+        for index in range(300):
+            store.add_incoming(
+                packet_id=index,
+                node_id=f"!n{index % 10:07x}",
+                sender_name="X",
+                sender_short_name="X",
+                channel_index=0,
+                text="m",
+                radio_rx_at=float(index),
+                received_at=float(index),
+            )
+        self.addCleanup(store.close)
+        calls = {"recent": 0, "older": 0}
+        original_recent = store.load_recent_page
+        original_older = store.load_older_page
+
+        def spy_recent(*args, **kwargs):
+            calls["recent"] += 1
+            return original_recent(*args, **kwargs)
+
+        def spy_older(*args, **kwargs):
+            calls["older"] += 1
+            return original_older(*args, **kwargs)
+
+        store.load_recent_page = spy_recent
+        store.load_older_page = spy_older
+
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            calls_before_query = dict(calls)
+            activity = app._mesh_last_message_activity()
+            # The aggregated per-node query must not trigger any additional
+            # bulk page load beyond whatever CHAT itself already did on mount.
+            self.assertEqual(calls, calls_before_query)
+            self.assertEqual(len(activity), 10)
+
+    async def test_outgoing_messages_never_count_as_mesh_activity(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accepted_send("hello from me")
+            await pilot.pause()
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity, {})
 
     async def test_tab_renders_bounded_working_set_and_shared_local_menu(self) -> None:
         radio = SimulatedRadioService(
