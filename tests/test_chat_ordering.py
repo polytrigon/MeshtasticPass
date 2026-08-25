@@ -53,7 +53,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
             channel_index=channel_index,
         )
 
-    async def test_live_delayed_packet_reorders_and_accumulates_one_notice_timer(self) -> None:
+    async def test_live_delayed_packet_reorders_and_notice_tracks_pending_review(self) -> None:
         self.settings.set_favorite("!a11ce001", True)
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 22)) as pilot:
@@ -89,15 +89,11 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
                 app._apply_color_theme(theme)
                 await pilot.pause()
                 self.assertEqual(status.visual_style.foreground.hex6, accent)
-            self.assertEqual(
-                len(
-                    [
-                        timer
-                        for timer in app._timers
-                        if timer.name == "chat-older-message-notice"
-                    ]
-                ),
-                1,
+            self.assertFalse(
+                any(
+                    timer.name == "chat-older-message-notice"
+                    for timer in app._timers
+                )
             )
 
             app.show_tab("chat")
@@ -105,6 +101,11 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(entry.is_new for entry in app.chat_history))
             first_widget = list(app.query(ChatEntryWidget))[0]
             first_widget.focus()
+            await pilot.pause()
+            self.assertFalse(first_widget.entry.is_new)
+            self.assertFalse(first_widget.has_class("new-message"))
+            self.assertTrue(first_widget.has_class("favorite-sender"))
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(len(app.query(ViewportMenu)), 1)
@@ -219,6 +220,32 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
                 "↓ 1 NEW",
             )
 
+            app._accept_received_message(
+                self.message(4598, "older above", self.base_time + 0.5)
+            )
+            await pilot.pause()
+            above = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.entry.text == "older above"
+            )
+            above.focus()
+            await pilot.pause()
+            self.assertEqual(app.transcript_new_count, 1)
+
+            below = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.entry.text == "older but below"
+            )
+            below.focus()
+            await pilot.pause()
+            self.assertEqual(app.transcript_new_count, 0)
+            self.assertEqual(
+                str(app.query_one("#chat-new-below", Static).render()),
+                "",
+            )
+
     async def test_delayed_insert_respects_default_mounted_cap(self) -> None:
         store = ChatStore.open(self.db_path)
         for index in range(100):
@@ -287,8 +314,180 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(loaded.is_new)
             self.assertTrue(loaded.unread)
+            self.assertEqual(
+                str(app.query_one("#send-error", Static).render()),
+                "1 OLDER MESSAGE RECEIVED",
+            )
             ids = [entry.message_id for entry in app.chat_history]
             self.assertEqual(len(ids), len(set(ids)))
+
+            loaded_widget = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.entry is loaded
+            )
+            loaded_widget.focus()
+            await pilot.pause()
+            self.assertFalse(loaded.is_new)
+            self.assertEqual(str(app.query_one("#send-error", Static).render()), "")
+
+    async def test_keyboard_selection_acknowledges_only_selected_older_messages(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            for packet_id, text, offset in (
+                (7001, "newest", 400),
+                (7002, "older one", 300),
+                (7003, "older two", 200),
+                (7004, "older three", 100),
+            ):
+                app._accept_received_message(
+                    self.message(packet_id, text, self.base_time + offset)
+                )
+            app.show_tab("chat")
+            await pilot.pause()
+            status = app.query_one("#send-error", Static)
+            self.assertEqual(str(status.render()), "3 OLDER MESSAGES RECEIVED")
+            widgets = list(app.query(ChatEntryWidget))
+
+            widgets[0].focus()
+            await pilot.pause()
+            self.assertFalse(widgets[0].entry.is_new)
+            self.assertTrue(all(widget.entry.is_new for widget in widgets[1:]))
+            self.assertEqual(str(status.render()), "2 OLDER MESSAGES RECEIVED")
+            self.assertEqual(
+                widgets[0].timestamp_label.visual_style.foreground.hex6,
+                "#565656",
+            )
+            self.assertEqual(
+                widgets[0].query_one(".chat-entry-author", Static)
+                .visual_style.foreground.hex6,
+                "#D8D8D8",
+            )
+
+            widgets[1].focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+            widgets[2].focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "")
+            self.assertTrue(widgets[3].entry.is_new)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(len(app.query(ViewportMenu)), 1)
+
+    async def test_mouse_selection_matches_keyboard_without_scroll_acknowledgement(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 18)) as pilot:
+            app.show_tab("chat")
+            for index in range(20):
+                app._accept_received_message(
+                    self.message(
+                        7100 + index,
+                        f"message {index}",
+                        self.base_time + index,
+                    )
+                )
+            await pilot.pause()
+            transcript = app.query_one(ChatTranscript)
+            transcript.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            transcript.scroll_to(y=4, animate=False)
+            await pilot.pause()
+            target = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.region.y >= transcript.region.y
+                and widget.region.bottom <= transcript.region.bottom
+            )
+            self.assertTrue(target.entry.is_new)
+            self.assertTrue(target.has_class("new-message"))
+
+            clicked = await pilot.click(target.message_label)
+            await pilot.pause()
+            self.assertTrue(clicked)
+            self.assertFalse(target.entry.is_new)
+            self.assertFalse(target.has_class("new-message"))
+
+    async def test_unrelated_selection_and_dedup_do_not_change_older_pending(self) -> None:
+        store = ChatStore.open(self.db_path)
+        store.add_incoming(
+            packet_id=7199,
+            node_id="!history",
+            sender_name="History",
+            sender_short_name="HIST",
+            channel_index=0,
+            text="historical",
+            radio_rx_at=self.base_time - 100,
+            received_at=self.base_time - 99,
+        )
+        app = MeshtasticPassApp(
+            self.radio(),
+            self.settings,
+            chat_store=store,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app._accept_received_message(
+                self.message(7201, "newer", self.base_time + 200)
+            )
+            app._accept_received_message(
+                self.message(7202, "older", self.base_time + 100)
+            )
+            app._accept_received_message(
+                self.message(7202, "older duplicate", self.base_time + 100)
+            )
+            app.show_tab("chat")
+            await pilot.pause()
+            status = app.query_one("#send-error", Static)
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+            widgets = list(app.query(ChatEntryWidget))
+
+            historical = next(
+                widget for widget in widgets if widget.entry.text == "historical"
+            )
+            historical.focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+
+            newest = next(widget for widget in widgets if widget.entry.text == "newer")
+            newest.focus()
+            await pilot.pause()
+            self.assertFalse(newest.entry.is_new)
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+
+            app._accepted_send("local message")
+            await pilot.pause()
+            outgoing = list(app.query(ChatEntryWidget))[-1]
+            app._accept_received_message(
+                self.message(7203, "another older", self.base_time + 50)
+            )
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+            outgoing.focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+
+    async def test_bulk_read_clears_pending_older_review(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 22)) as pilot:
+            app._accept_received_message(
+                self.message(7301, "newer", self.base_time + 200)
+            )
+            app._accept_received_message(
+                self.message(7302, "older", self.base_time + 100)
+            )
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertEqual(
+                str(app.query_one("#send-error", Static).render()),
+                "1 OLDER MESSAGE RECEIVED",
+            )
+
+            app.show_tab("connection")
+            await pilot.pause()
+            self.assertFalse(any(entry.is_new for entry in app.chat_history))
+            self.assertFalse(app._state_for(0).pending_older_ids)
+            self.assertEqual(str(app.query_one("#send-error", Static).render()), "")
 
     async def test_delayed_notice_and_order_are_isolated_per_channel(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
@@ -320,9 +519,17 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
                 [entry.text for entry in app.chat_history],
                 ["channel one older", "channel one newer"],
             )
-            self.assertEqual(str(app.query_one("#send-error", Static).render()), "")
+            self.assertEqual(
+                str(app.query_one("#send-error", Static).render()),
+                "1 OLDER MESSAGE RECEIVED",
+            )
             await app._switch_channel(0)
             self.assertEqual(str(app.query_one("#send-error", Static).render()), "")
+            await app._switch_channel(1)
+            self.assertEqual(
+                str(app.query_one("#send-error", Static).render()),
+                "1 OLDER MESSAGE RECEIVED",
+            )
 
 
 if __name__ == "__main__":
