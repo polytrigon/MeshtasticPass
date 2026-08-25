@@ -1,10 +1,11 @@
-"""Pure and headless tests for MESH: pure grid geometry plus the fixed
+"""Pure and headless tests for MESH: pure grid geometry, the real passive
 
-three-node (YOU/ALICE/BOB) interaction fixture that is the current,
-deliberately minimal MESH board. See app.py's module comment above
-MESH_GRID_ROWS for what this fixture intentionally does not yet do
-(ranking, staleness, favorites, real relay/message classification,
-dynamic geography, scrolling).
+working-set/role/staleness model (mesh_state.py), and the fixed-grid
+board that renders it. See app.py's module comment above MESH_GRID_ROWS
+and mesh_state.py's module docstring for what remains deliberately out
+of scope (Favorites, dynamic node-count growth beyond the bounded
+working set, scrolling, and RELAY inference from anything but
+trustworthy per-packet relay evidence, which this app does not have).
 """
 
 from __future__ import annotations
@@ -19,60 +20,64 @@ from textual.containers import ScrollableContainer
 
 from app import (
     CIRCLE_SOLID_LARGE,
+    CIRCLE_STROKED_LARGE,
     DOT_GRID_GLYPH,
     DOT_GRID_SPACING_X,
     DOT_GRID_SPACING_Y,
-    MESH_FIXTURE_CONNECTORS,
-    MESH_FIXTURE_CONTEXT_LABELS,
-    MESH_FIXTURE_CONTEXTS,
-    MESH_FIXTURE_NODES,
     MESH_GRID_CENTER_COLUMN,
     MESH_GRID_CENTER_ROW,
     MESH_GRID_COLUMNS,
     MESH_GRID_ROWS,
     MESH_SELECTED_GLYPH_WIDTH,
-    MESH_STALE_THRESHOLD_SECONDS,
     MeshCanvas,
-    MeshFixtureContext,
-    MeshFixtureNode,
     MeshNodeLabelWidget,
     MeshNodeWidget,
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
-    _mesh_context_line,
-    _mesh_fixture_directional_target,
-    _mesh_glyph_is_solid,
-    _mesh_glyph_is_solid_for_context,
+    _mesh_directional_target,
     _mesh_grid_pixel,
     _mesh_node_color,
     _mesh_translated_positions,
     _render_mesh_canvas,
 )
 from app_settings import AppSettings
+from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
 from geo import GeoPosition
+from mesh_state import (
+    DEFAULT_MAX_REMOTE_NODES,
+    MESH_STALE_THRESHOLD_SECONDS,
+    MeshNodeState,
+    build_mesh_working_set,
+    format_mesh_context_line,
+)
 from mesh_topology import (
+    DEFAULT_MAX_GRID_RADIUS,
     HORIZONTAL_GAP,
     NODE_HEIGHT,
     NODE_WIDTH,
+    assign_grid_slots,
     build_topology,
     compact_node_label,
     directional_target,
+    place_within_bounds,
     route_connector,
 )
 import mesh_topology as mesh_topology_module
 from radio_service import NodeMetadata
-from simulated_radio_service import SimulatedRadioService
+from simulated_radio_service import (
+    SIMULATED_LOCAL_POSITION,
+    SIMULATED_MESSAGES,
+    SIMULATED_NODES,
+    SimulatedRadioService,
+)
 from theme_palette import THEME_PALETTES
 
 
 LOCAL_GEO = GeoPosition(0.0, 0.0)
 _MILES_PER_DEGREE_AT_EQUATOR = 69.0
 
-YOU_ID = "!you"
-ALICE_ID = "!alice"
-BOB_ID = "!bob"
-NINE_A4B_ID = "!9a4b"
+YOU = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=LOCAL_GEO)
 
 
 def west_of_local(miles: float) -> GeoPosition:
@@ -112,16 +117,6 @@ def offset_xy(widget) -> tuple[int, int]:
     return (int(offset.x.value), int(offset.y.value))
 
 
-def expected_widget_offset(row: int, column: int, label: str) -> tuple[int, int]:
-    """The widget-box offset that centers `label` over the grid point,
-
-    mirroring MeshTopologyView.render_fixture's own placement formula.
-    """
-    grid_x, grid_y = _mesh_grid_pixel(row, column)
-    width = max(1, cell_len(label))
-    return (grid_x - width // 2, grid_y - 1)
-
-
 def glyph_screen_position(widget) -> tuple[int, int]:
     """The glyph's own anchor (x, y): the center column of its box.
 
@@ -134,6 +129,14 @@ def glyph_screen_position(widget) -> tuple[int, int]:
     offset_x, offset_y = offset_xy(widget)
     width = int(widget.styles.width.value)
     return (offset_x + width // 2, offset_y)
+
+
+def client_state(
+    node: NodeMetadata, *, last_interaction_at: float | None, is_relay: bool = False
+) -> MeshNodeState:
+    return MeshNodeState(
+        node=node, is_client=True, is_relay=is_relay, last_interaction_at=last_interaction_at
+    )
 
 
 class MeshTopologyModelTests(unittest.TestCase):
@@ -519,1216 +522,715 @@ class MeshCanvasRenderTests(unittest.TestCase):
         self.assertFalse(MeshCanvas.can_focus)
 
 
-class MeshFixtureModelTests(unittest.TestCase):
-    """Pure tests of the fixed 8x21 grid and its three-node fixture, with no
+class MeshGridPlacementTests(unittest.TestCase):
+    """Pure tests for assign_grid_slots()/place_within_bounds(): the shared
 
-    running app: grid dimensions, logical positions, and the whole-mesh
-    translation/recentering math from the exact worked examples in spec.
+    geometry MESH now uses to place a real, bounded working set on its
+    fixed grid.
     """
 
-    def test_grid_is_exactly_eight_rows_by_twenty_one_columns(self) -> None:
-        self.assertEqual(MESH_GRID_ROWS, 8)
-        self.assertEqual(MESH_GRID_COLUMNS, 21)
+    def test_assign_grid_slots_places_local_at_origin(self) -> None:
+        slots = assign_grid_slots([YOU])
+        self.assertEqual(len(slots), 1)
+        self.assertEqual((slots[0].x, slots[0].y), (0, 0))
+        self.assertEqual(slots[0].region, "LOCAL")
 
-    def test_center_position_is_row_five_column_eleven(self) -> None:
-        self.assertEqual(MESH_GRID_CENTER_ROW, 5)
-        self.assertEqual(MESH_GRID_CENTER_COLUMN, 11)
-
-    def test_you_fixed_logical_position_is_row_five_column_eleven(self) -> None:
-        you = next(node for node in MESH_FIXTURE_NODES if node.node_id == YOU_ID)
-        self.assertEqual((you.row, you.column), (5, 11))
-        self.assertTrue(you.is_local)
-
-    def test_alice_fixed_logical_position_is_row_four_column_ten(self) -> None:
-        alice = next(node for node in MESH_FIXTURE_NODES if node.node_id == ALICE_ID)
-        self.assertEqual((alice.row, alice.column), (4, 10))
-        self.assertFalse(alice.is_local)
-
-    def test_bob_is_two_columns_left_and_one_row_down_from_alice(self) -> None:
-        alice = next(node for node in MESH_FIXTURE_NODES if node.node_id == ALICE_ID)
-        bob = next(node for node in MESH_FIXTURE_NODES if node.node_id == BOB_ID)
-        self.assertEqual(bob.row, alice.row + 1)
-        self.assertEqual(bob.column, alice.column - 2)
-        self.assertEqual((bob.row, bob.column), (5, 8))
-        self.assertFalse(bob.is_local)
-
-    def test_9a4b_is_two_columns_left_and_two_rows_down_from_you(self) -> None:
-        you = next(node for node in MESH_FIXTURE_NODES if node.node_id == YOU_ID)
-        nine_a4b = next(
-            node for node in MESH_FIXTURE_NODES if node.node_id == NINE_A4B_ID
+    def test_place_within_bounds_centers_local_at_the_given_center(self) -> None:
+        slots = assign_grid_slots([YOU])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
         )
-        self.assertEqual(nine_a4b.row, you.row + 2)
-        self.assertEqual(nine_a4b.column, you.column - 2)
-        self.assertEqual((nine_a4b.row, nine_a4b.column), (7, 9))
-        self.assertFalse(nine_a4b.is_local)
+        self.assertEqual(positions["!you"], (5, 11))
 
-    def test_exactly_four_fixture_nodes_exist(self) -> None:
-        self.assertEqual(len(MESH_FIXTURE_NODES), 4)
-
-    def test_client_role_glyph_is_solid_relay_only_is_stroked(self) -> None:
-        """General rule (not an ALICE-specific exception): CLIENT and
-
-        CLIENT+RELAY both render solid; only RELAY-with-no-CLIENT would
-        render stroked. YOU has no observed role and is always solid.
-        """
-        self.assertTrue(_mesh_glyph_is_solid(YOU_ID, is_local=True))
-        # ALICE: CLIENT+RELAY -> solid (CLIENT takes priority over RELAY).
-        self.assertTrue(MESH_FIXTURE_CONTEXTS[ALICE_ID].is_client)
-        self.assertTrue(MESH_FIXTURE_CONTEXTS[ALICE_ID].is_relay)
-        self.assertTrue(_mesh_glyph_is_solid(ALICE_ID, is_local=False))
-        # BOB: CLIENT only -> solid.
-        self.assertTrue(_mesh_glyph_is_solid(BOB_ID, is_local=False))
-        # 9A4B: CLIENT only (stale) -> solid.
-        self.assertTrue(_mesh_glyph_is_solid(NINE_A4B_ID, is_local=False))
-
-    def test_relay_only_role_renders_stroked(self) -> None:
-        """No current fixture node is RELAY-only, so this proves the rule
-
-        directly against a synthetic RELAY-only context rather than
-        smuggling in a new board node just to exercise this branch.
-        """
-        relay_only = MeshFixtureContext(
-            is_client=False, is_relay=True, hops=2, last_interaction_seconds=60
+    def test_place_within_bounds_keeps_a_far_node_inside_the_grid(self) -> None:
+        far_east = NodeMetadata("!far", "Far", position=east_of_local(500))
+        slots = assign_grid_slots([YOU, far_east], max_radius=DEFAULT_MAX_GRID_RADIUS)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
         )
-        self.assertFalse(_mesh_glyph_is_solid_for_context(relay_only))
+        row, column = positions["!far"]
+        self.assertTrue(1 <= row <= 8)
+        self.assertTrue(1 <= column <= 21)
 
-    def test_fixture_labels_are_you_alice_bob_9a4b(self) -> None:
-        by_id = {node.node_id: node for node in MESH_FIXTURE_NODES}
-        self.assertEqual(by_id[YOU_ID].label, "YOU")
-        self.assertEqual(by_id[ALICE_ID].label, "ALICE")
-        self.assertEqual(by_id[BOB_ID].label, "Bob")
-        self.assertEqual(by_id[NINE_A4B_ID].label, "9A4B")
+    def test_place_within_bounds_never_overlaps_under_collision_pressure(self) -> None:
+        """Cram many nodes into the same compass direction so the shared,
 
-    def test_context_labels_are_you_alice_bob_9a4b(self) -> None:
-        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[YOU_ID], "YOU")
-        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[ALICE_ID], "ALICE")
-        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[BOB_ID], "BOB")
-        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[NINE_A4B_ID], "9A4B")
-
-    def test_you_selected_leaves_positions_untranslated(self) -> None:
-        positions = _mesh_translated_positions(YOU_ID)
-        self.assertEqual(positions[YOU_ID], (5, 11))
-        self.assertEqual(positions[ALICE_ID], (4, 10))
-        self.assertEqual(positions[BOB_ID], (5, 8))
-        self.assertEqual(positions[NINE_A4B_ID], (7, 9))
-
-    def test_alice_selected_recenters_alice_and_shifts_others_by_the_same_delta(
-        self,
-    ) -> None:
-        """The exact worked example: ALICE -> (5,11), YOU -> (6,12)."""
-        positions = _mesh_translated_positions(ALICE_ID)
-        self.assertEqual(positions[ALICE_ID], (5, 11))
-        self.assertEqual(positions[YOU_ID], (6, 12))
-        self.assertEqual(positions[BOB_ID], (6, 9))
-        self.assertEqual(positions[NINE_A4B_ID], (8, 10))
-
-    def test_9a4b_selected_recenters_9a4b_and_shifts_others_by_the_same_delta(
-        self,
-    ) -> None:
-        """Selecting 9A4B recenters the mesh exactly like selecting any
-
-        other node: 9A4B -> (5,11), and YOU/ALICE/BOB shift by the same
-        (row -2, column +2) delta.
+        unbounded collision-avoidance (_reserve_slot) would want to push
+        several of them past this fixed board's edge -- place_within_bounds
+        must still land every one in-bounds and collision-free.
         """
-        positions = _mesh_translated_positions(NINE_A4B_ID)
-        self.assertEqual(positions[NINE_A4B_ID], (5, 11))
-        self.assertEqual(positions[YOU_ID], (3, 13))
-        self.assertEqual(positions[ALICE_ID], (2, 12))
-        self.assertEqual(positions[BOB_ID], (3, 10))
+        nodes = [YOU] + [
+            NodeMetadata(f"!s{index:02x}", f"South{index}", position=south_of_local(index + 1))
+            for index in range(10)
+        ]
+        slots = assign_grid_slots(nodes, max_radius=3)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        self.assertEqual(len(positions), len(nodes))
+        self.assertEqual(len(positions), len(set(positions.values())))
+        for row, column in positions.values():
+            self.assertTrue(1 <= row <= 8)
+            self.assertTrue(1 <= column <= 21)
 
-    def test_9a4b_relationship_to_you_is_invariant_under_recentering(self) -> None:
-        """Whichever node is selected, 9A4B must stay exactly 2 columns
+    def test_place_within_bounds_is_deterministic_and_order_independent(self) -> None:
+        nodes = [
+            YOU,
+            NodeMetadata("!a", "A", position=north_of_local(2)),
+            NodeMetadata("!b", "B", position=north_of_local(5)),
+            NodeMetadata("!c", "C"),
+        ]
+        forward = place_within_bounds(
+            assign_grid_slots(nodes),
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+        )
+        backward = place_within_bounds(
+            assign_grid_slots(list(reversed(nodes))),
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(forward, backward)
 
-        left and 2 rows down from YOU -- the defining relationship must
-        survive whole-mesh translation, not just hold in the untranslated
-        fixture.
+
+class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
+    """Pure tests for app.py's generic (not fixture-specific) whole-mesh
+
+    translation and arrow-navigation helpers, now parametrized by
+    whatever working set/base positions the live model produces.
+    """
+
+    def test_translate_shifts_every_node_by_the_identical_delta(self) -> None:
+        base = {"!you": (5, 11), "!a": (4, 10), "!b": (6, 9)}
+        translated = _mesh_translated_positions(base, "!a")
+        self.assertEqual(translated["!a"], (5, 11))
+        row_delta, column_delta = 5 - 4, 11 - 10
+        self.assertEqual(translated["!you"], (5 + row_delta, 11 + column_delta))
+        self.assertEqual(translated["!b"], (6 + row_delta, 9 + column_delta))
+
+    def test_translate_with_unresolvable_selection_is_a_no_op(self) -> None:
+        base = {"!you": (5, 11)}
+        self.assertEqual(_mesh_translated_positions(base, "!missing"), base)
+
+    def test_directional_target_picks_the_nearest_candidate(self) -> None:
+        """No hardcoded node IDs: the same general nearest-candidate rule
+
+        used by mesh_topology.directional_target, just fed the current
+        working set's own positions.
         """
-        for reference_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
-            positions = _mesh_translated_positions(reference_id)
-            you_row, you_col = positions[YOU_ID]
-            nine_a4b_row, nine_a4b_col = positions[NINE_A4B_ID]
-            with self.subTest(selected=reference_id):
-                self.assertEqual(nine_a4b_row, you_row + 2)
-                self.assertEqual(nine_a4b_col, you_col - 2)
-
-    def test_translation_is_a_pure_whole_mesh_shift(self) -> None:
-        """Every node moves by the identical row/column delta -- relative
-
-        geometry between all four nodes never changes, regardless of
-        which node is selected.
-        """
-        for reference_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
-            you_selected = _mesh_translated_positions(YOU_ID)
-            other_selected = _mesh_translated_positions(reference_id)
-            you_row, you_col = you_selected[YOU_ID]
-            ref_row, ref_col = you_selected[reference_id]
-            you_row2, you_col2 = other_selected[YOU_ID]
-            ref_row2, ref_col2 = other_selected[reference_id]
-            with self.subTest(selected=reference_id):
-                self.assertEqual(
-                    (you_row - ref_row, you_col - ref_col),
-                    (you_row2 - ref_row2, you_col2 - ref_col2),
-                )
-
-    def test_directional_target_from_you_moving_left_is_alice(self) -> None:
-        """ALICE (4,10) is diagonally closer to YOU (5,11) than BOB (5,8),
-
-        which sits on YOU's own row with zero vertical deviation but much
-        farther away. mesh_topology.directional_target ranks candidates by
-        actual distance first (direction-purity only breaks ties), so LEFT
-        from YOU reaches the nearer ALICE, not the farther but axis-aligned
-        BOB. This is the general spatial rule applied faithfully to this
-        fixture's geometry, not a hardcoded key map.
-        """
-        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "left"), ALICE_ID)
-
-    def test_directional_target_from_you_moving_up_is_alice(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "up"), ALICE_ID)
-
-    def test_directional_target_from_alice_moving_left_is_bob(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "left"), BOB_ID)
-
-    def test_directional_target_from_alice_moving_down_is_you(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "down"), YOU_ID)
-
-    def test_directional_target_from_alice_moving_right_is_you(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "right"), YOU_ID)
-
-    def test_directional_target_from_bob_moving_right_is_alice(self) -> None:
-        """The reverse of LEFT-LEFT (YOU -> ALICE -> BOB): RIGHT from BOB
-
-        reaches the nearer ALICE first, not YOU -- symmetric traversal,
-        not a shortcut back to YOU.
-        """
-        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "right"), ALICE_ID)
-
-    def test_directional_target_from_bob_moving_up_is_alice(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "up"), ALICE_ID)
-
-    def test_directional_target_from_you_moving_down_is_9a4b(self) -> None:
-        """9A4B (2 columns left, 2 rows down from YOU) is naturally reached
-
-        by DOWN -- the direction its own defining relationship suggests --
-        not by an arbitrary or hardcoded mapping.
-        """
-        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "down"), NINE_A4B_ID)
-
-    def test_directional_target_from_9a4b_moving_right_is_you(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(NINE_A4B_ID, "right"), YOU_ID)
-
-    def test_directional_target_from_9a4b_moving_up_is_bob(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(NINE_A4B_ID, "up"), BOB_ID)
-
-    def test_directional_target_from_9a4b_moving_left_is_bob(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(NINE_A4B_ID, "left"), BOB_ID)
-
-    def test_directional_target_from_bob_moving_down_is_9a4b(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "down"), NINE_A4B_ID)
+        you = MeshNodeState(node=YOU, is_client=False, is_relay=False, last_interaction_at=None)
+        near = client_state(NodeMetadata("!near", "Near"), last_interaction_at=1.0)
+        far = client_state(NodeMetadata("!far", "Far"), last_interaction_at=1.0)
+        working_set = (you, near, far)
+        base_positions = {"!you": (5, 11), "!near": (4, 10), "!far": (1, 8)}
+        self.assertEqual(
+            _mesh_directional_target(working_set, base_positions, "!you", "left"), "!near"
+        )
 
     def test_directional_target_with_no_candidate_is_none(self) -> None:
-        self.assertIsNone(_mesh_fixture_directional_target(YOU_ID, "right"))
-        self.assertIsNone(_mesh_fixture_directional_target(BOB_ID, "left"))
-        self.assertIsNone(_mesh_fixture_directional_target(NINE_A4B_ID, "down"))
-        self.assertIsNone(_mesh_fixture_directional_target(ALICE_ID, "up"))
-
-    def test_background_grid_renders_a_dot_at_every_logical_position(self) -> None:
-        """Every one of the 8x21 logical grid positions must correspond to
-
-        exactly one visible background dot -- proven directly against the
-        procedural canvas renderer, independent of any node overlay.
-        """
-        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
-        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        self.assertEqual(len(rows), height)
-        for row in range(1, MESH_GRID_ROWS + 1):
-            for column in range(1, MESH_GRID_COLUMNS + 1):
-                x, y = _mesh_grid_pixel(row, column)
-                with self.subTest(row=row, column=column):
-                    self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
-
-    def test_background_dot_exists_at_you_grid_position(self) -> None:
-        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
-        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        x, y = _mesh_grid_pixel(5, 11)
-        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
-
-    def test_background_dot_exists_at_alice_grid_position(self) -> None:
-        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
-        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        x, y = _mesh_grid_pixel(4, 10)
-        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
-
-    def test_background_dot_exists_at_bob_grid_position(self) -> None:
-        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
-        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        x, y = _mesh_grid_pixel(5, 8)
-        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
-
-    def test_background_dot_exists_at_9a4b_grid_position(self) -> None:
-        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
-        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        x, y = _mesh_grid_pixel(7, 9)
-        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
-
-    def test_connectors_are_bob_alice_alice_you_and_you_9a4b_only(self) -> None:
-        self.assertEqual(
-            MESH_FIXTURE_CONNECTORS,
-            (("!you", "!alice"), ("!alice", "!bob"), ("!you", "!9a4b")),
-        )
-
-    def test_alice_bob_connector_route_moves_left_then_down(self) -> None:
-        """2 columns left, 1 row down -- route_connector always draws its
-
-        horizontal segment first (along ALICE's row) then its vertical
-        segment second (along BOB's column), so the corner cell must sit
-        at (bob_x, alice_y), every horizontal cell must share ALICE's row,
-        and every vertical cell must share BOB's column.
-        """
-        alice_x, alice_y = _mesh_grid_pixel(4, 10)
-        bob_x, bob_y = _mesh_grid_pixel(5, 8)
-        self.assertLess(bob_x, alice_x)
-        self.assertGreater(bob_y, alice_y)
-        route = route_connector(alice_x, alice_y, bob_x, bob_y)
-        self.assertTrue(route)
-
-        corner_index = next(
-            index for index, (x, y, _glyph) in enumerate(route) if (x, y) == (bob_x, alice_y)
-        )
-        for x, y, _glyph in route[:corner_index]:
-            self.assertEqual(y, alice_y)
-        for x, y, _glyph in route[corner_index:]:
-            self.assertEqual(x, bob_x)
-        last_x, last_y, _glyph = route[-1]
-        self.assertEqual((last_x, last_y), (bob_x, bob_y - 1))
-
-    def test_you_9a4b_connector_route_moves_left_then_down(self) -> None:
-        """2 columns left, 2 rows down -- an orthogonal L-shaped route, not
-
-        a diagonal line: horizontal segment along YOU's row, corner, then
-        a vertical segment along 9A4B's column.
-        """
-        you_x, you_y = _mesh_grid_pixel(5, 11)
-        nine_a4b_x, nine_a4b_y = _mesh_grid_pixel(7, 9)
-        self.assertLess(nine_a4b_x, you_x)
-        self.assertGreater(nine_a4b_y, you_y)
-        route = route_connector(you_x, you_y, nine_a4b_x, nine_a4b_y)
-        self.assertTrue(route)
-
-        corner_index = next(
-            index
-            for index, (x, y, _glyph) in enumerate(route)
-            if (x, y) == (nine_a4b_x, you_y)
-        )
-        for x, y, _glyph in route[:corner_index]:
-            self.assertEqual(y, you_y)
-        for x, y, _glyph in route[corner_index:]:
-            self.assertEqual(x, nine_a4b_x)
-        last_x, last_y, _glyph = route[-1]
-        self.assertEqual((last_x, last_y), (nine_a4b_x, nine_a4b_y - 1))
-
-    def test_you_has_no_observed_communication_role_context(self) -> None:
-        self.assertNotIn(YOU_ID, MESH_FIXTURE_CONTEXTS)
-
-    def test_alice_is_client_and_relay(self) -> None:
-        """ALICE originated a message we received (CLIENT) and separately
-
-        relayed BOB's message (RELAY) -- both true, independently.
-        """
-        alice = MESH_FIXTURE_CONTEXTS[ALICE_ID]
-        self.assertTrue(alice.is_client)
-        self.assertTrue(alice.is_relay)
-
-    def test_bob_is_client_only(self) -> None:
-        bob = MESH_FIXTURE_CONTEXTS[BOB_ID]
-        self.assertTrue(bob.is_client)
-        self.assertFalse(bob.is_relay)
-
-    def test_alice_and_bob_fixture_hops_and_last_interaction(self) -> None:
-        self.assertEqual(MESH_FIXTURE_CONTEXTS[ALICE_ID].hops, 0)
-        self.assertEqual(MESH_FIXTURE_CONTEXTS[BOB_ID].hops, 1)
-        self.assertEqual(MESH_FIXTURE_CONTEXTS[ALICE_ID].last_interaction, "30m")
-        self.assertEqual(MESH_FIXTURE_CONTEXTS[BOB_ID].last_interaction, "30m")
-
-    def test_context_line_exact_fixture_strings(self) -> None:
-        self.assertEqual(_mesh_context_line(YOU_ID), "YOU")
-        self.assertEqual(
-            _mesh_context_line(ALICE_ID), "ALICE / CLIENT+RELAY / 0 HOPS / 30m"
-        )
-        self.assertEqual(_mesh_context_line(BOB_ID), "BOB / CLIENT / 1 HOPS / 30m")
-
-    def test_context_line_uses_hops_plural_form_even_for_one(self) -> None:
-        """The fixture's HOPS value is intentionally not singularized --
-
-        "1 HOPS", not "1 HOP" -- these are the intended fixture values for
-        this pass, not a grammar bug to fix.
-        """
-        self.assertIn("1 HOPS", _mesh_context_line(BOB_ID))
-        self.assertNotIn("1 HOP ", _mesh_context_line(BOB_ID))
-
-    def test_9a4b_is_client_only_and_stale(self) -> None:
-        """9A4B is a stale CLIENT: we've heard from it before (CLIENT), but
-
-        not within the 24h recent/stale threshold, and there is no
-        evidence it relayed anything.
-        """
-        context = MESH_FIXTURE_CONTEXTS[NINE_A4B_ID]
-        self.assertTrue(context.is_client)
-        self.assertFalse(context.is_relay)
-        self.assertTrue(context.stale)
-        self.assertGreater(context.last_interaction_seconds, MESH_STALE_THRESHOLD_SECONDS)
-
-    def test_9a4b_context_line_exact_string(self) -> None:
-        self.assertEqual(_mesh_context_line(NINE_A4B_ID), "9A4B / CLIENT / 1 HOPS / 2d")
-
-    def test_stale_threshold_boundary_exactly_24h_is_recent(self) -> None:
-        exactly_24h = MeshFixtureContext(
-            is_client=True,
-            is_relay=False,
-            hops=1,
-            last_interaction_seconds=MESH_STALE_THRESHOLD_SECONDS,
-        )
-        self.assertFalse(exactly_24h.stale)
-
-    def test_stale_threshold_boundary_over_24h_is_stale(self) -> None:
-        just_over_24h = MeshFixtureContext(
-            is_client=True,
-            is_relay=False,
-            hops=1,
-            last_interaction_seconds=MESH_STALE_THRESHOLD_SECONDS + 1,
-        )
-        self.assertTrue(just_over_24h.stale)
+        you = MeshNodeState(node=YOU, is_client=False, is_relay=False, last_interaction_at=None)
+        target = _mesh_directional_target((you,), {"!you": (5, 11)}, "!you", "left")
+        self.assertIsNone(target)
 
 
-class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
-    """Headless app tests of the fixed YOU+ALICE+BOB MESH board: default
+class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
+    """Headless app tests proving MESH is now driven by real passive data:
 
-    selection, ACCENT/BASE styling, labels, the recenter-on-select
-    interaction, connectors, the bottom-left context label, horizontal
-    centering, and the absence of any selection background/focus rectangle
-    or scrollbars.
+    CLIENT derivation, RELAY truthfulness, the bounded working set,
+    geographic placement, context text, selection/navigation, the
+    preserved visual contract, and zero new radio traffic.
     """
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        root = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name)
         self.settings = AppSettings.load(
-            config_path=root / "config.json",
-            profile_path=root / "terminal.conf",
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
         )
 
-    def _make_app(self) -> MeshtasticPassApp:
+    def _make_app(
+        self, *, chat_store: ChatStore | None = None, scripted_messages=()
+    ) -> MeshtasticPassApp:
         radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
+            connect_delay=0, message_interval=0, scripted_messages=scripted_messages
         )
-        return MeshtasticPassApp(radio, self.settings)
+        return MeshtasticPassApp(radio, self.settings, chat_store=chat_store)
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
         await pilot.press("4")
         await pilot.pause()
-        # render_fixture defers its centering offset by one refresh cycle
-        # the very first time this view is laid out (self.size is 0x0
-        # before that); give it a chance to land before asserting on it.
         await pilot.pause()
 
-    def _widget(self, app, node_id: str) -> MeshNodeWidget:
-        return next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+    # ---- CLIENT derivation (spec section 21) -------------------------
 
-    def _label_widget(self, app, node_id: str) -> MeshNodeLabelWidget:
-        return next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == node_id)
-
-    async def test_you_is_selected_by_default(self) -> None:
+    async def test_incoming_message_makes_the_sender_a_client(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.selected_node_id, YOU_ID)
+            alice = next(
+                state
+                for state in view.working_set
+                if state.node.node_id == SIMULATED_MESSAGES[0].sender_node_id
+            )
+            self.assertTrue(alice.is_client)
 
-    async def test_default_styling_you_alice_bob_all_solid_9a4b_dim(self) -> None:
-        """ALICE is CLIENT+RELAY, so CLIENT takes priority: solid, not
-
-        stroked -- there is no fixture node currently rendering stroked
-        (see test_relay_only_role_renders_stroked for that rule proven
-        directly against a synthetic RELAY-only context). 9A4B is a
-        stale CLIENT: still solid, but DIM_BASE instead of BASE.
-        """
+    async def test_outgoing_message_does_not_make_a_remote_node_client(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accepted_send("hello from me")
             await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-            you, alice, bob, nine_a4b = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-                self._widget(app, NINE_A4B_ID),
-            )
-            you_rendered, alice_rendered, bob_rendered, nine_a4b_rendered = (
-                you.render(),
-                alice.render(),
-                bob.render(),
-                nine_a4b.render(),
-            )
-            self.assertEqual(
-                you_rendered.spans[0].style.foreground, Color.parse(palette.accent)
-            )
-            self.assertEqual(
-                alice_rendered.spans[0].style.foreground, Color.parse(palette.base)
-            )
-            self.assertEqual(
-                bob_rendered.spans[0].style.foreground, Color.parse(palette.base)
-            )
-            self.assertEqual(
-                nine_a4b_rendered.spans[0].style.foreground,
-                Color.parse(palette.dim_base),
-            )
-            for rendered in (you_rendered, alice_rendered, bob_rendered, nine_a4b_rendered):
-                # YOU is selected by default and renders the wider
-                # composite ("·●·"), so check the role glyph is present
-                # rather than requiring an exact single-character match.
-                self.assertIn(CIRCLE_SOLID_LARGE, rendered.plain)
-
-    async def test_node_labels_render_you_alice_bob_9a4b(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            you, alice, bob, nine_a4b = (
-                self._label_widget(app, YOU_ID),
-                self._label_widget(app, ALICE_ID),
-                self._label_widget(app, BOB_ID),
-                self._label_widget(app, NINE_A4B_ID),
-            )
-            self.assertEqual(str(you.render()).strip(), "YOU")
-            self.assertEqual(str(alice.render()).strip(), "ALICE")
-            self.assertEqual(str(bob.render()).strip(), "Bob")
-            self.assertEqual(str(nine_a4b.render()).strip(), "9A4B")
-
-    async def test_you_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
-        self,
-    ) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            self.assertEqual(
-                glyph_screen_position(self._widget(app, YOU_ID)),
-                _mesh_grid_pixel(5, 11),
-            )
-
-    async def test_alice_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
-        self,
-    ) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            self.assertEqual(
-                glyph_screen_position(self._widget(app, ALICE_ID)),
-                _mesh_grid_pixel(4, 10),
-            )
-
-    async def test_bob_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
-        self,
-    ) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            self.assertEqual(
-                glyph_screen_position(self._widget(app, BOB_ID)), _mesh_grid_pixel(5, 8)
-            )
-
-    async def test_9a4b_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
-        self,
-    ) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            self.assertEqual(
-                glyph_screen_position(self._widget(app, NINE_A4B_ID)),
-                _mesh_grid_pixel(7, 9),
-            )
-
-    async def test_node_glyph_stays_exactly_on_its_grid_point_regardless_of_label_width(
-        self,
-    ) -> None:
-        """Label width must never move the glyph off its grid coordinate --
-
-        YOU (3 cells), ALICE (5 cells), and Bob (3 cells) have different
-        label widths, but every glyph still lands exactly on its own
-        (grid_x, grid_y), and the label widget's own offset -- entirely
-        separate from the glyph widget -- centers it over that same point.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            positions = {
-                YOU_ID: (5, 11),
-                ALICE_ID: (4, 10),
-                BOB_ID: (5, 8),
-                NINE_A4B_ID: (7, 9),
+            view = app.query_one(MeshTopologyView)
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
             }
-            for node_id, (row, column) in positions.items():
-                glyph_widget = self._widget(app, node_id)
-                label_widget = self._label_widget(app, node_id)
-                with self.subTest(node=node_id):
-                    self.assertEqual(
-                        glyph_screen_position(glyph_widget),
-                        _mesh_grid_pixel(row, column),
-                    )
-                    self.assertEqual(
-                        offset_xy(label_widget),
-                        expected_widget_offset(row, column, label_widget.fixture.label),
-                    )
+            self.assertEqual(remote_ids, set())
 
-    async def test_labels_are_centered_over_their_fixed_glyph_coordinates(self) -> None:
-        """Equal left/right margin for an odd-cell-width label (YOU, ALICE,
+    async def test_persisted_incoming_history_survives_a_fresh_app_instance(self) -> None:
+        """Simulates a process restart: a new ChatStore/App reading the same
 
-        Bob); a deterministic, consistent one-cell left bias for the one
-        even-width label (9A4B, 4 cells) -- an even width can never split
-        perfectly evenly around a single glyph column, so floor((width)/2)
-        is the fixture's chosen, consistent bias (see
-        expected_widget_offset / render_fixture), never a per-node special
-        case and never a reason to move the glyph itself.
+        database file must still see Alice as CLIENT from "before".
         """
-        app = self._make_app()
+        db_path = self.root / "chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 10 * 24 * 60 * 60
+
+        first_process_store = ChatStore.open(db_path)
+        first_process_store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="before restart",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        first_process_store.close()
+
+        second_process_store = ChatStore.open(db_path)
+        self.addCleanup(second_process_store.close)
+        app = self._make_app(chat_store=second_process_store)
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
-            for node_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
-                # Both regions are in the same (absolute, on-screen)
-                # coordinate space -- unlike glyph_screen_position(), which
-                # is board-local, so they can be compared directly here.
-                # YOU is selected by default, so its glyph box is 3 cells
-                # wide; its anchor is still that box's center column.
-                glyph_region = self._widget(app, node_id).region
-                glyph_x = glyph_region.x + glyph_region.width // 2
-                label_region = self._label_widget(app, node_id).region
-                left_margin = glyph_x - label_region.x
-                right_margin = (label_region.x + label_region.width) - glyph_x - 1
-                with self.subTest(node=node_id):
-                    if label_region.width % 2:
-                        self.assertEqual(left_margin, right_margin)
-                    else:
-                        self.assertEqual(left_margin, right_margin + 1)
-
-    async def test_wide_emoji_label_does_not_move_the_glyph(self) -> None:
-        """A label far wider (in terminal cells) than its character count
-
-        must still leave the glyph exactly on its grid coordinate -- the
-        positioning formula uses cell_len(), not Python len(), so a label
-        this wide is deliberately provocative: len() would undercount it.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            you = self._widget(app, YOU_ID)
-            you_label = self._label_widget(app, YOU_ID)
-            original_glyph_position = glyph_screen_position(you)
-
-            emoji_label = "🐔🍕👨‍👩‍👧‍👦"
-            self.assertNotEqual(cell_len(emoji_label), len(emoji_label))
-            you.fixture = MeshFixtureNode(
-                you.fixture.node_id,
-                you.fixture.row,
-                you.fixture.column,
-                you.fixture.is_local,
-                emoji_label,
+            view = app.query_one(MeshTopologyView)
+            alice = next(
+                state for state in view.working_set if state.node.node_id == "!a11ce001"
             )
-            you_label.fixture = you.fixture
+            self.assertTrue(alice.is_client)
+            self.assertEqual(alice.last_interaction_at, old_timestamp)
 
-            view = app.query_one(MeshTopologyView)
-            view.render_fixture(theme=app._current_theme)
+    async def test_most_recent_incoming_message_determines_last_interaction(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
+            # SIMULATED_MESSAGES[0] and [3] both come from the "!cafe0003"-
+            # or "!a11ce001"-style senders at different ages; use the two
+            # channel-0 Cafe Relay messages (index 2 is channel 1, index 3
+            # is channel 0 and older than index 0's sender is irrelevant --
+            # pick two messages from the SAME sender at different ages).
+            older = SIMULATED_MESSAGES[3]
+            newer = older.__class__(**{**older.__dict__, "radio_rx_at": older.radio_rx_at + 500})
+            app._accept_received_message(older)
+            app._accept_received_message(newer)
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity[older.sender_node_id.lower()], newer.radio_rx_at)
 
-            self.assertEqual(glyph_screen_position(you), original_glyph_position)
-            self.assertEqual(
-                offset_xy(you_label),
-                expected_widget_offset(5, 11, emoji_label),
+    async def test_message_older_than_mounted_chat_window_still_makes_client(self) -> None:
+        db_path = self.root / "bounded_chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 30 * 24 * 60 * 60
+
+        store = ChatStore.open(db_path)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="a message from a month ago",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        for index in range(DEFAULT_HISTORY_LIMIT):
+            store.add_incoming(
+                packet_id=1000 + index,
+                node_id="!f177e001",
+                sender_name="Filler",
+                sender_short_name="FIL",
+                channel_index=0,
+                text=f"filler {index}",
+                radio_rx_at=now - index,
+                received_at=now - index,
             )
+        store.close()
 
-    async def test_connector_endpoints_stay_attached_to_rendered_glyph_coordinates(
-        self,
-    ) -> None:
-        """The live connector cells (drawn on the canvas) must terminate
+        store = ChatStore.open(db_path)
+        self.addCleanup(store.close)
+        app = self._make_app(chat_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            mounted_ids = {entry.node_id for entry in app.chat_history if entry.node_id}
+            self.assertNotIn("!a11ce001", mounted_ids)
+            await pilot.press("4")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            alice = next(
+                state for state in view.working_set if state.node.node_id == "!a11ce001"
+            )
+            self.assertTrue(alice.is_client)
+            self.assertTrue(alice.is_stale(now=now))
 
-        exactly one step short of each glyph's own actual rendered screen
-        position -- ties the connector geometry to the real widget, not
-        just to the pure _mesh_grid_pixel arithmetic both share.
+    # ---- RELAY truthfulness (spec section 22) ------------------------
+
+    async def test_no_node_is_ever_relay_from_current_real_data(self) -> None:
+        """No data source available to this app identifies a specific relay
+
+        node (see mesh_state.MeshNodeState's docstring) -- RELAY must
+        never be fabricated from hop count or a configured role, so
+        every real-data node produced by the live app is_relay=False,
+        even a node with a high hop count.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            you_glyph = offset_xy(self._widget(app, YOU_ID))
-            alice_glyph = offset_xy(self._widget(app, ALICE_ID))
-            bob_glyph = offset_xy(self._widget(app, BOB_ID))
-            nine_a4b_glyph = offset_xy(self._widget(app, NINE_A4B_ID))
-
-            canvas = app.query_one(MeshCanvas)
-            connector_points = {(x, y) for x, y, _glyph, _color in canvas._signature[2]}
-
-            for near, far in (
-                (you_glyph, alice_glyph),
-                (alice_glyph, bob_glyph),
-                (you_glyph, nine_a4b_glyph),
-            ):
-                # Recomputed from the real, live widget offsets (not the
-                # static _mesh_grid_pixel formula both this and app.py
-                # share) -- proves the drawn connector actually tracks
-                # wherever the glyph widgets really ended up on screen.
-                expected_route = {
-                    (x, y) for x, y, _glyph in route_connector(*near, *far)
-                }
-                with self.subTest(near=near, far=far):
-                    self.assertTrue(expected_route)
-                    self.assertTrue(expected_route <= connector_points)
-
-    async def test_no_selection_background_rectangle_in_css_or_at_runtime(self) -> None:
-        self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            for node_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
-                widget = self._widget(app, node_id)
-                # Selected or not, no widget's background may be a filled
-                # focus box -- it must stay fully transparent.
-                with self.subTest(node=node_id):
-                    self.assertEqual(widget.styles.background.a, 0)
-
-    async def test_selected_glyph_is_bold_unselected_glyphs_are_not(self) -> None:
-        """Bold is this fixture's deterministic, cell-geometry-safe stand-in
-
-        for "~50% larger": no character substitution (avoids Unicode
-        glyphs with unreliable terminal width) and no widget resize (so
-        the glyph's anchor coordinate never moves) -- see
-        MeshNodeWidget.refresh_visual. Proven at the render-state boundary
-        (the Style object), not by rasterizing terminal pixels.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            node_ids = (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID)
-            widgets = {node_id: self._widget(app, node_id) for node_id in node_ids}
+            self.assertTrue(view.working_set)
+            self.assertTrue(all(not state.is_relay for state in view.working_set))
 
-            for node_id in node_ids:
-                view.select_node(node_id)
-                view.render_fixture(theme=app._current_theme)
-                await pilot.pause()
-                with self.subTest(selected=node_id):
-                    for other_id, widget in widgets.items():
-                        is_bold = widget.render().spans[0].style.bold
-                        if other_id == node_id:
-                            self.assertTrue(is_bold)
-                        else:
-                            self.assertFalse(is_bold)
-
-    async def test_selected_glyph_enlargement_does_not_perturb_its_own_anchor(
-        self,
-    ) -> None:
-        """Applying the composite "larger" treatment to the selected glyph
-
-        must not add any extra offset beyond the ordinary translated grid
-        position -- re-rendering with the same selection is idempotent.
-        """
+    async def test_high_hop_count_does_not_produce_relay_state(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            far_hop_message = SIMULATED_MESSAGES[0].__class__(
+                **{**SIMULATED_MESSAGES[0].__dict__}
+            )
+            app._accept_received_message(far_hop_message)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(far_hop_message.sender_node_id, hops_away=9),
+            )
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            view.select_node(BOB_ID)
-            view.render_fixture(theme=app._current_theme)
-            await pilot.pause()
-            bob = self._widget(app, BOB_ID)
-            first_anchor = glyph_screen_position(bob)
-            self.assertTrue(bob.render().spans[0].style.bold)
+            remote = next(
+                state
+                for state in view.working_set
+                if state.node.node_id == far_hop_message.sender_node_id.lower()
+                or state.node.node_id == far_hop_message.sender_node_id
+            )
+            self.assertFalse(remote.is_relay)
 
-            view.render_fixture(theme=app._current_theme)
-            await pilot.pause()
-            self.assertEqual(glyph_screen_position(bob), first_anchor)
-            self.assertTrue(bob.render().spans[0].style.bold)
+    # ---- Working set (spec section 23) -------------------------------
 
-    async def test_selected_representation_occupies_more_area_than_unselected(
-        self,
-    ) -> None:
-        """Real proof that selection is not "bold alone": the selected
-
-        glyph widget is measurably wider (3 cells vs 1) and its rendered
-        content has more visible characters, not just a style flag.
-        """
+    async def test_working_set_is_bounded(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            for node_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
-                view = app.query_one(MeshTopologyView)
-                view.select_node(node_id)
-                view.render_fixture(theme=app._current_theme)
-                await pilot.pause()
-                selected_widget = self._widget(app, node_id)
-                selected_area = int(selected_widget.styles.width.value) * int(
-                    selected_widget.styles.height.value
+            await pilot.pause()
+            for index in range(20):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=f"!n{index:07x}",
+                        sender_long_name=f"Node{index}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_000_000 + index,
+                        radio_rx_at=1_700_000_000.0 - index,
+                    )
                 )
-                selected_visible_chars = len(selected_widget.render().plain.strip())
-                with self.subTest(node=node_id):
-                    self.assertGreater(selected_area, 1)
-                    self.assertGreater(selected_visible_chars, 1)
-                    for other_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
-                        if other_id == node_id:
-                            continue
-                        unselected_widget = self._widget(app, other_id)
-                        unselected_area = int(
-                            unselected_widget.styles.width.value
-                        ) * int(unselected_widget.styles.height.value)
-                        with self.subTest(node=node_id, unselected=other_id):
-                            self.assertGreater(selected_area, unselected_area)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            remote_count = sum(1 for state in view.working_set if not state.node.is_local)
+            self.assertEqual(remote_count, DEFAULT_MAX_REMOTE_NODES)
 
-    async def test_selection_does_not_alter_role_glyph_semantics(self) -> None:
-        """Selection is a visual overlay/state only: the underlying role
-
-        glyph (CLIENT/CLIENT+RELAY = solid, RELAY-only = stroked) must be
-        the same character selected or not -- the composite treatment
-        adds decoration around it, never replaces or reinterprets it.
-        """
+    async def test_stale_fallback_appears_when_nothing_is_recent(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            expected_glyph = {
-                YOU_ID: CIRCLE_SOLID_LARGE,
-                ALICE_ID: CIRCLE_SOLID_LARGE,
-                BOB_ID: CIRCLE_SOLID_LARGE,
-                NINE_A4B_ID: CIRCLE_SOLID_LARGE,
+            await pilot.pause()
+            very_old = 1_700_000_000.0 - MESH_STALE_THRESHOLD_SECONDS * 10
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!oldclient",
+                    sender_long_name="OldClient",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="ancient",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=very_old,
+                )
+            )
+            await pilot.press("4")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_000.0)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
             }
-            view = app.query_one(MeshTopologyView)
-            for node_id, glyph in expected_glyph.items():
-                view.select_node(node_id)
-                view.render_fixture(theme=app._current_theme)
-                await pilot.pause()
-                with self.subTest(selected=node_id):
-                    self.assertIn(glyph, self._widget(app, node_id).render().plain)
-                    for other_id, other_glyph in expected_glyph.items():
-                        if other_id == node_id:
-                            continue
-                        self.assertEqual(
-                            self._widget(app, other_id).render().plain, other_glyph
-                        )
+            self.assertIn("!oldclient", remote_ids)
 
-    async def test_deselection_restores_the_ordinary_one_cell_representation(
-        self,
-    ) -> None:
+    async def test_unchanged_data_produces_unchanged_positions(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
             await self._open_mesh(pilot)
-            you = self._widget(app, YOU_ID)
-            self.assertEqual(int(you.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
-
-            await pilot.press("left")
+            view = app.query_one(MeshTopologyView)
+            first_positions = dict(view.base_positions)
+            app._refresh_mesh(wall_now=1_700_000_500.0)
             await pilot.pause()
-            self.assertEqual(int(you.styles.width.value), 1)
-            self.assertEqual(you.render().plain, CIRCLE_SOLID_LARGE)
-            self.assertFalse(you.render().spans[0].style.bold)
+            self.assertEqual(view.base_positions, first_positions)
 
-            await pilot.press("right")
+    async def test_working_set_nodes_never_overlap(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            self.assertEqual(int(you.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
-            self.assertTrue(you.render().spans[0].style.bold)
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            positions = list(view.base_positions.values())
+            self.assertEqual(len(positions), len(set(positions)))
 
-    async def test_only_the_selected_node_widget_widens_others_stay_one_cell(
-        self,
-    ) -> None:
-        """The composite "larger" treatment is confined to the selected
-
-        node's own glyph widget -- every other node's glyph widget stays
-        exactly 1 cell wide and unbolded, regardless of which node is
-        currently selected. (Their absolute screen positions do shift
-        when selection changes -- that is whole-mesh recentering,
-        covered by the LEFT/RIGHT/UP/DOWN recenter tests -- but their
-        widget width and bold state must never follow suit.)
-        """
+    async def test_you_is_always_in_the_working_set_when_local_node_known(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            node_ids = (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID)
-            for node_id in node_ids:
-                view.select_node(node_id)
-                view.render_fixture(theme=app._current_theme)
-                await pilot.pause()
-                with self.subTest(selected=node_id):
-                    for other_id in node_ids:
-                        if other_id == node_id:
-                            continue
-                        other_widget = self._widget(app, other_id)
-                        with self.subTest(unselected=other_id):
-                            self.assertEqual(int(other_widget.styles.width.value), 1)
-                            self.assertFalse(
-                                other_widget.render().spans[0].style.bold
-                            )
+            self.assertTrue(any(state.node.is_local for state in view.working_set))
 
-    async def test_unselected_stale_9a4b_is_dim_glyph_dim_label_dim_connector(
-        self,
-    ) -> None:
+    # ---- Geography (spec section 24) ---------------------------------
+
+    async def test_north_node_appears_above_you_south_below(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-            glyph = self._widget(app, NINE_A4B_ID)
-            label = self._label_widget(app, NINE_A4B_ID)
-            self.assertEqual(
-                glyph.render().spans[0].style.foreground, Color.parse(palette.dim_base)
-            )
-            self.assertFalse(glyph.render().spans[0].style.bold)
-            self.assertEqual(
-                label.render().spans[0].style.foreground, Color.parse(palette.dim_base)
-            )
-
-            canvas = app.query_one(MeshCanvas)
-            colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertIn(palette.dim_base, colors)
-
-    async def test_selected_stale_9a4b_is_accent_and_bold(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-            await pilot.press("down")
             await pilot.pause()
-
-            view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.selected_node_id, NINE_A4B_ID)
-
-            glyph = self._widget(app, NINE_A4B_ID)
-            label = self._label_widget(app, NINE_A4B_ID)
-            self.assertEqual(
-                glyph.render().spans[0].style.foreground, Color.parse(palette.accent)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(
+                    app.radio.info.node_id, is_local=True, position=LOCAL_GEO
+                ),
+                NodeMetadata("!north1", "North1", position=north_of_local(5)),
+                NodeMetadata("!south1", "South1", position=south_of_local(5)),
             )
-            self.assertTrue(glyph.render().spans[0].style.bold)
-            self.assertEqual(
-                label.render().spans[0].style.foreground, Color.parse(palette.accent)
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!north1",
+                    sender_long_name="North1",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
             )
-
-    async def test_deselecting_9a4b_returns_it_to_dim_stale_treatment(self) -> None:
-        """Selection merely overrides the rendering; the underlying stale
-
-        state does not disappear -- moving away must restore DIM_BASE.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-            await pilot.press("down")
-            await pilot.pause()
-            await pilot.press("right")
-            await pilot.pause()
-
-            view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.selected_node_id, YOU_ID)
-
-            glyph = self._widget(app, NINE_A4B_ID)
-            label = self._label_widget(app, NINE_A4B_ID)
-            self.assertEqual(
-                glyph.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!south1",
+                    sender_long_name="South1",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=2,
+                    radio_rx_at=1_700_000_000.0,
+                )
             )
-            self.assertFalse(glyph.render().spans[0].style.bold)
-            self.assertEqual(
-                label.render().spans[0].style.foreground, Color.parse(palette.dim_base)
-            )
-
-    async def test_board_is_horizontally_centered_in_the_mesh_viewport(self) -> None:
-        """No right-heavy extra padding: the board's left and right margins
-
-        inside the MESH viewport must be equal, applied as a single
-        board-level offset rather than by moving any node.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            left_margin = view.board.region.x - view.region.x
-            right_margin = (view.region.x + view.region.width) - (
-                view.board.region.x + view.board.region.width
-            )
-            self.assertEqual(left_margin, right_margin)
+            you_row, _you_col = view.base_positions[app.radio.info.node_id]
+            north_row, _ = view.base_positions["!north1"]
+            south_row, _ = view.base_positions["!south1"]
+            self.assertLess(north_row, you_row)
+            self.assertGreater(south_row, you_row)
 
-    async def test_left_from_you_selects_alice_and_recenters_the_whole_mesh(
-        self,
-    ) -> None:
+    async def test_east_node_appears_right_of_you_west_left(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            await pilot.press("left")
             await pilot.pause()
-
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(
+                    app.radio.info.node_id, is_local=True, position=LOCAL_GEO
+                ),
+                NodeMetadata("!east1", "East1", position=east_of_local(5)),
+                NodeMetadata("!west1", "West1", position=west_of_local(5)),
+            )
+            for node_id in ("!east1", "!west1"):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=node_id,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.selected_node_id, ALICE_ID)
+            _you_row, you_column = view.base_positions[app.radio.info.node_id]
+            _er, east_column = view.base_positions["!east1"]
+            _wr, west_column = view.base_positions["!west1"]
+            self.assertGreater(east_column, you_column)
+            self.assertLess(west_column, you_column)
 
-            you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-            )
-            self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(5, 11))
-            self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(6, 12))
-            self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(6, 9))
-
-    async def test_left_left_from_you_selects_bob_and_recenters_the_whole_mesh(
-        self,
-    ) -> None:
+    async def test_farther_node_is_at_least_as_many_grid_steps_away(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(
+                    app.radio.info.node_id, is_local=True, position=LOCAL_GEO
+                ),
+                NodeMetadata("!near1", "Near1", position=north_of_local(1)),
+                NodeMetadata("!far1", "Far1", position=north_of_local(500)),
+            )
+            for node_id in ("!near1", "!far1"):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=node_id,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
             await self._open_mesh(pilot)
-            await pilot.press("left")
-            await pilot.pause()
-            await pilot.press("left")
-            await pilot.pause()
-
             view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.selected_node_id, BOB_ID)
+            you_row, _ = view.base_positions[app.radio.info.node_id]
+            near_row, _ = view.base_positions["!near1"]
+            far_row, _ = view.base_positions["!far1"]
+            self.assertGreaterEqual(you_row - far_row, you_row - near_row)
 
-            you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-            )
-            self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(5, 11))
-            self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(5, 14))
-            self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(4, 13))
-
-    async def test_up_from_you_also_selects_alice_and_recenters_the_whole_mesh(
-        self,
-    ) -> None:
-        """ALICE remains reachable via UP too -- the ranking change only
-
-        affects which candidate wins a tie/competition, not this
-        single-candidate case.
-        """
+    async def test_missing_gps_fallback_is_deterministic_and_collision_free(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            await pilot.press("up")
             await pilot.pause()
-
+            no_gps_nodes = tuple(
+                NodeMetadata(f"!ng{index:02x}", f"NoGps{index}") for index in range(4)
+            )
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                *no_gps_nodes,
+            )
+            for node in no_gps_nodes:
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node.node_id,
+                        sender_long_name=node.long_name,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node.node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.selected_node_id, ALICE_ID)
-
-            you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-            )
-            self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(5, 11))
-            self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(6, 12))
-            self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(6, 9))
-
-    async def test_left_from_you_makes_alice_accent_you_base_bob_base(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            await pilot.press("left")
-            await pilot.pause()
-
-            palette = THEME_PALETTES[app._current_theme]
-            you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-            )
+            first_positions = dict(view.base_positions)
             self.assertEqual(
-                alice.render().spans[0].style.foreground, Color.parse(palette.accent)
-            )
-            self.assertEqual(
-                you.render().spans[0].style.foreground, Color.parse(palette.base)
-            )
-            self.assertEqual(
-                bob.render().spans[0].style.foreground, Color.parse(palette.base)
-            )
-            you_label, alice_label, bob_label = (
-                self._label_widget(app, YOU_ID),
-                self._label_widget(app, ALICE_ID),
-                self._label_widget(app, BOB_ID),
-            )
-            self.assertEqual(
-                alice_label.render().spans[0].style.foreground,
-                Color.parse(palette.accent),
-            )
-            self.assertEqual(
-                you_label.render().spans[0].style.foreground, Color.parse(palette.base)
-            )
-            self.assertEqual(
-                bob_label.render().spans[0].style.foreground, Color.parse(palette.base)
+                len(first_positions.values()), len(set(first_positions.values()))
             )
 
-    async def test_left_left_from_you_makes_bob_accent_alice_you_base(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            await pilot.press("left")
+            app._refresh_mesh(wall_now=1_700_000_100.0)
             await pilot.pause()
-            await pilot.press("left")
-            await pilot.pause()
+            self.assertEqual(view.base_positions, first_positions)
 
-            palette = THEME_PALETTES[app._current_theme]
-            you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-            )
-            self.assertEqual(
-                bob.render().spans[0].style.foreground, Color.parse(palette.accent)
-            )
-            self.assertEqual(
-                you.render().spans[0].style.foreground, Color.parse(palette.base)
-            )
-            self.assertEqual(
-                alice.render().spans[0].style.foreground, Color.parse(palette.base)
-            )
+    # ---- Context (spec section 25) -----------------------------------
 
-    async def test_left_from_you_turns_you_alice_connector_accent_alice_bob_dim(
-        self,
-    ) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-
-            canvas = app.query_one(MeshCanvas)
-            before_colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertEqual(before_colors, {palette.dim_base})
-
-            await pilot.press("left")
-            await pilot.pause()
-            after_colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertEqual(after_colors, {palette.dim_base, palette.accent})
-
-    async def test_left_left_from_you_turns_alice_bob_connector_accent(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-            await pilot.press("left")
-            await pilot.pause()
-            await pilot.press("left")
-            await pilot.pause()
-            canvas = app.query_one(MeshCanvas)
-            colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertEqual(colors, {palette.dim_base, palette.accent})
-
-    async def test_up_from_you_turns_you_alice_connector_accent(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            palette = THEME_PALETTES[app._current_theme]
-            await pilot.press("up")
-            await pilot.pause()
-            canvas = app.query_one(MeshCanvas)
-            colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertEqual(colors, {palette.dim_base, palette.accent})
-
-    async def test_right_right_from_bob_reselects_you_and_restores_original_positions(
-        self,
-    ) -> None:
-        """The exact reverse of LEFT, LEFT: BOB -> ALICE -> YOU, restoring
-
-        every node to its original on-screen position -- proves the
-        whole-mesh translation round-trips losslessly.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
-            )
-            original = {
-                YOU_ID: glyph_screen_position(you),
-                ALICE_ID: glyph_screen_position(alice),
-                BOB_ID: glyph_screen_position(bob),
-            }
-
-            view = app.query_one(MeshTopologyView)
-            await pilot.press("left")
-            await pilot.pause()
-            await pilot.press("left")
-            await pilot.pause()
-            self.assertEqual(view.selected_node_id, BOB_ID)
-
-            await pilot.press("right")
-            await pilot.pause()
-            self.assertEqual(view.selected_node_id, ALICE_ID)
-
-            await pilot.press("right")
-            await pilot.pause()
-            self.assertEqual(view.selected_node_id, YOU_ID)
-            self.assertEqual(glyph_screen_position(you), original[YOU_ID])
-            self.assertEqual(glyph_screen_position(alice), original[ALICE_ID])
-            self.assertEqual(glyph_screen_position(bob), original[BOB_ID])
-
-    async def test_right_right_from_bob_returns_connectors_to_dim_base(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-            await pilot.press("left")
-            await pilot.pause()
-            await pilot.press("left")
-            await pilot.pause()
-            await pilot.press("right")
-            await pilot.pause()
-            await pilot.press("right")
-            await pilot.pause()
-
-            palette = THEME_PALETTES[app._current_theme]
-            canvas = app.query_one(MeshCanvas)
-            colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertEqual(colors, {palette.dim_base})
-
-    async def test_context_status_line_shows_exact_fixture_strings(self) -> None:
+    async def test_context_line_for_you(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             status = str(app.query_one("#mesh-context-status").render())
             self.assertEqual(status, "YOU")
 
-            await pilot.press("left")
-            await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "ALICE / CLIENT+RELAY / 0 HOPS / 30m")
-
-            await pilot.press("left")
-            await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "BOB / CLIENT / 1 HOPS / 30m")
-
-    async def test_context_status_line_updates_immediately_as_selection_reverses(
-        self,
-    ) -> None:
-        """The context is selection-driven, not viewport-position-driven:
-
-        it must update on every arrow press, including the reverse
-        traversal back through ALICE to YOU.
-        """
+    async def test_context_line_for_client(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[1])  # Bob, hops_away=1
             await self._open_mesh(pilot)
-            await pilot.press("left")
-            await pilot.pause()
-            await pilot.press("left")
-            await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "BOB / CLIENT / 1 HOPS / 30m")
-
-            await pilot.press("right")
-            await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "ALICE / CLIENT+RELAY / 0 HOPS / 30m")
-
-            await pilot.press("right")
+            view = app.query_one(MeshTopologyView)
+            bob_id = SIMULATED_MESSAGES[1].sender_node_id
+            view.select_node(bob_id)
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
+            )
+            app._update_mesh_context_status()
             await pilot.pause()
             status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "YOU")
+            self.assertIn("CLIENT", status)
+            self.assertIn("1 HOPS", status)
+            self.assertNotIn("CLIENT+RELAY", status)
 
-    async def test_navigation_never_moves_the_board_or_creates_scrollbars(
-        self,
-    ) -> None:
+    async def test_context_line_unknown_hops_shows_question_mark(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata("!unknownhop", "UnknownHop", hops_away=None),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!unknownhop",
+                    sender_long_name="UnknownHop",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            view.select_node("!unknownhop")
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            app._update_mesh_context_status()
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertIn("? HOPS", status)
+            self.assertNotIn("0 HOPS", status)
+
+    def test_context_line_supports_client_and_relay_and_relay_only_format(self) -> None:
+        """Formatting-level proof (see mesh_state tests): the live app's
+
+        role-to-glyph and context-line logic supports CLIENT+RELAY and
+        RELAY-only correctly even though no current real-data path can
+        produce them (see MeshNodeState's docstring on why is_relay is
+        always False today) -- so the code is truthfully ready without
+        the live app ever fabricating either state.
+        """
+        client_and_relay = MeshNodeState(
+            node=NodeMetadata("!cr", "ClientRelay", 0),
+            is_client=True,
+            is_relay=True,
+            last_interaction_at=1_700_000_000.0,
+        )
+        relay_only = MeshNodeState(
+            node=NodeMetadata("!ro", "RelayOnly", 2),
+            is_client=False,
+            is_relay=True,
+            last_interaction_at=1_700_000_000.0,
+        )
+        self.assertIn(
+            "CLIENT+RELAY", format_mesh_context_line(client_and_relay, now=1_700_000_100.0)
+        )
+        self.assertIn("RELAY", format_mesh_context_line(relay_only, now=1_700_000_100.0))
+        self.assertNotIn("CLIENT", format_mesh_context_line(relay_only, now=1_700_000_100.0))
+
+    # ---- Selection preservation / navigation (spec section 18/19) ----
+
+    async def test_selection_preserved_across_refresh_if_still_present(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice_id = SIMULATED_MESSAGES[0].sender_node_id
+            view.select_node(alice_id)
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
+            )
+            await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id.lower(), alice_id.lower())
+
+    async def test_selection_falls_back_to_you_if_it_disappears(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice_id = SIMULATED_MESSAGES[0].sender_node_id
+            view.select_node(alice_id)
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
+            )
+            await pilot.pause()
+
+            # Alice no longer has any recorded interaction at all -- she
+            # can no longer exist in a CLIENT-only working set.
+            app._channel_states.clear()
+            app.chat_store = None
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
+            self.assertTrue(view.selected_node_id)
+            selected_state = next(
+                state
+                for state in view.working_set
+                if state.node.node_id == view.selected_node_id
+            )
+            self.assertTrue(selected_state.node.is_local)
+
+    async def test_navigation_is_general_not_hardcoded_by_node_id(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!zzzznode", "ZzzzNode", position=north_of_local(2)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!zzzznode",
+                    sender_long_name="ZzzzNode",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, app.radio.info.node_id)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!zzzznode")
+
+    async def test_no_scrollbars_on_mesh(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
@@ -1736,95 +1238,100 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(view, ScrollableContainer)
             self.assertFalse(view.show_vertical_scrollbar)
             self.assertFalse(view.show_horizontal_scrollbar)
-            self.assertEqual(view.styles.overflow_x, "hidden")
-            self.assertEqual(view.styles.overflow_y, "hidden")
 
-            board_offset_before = view.board.styles.offset
-            await pilot.press("left")
-            await pilot.pause()
-            self.assertEqual(view.board.styles.offset, board_offset_before)
-            self.assertFalse(view.show_vertical_scrollbar)
-            self.assertFalse(view.show_horizontal_scrollbar)
+    # ---- Preserved visual contract -----------------------------------
 
-    async def test_arrow_with_no_candidate_is_a_noop(self) -> None:
+    async def test_selected_node_uses_accent_and_wider_composite(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            await pilot.press("right")
-            await pilot.pause()
-            self.assertEqual(view.selected_node_id, YOU_ID)
+            palette = THEME_PALETTES[app._current_theme]
+            you_widget = next(
+                widget
+                for widget in app.query(MeshNodeWidget)
+                if widget.node_id == view.selected_node_id
+            )
+            rendered = you_widget.render()
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent))
+            self.assertEqual(int(you_widget.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
 
-    async def test_bob_is_reachable_via_spatial_arrow_navigation_from_you(self) -> None:
+    async def test_stale_unselected_node_uses_dim_base(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            very_old = 1_700_000_000.0 - MESH_STALE_THRESHOLD_SECONDS * 5
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!stale001",
+                    sender_long_name="StaleOne",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="ancient",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=very_old,
+                )
+            )
+            await pilot.press("4")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_000.0)
+            await pilot.pause()
+            palette = THEME_PALETTES[app._current_theme]
+            stale_widget = next(
+                widget for widget in app.query(MeshNodeWidget) if widget.node_id == "!stale001"
+            )
+            rendered = stale_widget.render()
+            self.assertEqual(
+                rendered.spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+    async def test_no_selection_background_rectangle(self) -> None:
+        self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
-            view = app.query_one(MeshTopologyView)
-            await pilot.press("left")
-            await pilot.pause()
-            self.assertEqual(view.selected_node_id, ALICE_ID)
-            await pilot.press("left")
-            await pilot.pause()
-            self.assertEqual(view.selected_node_id, BOB_ID)
-
-    async def test_grid_dots_nodes_and_connectors_fit_inside_the_uconsole_viewport(
-        self,
-    ) -> None:
-        """At the actual small/uConsole-like viewport (90x28, the size used
-
-        by every other MESH test in this module and the stated supported
-        terminal size), the fixed 8x21 board must never clip: all 168
-        background dots, all four node glyphs, and all three connectors
-        must render entirely inside the visible MESH region -- MESH has no
-        scrolling to fall back on if the board is too big for the viewport.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await self._open_mesh(pilot)
-
-            view = app.query_one(MeshTopologyView)
-            viewport = view.region
-            board = view.board
-            canvas = app.query_one(MeshCanvas)
-
-            # The board container and its background canvas (dots plus
-            # connectors) must both render fully inside the visible region.
-            self.assertTrue(viewport.contains_region(board.region))
-            self.assertTrue(viewport.contains_region(canvas.region))
-
-            # All 168 (8x21) logical grid-dot positions, individually.
-            dot_count = 0
-            for row in range(1, MESH_GRID_ROWS + 1):
-                for column in range(1, MESH_GRID_COLUMNS + 1):
-                    x, y = _mesh_grid_pixel(row, column)
-                    screen_x = board.region.x + x
-                    screen_y = board.region.y + y
-                    with self.subTest(row=row, column=column):
-                        self.assertTrue(viewport.contains_point((screen_x, screen_y)))
-                    dot_count += 1
-            self.assertEqual(dot_count, 8 * 21)
-
-            # YOU, ALICE, BOB, and 9A4B.
             for widget in app.query(MeshNodeWidget):
-                with self.subTest(node=widget.node_id):
-                    self.assertTrue(viewport.contains_region(widget.region))
+                self.assertEqual(widget.styles.background.a, 0)
 
-            # All three connectors, cell by cell: YOU-ALICE, ALICE-BOB,
-            # and YOU-9A4B.
-            fixed_pixel = {
-                YOU_ID: _mesh_grid_pixel(5, 11),
-                ALICE_ID: _mesh_grid_pixel(4, 10),
-                BOB_ID: _mesh_grid_pixel(5, 8),
-                NINE_A4B_ID: _mesh_grid_pixel(7, 9),
-            }
-            for near_id, far_id in MESH_FIXTURE_CONNECTORS:
-                route = route_connector(*fixed_pixel[near_id], *fixed_pixel[far_id])
-                self.assertTrue(route)
-                for x, y, _glyph in route:
-                    screen_x = board.region.x + x
-                    screen_y = board.region.y + y
-                    with self.subTest(near=near_id, far=far_id, cell=(x, y)):
-                        self.assertTrue(viewport.contains_point((screen_x, screen_y)))
+    # ---- Zero new radio traffic (spec section 26) ---------------------
+
+    async def test_mesh_refresh_navigation_generate_no_radio_traffic(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            for key in ("up", "down", "left", "right", "up", "down"):
+                await pilot.press(key)
+                await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
+            self.assertEqual(app.radio.sent_messages, ())
+
+    async def test_mesh_never_calls_send_text_or_traceroute_paths(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for method_name in ("send_text", "sendData", "sendText", "sendPosition"):
+                if hasattr(app.radio, method_name):
+                    setattr(
+                        app.radio,
+                        method_name,
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            AssertionError(f"MESH must never call {method_name}")
+                        ),
+                    )
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            for key in ("up", "down", "left", "right"):
+                await pilot.press(key)
+                await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):

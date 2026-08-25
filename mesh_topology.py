@@ -78,24 +78,28 @@ def compact_node_label(node: NodeMetadata, max_cells: int = NODE_WIDTH - 2) -> s
     return f"…{node_id[-(max_cells - 1):]}"
 
 
-def build_topology(
+def assign_grid_slots(
     nodes: Iterable[NodeMetadata],
     *,
     max_radius: int = DEFAULT_MAX_GRID_RADIUS,
-) -> TopologyLayout:
-    """Arrange YOU centrally, then a bounded relative spatial grid outward.
+) -> tuple[PositionedNode, ...]:
+    """Place YOU at (0, 0), then a bounded relative spatial grid outward.
 
-    A remote node is placed by compass direction only when both YOU and that
-    node have trustworthy position data; distance only orders nodes outward
-    within their direction bucket as a discrete grid-step rank, clamped to
-    `max_radius` so one very distant node can never explode the board -- it
-    is never proportional to real distance. Nodes without a resolvable
-    bearing are placed deterministically around the outer ring instead of
-    being mixed into the directional grid with a fabricated direction.
-    Coordinates never imply literal geography, routing edges, or exact scale.
-    The result is bounded by construction (the caller is expected to pass a
-    working set of a handful of nodes, not the full node database), so there
-    is no scrolling: the whole board is meant to fit one viewport.
+    Pure logical grid-STEP placement (not pixel/cell coordinates): a
+    remote node is placed by compass direction only when both YOU and
+    that node have trustworthy position data; distance only orders nodes
+    outward within their direction bucket as a discrete grid-step rank,
+    clamped to `max_radius` so one very distant node can never explode
+    the board -- it is never proportional to real distance. Nodes
+    without a resolvable bearing are placed deterministically around the
+    outer ring instead of being mixed into the directional grid with a
+    fabricated direction. Coordinates never imply literal geography,
+    routing edges, or exact scale.
+
+    This is the shared core reused both by build_topology() (which scales
+    these steps into pixel positions for its own auto-sized board) and by
+    any caller mapping them directly onto a different, e.g. fixed-size,
+    grid.
     """
     max_radius = max(1, max_radius)
     unique: dict[str, NodeMetadata] = {}
@@ -143,28 +147,125 @@ def build_topology(
             slot_x, slot_y = _reserve_slot(grid_x, grid_y, occupied)
             logical.append((node, slot_x, slot_y, "UNKNOWN"))
 
-    if not logical:
+    return tuple(
+        PositionedNode(node, grid_x, grid_y, region)
+        for node, grid_x, grid_y, region in logical
+    )
+
+
+def build_topology(
+    nodes: Iterable[NodeMetadata],
+    *,
+    max_radius: int = DEFAULT_MAX_GRID_RADIUS,
+) -> TopologyLayout:
+    """Arrange YOU centrally, then a bounded relative spatial grid outward,
+
+    scaled into pixel/cell coordinates for an auto-sized board. See
+    assign_grid_slots() for the pure logical placement this scales.
+    The result is bounded by construction (the caller is expected to pass
+    a working set of a handful of nodes, not the full node database), so
+    there is no scrolling: the whole board is meant to fit one viewport.
+    """
+    slots = assign_grid_slots(nodes, max_radius=max_radius)
+    if not slots:
         return TopologyLayout((), 1, 1)
-    min_x = min(item[1] for item in logical)
-    max_x = max(item[1] for item in logical)
-    min_y = min(item[2] for item in logical)
-    max_y = max(item[2] for item in logical)
+    min_x = min(item.x for item in slots)
+    max_x = max(item.x for item in slots)
+    min_y = min(item.y for item in slots)
+    max_y = max(item.y for item in slots)
     cell_width = NODE_WIDTH + HORIZONTAL_GAP
     cell_height = NODE_HEIGHT + VERTICAL_GAP
     positioned = tuple(
         PositionedNode(
-            node,
-            BOARD_MARGIN_X + (grid_x - min_x) * cell_width,
-            BOARD_MARGIN_Y + (grid_y - min_y) * cell_height,
-            region,
+            item.node,
+            BOARD_MARGIN_X + (item.x - min_x) * cell_width,
+            BOARD_MARGIN_Y + (item.y - min_y) * cell_height,
+            item.region,
         )
-        for node, grid_x, grid_y, region in logical
+        for item in slots
     )
     return TopologyLayout(
         positioned,
         BOARD_MARGIN_X * 2 + (max_x - min_x) * cell_width + NODE_WIDTH,
         BOARD_MARGIN_Y * 2 + (max_y - min_y) * cell_height + NODE_HEIGHT,
     )
+
+
+def place_within_bounds(
+    slots: tuple[PositionedNode, ...],
+    *,
+    center_row: int,
+    center_column: int,
+    row_count: int,
+    column_count: int,
+) -> dict[str, tuple[int, int]]:
+    """Map assign_grid_slots()'s unbounded logical (x, y) steps from LOCAL
+
+    onto a fixed row_count x column_count grid (1-indexed row, column),
+    guaranteeing every node lands in-bounds and collision-free.
+
+    assign_grid_slots()'s own collision avoidance (_reserve_slot) assumes
+    an auto-growing board: if several nodes cluster in the same compass
+    direction, its outward spiral search can place a node farther from
+    LOCAL than max_radius. On a FIXED board that can push a node past the
+    edge. Nodes closest to LOCAL claim their intended cell first (any
+    necessary nudging falls on whichever node was already placed
+    farthest out); a node whose clamped cell is taken searches an
+    expanding ring within bounds, falling back to the first free cell in
+    the grid in the extreme case (guaranteed to exist for any working set
+    much smaller than the grid's total cell count).
+    """
+    occupied: set[tuple[int, int]] = set()
+    result: dict[str, tuple[int, int]] = {}
+    ordered = sorted(
+        slots,
+        key=lambda item: (
+            item.x * item.x + item.y * item.y,
+            item.node.node_id.casefold(),
+        ),
+    )
+    for item in ordered:
+        row = _clamp(center_row + item.y, 1, row_count)
+        column = _clamp(center_column + item.x, 1, column_count)
+        row, column = _reserve_bounded_cell(
+            row, column, occupied, row_count=row_count, column_count=column_count
+        )
+        occupied.add((row, column))
+        result[item.node.node_id] = (row, column)
+    return result
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def _reserve_bounded_cell(
+    row: int,
+    column: int,
+    occupied: set[tuple[int, int]],
+    *,
+    row_count: int,
+    column_count: int,
+) -> tuple[int, int]:
+    if (row, column) not in occupied:
+        return row, column
+    radius = 1
+    max_span = row_count + column_count
+    while radius <= max_span:
+        for delta_row, delta_column in _square_ring(radius):
+            candidate = (row + delta_row, column + delta_column)
+            if (
+                1 <= candidate[0] <= row_count
+                and 1 <= candidate[1] <= column_count
+                and candidate not in occupied
+            ):
+                return candidate
+        radius += 1
+    for candidate_row in range(1, row_count + 1):  # pragma: no cover - grid full
+        for candidate_column in range(1, column_count + 1):
+            if (candidate_row, candidate_column) not in occupied:
+                return (candidate_row, candidate_column)
+    return (row, column)  # pragma: no cover - unreachable, grid full
 
 
 def _direction_bucket(bearing: float) -> str:

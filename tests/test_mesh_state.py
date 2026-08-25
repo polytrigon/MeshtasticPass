@@ -1,4 +1,4 @@
-"""Tests for MESH's bounded working-set ranking and freshness classification."""
+"""Tests for MESH's real-data working-set ranking, roles, and staleness."""
 
 from __future__ import annotations
 
@@ -6,164 +6,252 @@ import unittest
 
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
-    RECENT_ACTIVITY_SECONDS,
-    VERY_STALE_SECONDS,
-    build_display_nodes,
-    classify_recency,
+    MESH_STALE_THRESHOLD_SECONDS,
+    MeshNodeState,
+    build_mesh_working_set,
+    format_mesh_context_line,
 )
 from radio_service import NodeMetadata
 
 
 NOW = 1_000_000.0
+YOU = NodeMetadata("!you", "Local", "ME", 0, NOW, True)
 
 
-class ClassifyRecencyTests(unittest.TestCase):
-    def test_recent_boundary_is_inclusive(self) -> None:
-        self.assertEqual(classify_recency(NOW - RECENT_ACTIVITY_SECONDS, NOW), "recent")
-        self.assertEqual(
-            classify_recency(NOW - RECENT_ACTIVITY_SECONDS - 1, NOW), "stale"
+def client_state(
+    node: NodeMetadata, *, last_interaction_at: float | None, is_relay: bool = False
+) -> MeshNodeState:
+    return MeshNodeState(
+        node=node, is_client=True, is_relay=is_relay, last_interaction_at=last_interaction_at
+    )
+
+
+class MeshNodeStateStalenessTests(unittest.TestCase):
+    def test_at_exactly_the_threshold_is_recent(self) -> None:
+        state = client_state(
+            NodeMetadata("!a", "A"),
+            last_interaction_at=NOW - MESH_STALE_THRESHOLD_SECONDS,
         )
+        self.assertFalse(state.is_stale(now=NOW))
 
-    def test_very_stale_boundary_is_inclusive_for_stale(self) -> None:
-        self.assertEqual(classify_recency(NOW - VERY_STALE_SECONDS, NOW), "stale")
-        self.assertEqual(
-            classify_recency(NOW - VERY_STALE_SECONDS - 1, NOW), "very_stale"
+    def test_one_second_past_the_threshold_is_stale(self) -> None:
+        state = client_state(
+            NodeMetadata("!a", "A"),
+            last_interaction_at=NOW - MESH_STALE_THRESHOLD_SECONDS - 1,
         )
+        self.assertTrue(state.is_stale(now=NOW))
 
-    def test_missing_or_malformed_activity_is_unknown(self) -> None:
-        self.assertEqual(classify_recency(None, NOW), "unknown")
-        self.assertEqual(classify_recency("not a number", NOW), "unknown")
-        self.assertEqual(classify_recency(True, NOW), "unknown")
+    def test_no_known_interaction_is_stale_not_fabricated_recent(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!a", "A"),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertTrue(state.is_stale(now=NOW))
 
-    def test_future_timestamp_is_unknown_not_fabricated_as_fresh(self) -> None:
-        self.assertEqual(classify_recency(NOW + 60, NOW), "unknown")
+
+class MeshNodeStateGlyphRuleTests(unittest.TestCase):
+    """CLIENT appearance (solid) takes priority; only RELAY-with-no-CLIENT
+
+    renders stroked. No current fixture/data path in this app can ever
+    produce a RELAY-only state (see MeshNodeState's docstring on why
+    is_relay is always False from build_mesh_working_set), so the
+    RELAY-only case is proven directly against a synthetic state.
+    """
+
+    def test_client_only_is_solid(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!a", "A"),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW,
+        )
+        self.assertTrue(state.glyph_is_solid())
+
+    def test_client_and_relay_is_solid(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!a", "A"),
+            is_client=True,
+            is_relay=True,
+            last_interaction_at=NOW,
+        )
+        self.assertTrue(state.glyph_is_solid())
+
+    def test_relay_only_is_stroked(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!a", "A"),
+            is_client=False,
+            is_relay=True,
+            last_interaction_at=NOW,
+        )
+        self.assertFalse(state.glyph_is_solid())
+
+    def test_neither_role_defaults_solid(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!a", "A"),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertTrue(state.glyph_is_solid())
 
 
-class BuildDisplayNodesTests(unittest.TestCase):
+class BuildMeshWorkingSetTests(unittest.TestCase):
+    def test_you_is_always_included_when_present(self) -> None:
+        result = build_mesh_working_set([YOU], last_message_at={})
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].node.is_local)
+
+    def test_you_absent_when_local_node_unknown(self) -> None:
+        result = build_mesh_working_set([], last_message_at={})
+        self.assertEqual(result, ())
+
+    def test_incoming_message_makes_a_node_client(self) -> None:
+        alice = NodeMetadata("!alice", "Alice", "ALC", 1, NOW)
+        result = build_mesh_working_set(
+            [YOU, alice], last_message_at={"!alice": NOW - 10}
+        )
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertTrue(remote.is_client)
+        self.assertFalse(remote.is_relay)
+        self.assertEqual(remote.last_interaction_at, NOW - 10)
+
+    def test_node_with_no_message_history_is_excluded(self) -> None:
+        heard_only = NodeMetadata("!heard", "HeardOnly", None, None, NOW - 5)
+        result = build_mesh_working_set([YOU, heard_only], last_message_at={})
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].node.is_local)
+
+    def test_client_node_missing_from_known_nodes_still_appears(self) -> None:
+        """A CLIENT node absent from the passive node database (e.g. its
+
+        record has not synced yet) still appears, with only its node ID
+        known -- CHAT history, not the node database, is authoritative
+        for CLIENT.
+        """
+        result = build_mesh_working_set([YOU], last_message_at={"!ghost": NOW - 5})
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertEqual(remote.node.node_id, "!ghost")
+        self.assertTrue(remote.is_client)
+
+    def test_case_insensitive_node_id_matching(self) -> None:
+        alice = NodeMetadata("!AlIcE", "Alice", "ALC", 1, NOW)
+        result = build_mesh_working_set(
+            [YOU, alice], last_message_at={"!alice": NOW - 10}
+        )
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertEqual(remote.node.long_name, "Alice")
+
     def test_working_set_is_bounded_to_max_remote_nodes(self) -> None:
-        nodes = [NodeMetadata("!you", "YOU", None, 0, NOW, True)]
-        for index in range(20):
-            nodes.append(
-                NodeMetadata(f"!n{index:04x}", f"Node{index}", None, None, NOW - index)
-            )
-        result = build_display_nodes(nodes, now=NOW, is_favorite=lambda _n: False)
+        last_message_at = {f"!n{i:04x}": NOW - i for i in range(20)}
+        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
         self.assertEqual(len(result) - 1, DEFAULT_MAX_REMOTE_NODES)
 
-    def test_never_renders_the_full_historical_node_database(self) -> None:
-        nodes = [NodeMetadata("!you", "YOU", None, 0, NOW, True)]
-        nodes.extend(
-            NodeMetadata(f"!n{i:04x}", f"Node{i}", None, None, NOW - i)
-            for i in range(200)
-        )
-        result = build_display_nodes(nodes, now=NOW, is_favorite=lambda _n: False)
-        self.assertLess(len(result), len(nodes))
+    def test_never_renders_the_full_historical_client_list(self) -> None:
+        last_message_at = {f"!n{i:04x}": NOW - i for i in range(200)}
+        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        self.assertLess(len(result), len(last_message_at))
 
-    def test_recent_message_activity_ranks_above_last_heard_only(self) -> None:
-        nodes = [
-            NodeMetadata("!you", "YOU", None, 0, NOW, True),
-            NodeMetadata("!heard_recent", "HeardOnly", None, None, NOW - 10),
-            NodeMetadata("!messaged_old", "MessagedOlder", None, None, NOW - 5_000),
-        ]
-        result = build_display_nodes(
-            nodes,
-            now=NOW,
-            is_favorite=lambda _n: False,
-            last_message_at={"!messaged_old": NOW - 5_000},
-        )
-        remote_ids = [display.node.node_id for display in result if not display.node.is_local]
-        self.assertEqual(remote_ids[0], "!messaged_old")
+    def test_most_recent_interaction_ranks_first(self) -> None:
+        last_message_at = {"!old": NOW - 5_000, "!new": NOW - 10}
+        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        remote_ids = [state.node.node_id for state in result if not state.node.is_local]
+        self.assertEqual(remote_ids[0], "!new")
 
-    def test_favorite_beats_plain_recency_when_no_recent_message(self) -> None:
-        nodes = [NodeMetadata("!you", "YOU", None, 0, NOW, True)]
-        for index in range(10):
-            nodes.append(
-                NodeMetadata(
-                    f"!n{index:04x}", f"Node{index}", None, None, NOW - (index + 1) * 100_000
-                )
-            )
-        oldest_id = "!n0009"
-        result = build_display_nodes(
-            nodes,
-            now=NOW,
-            is_favorite=lambda node_id: node_id.lower() == oldest_id,
-            max_remote_nodes=8,
-        )
-        remote_ids = {display.node.node_id for display in result if not display.node.is_local}
-        self.assertIn(oldest_id, remote_ids)
-        remote_display = next(d for d in result if d.node.node_id == oldest_id)
-        self.assertTrue(remote_display.favorite)
+    def test_stale_fallback_shows_most_recent_historical_nodes(self) -> None:
+        """When nothing is recent, ranking naturally surfaces the most
 
-    def test_stale_fallback_shows_something_useful_when_nothing_recent(self) -> None:
-        nodes = [NodeMetadata("!you", "YOU", None, 0, NOW, True)]
-        for index in range(5):
-            nodes.append(
-                NodeMetadata(
-                    f"!n{index:04x}",
-                    f"Node{index}",
-                    None,
-                    None,
-                    NOW - VERY_STALE_SECONDS * 2,
-                )
-            )
-        result = build_display_nodes(nodes, now=NOW, is_favorite=lambda _n: False)
-        # Board is not empty just because nothing recent happened.
+        recently-active stale nodes instead of an empty working set --
+        there is no separate priority tier that would exclude them.
+        """
+        very_old = NOW - MESH_STALE_THRESHOLD_SECONDS * 10
+        last_message_at = {f"!n{i:04x}": very_old - i for i in range(5)}
+        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
         self.assertEqual(len(result) - 1, 5)
-        self.assertTrue(all(d.recency_bucket == "very_stale" for d in result[1:]))
-
-    def test_stale_node_is_never_classified_as_active(self) -> None:
-        nodes = [
-            NodeMetadata("!you", "YOU", None, 0, NOW, True),
-            NodeMetadata("!old", "Old", None, None, NOW - VERY_STALE_SECONDS - 1),
-        ]
-        result = build_display_nodes(nodes, now=NOW, is_favorite=lambda _n: False)
-        remote = next(d for d in result if not d.node.is_local)
-        self.assertNotEqual(remote.recency_bucket, "recent")
-
-    def test_relationship_kind_direct_only_from_trustworthy_message_activity(
-        self,
-    ) -> None:
-        nodes = [
-            NodeMetadata("!you", "YOU", None, 0, NOW, True),
-            NodeMetadata("!messaged", "Messaged", None, None, NOW - 10),
-            NodeMetadata("!context_only", "ContextOnly", None, None, NOW - 10),
-        ]
-        result = build_display_nodes(
-            nodes,
-            now=NOW,
-            is_favorite=lambda _n: False,
-            last_message_at={"!messaged": NOW - 10},
-        )
-        by_id = {d.node.node_id: d for d in result}
-        self.assertEqual(by_id["!messaged"].relationship_kind, "direct")
-        self.assertEqual(by_id["!context_only"].relationship_kind, "context")
-        # "relay" is reserved for a future trustworthy data source; nothing
-        # in this application can produce it today (see module docstring).
-        self.assertTrue(
-            all(d.relationship_kind != "relay" for d in result)
-        )
+        remotes = [state for state in result if not state.node.is_local]
+        self.assertTrue(all(state.is_stale(now=NOW) for state in remotes))
 
     def test_ranking_is_deterministic_and_arrival_order_independent(self) -> None:
-        nodes = [NodeMetadata("!you", "YOU", None, 0, NOW, True)]
-        for index in range(10):
-            nodes.append(
-                NodeMetadata(f"!n{index:04x}", f"Node{index}", None, None, NOW - index * 7)
-            )
-        forward = build_display_nodes(nodes, now=NOW, is_favorite=lambda _n: False)
-        backward = build_display_nodes(
-            list(reversed(nodes)), now=NOW, is_favorite=lambda _n: False
+        last_message_at = {f"!n{i:04x}": NOW - i * 7 for i in range(10)}
+        nodes = [YOU] + [
+            NodeMetadata(f"!n{i:04x}", f"Node{i}") for i in range(10)
+        ]
+        forward = build_mesh_working_set(nodes, last_message_at=last_message_at)
+        backward = build_mesh_working_set(
+            list(reversed(nodes)), last_message_at=last_message_at
         )
         self.assertEqual(
-            [d.node.node_id for d in forward], [d.node.node_id for d in backward]
+            [state.node.node_id for state in forward],
+            [state.node.node_id for state in backward],
         )
 
-    def test_duplicate_node_ids_are_deduplicated(self) -> None:
-        nodes = [
-            NodeMetadata("!you", "YOU", None, 0, NOW, True),
-            NodeMetadata("!DUP0001", "First", None, None, NOW),
-            NodeMetadata("!dup0001", "Second", None, None, NOW),
-        ]
-        result = build_display_nodes(nodes, now=NOW, is_favorite=lambda _n: False)
-        self.assertEqual(len(result), 2)
+    def test_tie_break_on_node_id_is_stable(self) -> None:
+        last_message_at = {"!bbb": NOW - 10, "!aaa": NOW - 10}
+        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        remote_ids = [state.node.node_id for state in result if not state.node.is_local]
+        self.assertEqual(remote_ids, ["!aaa", "!bbb"])
+
+
+class FormatMeshContextLineTests(unittest.TestCase):
+    def test_you_context_is_bare_literal_you(self) -> None:
+        """compact_node_label() always returns literal "YOU" for the local
+
+        node regardless of its configured name -- see mesh_topology.py.
+        """
+        state = MeshNodeState(
+            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
+
+    def test_client_only_format(self) -> None:
+        state = client_state(
+            NodeMetadata("!bob", "Bob Basecamp", "BOB", 1, NOW),
+            last_interaction_at=NOW - 30 * 60,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW),
+            "Bob Basecamp / CLIENT / 1 HOPS / 30m",
+        )
+
+    def test_client_and_relay_format(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!alice", "Alice Trail", "ALC", 0, NOW),
+            is_client=True,
+            is_relay=True,
+            last_interaction_at=NOW - 30 * 60,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW),
+            "Alice Trail / CLIENT+RELAY / 0 HOPS / 30m",
+        )
+
+    def test_relay_only_format(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!r", "Relay Only", None, 2, NOW),
+            is_client=False,
+            is_relay=True,
+            last_interaction_at=NOW - 60,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "Relay Only / RELAY / 2 HOPS / 1m"
+        )
+
+    def test_unknown_hops_renders_question_mark_not_zero(self) -> None:
+        state = client_state(
+            NodeMetadata("!x", "X", None, None, NOW), last_interaction_at=NOW - 10
+        )
+        self.assertIn("? HOPS", format_mesh_context_line(state, now=NOW))
+        self.assertNotIn("0 HOPS", format_mesh_context_line(state, now=NOW))
+
+    def test_unknown_interaction_time_renders_question_mark(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!x", "X", None, 1, NOW),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertEqual(format_mesh_context_line(state, now=NOW), "X / CLIENT / 1 HOPS / ?")
 
 
 if __name__ == "__main__":

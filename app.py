@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from time import monotonic, time
 
@@ -46,10 +46,15 @@ from chat_store import (
 )
 from geo import format_distance_miles
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
+from mesh_state import MeshNodeState, build_mesh_working_set, format_mesh_context_line
 from mesh_topology import (
+    DEFAULT_MAX_GRID_RADIUS,
     PositionedNode,
     TopologyLayout,
+    assign_grid_slots,
+    compact_node_label,
     directional_target,
+    place_within_bounds,
     route_connector,
 )
 from node_activity import is_node_active
@@ -382,23 +387,22 @@ class ConnectionPage(VerticalScroll):
 CIRCLE_SOLID_LARGE = "●"
 CIRCLE_STROKED_LARGE = "○"
 
-# --- MESH minimal fixed-grid interaction fixture ---------------------------
+# --- MESH: real passive-data visualization on a fixed grid -----------------
 #
-# MESH is being rebuilt one component at a time. This pass establishes only
-# the visual/interaction foundation: a fixed 8x21 grid holding a hardcoded
-# YOU + ALICE + BOB + 9A4B fixture, arrow-key selection, and whole-mesh
-# recentering translation. It intentionally does NOT do relevance ranking,
-# production staleness/history tracking, Favorites, real relay/message
-# classification, GPS-derived placement, a dynamic node count, or
-# scrolling -- see mesh_state.py and mesh_topology.build_topology()/
-# route_connector() for the pure, still-importable pieces that implement
-# richer behavior; they are simply not wired into this view right now so a
-# future pass can reintroduce them deliberately.
+# MESH is being rebuilt one component at a time. This pass wires the
+# approved fixed-grid visual design to real passive Meshtastic data: no
+# LoRa traffic is ever generated to populate it (see _refresh_mesh). It
+# intentionally does NOT yet do Favorites, GPS-derived placement beyond
+# the coarse compass/distance abstraction already in mesh_topology.py,
+# dynamic node-count growth beyond the bounded working set, or scrolling.
+# See mesh_state.py for the working-set/role/staleness model and
+# mesh_topology.py for the pure grid geometry (assign_grid_slots(),
+# place_within_bounds(), directional_target(), route_connector()) reused
+# here.
 MESH_GRID_ROWS = 8
 MESH_GRID_COLUMNS = 21
 MESH_GRID_CENTER_ROW = 5
 MESH_GRID_CENTER_COLUMN = 11
-MESH_STALE_THRESHOLD_SECONDS = 24 * 60 * 60
 # Selected-node "visually larger" treatment: a 3-cell-wide composite
 # (small dot + role glyph + small dot) replacing the ordinary 1-cell
 # glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
@@ -408,178 +412,16 @@ MESH_SELECTED_GLYPH_WIDTH = 3
 MESH_SELECTED_HALO_GLYPH = "·"
 
 
-@dataclass(frozen=True)
-class MeshFixtureNode:
-    """One node in the fixed, hardcoded MESH fixture.
+def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
+    """Selection (ACCENT) always overrides the stale (DIM_BASE) treatment.
 
-    row/column are the node's fixed logical grid position (1-indexed),
-    before whole-mesh translation/recentering is applied. `label` is a
-    board-level visual overlay only -- it never affects the glyph's own
-    grid coordinate. Glyph shape (solid vs stroked) and stale styling are
-    NOT stored here: they are derived from the node's OBSERVED
-    COMMUNICATION ROLE (see MeshFixtureContext, _mesh_glyph_is_solid) so
-    the rule stays general rather than an as-needed per-node exception.
-    """
-
-    node_id: str
-    row: int
-    column: int
-    is_local: bool
-    label: str
-
-
-MESH_FIXTURE_NODES = (
-    MeshFixtureNode("!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True, "YOU"),
-    MeshFixtureNode("!alice", 4, 10, False, "ALICE"),
-    # BOB is defined relative to ALICE's fixed base position: two columns
-    # left, one row down -- see MESH_FIXTURE_CONNECTORS for the connector
-    # that traces exactly that displacement.
-    MeshFixtureNode("!bob", 4 + 1, 10 - 2, False, "Bob"),
-    # 9A4B is defined relative to YOU's fixed base position: two columns
-    # left, two rows down.
-    MeshFixtureNode(
-        "!9a4b",
-        MESH_GRID_CENTER_ROW + 2,
-        MESH_GRID_CENTER_COLUMN - 2,
-        False,
-        "9A4B",
-    ),
-)
-
-# (near, far) node-id pairs -- each drawn near-to-far with route_connector,
-# and each colored ACCENT only when its far/target endpoint is selected
-# (mirrors the original YOU-ALICE rule: selecting the "closer to YOU" end
-# of an edge is not itself reason to highlight that edge).
-MESH_FIXTURE_CONNECTORS: tuple[tuple[str, str], ...] = (
-    ("!you", "!alice"),
-    ("!alice", "!bob"),
-    ("!you", "!9a4b"),
-)
-
-# Bottom-left context-line text only -- the board itself renders each
-# node's own `label` field above its glyph, which can differ from this.
-MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {
-    "!you": "YOU",
-    "!alice": "ALICE",
-    "!bob": "BOB",
-    "!9a4b": "9A4B",
-}
-
-
-@dataclass(frozen=True)
-class MeshFixtureContext:
-    """A remote node's OBSERVED COMMUNICATION ROLE for the bottom-left
-
-    status line and glyph styling -- deliberately distinct from a node's
-    configured Meshtastic device role, and not (yet) backed by
-    trustworthy radio evidence. For this deterministic fixture pass:
-
-    - CLIENT: this node has originated a message we received.
-    - RELAY: we have trustworthy evidence this node relayed/hopped
-      traffic originated by another node.
-
-    Neither implies the other -- a node can be CLIENT, RELAY, or both
-    (CLIENT+RELAY) -- and RELAY must never be inferred merely from a
-    configured role or from hop count alone, here or once this fixture is
-    replaced with real radio data. `last_interaction_seconds` is a
-    deterministic fixture duration (not a timestamp), so tests never
-    depend on wall-clock time; the full activity/history model is a
-    later pass. `last_interaction` and `stale` are both derived from it.
-    """
-
-    is_client: bool
-    is_relay: bool
-    hops: int
-    last_interaction_seconds: float
-
-    @property
-    def last_interaction(self) -> str:
-        return format_relative_age(self.last_interaction_seconds)
-
-    @property
-    def stale(self) -> bool:
-        """>24h since last interaction; exactly 24h still counts as recent."""
-        return self.last_interaction_seconds > MESH_STALE_THRESHOLD_SECONDS
-
-
-# YOU is intentionally absent: it has no observed communication role, and
-# its context line is always just its bare label (see _mesh_context_line).
-MESH_FIXTURE_CONTEXTS: dict[str, MeshFixtureContext] = {
-    # ALICE relayed BOB's message (RELAY) and has separately originated a
-    # message of her own that we received (CLIENT) -- both are true, so
-    # she is CLIENT+RELAY, not just RELAY.
-    "!alice": MeshFixtureContext(
-        is_client=True, is_relay=True, hops=0, last_interaction_seconds=30 * 60
-    ),
-    # BOB originated a message we received (CLIENT); no evidence he
-    # relayed anything, so he is CLIENT only.
-    "!bob": MeshFixtureContext(
-        is_client=True, is_relay=False, hops=1, last_interaction_seconds=30 * 60
-    ),
-    # 9A4B originated a message we received in the past (CLIENT), but
-    # that was over 24h ago -- a stale client, not a relay. Fixture age:
-    # 48h (2 days), well past the 24h stale threshold.
-    "!9a4b": MeshFixtureContext(
-        is_client=True, is_relay=False, hops=1, last_interaction_seconds=48 * 60 * 60
-    ),
-}
-
-
-def _mesh_context_line(node_id: str) -> str:
-    """Build the bottom-left status text for a selected fixture node.
-
-    YOU has no observed communication role, so its line is just its bare
-    label. A remote node's line is "LABEL / ROLE / N HOPS / AGE", with
-    ROLE one of CLIENT, RELAY, or CLIENT+RELAY per MeshFixtureContext.
-    """
-    label = MESH_FIXTURE_CONTEXT_LABELS.get(node_id, "")
-    context = MESH_FIXTURE_CONTEXTS.get(node_id)
-    if context is None:
-        return label
-    role = "+".join(
-        role_name
-        for role_name, present in (("CLIENT", context.is_client), ("RELAY", context.is_relay))
-        if present
-    )
-    return f"{label} / {role} / {context.hops} HOPS / {context.last_interaction}"
-
-
-def _mesh_glyph_is_solid_for_context(context: MeshFixtureContext | None) -> bool:
-    """CLIENT appearance (solid) takes priority over RELAY-only (stroked).
-
-    Pure decision rule, isolated from node lookup, so it can be tested
-    directly against any role combination -- including RELAY-only, which
-    no current fixture node exercises on its own.
-    """
-    if context is None:
-        return True
-    if context.is_client:
-        return True
-    return not context.is_relay
-
-
-def _mesh_glyph_is_solid(node_id: str, *, is_local: bool) -> bool:
-    """CLIENT appearance (solid) takes priority over RELAY-only (stroked).
-
-    Based on the MESH visualization's OBSERVED COMMUNICATION ROLE (see
-    MeshFixtureContext) -- never the node's configured Meshtastic device
-    role. YOU has no observed role and is always solid.
-    """
-    if is_local:
-        return True
-    return _mesh_glyph_is_solid_for_context(MESH_FIXTURE_CONTEXTS.get(node_id))
-
-
-def _mesh_node_color(node_id: str, *, selected: bool, theme: str) -> str:
-    """Selection (ACCENT) always overrides the stale (DIM_BASE) treatment;
-
-    a node with no context, or a non-stale one, uses ordinary BASE.
+    YOU has no staleness concept (it is not an observed-interaction
+    record) and always uses ordinary ACCENT/BASE.
     """
     palette = THEME_PALETTES[theme]
     if selected:
         return palette.accent
-    context = MESH_FIXTURE_CONTEXTS.get(node_id)
-    if context is not None and context.stale:
+    if not state.node.is_local and state.is_stale(now=now):
         return palette.dim_base
     return palette.base
 
@@ -592,48 +434,57 @@ def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
     return (column - 1) * DOT_GRID_SPACING_X, (row - 1) * DOT_GRID_SPACING_Y
 
 
-def _mesh_translated_positions(selected_node_id: str) -> dict[str, tuple[int, int]]:
-    """Translate the whole fixed mesh so the selected node sits at the
+def _mesh_translated_positions(
+    base_positions: Mapping[str, tuple[int, int]], selected_node_id: str
+) -> dict[str, tuple[int, int]]:
+    """Translate the whole current layout so the selected node sits at the
 
-    center grid position. This is a pure whole-mesh translation: every node
-    shifts by the same row/column delta, so relative geometry between nodes
-    never changes -- it is never an independent per-node recomputation.
+    center grid position. This is a pure whole-mesh translation: every
+    node shifts by the same row/column delta, so relative geometry
+    between nodes never changes -- it is never an independent per-node
+    recomputation, and it never touches `base_positions` (the working
+    set's fixed geographic/fallback layout) itself.
     """
-    selected = next(
-        (node for node in MESH_FIXTURE_NODES if node.node_id == selected_node_id),
-        MESH_FIXTURE_NODES[0],
-    )
-    row_delta = MESH_GRID_CENTER_ROW - selected.row
-    column_delta = MESH_GRID_CENTER_COLUMN - selected.column
+    selected = base_positions.get(selected_node_id)
+    if selected is None:
+        return dict(base_positions)
+    row_delta = MESH_GRID_CENTER_ROW - selected[0]
+    column_delta = MESH_GRID_CENTER_COLUMN - selected[1]
     return {
-        node.node_id: (node.row + row_delta, node.column + column_delta)
-        for node in MESH_FIXTURE_NODES
+        node_id: (row + row_delta, column + column_delta)
+        for node_id, (row, column) in base_positions.items()
     }
 
 
-def _mesh_fixture_directional_target(current_node_id: str, direction: str) -> str | None:
-    """Pick the fixture node reached by an arrow press, reusing the shared
+def _mesh_directional_target(
+    working_set: tuple[MeshNodeState, ...],
+    base_positions: Mapping[str, tuple[int, int]],
+    current_node_id: str,
+    direction: str,
+) -> str | None:
+    """Pick the working-set node reached by an arrow press, reusing the
 
-    spatial-navigation rule (mesh_topology.directional_target) against the
-    fixture's fixed, untranslated LOGICAL (row, column) positions -- not
-    their rendered pixel positions. DOT_GRID_SPACING_X/Y (4x2) make one
-    logical row-step visually shorter than one column-step on screen, a
-    purely cosmetic choice; ranking by pixel distance would let that
-    asymmetry distort "sensible direction" (e.g. a relationship defined
-    as "2 columns left, 2 rows down" is a clean logical diagonal, but a
-    lopsided one in pixel space). Direction is a property of the mesh's
-    logical geometry, not of wherever the selection happens to be
-    recentered on screen or how wide a screen dot happens to be.
+    shared spatial-navigation rule (mesh_topology.directional_target)
+    against the CURRENT working set's fixed, untranslated LOGICAL
+    (row, column) positions -- not their rendered pixel positions.
+    DOT_GRID_SPACING_X/Y (4x2) make one logical row-step visually shorter
+    than one column-step on screen, a purely cosmetic choice; ranking by
+    pixel distance would let that asymmetry distort "sensible direction".
+    Direction is a property of the mesh's logical geometry, not of
+    wherever the selection happens to be recentered on screen. No node
+    IDs are hardcoded: this is the same general nearest-candidate rule
+    for any working set the model produces.
     """
     layout = TopologyLayout(
         tuple(
             PositionedNode(
-                node=NodeMetadata(node_id=node.node_id, is_local=node.is_local),
-                x=node.column,
-                y=node.row,
-                region="LOCAL" if node.is_local else "UNKNOWN",
+                node=state.node,
+                x=base_positions[state.node.node_id][1],
+                y=base_positions[state.node.node_id][0],
+                region="LOCAL" if state.node.is_local else "UNKNOWN",
             )
-            for node in MESH_FIXTURE_NODES
+            for state in working_set
+            if state.node.node_id in base_positions
         ),
         width=MESH_GRID_COLUMNS,
         height=MESH_GRID_ROWS,
@@ -667,19 +518,20 @@ class MeshNodeWidget(Static):
     at the App level against MeshTopologyView.selected_node_id.
     """
 
-    def __init__(self, fixture: MeshFixtureNode) -> None:
-        self.fixture = fixture
-        self.node_id = fixture.node_id
+    def __init__(self, state: MeshNodeState) -> None:
+        self.state = state
+        self.node_id = state.node.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str) -> None:
-        color = _mesh_node_color(self.node_id, selected=selected, theme=theme)
+    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+        color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
         # The role glyph itself is never altered by selection -- CLIENT
         # (solid) vs RELAY-only (stroked) stays the authoritative node
-        # semantic regardless of visual selection state.
+        # semantic regardless of visual selection state. YOU has no
+        # observed role and is always solid.
         glyph = (
             CIRCLE_SOLID_LARGE
-            if _mesh_glyph_is_solid(self.node_id, is_local=self.fixture.is_local)
+            if self.state.node.is_local or self.state.glyph_is_solid()
             else CIRCLE_STROKED_LARGE
         )
         style = Style(color=color, bold=selected)
@@ -688,7 +540,7 @@ class MeshNodeWidget(Static):
             # the anchor cell's role glyph is flanked by a small dot in
             # each immediately neighboring cell on the same row -- a real,
             # ~3x wider visual footprint, not a font-weight trick. The
-            # widget's own width/offset (set in render_fixture) keep the
+            # widget's own width/offset (set in MeshTopologyView.set_nodes) keep the
             # center *column* of this 3-cell composite exactly on the
             # glyph's (grid_x, grid_y) anchor, so growing it can never
             # move that coordinate.
@@ -709,18 +561,18 @@ class MeshNodeLabelWidget(Static):
 
     Always exactly cell_len(label) cells wide -- its own box is never wider
     than its content, so it needs no internal centering, only a computed
-    offset (see MeshTopologyView.render_fixture). Never influences the
+    offset (see MeshTopologyView.set_nodes). Never influences the
     glyph's own coordinate; see MeshNodeWidget.
     """
 
-    def __init__(self, fixture: MeshFixtureNode) -> None:
-        self.fixture = fixture
-        self.node_id = fixture.node_id
+    def __init__(self, state: MeshNodeState) -> None:
+        self.state = state
+        self.node_id = state.node.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str) -> None:
-        color = _mesh_node_color(self.node_id, selected=selected, theme=theme)
-        self.update(Text(self.fixture.label, style=Style(color=color)))
+    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+        color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
+        self.update(Text(compact_node_label(self.state.node), style=Style(color=color)))
 
     def on_click(self, _event: Click) -> None:
         _mesh_select_node(self.app, self.node_id)
@@ -729,7 +581,7 @@ class MeshNodeLabelWidget(Static):
 def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
-    view.render_fixture(theme=app._current_theme)
+    view.render_layout(theme=app._current_theme, now=time())
     app._update_mesh_context_status()
 
 
@@ -815,11 +667,14 @@ class MeshCanvas(Static):
 
 
 class MeshTopologyView(Container):
-    """A fixed 8x21 grid MESH board: the minimal three-node interaction fixture.
+    """A fixed 8x21 grid MESH board driven by a real, bounded MESH working set.
 
-    No scrolling, no scrollbars, no dynamic node count -- see the module-
-    level comment above MESH_GRID_ROWS for what this pass intentionally
-    does not do yet.
+    No scrolling, no scrollbars -- the working set is bounded precisely
+    so the whole board always fits this one fixed viewport (see
+    mesh_state.build_mesh_working_set). Node identity, positions
+    (base_positions, from mesh_topology.assign_grid_slots() +
+    place_within_bounds()), and roles all come from the current working
+    set passed to set_nodes(); this view only lays out and renders them.
     """
 
     can_focus = True
@@ -829,8 +684,9 @@ class MeshTopologyView(Container):
             Container(MeshCanvas(), id="mesh-board"),
             id="mesh-view",
         )
-        self._selected_node_id = MESH_FIXTURE_NODES[0].node_id
-        self._mounted = False
+        self._selected_node_id = ""
+        self._working_set: tuple[MeshNodeState, ...] = ()
+        self._base_positions: dict[str, tuple[int, int]] = {}
 
     @property
     def board(self) -> Container:
@@ -840,8 +696,31 @@ class MeshTopologyView(Container):
     def selected_node_id(self) -> str:
         return self._selected_node_id
 
-    def render_fixture(self, *, theme: str) -> None:
-        """Render the fixed YOU+ALICE+BOB fixture, recentered on the selection."""
+    @property
+    def working_set(self) -> tuple[MeshNodeState, ...]:
+        return self._working_set
+
+    @property
+    def base_positions(self) -> dict[str, tuple[int, int]]:
+        return self._base_positions
+
+    def set_nodes(
+        self,
+        working_set: tuple[MeshNodeState, ...],
+        base_positions: Mapping[str, tuple[int, int]],
+        *,
+        theme: str,
+        now: float,
+    ) -> None:
+        """Render the current working set, recentered on the selection.
+
+        Preserves the current selection if it is still in the working
+        set; otherwise falls back to YOU (or the first node, if somehow
+        there is no local node). Widgets are added/removed only for
+        nodes that actually entered/left the working set -- unchanged
+        nodes keep their existing widget, so unchanged data never
+        reshuffles or remounts anything.
+        """
         board = self.board
         board_width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
         board_height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
@@ -857,22 +736,80 @@ class MeshTopologyView(Container):
         if view_width:
             board.styles.offset = (max(0, (view_width - board_width) // 2), 0)
         else:
-            self.app.call_after_refresh(lambda: self.render_fixture(theme=theme))
-
-        if not self._mounted:
-            board.mount_all(MeshNodeWidget(fixture) for fixture in MESH_FIXTURE_NODES)
-            board.mount_all(
-                MeshNodeLabelWidget(fixture) for fixture in MESH_FIXTURE_NODES
+            self.app.call_after_refresh(
+                lambda: self.set_nodes(working_set, base_positions, theme=theme, now=now)
             )
-            self._mounted = True
 
-        positions = _mesh_translated_positions(self._selected_node_id)
+        self._working_set = working_set
+        self._base_positions = dict(base_positions)
+        current_ids = {state.node.node_id for state in working_set}
+        if self._selected_node_id not in current_ids:
+            local_id = next(
+                (state.node.node_id for state in working_set if state.node.is_local),
+                None,
+            )
+            self._selected_node_id = local_id or (
+                working_set[0].node.node_id if working_set else ""
+            )
+
+        states_by_id = {state.node.node_id: state for state in working_set}
+        # Widget.remove() only schedules removal -- it does not take effect
+        # before the next refresh -- so every query below must keep
+        # filtering by `current_ids` itself rather than assume a removed
+        # widget is already gone from self.query().
+        for widget in list(self.query(MeshNodeWidget)):
+            if widget.node_id not in current_ids:
+                widget.remove()
+        for widget in list(self.query(MeshNodeLabelWidget)):
+            if widget.node_id not in current_ids:
+                widget.remove()
+        existing_glyph_ids = {
+            widget.node_id
+            for widget in self.query(MeshNodeWidget)
+            if widget.node_id in current_ids
+        }
+        existing_label_ids = {
+            widget.node_id
+            for widget in self.query(MeshNodeLabelWidget)
+            if widget.node_id in current_ids
+        }
+        new_glyphs = [
+            MeshNodeWidget(states_by_id[node_id])
+            for node_id in states_by_id
+            if node_id not in existing_glyph_ids
+        ]
+        new_labels = [
+            MeshNodeLabelWidget(states_by_id[node_id])
+            for node_id in states_by_id
+            if node_id not in existing_label_ids
+        ]
+        if new_glyphs:
+            board.mount_all(new_glyphs)
+        if new_labels:
+            board.mount_all(new_labels)
+        glyph_widgets = [
+            widget for widget in self.query(MeshNodeWidget) if widget.node_id in current_ids
+        ]
+        label_widgets = [
+            widget
+            for widget in self.query(MeshNodeLabelWidget)
+            if widget.node_id in current_ids
+        ]
+        for widget in glyph_widgets:
+            widget.state = states_by_id[widget.node_id]
+        for widget in label_widgets:
+            widget.state = states_by_id[widget.node_id]
+
+        positions = _mesh_translated_positions(
+            self._base_positions, self._selected_node_id
+        )
         centers: dict[str, tuple[int, int]] = {}
         # The glyph is the sole coordinate authority: it is always a 1x1
-        # widget offset exactly to (grid_x, grid_y), so label width can
-        # never influence it. Positioned first so `centers` (used for
-        # connector endpoints below) only ever reflects glyph coordinates.
-        for widget in self.query(MeshNodeWidget):
+        # (or, selected, 3x1) widget centered exactly on (grid_x, grid_y),
+        # so label width can never influence it. Positioned first so
+        # `centers` (used for connector endpoints below) only ever
+        # reflects glyph coordinates.
+        for widget in glyph_widgets:
             row, column = positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
             selected = widget.node_id == self._selected_node_id
@@ -885,33 +822,49 @@ class MeshTopologyView(Container):
             widget.styles.height = 1
             widget.styles.offset = (grid_x - width // 2, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
-            widget.refresh_visual(selected=selected, theme=theme)
+            widget.refresh_visual(selected=selected, theme=theme, now=now)
 
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
         # over the glyph's fixed (grid_x, grid_y) by offsetting the whole
         # label widget -- never by resizing or repositioning the glyph.
-        for widget in self.query(MeshNodeLabelWidget):
+        for widget in label_widgets:
             grid_x, grid_y = centers[widget.node_id]
-            label_width = max(1, cell_len(widget.fixture.label))
+            label_width = max(1, cell_len(compact_node_label(widget.state.node)))
             widget.styles.width = label_width
             widget.styles.height = 1
             widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
             selected = widget.node_id == self._selected_node_id
-            widget.refresh_visual(selected=selected, theme=theme)
+            widget.refresh_visual(selected=selected, theme=theme, now=now)
 
+        # Connector semantics: a YOU-to-node edge means "we have observed
+        # communication with this node" (it is CLIENT), never proven RF
+        # adjacency or a routing edge. A relay-chain edge (node-to-node,
+        # not via YOU) would require trustworthy relay evidence this app
+        # cannot currently obtain (see mesh_state.MeshNodeState) and is
+        # therefore never drawn.
         palette = THEME_PALETTES[theme]
+        you_id = next(
+            (state.node.node_id for state in working_set if state.node.is_local),
+            None,
+        )
         connector_cells: list[tuple[int, int, str, str]] = []
-        for near_id, far_id in MESH_FIXTURE_CONNECTORS:
-            color = (
-                palette.accent
-                if self._selected_node_id == far_id
-                else palette.dim_base
-            )
-            connector_cells.extend(
-                (x, y, glyph, color)
-                for x, y, glyph in route_connector(*centers[near_id], *centers[far_id])
-            )
+        if you_id is not None and you_id in centers:
+            for state in working_set:
+                remote_id = state.node.node_id
+                if state.node.is_local or remote_id not in centers:
+                    continue
+                color = (
+                    palette.accent
+                    if self._selected_node_id == remote_id
+                    else palette.dim_base
+                )
+                connector_cells.extend(
+                    (x, y, glyph, color)
+                    for x, y, glyph in route_connector(
+                        *centers[you_id], *centers[remote_id]
+                    )
+                )
         self.board.query_one(MeshCanvas).render_scene(
             board_width, board_height, tuple(connector_cells), theme
         )
@@ -919,15 +872,21 @@ class MeshTopologyView(Container):
     def clear_nodes(self) -> None:
         self.board.remove_children(MeshNodeWidget)
         self.board.remove_children(MeshNodeLabelWidget)
-        self._mounted = False
+        self._working_set = ()
+        self._base_positions = {}
+        self._selected_node_id = ""
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
     def select_node(self, node_id: str) -> None:
         self._selected_node_id = node_id
 
     def select_local(self) -> None:
-        local_id = next(node.node_id for node in MESH_FIXTURE_NODES if node.is_local)
-        self.select_node(local_id)
+        local_id = next(
+            (state.node.node_id for state in self._working_set if state.node.is_local),
+            None,
+        )
+        if local_id is not None:
+            self.select_node(local_id)
 
 
 class IdentityNameControl(Horizontal):
@@ -1512,7 +1471,7 @@ class MeshtasticPassApp(App[None]):
     #mesh-view {
         height: 1fr;
         /* Horizontal centering is applied explicitly in code as a
-           board-level offset (see MeshTopologyView.render_fixture), not
+           board-level offset (see MeshTopologyView.set_nodes), not
            via CSS align, so it stays exact regardless of board width
            parity; vertical centering is still fine left to CSS. */
         align: left middle;
@@ -2697,6 +2656,46 @@ class MeshtasticPassApp(App[None]):
         value = "—" if active is None else str(active)
         selectors[0].set_suffix(f"· ACTIVE {value}")
 
+    def _mesh_last_message_activity(self) -> dict[str, float]:
+        """Most recent trustworthy incoming-message timestamp per node.
+
+        Distinct from RadioService's `lastHeard` (passive node-database
+        sync): this is specifically CHAT receive activity, the source of
+        truth for MESH's CLIENT role and last-interaction time.
+
+        Persisted CHAT history is authoritative, not whatever bounded page
+        happens to be mounted in memory: a node's last message may be far
+        older than the currently loaded window, or from before the app was
+        last restarted, and must still count. In-memory channel state is
+        merged on top of the persisted baseline -- both sources only ever
+        contribute a per-node maximum, never a sum, so merging cannot
+        double-count -- because a just-received message reaches this method
+        (via _refresh_mesh) before its own persistence write completes; see
+        _accept_received_message, which refreshes MESH before persisting.
+        """
+        activity: dict[str, float] = {}
+        if self.chat_store is not None:
+            try:
+                activity.update(self.chat_store.latest_incoming_message_at())
+            except ChatStoreError:
+                pass
+        for state in self._channel_states.values():
+            for entry in state.entries:
+                if entry.outgoing or not entry.node_id:
+                    continue
+                key = entry.node_id.strip().lower()
+                if not key:
+                    continue
+                # Matches StoredMessage.message_time's incoming precedence:
+                # no receipt-time fallback, so in-memory and persisted
+                # activity resolve by the same truthful message clock.
+                timestamp = entry.origin_sent_at or entry.radio_rx_at
+                if timestamp is None:
+                    continue
+                if key not in activity or timestamp > activity[key]:
+                    activity[key] = timestamp
+        return activity
+
     def _refresh_mesh(self, wall_now: float | None = None) -> None:
         """Refresh passive topology data without causing Meshtastic traffic."""
         views = list(self.query(MeshTopologyView))
@@ -2724,24 +2723,51 @@ class MeshtasticPassApp(App[None]):
             nodes = ()
         current_time = time() if wall_now is None else wall_now
         # ACTIVE keeps CHAT's five-minute freshness semantics and counts the
-        # full known-node population; the board below is a fixed two-node
-        # fixture, independent of this passively-observed count.
+        # full known-node population -- independent of the bounded MESH
+        # working set below, which represents recent CLIENT relationships,
+        # not every node ever passively heard.
         active = sum(
             1
             for node in nodes
             if not node.is_local and is_node_active(node.last_heard, current_time)
         )
         title.update(f"> MESH · ACTIVE {active}")
+        working_set = build_mesh_working_set(
+            nodes, last_message_at=self._mesh_last_message_activity()
+        )
+        if not working_set:
+            view.clear_nodes()
+            status.update("NO MESH DATA")
+            self._update_mesh_context_status()
+            return
         status.update("")
-        view.render_fixture(theme=self._current_theme)
+        slots = assign_grid_slots(
+            tuple(state.node for state in working_set),
+            max_radius=DEFAULT_MAX_GRID_RADIUS,
+        )
+        base_positions = place_within_bounds(
+            slots,
+            center_row=MESH_GRID_CENTER_ROW,
+            center_column=MESH_GRID_CENTER_COLUMN,
+            row_count=MESH_GRID_ROWS,
+            column_count=MESH_GRID_COLUMNS,
+        )
+        view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
         self._update_mesh_context_status()
 
     def _move_mesh_focus(self, direction: str) -> None:
         view = self.query_one(MeshTopologyView)
-        target_id = _mesh_fixture_directional_target(view.selected_node_id, direction)
+        target_id = _mesh_directional_target(
+            view.working_set, view.base_positions, view.selected_node_id, direction
+        )
         if target_id is not None:
             view.select_node(target_id)
-            view.render_fixture(theme=self._current_theme)
+            view.set_nodes(
+                view.working_set,
+                view.base_positions,
+                theme=self._current_theme,
+                now=time(),
+            )
             self._update_mesh_context_status()
 
     def _update_mesh_context_status(self) -> None:
@@ -2757,8 +2783,18 @@ class MeshtasticPassApp(App[None]):
         if not views:
             status_widget.update("")
             return
-        selected_id = views[0].selected_node_id
-        status_widget.update(_mesh_context_line(selected_id))
+        view = views[0]
+        state = next(
+            (
+                candidate
+                for candidate in view.working_set
+                if candidate.node.node_id == view.selected_node_id
+            ),
+            None,
+        )
+        status_widget.update(
+            format_mesh_context_line(state, now=time()) if state is not None else ""
+        )
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
