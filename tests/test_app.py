@@ -27,6 +27,7 @@ from app import (
     FontSizeSelector,
     LoadOlderControl,
     LongNameControl,
+    MessageActionControl,
     MeshtasticPassApp,
     ThinScrollBarRender,
 )
@@ -34,6 +35,7 @@ from app_controller import received_chat_entry
 from app_settings import AppSettings
 from chat_store import ChatStore
 from geo import format_distance_miles
+from keyboard_dropdown import KeyboardDropdown
 from radio_service import (
     DeliveryState,
     RadioEvent,
@@ -47,7 +49,7 @@ from simulated_radio_service import (
     SimulatedRadioService,
     SimulatedSendOutcome,
 )
-from theme_palette import THEME_PALETTES
+from theme_palette import ERROR, THEME_PALETTES
 
 
 class CallbackRadioService(RadioService):
@@ -420,6 +422,71 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(control.editing)
             self.assertIs(app.focused, control)
 
+    async def test_connection_navigation_has_one_focus_and_one_caret(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(62, 22)) as pilot:
+            await pilot.pause()
+            device = app.query_one(DeviceSelector)
+            long_name = app.query_one(LongNameControl)
+            font = app.query_one(FontSizeSelector)
+            color = app.query_one(ColorSelector)
+            controls = (device, long_name, font, color)
+
+            def caret_count() -> int:
+                dropdowns = (device, font, color)
+                count = sum(
+                    str(control.render()).startswith("> ")
+                    for control in dropdowns
+                )
+                label = long_name.query_one(".identity-label", Static)
+                return count + str(label.render()).startswith("> ")
+
+            def assert_selected(expected: object) -> None:
+                self.assertIs(app.focused, expected)
+                self.assertEqual(
+                    sum(control.has_focus for control in controls),
+                    1,
+                )
+                self.assertEqual(caret_count(), 1)
+
+            device.focus()
+            await pilot.pause()
+            assert_selected(device)
+            for key, expected in (
+                ("down", long_name),
+                ("down", font),
+                ("down", color),
+                ("up", font),
+                ("up", long_name),
+                ("up", device),
+            ):
+                await pilot.press(key)
+                await pilot.pause()
+                assert_selected(expected)
+
+            long_name.focus()
+            await pilot.press("enter")
+            self.assertTrue(long_name.editing)
+            self.assertIs(app.focused, long_name.editor)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert_selected(long_name)
+            await pilot.press("down")
+            await pilot.pause()
+            assert_selected(font)
+            self.assertFalse(
+                str(
+                    long_name.query_one(".identity-label", Static).render()
+                ).startswith("> ")
+            )
+
     async def test_long_name_field_resizes_without_horizontal_page_scroll(self) -> None:
         app = MeshtasticPassApp(
             SimulatedRadioService(
@@ -552,20 +619,59 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test(size=(100, 30)) as pilot:
             status = app.query_one("#style-status", Static)
-            self.assertEqual(status.visual_style.foreground.hex6, "#D8D8D8")
+            font = app.query_one(FontSizeSelector)
+            color = app.query_one(ColorSelector)
+            for theme, palette in THEME_PALETTES.items():
+                app._apply_color_theme(theme)
+                await app.dropdown_selected(
+                    KeyboardDropdown.Selected(font, font.value)
+                )
+                await pilot.pause()
+                self.assertIn("FONT SIZE SAVED", str(status.render()))
+                self.assertTrue(status.has_class("setting-success"))
+                self.assertEqual(
+                    status.visual_style.foreground.hex6,
+                    palette.accent,
+                )
 
-            await pilot.press("down", "enter", "down", "enter")
-            await pilot.pause()
-            self.assertIn("COLOR SAVED", str(status.render()))
-            self.assertEqual(status.visual_style.foreground.hex6, "#39FF14")
+                color.value = theme
+                observed_theme: list[bool] = []
+                original_update = status.update
 
-            await pilot.press("enter", "down", "enter")
-            await pilot.pause()
-            self.assertEqual(status.visual_style.foreground.hex6, "#FF8C00")
+                def capture_update(content: object, *args: object, **kwargs: object) -> object:
+                    if content == "COLOR SAVED":
+                        observed_theme.append(
+                            app.screen.has_class(f"theme-{theme}")
+                        )
+                    return original_update(content, *args, **kwargs)
 
-            await pilot.press("enter", "down", "enter")
+                status.update = capture_update  # type: ignore[method-assign]
+                try:
+                    await app.dropdown_selected(
+                        KeyboardDropdown.Selected(color, theme)
+                    )
+                finally:
+                    status.update = original_update  # type: ignore[method-assign]
+                await pilot.pause()
+                self.assertEqual(observed_theme, [True])
+                self.assertIn("COLOR SAVED", str(status.render()))
+                self.assertEqual(
+                    status.visual_style.foreground.hex6,
+                    palette.accent,
+                )
+
+            original_save = self.settings.save
+            self.settings.save = Mock(side_effect=OSError("read only"))
+            try:
+                await app.dropdown_selected(
+                    KeyboardDropdown.Selected(font, font.value)
+                )
+            finally:
+                self.settings.save = original_save
             await pilot.pause()
-            self.assertEqual(status.visual_style.foreground.hex6, "#D8D8D8")
+            self.assertTrue(status.has_class("setting-error"))
+            self.assertFalse(status.has_class("setting-success"))
+            self.assertEqual(status.visual_style.foreground.hex6, ERROR)
 
     async def test_chat_unread_counter_tracks_only_hidden_incoming_messages(self) -> None:
         radio = SimulatedRadioService(
@@ -933,6 +1039,114 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             device.focus()
             await pilot.press("enter", "f4")
             exit_mock.assert_called_once_with()
+
+    async def test_chat_down_from_final_message_returns_to_preserved_draft(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            for index in range(3):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=81_000 + index,
+                        text=f"message {index}",
+                    )
+                )
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "hello wor"
+            chat_input.cursor_position = len(chat_input.value)
+
+            await pilot.press("escape")
+            self.assertIs(app.focused, app.query_one(ChatTranscript))
+            targets = app._chat_navigation_targets()
+            self.assertEqual(len(targets), 3)
+            for target in targets:
+                await pilot.press("down")
+                self.assertIs(app.focused, target)
+            self.assertIsNot(app.focused, chat_input)
+
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+            self.assertEqual(chat_input.value, "hello wor")
+            self.assertEqual(chat_input.cursor_position, len("hello wor"))
+            await pilot.press("k")
+            self.assertEqual(chat_input.value, "hello work")
+            self.assertEqual(sum(entry.is_new for entry in app.chat_history), 0)
+            footer = str(app.query_one("#footer", Static).render())
+            self.assertNotIn("composer", footer.lower())
+
+    async def test_chat_down_uses_final_resend_before_composer(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            app._accepted_send("retry me")
+            entry = app.chat_history[-1]
+            app._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "draft"
+
+            await pilot.press("escape", "down")
+            self.assertIsInstance(app.focused, ChatEntryWidget)
+            await pilot.press("down")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+            self.assertEqual(chat_input.value, "draft")
+
+    async def test_chat_middle_right_and_empty_navigation_do_not_trap_focus(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0,
+                message_interval=0,
+                scripted_messages=(),
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            await pilot.press("escape")
+            transcript = app.query_one(ChatTranscript)
+            self.assertIs(app.focused, transcript)
+            await pilot.press("right")
+            self.assertIs(app.focused, transcript)
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+
+            chat_input.value = "still here"
+            for index in range(3):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=82_000 + index,
+                        text=f"later {index}",
+                    )
+                )
+            await pilot.pause()
+            chat_input.focus()
+            await pilot.press("escape", "down", "down")
+            targets = app._chat_navigation_targets()
+            self.assertIs(app.focused, targets[1])
+            self.assertIsNot(app.focused, chat_input)
+            await pilot.press("right")
+            self.assertIsNot(app.focused, chat_input)
+            self.assertEqual(chat_input.value, "still here")
 
     async def test_f4_exit_runs_normal_cursor_cleanup(self) -> None:
         cursor = Mock()

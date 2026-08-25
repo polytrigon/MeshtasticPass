@@ -55,7 +55,6 @@ class KeyboardDropdown(Static):
         self.value = value
         self.is_open = False
         self._highlighted_index = self._selected_index()
-        self._focused = False
         default_palette = THEME_PALETTES["white"]
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
@@ -154,15 +153,12 @@ class KeyboardDropdown(Static):
             event.stop()
 
     def on_focus(self, _event: Focus) -> None:
-        self._focused = True
-        self._render_dropdown()
+        self._render_dropdown(focused=True)
 
     def on_blur(self, _event: Blur) -> None:
-        self._focused = False
         if self.is_open:
             self.close_menu()
-        else:
-            self._render_dropdown()
+        self._render_dropdown(focused=False)
 
     @on(Click)
     def clicked(self) -> None:
@@ -181,8 +177,8 @@ class KeyboardDropdown(Static):
             0,
         )
 
-    def _render_dropdown(self) -> None:
-        marker = ">" if self._focused else " "
+    def _render_dropdown(self, *, focused: bool | None = None) -> None:
+        marker = ">" if (self.has_focus if focused is None else focused) else " "
         heading = f"{marker} {self.prefix}{self.label} [ {self.selected_label} ▾ ]"
         if self.suffix:
             heading += f" {self.suffix}"

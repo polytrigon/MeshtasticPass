@@ -434,8 +434,9 @@ class LongNameControl(Horizontal):
             self.focus()
         self._resize_field()
 
-    def _update_label(self) -> None:
-        marker = ">" if (self.has_focus or self.editing) and not self.disabled else " "
+    def _update_label(self, *, focused: bool | None = None) -> None:
+        navigation_focus = self.has_focus if focused is None else focused
+        marker = ">" if (navigation_focus or self.editing) and not self.disabled else " "
         self.query_one(".identity-label", Static).update(f"{marker} LONG NAME")
 
     def _resize_field(self) -> None:
@@ -447,10 +448,10 @@ class LongNameControl(Horizontal):
         self.editor.styles.width = min(desired, available)
 
     def on_focus(self, _event: Focus) -> None:
-        self._update_label()
+        self._update_label(focused=True)
 
     def on_blur(self) -> None:
-        self._update_label()
+        self._update_label(focused=False)
 
     def on_resize(self) -> None:
         self._resize_field()
@@ -613,6 +614,9 @@ class MeshtasticPassApp(App[None]):
     $white_dim: {THEME_PALETTES["white"].dim_base};
     $green_dim: {THEME_PALETTES["green"].dim_base};
     $orange_dim: {THEME_PALETTES["orange"].dim_base};
+    $white_accent: {THEME_PALETTES["white"].accent};
+    $green_accent: {THEME_PALETTES["green"].accent};
+    $orange_accent: {THEME_PALETTES["orange"].accent};
     $error: {ERROR};
     """ + """
     Screen {
@@ -765,6 +769,18 @@ class MeshtasticPassApp(App[None]):
 
     #style-status {
         height: 2;
+    }
+
+    #style-status.setting-success {
+        color: $white_accent;
+    }
+
+    Screen.theme-green #style-status.setting-success {
+        color: $green_accent;
+    }
+
+    Screen.theme-orange #style-status.setting-success {
+        color: $orange_accent;
     }
 
     #connection-error, #send-error, #style-status.setting-error {
@@ -1167,7 +1183,11 @@ class MeshtasticPassApp(App[None]):
                 yield ChatTranscript(id="chat-log")
                 yield Static(id="chat-new-below")
                 yield Static(id="send-error")
-                yield Input(placeholder="> message", id="chat-input")
+                yield Input(
+                    placeholder="> message",
+                    id="chat-input",
+                    select_on_focus=False,
+                )
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
@@ -1400,10 +1420,12 @@ class MeshtasticPassApp(App[None]):
                 self.settings.save()
                 self._apply_color_theme(self.settings.color)
         except (OSError, ValueError) as error:
+            status.remove_class("setting-success")
             status.add_class("setting-error")
             status.update(f"SETTING NOT SAVED — {error}")
         else:
             status.remove_class("setting-error")
+            status.add_class("setting-success")
             message = (
                 "FONT SIZE SAVED — APPLIES ON NEXT LAUNCH"
                 if event.setting_name == "font_size"
@@ -1932,15 +1954,27 @@ class MeshtasticPassApp(App[None]):
     def _move_chat_focus(self, direction: int) -> None:
         targets = self._chat_navigation_targets()
         if not targets:
+            if direction > 0:
+                self._focus_chat_composer()
             return
         try:
             index = targets.index(self.focused)
-            target = targets[max(0, min(len(targets) - 1, index + direction))]
+            next_index = index + direction
+            if direction > 0 and next_index >= len(targets):
+                self._focus_chat_composer()
+                return
+            target = targets[max(0, min(len(targets) - 1, next_index))]
         except ValueError:
             target = targets[-1] if direction < 0 else targets[0]
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
+
+    def _focus_chat_composer(self) -> None:
+        """Return to typing without changing the current draft or read state."""
+        chat_input = self.query_one("#chat-input", Input)
+        chat_input.focus()
+        chat_input.cursor_position = len(chat_input.value)
 
     @on(MessageActionControl.Activated)
     def message_action_activated(
