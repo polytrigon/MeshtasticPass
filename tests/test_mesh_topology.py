@@ -32,6 +32,7 @@ from app import (
     MESH_GRID_ROWS,
     MeshCanvas,
     MeshFixtureNode,
+    MeshNodeLabelWidget,
     MeshNodeWidget,
     MeshTopologyView,
     MeshtasticPassApp,
@@ -114,13 +115,13 @@ def expected_widget_offset(row: int, column: int, label: str) -> tuple[int, int]
 
 
 def glyph_screen_position(widget) -> tuple[int, int]:
-    """The glyph's own on-screen (x, y), independent of label width --
+    """The glyph widget's own on-screen (x, y).
 
-    the glyph is always the widget's second line, horizontally centered.
+    MeshNodeWidget (the glyph) is always a 1x1 widget offset directly to
+    its grid coordinate -- independent of the separately positioned
+    MeshNodeLabelWidget, so this is simply its own offset.
     """
-    offset_x, offset_y = offset_xy(widget)
-    width = max(1, cell_len(widget.fixture.label))
-    return (offset_x + width // 2, offset_y + 1)
+    return offset_xy(widget)
 
 
 class MeshTopologyModelTests(unittest.TestCase):
@@ -728,6 +729,9 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
     def _widget(self, app, node_id: str) -> MeshNodeWidget:
         return next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
 
+    def _label_widget(self, app, node_id: str) -> MeshNodeLabelWidget:
+        return next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == node_id)
+
     async def test_you_is_selected_by_default(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -771,21 +775,50 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 str(bob_rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE
             )
 
-    async def test_node_labels_render_you_alice_bob_center_justified(self) -> None:
+    async def test_node_labels_render_you_alice_bob(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             you, alice, bob = (
-                self._widget(app, YOU_ID),
-                self._widget(app, ALICE_ID),
-                self._widget(app, BOB_ID),
+                self._label_widget(app, YOU_ID),
+                self._label_widget(app, ALICE_ID),
+                self._label_widget(app, BOB_ID),
             )
-            self.assertEqual(str(you.render()).splitlines()[0].strip(), "YOU")
-            self.assertEqual(str(alice.render()).splitlines()[0].strip(), "ALICE")
-            self.assertEqual(str(bob.render()).splitlines()[0].strip(), "Bob")
-            for widget in (you, alice, bob):
-                with self.subTest(node=widget.node_id):
-                    self.assertEqual(widget.styles.content_align_horizontal, "center")
+            self.assertEqual(str(you.render()).strip(), "YOU")
+            self.assertEqual(str(alice.render()).strip(), "ALICE")
+            self.assertEqual(str(bob.render()).strip(), "Bob")
+
+    async def test_you_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            self.assertEqual(
+                glyph_screen_position(self._widget(app, YOU_ID)),
+                _mesh_grid_pixel(5, 11),
+            )
+
+    async def test_alice_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            self.assertEqual(
+                glyph_screen_position(self._widget(app, ALICE_ID)),
+                _mesh_grid_pixel(4, 10),
+            )
+
+    async def test_bob_glyph_stays_exactly_on_its_grid_coordinate_with_label_present(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            self.assertEqual(
+                glyph_screen_position(self._widget(app, BOB_ID)), _mesh_grid_pixel(5, 8)
+            )
 
     async def test_node_glyph_stays_exactly_on_its_grid_point_regardless_of_label_width(
         self,
@@ -794,22 +827,112 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
 
         YOU (3 cells), ALICE (5 cells), and Bob (3 cells) have different
         label widths, but every glyph still lands exactly on its own
-        (grid_x, grid_y).
+        (grid_x, grid_y), and the label widget's own offset -- entirely
+        separate from the glyph widget -- centers it over that same point.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             positions = {YOU_ID: (5, 11), ALICE_ID: (4, 10), BOB_ID: (5, 8)}
             for node_id, (row, column) in positions.items():
-                widget = self._widget(app, node_id)
+                glyph_widget = self._widget(app, node_id)
+                label_widget = self._label_widget(app, node_id)
                 with self.subTest(node=node_id):
                     self.assertEqual(
-                        glyph_screen_position(widget), _mesh_grid_pixel(row, column)
+                        glyph_screen_position(glyph_widget),
+                        _mesh_grid_pixel(row, column),
                     )
                     self.assertEqual(
-                        offset_xy(widget),
-                        expected_widget_offset(row, column, widget.fixture.label),
+                        offset_xy(label_widget),
+                        expected_widget_offset(row, column, label_widget.fixture.label),
                     )
+
+    async def test_labels_are_centered_over_their_fixed_glyph_coordinates(self) -> None:
+        """Equal left/right margin between each label's own box and its
+
+        glyph's screen column -- proof of centering independent of the
+        offset formula under test elsewhere.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            for node_id in (YOU_ID, ALICE_ID, BOB_ID):
+                # Both regions are in the same (absolute, on-screen)
+                # coordinate space -- unlike glyph_screen_position(), which
+                # is board-local, so they can be compared directly here.
+                glyph_x = self._widget(app, node_id).region.x
+                label_region = self._label_widget(app, node_id).region
+                left_margin = glyph_x - label_region.x
+                right_margin = (label_region.x + label_region.width) - glyph_x - 1
+                with self.subTest(node=node_id):
+                    self.assertEqual(left_margin, right_margin)
+
+    async def test_wide_emoji_label_does_not_move_the_glyph(self) -> None:
+        """A label far wider (in terminal cells) than its character count
+
+        must still leave the glyph exactly on its grid coordinate -- the
+        positioning formula uses cell_len(), not Python len(), so a label
+        this wide is deliberately provocative: len() would undercount it.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            you = self._widget(app, YOU_ID)
+            you_label = self._label_widget(app, YOU_ID)
+            original_glyph_position = glyph_screen_position(you)
+
+            emoji_label = "🐔🍕👨‍👩‍👧‍👦"
+            self.assertNotEqual(cell_len(emoji_label), len(emoji_label))
+            you.fixture = MeshFixtureNode(
+                you.fixture.node_id,
+                you.fixture.row,
+                you.fixture.column,
+                you.fixture.is_local,
+                emoji_label,
+                you.fixture.solid,
+            )
+            you_label.fixture = you.fixture
+
+            view = app.query_one(MeshTopologyView)
+            view.render_fixture(theme=app._current_theme)
+            await pilot.pause()
+
+            self.assertEqual(glyph_screen_position(you), original_glyph_position)
+            self.assertEqual(
+                offset_xy(you_label),
+                expected_widget_offset(5, 11, emoji_label),
+            )
+
+    async def test_connector_endpoints_stay_attached_to_rendered_glyph_coordinates(
+        self,
+    ) -> None:
+        """The live connector cells (drawn on the canvas) must terminate
+
+        exactly one step short of each glyph's own actual rendered screen
+        position -- ties the connector geometry to the real widget, not
+        just to the pure _mesh_grid_pixel arithmetic both share.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            you_glyph = offset_xy(self._widget(app, YOU_ID))
+            alice_glyph = offset_xy(self._widget(app, ALICE_ID))
+            bob_glyph = offset_xy(self._widget(app, BOB_ID))
+
+            canvas = app.query_one(MeshCanvas)
+            connector_points = {(x, y) for x, y, _glyph, _color in canvas._signature[2]}
+
+            for near, far in ((you_glyph, alice_glyph), (alice_glyph, bob_glyph)):
+                # Recomputed from the real, live widget offsets (not the
+                # static _mesh_grid_pixel formula both this and app.py
+                # share) -- proves the drawn connector actually tracks
+                # wherever the glyph widgets really ended up on screen.
+                expected_route = {
+                    (x, y) for x, y, _glyph in route_connector(*near, *far)
+                }
+                with self.subTest(near=near, far=far):
+                    self.assertTrue(expected_route)
+                    self.assertTrue(expected_route <= connector_points)
 
     async def test_no_selection_background_rectangle_in_css_or_at_runtime(self) -> None:
         self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)

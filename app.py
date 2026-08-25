@@ -504,7 +504,21 @@ def _mesh_fixture_directional_target(current_node_id: str, direction: str) -> st
 
 
 class MeshNodeWidget(Static):
-    """One node on the fixed MESH grid: a label above a glyph.
+    """The node's glyph: a single cell, anchored exactly on its grid
+
+    coordinate. The glyph's own screen position must never depend on its
+    label's width -- see MeshNodeLabelWidget for the label, a separately
+    positioned overlay above this glyph, never the other way around.
+
+    (A single two-line Text with justify="center" was tried here first,
+    relying on Rich's own per-line centering to align the 1-cell glyph
+    line under the wider label line. That does not hold once Textual
+    composites the Static's content into the screen buffer -- the short
+    line renders flush against the box's left edge instead of centered,
+    silently shifting the glyph off its grid coordinate. Two independently
+    positioned single-line widgets sidesteps that entirely: neither box is
+    ever wider than its own content, so there is no centering decision left
+    for Textual's renderer to get wrong.)
 
     Selection state lives on MeshTopologyView, not Textual's focus system:
     rendering always reflects the current selection synchronously, so there
@@ -523,11 +537,40 @@ class MeshNodeWidget(Static):
         palette = THEME_PALETTES[theme]
         color = palette.accent if selected else palette.base
         glyph = CIRCLE_SOLID_LARGE if self.fixture.solid else CIRCLE_STROKED_LARGE
-        content = Text(justify="center")
-        content.append(self.fixture.label, style=Style(color=color))
-        content.append("\n")
-        content.append(glyph, style=Style(color=color))
-        self.update(content)
+        self.update(Text(glyph, style=Style(color=color)))
+
+    def on_click(self, _event: Click) -> None:
+        _mesh_select_node(self.app, self.node_id)
+
+
+class MeshNodeLabelWidget(Static):
+    """The node's label: a separately positioned overlay above its glyph.
+
+    Always exactly cell_len(label) cells wide -- its own box is never wider
+    than its content, so it needs no internal centering, only a computed
+    offset (see MeshTopologyView.render_fixture). Never influences the
+    glyph's own coordinate; see MeshNodeWidget.
+    """
+
+    def __init__(self, fixture: MeshFixtureNode) -> None:
+        self.fixture = fixture
+        self.node_id = fixture.node_id
+        super().__init__(classes="mesh-node", markup=False)
+
+    def refresh_visual(self, *, selected: bool, theme: str) -> None:
+        palette = THEME_PALETTES[theme]
+        color = palette.accent if selected else palette.base
+        self.update(Text(self.fixture.label, style=Style(color=color)))
+
+    def on_click(self, _event: Click) -> None:
+        _mesh_select_node(self.app, self.node_id)
+
+
+def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
+    view = app.query_one(MeshTopologyView)
+    view.select_node(node_id)
+    view.render_fixture(theme=app._current_theme)
+    app._update_mesh_context_status()
 
     def on_click(self, _event: Click) -> None:
         view = self.app.query_one(MeshTopologyView)
@@ -664,23 +707,37 @@ class MeshTopologyView(Container):
 
         if not self._mounted:
             board.mount_all(MeshNodeWidget(fixture) for fixture in MESH_FIXTURE_NODES)
+            board.mount_all(
+                MeshNodeLabelWidget(fixture) for fixture in MESH_FIXTURE_NODES
+            )
             self._mounted = True
 
         positions = _mesh_translated_positions(self._selected_node_id)
         centers: dict[str, tuple[int, int]] = {}
+        # The glyph is the sole coordinate authority: it is always a 1x1
+        # widget offset exactly to (grid_x, grid_y), so label width can
+        # never influence it. Positioned first so `centers` (used for
+        # connector endpoints below) only ever reflects glyph coordinates.
         for widget in self.query(MeshNodeWidget):
             row, column = positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
-            # The glyph (second line) must land exactly on (grid_x, grid_y);
-            # the label (first line) is a visual overlay above it only. For
-            # an odd-cell-width label, centering the whole box on grid_x
-            # keeps the single-cell glyph exactly on grid_x -- see the
-            # module docstring's label-centering test for the proof.
+            widget.styles.width = 1
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x, grid_y)
+            centers[widget.node_id] = (grid_x, grid_y)
+            selected = widget.node_id == self._selected_node_id
+            widget.refresh_visual(selected=selected, theme=theme)
+
+        # The label is a separate, independently positioned overlay: its
+        # own box is exactly cell_len(label) wide (never wider), centered
+        # over the glyph's fixed (grid_x, grid_y) by offsetting the whole
+        # label widget -- never by resizing or repositioning the glyph.
+        for widget in self.query(MeshNodeLabelWidget):
+            grid_x, grid_y = centers[widget.node_id]
             label_width = max(1, cell_len(widget.fixture.label))
             widget.styles.width = label_width
-            widget.styles.height = 2
+            widget.styles.height = 1
             widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
-            centers[widget.node_id] = (grid_x, grid_y)
             selected = widget.node_id == self._selected_node_id
             widget.refresh_visual(selected=selected, theme=theme)
 
@@ -702,6 +759,7 @@ class MeshTopologyView(Container):
 
     def clear_nodes(self) -> None:
         self.board.remove_children(MeshNodeWidget)
+        self.board.remove_children(MeshNodeLabelWidget)
         self._mounted = False
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
