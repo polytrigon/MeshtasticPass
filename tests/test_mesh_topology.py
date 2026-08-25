@@ -1,9 +1,10 @@
 """Pure and headless tests for MESH: pure grid geometry plus the fixed
 
-two-node (YOU/ALICE) interaction fixture that is the current, deliberately
-minimal MESH board. See app.py's module comment above MESH_GRID_ROWS for
-what this fixture intentionally does not yet do (ranking, staleness,
-favorites, relay state, dynamic geography, scrolling).
+three-node (YOU/ALICE/BOB) interaction fixture that is the current,
+deliberately minimal MESH board. See app.py's module comment above
+MESH_GRID_ROWS for what this fixture intentionally does not yet do
+(ranking, staleness, favorites, real relay/message classification,
+dynamic geography, scrolling).
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from app import (
     DOT_GRID_GLYPH,
     DOT_GRID_SPACING_X,
     DOT_GRID_SPACING_Y,
+    MESH_FIXTURE_CONNECTORS,
+    MESH_FIXTURE_CONTEXT_LABELS,
     MESH_FIXTURE_NODES,
     MESH_GRID_CENTER_COLUMN,
     MESH_GRID_CENTER_ROW,
@@ -60,6 +63,7 @@ _MILES_PER_DEGREE_AT_EQUATOR = 69.0
 
 YOU_ID = "!you"
 ALICE_ID = "!alice"
+BOB_ID = "!bob"
 
 
 def west_of_local(miles: float) -> GeoPosition:
@@ -97,6 +101,26 @@ def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
 def offset_xy(widget) -> tuple[int, int]:
     offset = widget.styles.offset
     return (int(offset.x.value), int(offset.y.value))
+
+
+def expected_widget_offset(row: int, column: int, label: str) -> tuple[int, int]:
+    """The widget-box offset that centers `label` over the grid point,
+
+    mirroring MeshTopologyView.render_fixture's own placement formula.
+    """
+    grid_x, grid_y = _mesh_grid_pixel(row, column)
+    width = max(1, cell_len(label))
+    return (grid_x - width // 2, grid_y - 1)
+
+
+def glyph_screen_position(widget) -> tuple[int, int]:
+    """The glyph's own on-screen (x, y), independent of label width --
+
+    the glyph is always the widget's second line, horizontally centered.
+    """
+    offset_x, offset_y = offset_xy(widget)
+    width = max(1, cell_len(widget.fixture.label))
+    return (offset_x + width // 2, offset_y + 1)
 
 
 class MeshTopologyModelTests(unittest.TestCase):
@@ -483,14 +507,14 @@ class MeshCanvasRenderTests(unittest.TestCase):
 
 
 class MeshFixtureModelTests(unittest.TestCase):
-    """Pure tests of the fixed 9x21 grid and its two-node fixture, with no
+    """Pure tests of the fixed 8x21 grid and its three-node fixture, with no
 
     running app: grid dimensions, logical positions, and the whole-mesh
-    translation/recentering math from the exact worked example in spec.
+    translation/recentering math from the exact worked examples in spec.
     """
 
-    def test_grid_is_exactly_nine_rows_by_twenty_one_columns(self) -> None:
-        self.assertEqual(MESH_GRID_ROWS, 9)
+    def test_grid_is_exactly_eight_rows_by_twenty_one_columns(self) -> None:
+        self.assertEqual(MESH_GRID_ROWS, 8)
         self.assertEqual(MESH_GRID_COLUMNS, 21)
 
     def test_center_position_is_row_five_column_eleven(self) -> None:
@@ -507,50 +531,101 @@ class MeshFixtureModelTests(unittest.TestCase):
         self.assertEqual((alice.row, alice.column), (4, 10))
         self.assertFalse(alice.is_local)
 
-    def test_only_two_fixture_nodes_exist(self) -> None:
-        self.assertEqual(len(MESH_FIXTURE_NODES), 2)
+    def test_bob_is_two_columns_left_and_one_row_down_from_alice(self) -> None:
+        alice = next(node for node in MESH_FIXTURE_NODES if node.node_id == ALICE_ID)
+        bob = next(node for node in MESH_FIXTURE_NODES if node.node_id == BOB_ID)
+        self.assertEqual(bob.row, alice.row + 1)
+        self.assertEqual(bob.column, alice.column - 2)
+        self.assertEqual((bob.row, bob.column), (5, 8))
+        self.assertFalse(bob.is_local)
+
+    def test_exactly_three_fixture_nodes_exist(self) -> None:
+        self.assertEqual(len(MESH_FIXTURE_NODES), 3)
+
+    def test_you_and_bob_use_solid_glyph_alice_uses_stroked_glyph(self) -> None:
+        by_id = {node.node_id: node for node in MESH_FIXTURE_NODES}
+        self.assertTrue(by_id[YOU_ID].solid)
+        self.assertTrue(by_id[BOB_ID].solid)
+        self.assertFalse(by_id[ALICE_ID].solid)
+
+    def test_fixture_labels_are_you_alice_bob(self) -> None:
+        by_id = {node.node_id: node for node in MESH_FIXTURE_NODES}
+        self.assertEqual(by_id[YOU_ID].label, "YOU")
+        self.assertEqual(by_id[ALICE_ID].label, "ALICE")
+        self.assertEqual(by_id[BOB_ID].label, "Bob")
+
+    def test_context_labels_are_you_alice_bob(self) -> None:
+        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[YOU_ID], "YOU")
+        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[ALICE_ID], "ALICE")
+        self.assertEqual(MESH_FIXTURE_CONTEXT_LABELS[BOB_ID], "BOB")
 
     def test_you_selected_leaves_positions_untranslated(self) -> None:
         positions = _mesh_translated_positions(YOU_ID)
         self.assertEqual(positions[YOU_ID], (5, 11))
         self.assertEqual(positions[ALICE_ID], (4, 10))
+        self.assertEqual(positions[BOB_ID], (5, 8))
 
-    def test_alice_selected_recenters_alice_and_shifts_you_by_the_same_delta(
+    def test_alice_selected_recenters_alice_and_shifts_others_by_the_same_delta(
         self,
     ) -> None:
         """The exact worked example: ALICE -> (5,11), YOU -> (6,12)."""
         positions = _mesh_translated_positions(ALICE_ID)
         self.assertEqual(positions[ALICE_ID], (5, 11))
         self.assertEqual(positions[YOU_ID], (6, 12))
+        self.assertEqual(positions[BOB_ID], (6, 9))
 
     def test_translation_is_a_pure_whole_mesh_shift(self) -> None:
         """Every node moves by the identical row/column delta -- relative
 
-        geometry between YOU and ALICE never changes, regardless of which
-        node is selected.
+        geometry between all three nodes never changes, regardless of
+        which node is selected.
         """
-        you_selected = _mesh_translated_positions(YOU_ID)
-        alice_selected = _mesh_translated_positions(ALICE_ID)
-        you_row, you_col = you_selected[YOU_ID]
-        alice_row, alice_col = you_selected[ALICE_ID]
-        you_row2, you_col2 = alice_selected[YOU_ID]
-        alice_row2, alice_col2 = alice_selected[ALICE_ID]
-        self.assertEqual(
-            (you_row - alice_row, you_col - alice_col),
-            (you_row2 - alice_row2, you_col2 - alice_col2),
-        )
+        for reference_id in (YOU_ID, ALICE_ID, BOB_ID):
+            you_selected = _mesh_translated_positions(YOU_ID)
+            other_selected = _mesh_translated_positions(reference_id)
+            you_row, you_col = you_selected[YOU_ID]
+            ref_row, ref_col = you_selected[reference_id]
+            you_row2, you_col2 = other_selected[YOU_ID]
+            ref_row2, ref_col2 = other_selected[reference_id]
+            with self.subTest(selected=reference_id):
+                self.assertEqual(
+                    (you_row - ref_row, you_col - ref_col),
+                    (you_row2 - ref_row2, you_col2 - ref_col2),
+                )
 
-    def test_directional_target_from_you_moving_left_is_alice(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "left"), ALICE_ID)
+    def test_directional_target_from_you_moving_left_is_bob(self) -> None:
+        """BOB sits on YOU's own row (5,8 vs 5,11), directly left with zero
 
-    def test_directional_target_from_alice_moving_right_is_you(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "right"), YOU_ID)
+        vertical deviation, while ALICE is diagonal (4,10) -- the existing
+        nearest-node rule (mesh_topology.directional_target) picks the more
+        directionally-pure candidate over the merely-closer one, so LEFT
+        from YOU reaches BOB. ALICE is reached via UP instead (see below).
+        This is the current spatial rule applied faithfully to this
+        fixture's geometry, not a hardcoded key map.
+        """
+        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "left"), BOB_ID)
+
+    def test_directional_target_from_you_moving_up_is_alice(self) -> None:
+        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "up"), ALICE_ID)
+
+    def test_directional_target_from_alice_moving_left_is_bob(self) -> None:
+        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "left"), BOB_ID)
+
+    def test_directional_target_from_alice_moving_down_is_you(self) -> None:
+        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "down"), YOU_ID)
+
+    def test_directional_target_from_bob_moving_right_is_you(self) -> None:
+        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "right"), YOU_ID)
+
+    def test_directional_target_from_bob_moving_up_is_alice(self) -> None:
+        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "up"), ALICE_ID)
 
     def test_directional_target_with_no_candidate_is_none(self) -> None:
         self.assertIsNone(_mesh_fixture_directional_target(YOU_ID, "down"))
+        self.assertIsNone(_mesh_fixture_directional_target(BOB_ID, "left"))
 
     def test_background_grid_renders_a_dot_at_every_logical_position(self) -> None:
-        """Every one of the 9x21 logical grid positions must correspond to
+        """Every one of the 8x21 logical grid positions must correspond to
 
         exactly one visible background dot -- proven directly against the
         procedural canvas renderer, independent of any node overlay.
@@ -579,16 +654,51 @@ class MeshFixtureModelTests(unittest.TestCase):
         x, y = _mesh_grid_pixel(4, 10)
         self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
 
-    def test_fixture_nodes_have_no_label_field(self) -> None:
-        self.assertNotIn("label", MeshFixtureNode.__dataclass_fields__)
+    def test_background_dot_exists_at_bob_grid_position(self) -> None:
+        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
+        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
+        x, y = _mesh_grid_pixel(5, 8)
+        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
+
+    def test_connectors_are_you_alice_and_alice_bob_only(self) -> None:
+        self.assertEqual(
+            MESH_FIXTURE_CONNECTORS, (("!you", "!alice"), ("!alice", "!bob"))
+        )
+
+    def test_alice_bob_connector_route_moves_left_then_down(self) -> None:
+        """2 columns left, 1 row down -- route_connector always draws its
+
+        horizontal segment first (along ALICE's row) then its vertical
+        segment second (along BOB's column), so the corner cell must sit
+        at (bob_x, alice_y), every horizontal cell must share ALICE's row,
+        and every vertical cell must share BOB's column.
+        """
+        alice_x, alice_y = _mesh_grid_pixel(4, 10)
+        bob_x, bob_y = _mesh_grid_pixel(5, 8)
+        self.assertLess(bob_x, alice_x)
+        self.assertGreater(bob_y, alice_y)
+        route = route_connector(alice_x, alice_y, bob_x, bob_y)
+        self.assertTrue(route)
+
+        corner_index = next(
+            index for index, (x, y, _glyph) in enumerate(route) if (x, y) == (bob_x, alice_y)
+        )
+        for x, y, _glyph in route[:corner_index]:
+            self.assertEqual(y, alice_y)
+        for x, y, _glyph in route[corner_index:]:
+            self.assertEqual(x, bob_x)
+        last_x, last_y, _glyph = route[-1]
+        self.assertEqual((last_x, last_y), (bob_x, bob_y - 1))
 
 
 class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
-    """Headless app tests of the fixed YOU+ALICE MESH board: default
+    """Headless app tests of the fixed YOU+ALICE+BOB MESH board: default
 
-    selection, ACCENT/BASE styling, the recenter-on-select interaction, the
-    reverse interaction, the bottom-left context label, and the absence of
-    any selection background/focus rectangle or scrollbars.
+    selection, ACCENT/BASE styling, labels, the recenter-on-select
+    interaction, connectors, the bottom-left context label, horizontal
+    centering, and the absence of any selection background/focus rectangle
+    or scrollbars.
     """
 
     def setUp(self) -> None:
@@ -606,26 +716,42 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
         )
         return MeshtasticPassApp(radio, self.settings)
 
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("4")
+        await pilot.pause()
+        # render_fixture defers its centering offset by one refresh cycle
+        # the very first time this view is laid out (self.size is 0x0
+        # before that); give it a chance to land before asserting on it.
+        await pilot.pause()
+
+    def _widget(self, app, node_id: str) -> MeshNodeWidget:
+        return next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+
     async def test_you_is_selected_by_default(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.selected_node_id, YOU_ID)
 
-    async def test_default_styling_you_accent_alice_base(self) -> None:
+    async def test_default_styling_you_solid_accent_alice_stroked_base_bob_solid_base(
+        self,
+    ) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             palette = THEME_PALETTES[app._current_theme]
-            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
-            alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
-            you_rendered = you.render()
-            alice_rendered = alice.render()
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            you_rendered, alice_rendered, bob_rendered = (
+                you.render(),
+                alice.render(),
+                bob.render(),
+            )
             self.assertEqual(
                 you_rendered.spans[0].style.foreground, Color.parse(palette.accent)
             )
@@ -633,103 +759,153 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 alice_rendered.spans[0].style.foreground, Color.parse(palette.base)
             )
             self.assertEqual(
+                bob_rendered.spans[0].style.foreground, Color.parse(palette.base)
+            )
+            self.assertEqual(
                 str(you_rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE
             )
             self.assertEqual(
                 str(alice_rendered).splitlines()[-1].strip(), CIRCLE_STROKED_LARGE
             )
+            self.assertEqual(
+                str(bob_rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE
+            )
 
-    async def test_node_widgets_render_glyph_only_no_labels(self) -> None:
-        """The board renders no node-name text anywhere -- only the
+    async def test_node_labels_render_you_alice_bob_center_justified(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            self.assertEqual(str(you.render()).splitlines()[0].strip(), "YOU")
+            self.assertEqual(str(alice.render()).splitlines()[0].strip(), "ALICE")
+            self.assertEqual(str(bob.render()).splitlines()[0].strip(), "Bob")
+            for widget in (you, alice, bob):
+                with self.subTest(node=widget.node_id):
+                    self.assertEqual(widget.styles.content_align_horizontal, "center")
 
-        one-cell circle glyph, sized to exactly one cell wide and tall.
+    async def test_node_glyph_stays_exactly_on_its_grid_point_regardless_of_label_width(
+        self,
+    ) -> None:
+        """Label width must never move the glyph off its grid coordinate --
+
+        YOU (3 cells), ALICE (5 cells), and Bob (3 cells) have different
+        label widths, but every glyph still lands exactly on its own
+        (grid_x, grid_y).
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            for widget in app.query(MeshNodeWidget):
-                expected_glyph = (
-                    CIRCLE_SOLID_LARGE if widget.fixture.is_local else CIRCLE_STROKED_LARGE
-                )
-                rendered = widget.render()
-                self.assertEqual(rendered.plain, expected_glyph)
-                self.assertNotIn("YOU", rendered.plain)
-                self.assertNotIn("ALICE", rendered.plain)
-                self.assertEqual(int(widget.styles.width.value), 1)
-                self.assertEqual(int(widget.styles.height.value), 1)
-
-    async def test_node_glyph_centers_align_exactly_to_grid_dot_coordinates(
-        self,
-    ) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
-            alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
-            self.assertEqual(offset_xy(you), _mesh_grid_pixel(5, 11))
-            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(4, 10))
+            await self._open_mesh(pilot)
+            positions = {YOU_ID: (5, 11), ALICE_ID: (4, 10), BOB_ID: (5, 8)}
+            for node_id, (row, column) in positions.items():
+                widget = self._widget(app, node_id)
+                with self.subTest(node=node_id):
+                    self.assertEqual(
+                        glyph_screen_position(widget), _mesh_grid_pixel(row, column)
+                    )
+                    self.assertEqual(
+                        offset_xy(widget),
+                        expected_widget_offset(row, column, widget.fixture.label),
+                    )
 
     async def test_no_selection_background_rectangle_in_css_or_at_runtime(self) -> None:
         self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
-            # YOU is selected by default; its background must stay fully
-            # transparent -- no filled focus box, selected or not.
-            self.assertEqual(you.styles.background.a, 0)
+            await self._open_mesh(pilot)
+            for node_id in (YOU_ID, ALICE_ID, BOB_ID):
+                widget = self._widget(app, node_id)
+                # Selected or not, no widget's background may be a filled
+                # focus box -- it must stay fully transparent.
+                with self.subTest(node=node_id):
+                    self.assertEqual(widget.styles.background.a, 0)
 
-    async def test_left_from_you_selects_alice_and_recenters_the_whole_mesh(
-        self,
-    ) -> None:
+    async def test_board_is_horizontally_centered_in_the_mesh_viewport(self) -> None:
+        """No right-heavy extra padding: the board's left and right margins
+
+        inside the MESH viewport must be equal, applied as a single
+        board-level offset rather than by moving any node.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            left_margin = view.board.region.x - view.region.x
+            right_margin = (view.region.x + view.region.width) - (
+                view.board.region.x + view.board.region.width
+            )
+            self.assertEqual(left_margin, right_margin)
+
+    async def test_left_from_you_selects_bob_and_recenters_the_whole_mesh(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
             await pilot.press("left")
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, BOB_ID)
+
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(5, 11))
+            self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(5, 14))
+            self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(4, 13))
+
+    async def test_up_from_you_selects_alice_and_recenters_the_whole_mesh(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            await pilot.press("up")
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.selected_node_id, ALICE_ID)
 
-            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
-            alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(5, 11))
+            self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(6, 12))
+            self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(6, 9))
 
-            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(5, 11))
-            self.assertEqual(offset_xy(you), _mesh_grid_pixel(6, 12))
-
-    async def test_left_from_you_makes_alice_accent_and_you_base(self) -> None:
+    async def test_left_from_you_makes_bob_accent_you_base_alice_base(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             await pilot.press("left")
             await pilot.pause()
 
             palette = THEME_PALETTES[app._current_theme]
-            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
-            alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
             self.assertEqual(
-                alice.render().spans[0].style.foreground, Color.parse(palette.accent)
+                bob.render().spans[0].style.foreground, Color.parse(palette.accent)
             )
             self.assertEqual(
                 you.render().spans[0].style.foreground, Color.parse(palette.base)
             )
+            self.assertEqual(
+                alice.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
 
-    async def test_left_from_you_turns_the_connector_accent(self) -> None:
+    async def test_left_from_you_turns_alice_bob_connector_accent_you_alice_dim(
+        self,
+    ) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             palette = THEME_PALETTES[app._current_theme]
 
             canvas = app.query_one(MeshCanvas)
@@ -739,20 +915,35 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("left")
             await pilot.pause()
             after_colors = {color for *_pos, color in canvas._signature[2]}
-            self.assertEqual(after_colors, {palette.accent})
+            self.assertEqual(after_colors, {palette.dim_base, palette.accent})
 
-    async def test_right_from_alice_reselects_you_and_restores_original_positions(
+    async def test_up_from_you_turns_you_alice_connector_accent(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            palette = THEME_PALETTES[app._current_theme]
+            await pilot.press("up")
+            await pilot.pause()
+            canvas = app.query_one(MeshCanvas)
+            colors = {color for *_pos, color in canvas._signature[2]}
+            self.assertEqual(colors, {palette.dim_base, palette.accent})
+
+    async def test_right_from_bob_reselects_you_and_restores_original_positions(
         self,
     ) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
-            alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
-            original_you_offset = offset_xy(you)
-            original_alice_offset = offset_xy(alice)
+            await self._open_mesh(pilot)
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            original = {
+                YOU_ID: glyph_screen_position(you),
+                ALICE_ID: glyph_screen_position(alice),
+                BOB_ID: glyph_screen_position(bob),
+            }
 
             await pilot.press("left")
             await pilot.pause()
@@ -761,15 +952,14 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
 
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.selected_node_id, YOU_ID)
-            self.assertEqual(offset_xy(you), original_you_offset)
-            self.assertEqual(offset_xy(alice), original_alice_offset)
+            self.assertEqual(glyph_screen_position(you), original[YOU_ID])
+            self.assertEqual(glyph_screen_position(alice), original[ALICE_ID])
+            self.assertEqual(glyph_screen_position(bob), original[BOB_ID])
 
-    async def test_right_from_alice_returns_the_connector_to_dim_base(self) -> None:
+    async def test_right_from_bob_returns_connectors_to_dim_base(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             await pilot.press("left")
             await pilot.pause()
             await pilot.press("right")
@@ -780,19 +970,24 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             colors = {color for *_pos, color in canvas._signature[2]}
             self.assertEqual(colors, {palette.dim_base})
 
-    async def test_context_status_line_updates_for_you_and_alice(self) -> None:
+    async def test_context_status_line_updates_for_you_alice_bob(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             status = str(app.query_one("#mesh-context-status").render())
             self.assertEqual(status, "YOU")
 
-            await pilot.press("left")
+            await pilot.press("up")
             await pilot.pause()
             status = str(app.query_one("#mesh-context-status").render())
             self.assertEqual(status, "ALICE")
+
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(status, "BOB")
 
             await pilot.press("right")
             await pilot.pause()
@@ -804,9 +999,7 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             self.assertNotIsInstance(view, ScrollableContainer)
             self.assertFalse(view.show_vertical_scrollbar)
@@ -824,30 +1017,35 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_arrow_with_no_candidate_is_a_noop(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             await pilot.press("down")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, YOU_ID)
 
-    async def test_grid_dots_nodes_and_connector_fit_inside_the_uconsole_viewport(
+    async def test_bob_is_reachable_via_spatial_arrow_navigation_from_you(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, BOB_ID)
+
+    async def test_grid_dots_nodes_and_connectors_fit_inside_the_uconsole_viewport(
         self,
     ) -> None:
         """At the actual small/uConsole-like viewport (90x28, the size used
 
         by every other MESH test in this module and the stated supported
-        terminal size), the fixed 9x21 board must never clip: all 189
-        background dots, both node glyphs, and the connector must render
-        entirely inside the visible MESH region -- MESH has no scrolling
-        to fall back on if the board is too big for the viewport.
+        terminal size), the fixed 8x21 board must never clip: all 168
+        background dots, all three node glyphs, and both connectors must
+        render entirely inside the visible MESH region -- MESH has no
+        scrolling to fall back on if the board is too big for the viewport.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            await self._open_mesh(pilot)
 
             view = app.query_one(MeshTopologyView)
             viewport = view.region
@@ -855,11 +1053,11 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             canvas = app.query_one(MeshCanvas)
 
             # The board container and its background canvas (dots plus
-            # connector) must both render fully inside the visible region.
+            # connectors) must both render fully inside the visible region.
             self.assertTrue(viewport.contains_region(board.region))
             self.assertTrue(viewport.contains_region(canvas.region))
 
-            # All 189 (9x21) logical grid-dot positions, individually.
+            # All 168 (8x21) logical grid-dot positions, individually.
             dot_count = 0
             for row in range(1, MESH_GRID_ROWS + 1):
                 for column in range(1, MESH_GRID_COLUMNS + 1):
@@ -869,23 +1067,27 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(row=row, column=column):
                         self.assertTrue(viewport.contains_point((screen_x, screen_y)))
                     dot_count += 1
-            self.assertEqual(dot_count, 9 * 21)
+            self.assertEqual(dot_count, 8 * 21)
 
-            # YOU and ALICE.
+            # YOU, ALICE, and BOB.
             for widget in app.query(MeshNodeWidget):
                 with self.subTest(node=widget.node_id):
                     self.assertTrue(viewport.contains_region(widget.region))
 
-            # The connector between YOU (5,11) and ALICE (4,10), cell by cell.
-            you_x, you_y = _mesh_grid_pixel(5, 11)
-            alice_x, alice_y = _mesh_grid_pixel(4, 10)
-            connector = route_connector(you_x, you_y, alice_x, alice_y)
-            self.assertTrue(connector)
-            for x, y, _glyph in connector:
-                screen_x = board.region.x + x
-                screen_y = board.region.y + y
-                with self.subTest(connector_cell=(x, y)):
-                    self.assertTrue(viewport.contains_point((screen_x, screen_y)))
+            # Both connectors, cell by cell: YOU-ALICE and ALICE-BOB.
+            fixed_pixel = {
+                YOU_ID: _mesh_grid_pixel(5, 11),
+                ALICE_ID: _mesh_grid_pixel(4, 10),
+                BOB_ID: _mesh_grid_pixel(5, 8),
+            }
+            for near_id, far_id in MESH_FIXTURE_CONNECTORS:
+                route = route_connector(*fixed_pixel[near_id], *fixed_pixel[far_id])
+                self.assertTrue(route)
+                for x, y, _glyph in route:
+                    screen_x = board.region.x + x
+                    screen_y = board.region.y + y
+                    with self.subTest(near=near_id, far=far_id, cell=(x, y)):
+                        self.assertTrue(viewport.contains_point((screen_x, screen_y)))
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):

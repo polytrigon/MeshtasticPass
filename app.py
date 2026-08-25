@@ -385,15 +385,16 @@ CIRCLE_STROKED_LARGE = "○"
 # --- MESH minimal fixed-grid interaction fixture ---------------------------
 #
 # MESH is being rebuilt one component at a time. This pass establishes only
-# the visual/interaction foundation: a fixed 9x21 grid holding a hardcoded
-# YOU + ALICE fixture, arrow-key selection, and whole-mesh recentering
+# the visual/interaction foundation: a fixed 8x21 grid holding a hardcoded
+# YOU + ALICE + BOB fixture, arrow-key selection, and whole-mesh recentering
 # translation. It intentionally does NOT do relevance ranking, staleness
-# classification, Favorites, relay state, GPS-derived placement, a dynamic
-# node count, or scrolling -- see mesh_state.py and mesh_topology.
-# build_topology()/route_connector() for the pure, still-importable pieces
-# that implement richer behavior; they are simply not wired into this view
-# right now so a future pass can reintroduce them deliberately.
-MESH_GRID_ROWS = 9
+# classification, Favorites, real relay/message classification, GPS-derived
+# placement, a dynamic node count, or scrolling -- see mesh_state.py and
+# mesh_topology.build_topology()/route_connector() for the pure, still-
+# importable pieces that implement richer behavior; they are simply not
+# wired into this view right now so a future pass can reintroduce them
+# deliberately.
+MESH_GRID_ROWS = 8
 MESH_GRID_COLUMNS = 21
 MESH_GRID_CENTER_ROW = 5
 MESH_GRID_CENTER_COLUMN = 11
@@ -404,27 +405,50 @@ class MeshFixtureNode:
     """One node in the fixed, hardcoded MESH fixture.
 
     row/column are the node's fixed logical grid position (1-indexed),
-    before whole-mesh translation/recentering is applied. The board itself
-    renders only a one-cell glyph per node -- no label -- so there is no
-    label field here; see MESH_FIXTURE_CONTEXT_LABELS for the separate
-    bottom-left context line text.
+    before whole-mesh translation/recentering is applied. `label` is a
+    board-level visual overlay only -- it never affects the glyph's own
+    grid coordinate. `solid` selects the glyph shape independent of
+    `is_local`: for this fixture-only pass, a solid dot marks a node that
+    sent a message the user received (YOU, BOB), a stroked dot marks a
+    hop/relay node that did not itself send one (ALICE) -- see
+    MESH_FIXTURE_CONTEXT_LABELS for the separate bottom-left context text.
     """
 
     node_id: str
     row: int
     column: int
     is_local: bool
+    label: str
+    solid: bool
 
 
 MESH_FIXTURE_NODES = (
-    MeshFixtureNode("!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True),
-    MeshFixtureNode("!alice", 4, 10, False),
+    MeshFixtureNode(
+        "!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True, "YOU", True
+    ),
+    MeshFixtureNode("!alice", 4, 10, False, "ALICE", False),
+    # BOB is defined relative to ALICE's fixed base position: two columns
+    # left, one row down -- see MESH_FIXTURE_CONNECTORS for the connector
+    # that traces exactly that displacement.
+    MeshFixtureNode("!bob", 4 + 1, 10 - 2, False, "Bob", True),
 )
 
-# Bottom-left context-line text only -- the board itself never renders
-# these strings; see section 8/9 of the minimal-fixture spec this fixture
-# implements.
-MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {"!you": "YOU", "!alice": "ALICE"}
+# (near, far) node-id pairs -- each drawn near-to-far with route_connector,
+# and each colored ACCENT only when its far/target endpoint is selected
+# (mirrors the original YOU-ALICE rule: selecting the "closer to YOU" end
+# of an edge is not itself reason to highlight that edge).
+MESH_FIXTURE_CONNECTORS: tuple[tuple[str, str], ...] = (
+    ("!you", "!alice"),
+    ("!alice", "!bob"),
+)
+
+# Bottom-left context-line text only -- the board itself renders each
+# node's own `label` field above its glyph, which can differ from this.
+MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {
+    "!you": "YOU",
+    "!alice": "ALICE",
+    "!bob": "BOB",
+}
 
 
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
@@ -480,7 +504,7 @@ def _mesh_fixture_directional_target(current_node_id: str, direction: str) -> st
 
 
 class MeshNodeWidget(Static):
-    """One glyph-only node on the fixed MESH grid -- no label, one cell.
+    """One node on the fixed MESH grid: a label above a glyph.
 
     Selection state lives on MeshTopologyView, not Textual's focus system:
     rendering always reflects the current selection synchronously, so there
@@ -498,8 +522,12 @@ class MeshNodeWidget(Static):
     def refresh_visual(self, *, selected: bool, theme: str) -> None:
         palette = THEME_PALETTES[theme]
         color = palette.accent if selected else palette.base
-        glyph = CIRCLE_SOLID_LARGE if self.fixture.is_local else CIRCLE_STROKED_LARGE
-        self.update(Text(glyph, style=Style(color=color)))
+        glyph = CIRCLE_SOLID_LARGE if self.fixture.solid else CIRCLE_STROKED_LARGE
+        content = Text(justify="center")
+        content.append(self.fixture.label, style=Style(color=color))
+        content.append("\n")
+        content.append(glyph, style=Style(color=color))
+        self.update(content)
 
     def on_click(self, _event: Click) -> None:
         view = self.app.query_one(MeshTopologyView)
@@ -590,7 +618,7 @@ class MeshCanvas(Static):
 
 
 class MeshTopologyView(Container):
-    """A fixed 9x21 grid MESH board: the minimal two-node interaction fixture.
+    """A fixed 8x21 grid MESH board: the minimal three-node interaction fixture.
 
     No scrolling, no scrollbars, no dynamic node count -- see the module-
     level comment above MESH_GRID_ROWS for what this pass intentionally
@@ -616,12 +644,23 @@ class MeshTopologyView(Container):
         return self._selected_node_id
 
     def render_fixture(self, *, theme: str) -> None:
-        """Render the fixed YOU+ALICE fixture, recentered on the selection."""
+        """Render the fixed YOU+ALICE+BOB fixture, recentered on the selection."""
         board = self.board
         board_width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
         board_height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
         board.styles.width = board_width
         board.styles.height = board_height
+        # Horizontally center the whole board as one rigid block inside the
+        # available MESH region -- a board-level offset, not a per-node one,
+        # so it can never desync node-to-grid coordinates. On the very first
+        # render (before this view has ever been laid out), self.size is
+        # not resolved yet (0x0); re-run once after the next refresh, when
+        # it is, rather than leaving the board visibly left-anchored.
+        view_width = self.size.width
+        if view_width:
+            board.styles.offset = (max(0, (view_width - board_width) // 2), 0)
+        else:
+            self.app.call_after_refresh(lambda: self.render_fixture(theme=theme))
 
         if not self._mounted:
             board.mount_all(MeshNodeWidget(fixture) for fixture in MESH_FIXTURE_NODES)
@@ -632,29 +671,33 @@ class MeshTopologyView(Container):
         for widget in self.query(MeshNodeWidget):
             row, column = positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
-            # One cell exactly: the glyph visually replaces/covers the
-            # background grid dot at (grid_x, grid_y), no label width.
-            widget.styles.width = 1
-            widget.styles.height = 1
-            widget.styles.offset = (grid_x, grid_y)
+            # The glyph (second line) must land exactly on (grid_x, grid_y);
+            # the label (first line) is a visual overlay above it only. For
+            # an odd-cell-width label, centering the whole box on grid_x
+            # keeps the single-cell glyph exactly on grid_x -- see the
+            # module docstring's label-centering test for the proof.
+            label_width = max(1, cell_len(widget.fixture.label))
+            widget.styles.width = label_width
+            widget.styles.height = 2
+            widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
             centers[widget.node_id] = (grid_x, grid_y)
             selected = widget.node_id == self._selected_node_id
             widget.refresh_visual(selected=selected, theme=theme)
 
-        local_id = next(node.node_id for node in MESH_FIXTURE_NODES if node.is_local)
-        remote_id = next(
-            node.node_id for node in MESH_FIXTURE_NODES if not node.is_local
-        )
         palette = THEME_PALETTES[theme]
-        connector_color = (
-            palette.accent if self._selected_node_id == remote_id else palette.dim_base
-        )
-        connector = tuple(
-            (x, y, glyph, connector_color)
-            for x, y, glyph in route_connector(*centers[local_id], *centers[remote_id])
-        )
+        connector_cells: list[tuple[int, int, str, str]] = []
+        for near_id, far_id in MESH_FIXTURE_CONNECTORS:
+            color = (
+                palette.accent
+                if self._selected_node_id == far_id
+                else palette.dim_base
+            )
+            connector_cells.extend(
+                (x, y, glyph, color)
+                for x, y, glyph in route_connector(*centers[near_id], *centers[far_id])
+            )
         self.board.query_one(MeshCanvas).render_scene(
-            board_width, board_height, connector, theme
+            board_width, board_height, tuple(connector_cells), theme
         )
 
     def clear_nodes(self) -> None:
@@ -1251,7 +1294,11 @@ class MeshtasticPassApp(App[None]):
 
     #mesh-view {
         height: 1fr;
-        align: center middle;
+        /* Horizontal centering is applied explicitly in code as a
+           board-level offset (see MeshTopologyView.render_fixture), not
+           via CSS align, so it stays exact regardless of board width
+           parity; vertical centering is still fine left to CSS. */
+        align: left middle;
     }
 
     #mesh-board {
