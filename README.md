@@ -106,7 +106,9 @@ only when the transcript is already near the bottom. If you are reading older
 messages, `↓ n NEW` counts messages below the viewport; either newest shortcut
 clears that indicator. Neither shortcut is advertised in the deliberately
 minimal CHAT footer. There is no visible END OF CHAT control;
-Up/Down stop at the newest meaningful message or action. Press `F4` to quit from
+Down moves through the newest meaningful message or action, then returns to the
+composer without clearing its draft. Right Arrow and End remain newest-edge
+shortcuts and do not enter typing mode. Press `F4` to quit from
 any normal app context;
 `q` is ordinary input and is not a quit shortcut. Radio
 monitoring, CHAT storage, and the radio service close during shutdown.
@@ -405,7 +407,10 @@ fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
 Long Name is a two-state keyboard control: use Up/Down to reach its
 bracketed value, press Enter to edit, then press Enter to validate/save or Escape
 to restore the value from before editing. Arrow keys belong to the text caret
-only while edit mode is active. The field follows its content without creating
+only while edit mode is active. USB DEVICE, LONG NAME, FONT SIZE, and COLOR use
+Textual focus as their single navigation-selection source, so exactly one row
+shows the `>` caret while moving through CONNECTION/CONFIG. The field follows
+its content without creating
 horizontal page scrolling. A saved name is applied to the actual radio through
 Meshtastic Python SDK 2.7.11's supported
 `interface.localNode.setOwner(long_name=...)` path. It is not a local app-only
@@ -426,7 +431,9 @@ are SMALL (11), MEDIUM (13), LARGE (16), XL (18), and XXL (22). Color choices
 are WHITE (the default), GREEN, and ORANGE. All settings save to
 `~/.config/meshtasticpass/config.json`. Color changes the running Textual app
 immediately. Font size is also written only to the dedicated MeshtasticPass
-LXTerminal profile and applies on the next menu launch.
+LXTerminal profile and applies on the next menu launch. Successful FONT SIZE
+and COLOR confirmations use the active theme's ACCENT; COLOR applies its new
+theme before rendering the confirmation. Save errors remain semantic ERROR red.
 
 USB DEVICE, FONT SIZE, COLOR, CHAT channel, and contextual node menus share one
 viewport-aware popup implementation. A popup prefers to open downward, opens
