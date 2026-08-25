@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Literal
+import unicodedata
 
 from rich.cells import cell_len
 
@@ -188,14 +189,61 @@ def _square_ring(radius: int) -> tuple[tuple[int, int], ...]:
     return tuple(points)
 
 
+_ZERO_WIDTH_JOINER = "‍"
+_VARIATION_SELECTORS = ("︎", "️")
+_EMOJI_MODIFIER_RANGE = range(0x1F3FB, 0x1F400)  # Fitzpatrick skin-tone modifiers
+_REGIONAL_INDICATOR_RANGE = range(0x1F1E6, 0x1F200)  # flag letter pairs
+
+
+def _attaches_to_previous(
+    character: str, previous_cluster: str, join_next: bool
+) -> bool:
+    """Return whether `character` must stay glued to the prior grapheme cluster."""
+    code_point = ord(character)
+    if (
+        join_next
+        or character == _ZERO_WIDTH_JOINER
+        or character in _VARIATION_SELECTORS
+        or code_point in _EMOJI_MODIFIER_RANGE
+        or unicodedata.combining(character)
+    ):
+        return True
+    return (
+        len(previous_cluster) == 1
+        and ord(previous_cluster) in _REGIONAL_INDICATOR_RANGE
+        and code_point in _REGIONAL_INDICATOR_RANGE
+    )
+
+
+def _grapheme_clusters(value: str) -> tuple[str, ...]:
+    """Group codepoints so ZWJ/flag/modifier/combining sequences never split.
+
+    Truncating raw codepoints can leave a dangling joiner, variation selector,
+    skin-tone modifier, or a lone half of a flag pair. Terminals render such
+    orphaned fragments unpredictably (often as an unexpectedly wide glyph),
+    which is what let emoji-containing labels overflow their fixed-width node
+    box and visibly corrupt neighboring layout/scrollbar rendering.
+    """
+    clusters: list[str] = []
+    join_next = False
+    for character in value:
+        previous = clusters[-1] if clusters else ""
+        if clusters and _attaches_to_previous(character, previous, join_next):
+            clusters[-1] += character
+        else:
+            clusters.append(character)
+        join_next = character == _ZERO_WIDTH_JOINER
+    return tuple(clusters)
+
+
 def _truncate(value: str, width: int) -> str:
     if cell_len(value) <= width:
         return value
     if width <= 1:
         return "…"[:width]
     visible = ""
-    for character in value:
-        if cell_len(f"{visible}{character}…") > width:
+    for cluster in _grapheme_clusters(value):
+        if cell_len(f"{visible}{cluster}…") > width:
             break
-        visible += character
+        visible += cluster
     return f"{visible}…"

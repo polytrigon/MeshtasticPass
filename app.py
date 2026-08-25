@@ -84,7 +84,6 @@ TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
     "profile": "PROFILE",
-    "pass-map": "PASS MAP",
     "mesh": "MESH",
 }
 
@@ -99,6 +98,7 @@ CONNECTION_ROW_PREFIX = "  "
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
+HORIZONTAL_SCROLLBAR_THUMB_GLYPH = "▁"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED)
 )
@@ -110,7 +110,12 @@ def can_manual_resend(entry: ChatEntry) -> bool:
 
 
 class ThinScrollBarRender(ScrollBarRender):
-    """Use one aligned narrow glyph for both track and draggable thumb."""
+    """Use one aligned narrow glyph for both track and draggable thumb.
+
+    Applies to both orientations so a horizontal scrollbar (e.g. MESH) matches
+    the same minimal style as a vertical one (e.g. CHAT), instead of falling
+    back to Textual's thicker default horizontal bar glyphs.
+    """
 
     @classmethod
     def render_bar(
@@ -134,19 +139,23 @@ class ThinScrollBarRender(ScrollBarRender):
             back_color=back_color,
             bar_color=bar_color,
         )
-        if not vertical:
-            return rendered
+        glyph = (
+            CHAT_SCROLLBAR_THUMB_GLYPH if vertical else HORIZONTAL_SCROLLBAR_THUMB_GLYPH
+        )
+        # Vertical segments are rows (thickness cells wide each); horizontal
+        # segments are single columns repeated across `thickness` rows.
+        glyph_width = thickness if vertical else 1
 
         segments = []
         for segment in rendered.segments:
-            if segment.text == "\n":
+            if segment.text in ("\n", ""):
                 segments.append(segment)
                 continue
             metadata = segment.style.meta if segment.style is not None else {}
             is_thumb = metadata.get("@mouse.down") == "grab"
             segments.append(
                 Segment(
-                    CHAT_SCROLLBAR_THUMB_GLYPH * thickness,
+                    glyph * glyph_width,
                     Style(color=bar_color if is_thumb else back_color, meta=metadata),
                 )
             )
@@ -425,8 +434,14 @@ class MeshNodeWidget(Static):
             event.stop()
 
 
-class MeshTopologyView(ScrollableContainer):
-    """A two-axis viewport over the passive topology board."""
+class MeshTopologyView(ScrollableContainer, inherit_bindings=False):
+    """A two-axis viewport over the passive topology board.
+
+    Binding inheritance is disabled so ScrollableContainer's default arrow-key
+    scroll bindings never intercept node-navigation keys before the app-level
+    handler sees them; mouse wheel and scrollbar drag are unaffected since
+    those use a separate event path.
+    """
 
     can_focus = True
 
@@ -437,6 +452,7 @@ class MeshTopologyView(ScrollableContainer):
 
     def on_mount(self) -> None:
         self.vertical_scrollbar.renderer = ThinScrollBarRender
+        self.horizontal_scrollbar.renderer = ThinScrollBarRender
 
     @property
     def board(self) -> Container:
@@ -534,14 +550,47 @@ class MeshTopologyView(ScrollableContainer):
                 )
                 return
 
+    def center_node(self, node_id: str) -> None:
+        """Focus a node and center the viewport on it, clamped to scroll bounds."""
+        for widget in self.query(MeshNodeWidget):
+            if widget.node.node_id == node_id:
+                widget.focus(scroll_visible=False)
+                target_x, target_y = self._center_offsets(widget.positioned)
+                self.scroll_to(
+                    x=target_x,
+                    y=target_y,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                self.app.call_after_refresh(
+                    self.scroll_to,
+                    x=target_x,
+                    y=target_y,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                return
+
+    def _center_offsets(self, positioned: PositionedNode) -> tuple[float, float]:
+        visible_width = max(1, self.size.width)
+        visible_height = max(1, self.size.height)
+        target_x = positioned.x + NODE_WIDTH / 2 - visible_width / 2
+        target_y = positioned.y + NODE_HEIGHT / 2 - visible_height / 2
+        target_x = max(0.0, min(target_x, self.max_scroll_x))
+        target_y = max(0.0, min(target_y, self.max_scroll_y))
+        return target_x, target_y
+
     def focus_local(self) -> None:
+        """Select YOU (or the first known node) and center it in the viewport."""
         local = next(
             (item for item in self.layout_model.nodes if item.node.is_local),
             None,
         )
         target = local or next(iter(self.layout_model.nodes), None)
         if target is not None:
-            self.focus_node(target.node.node_id)
+            self.center_node(target.node.node_id)
 
 
 class IdentityNameControl(Horizontal):
@@ -1507,9 +1556,6 @@ class MeshtasticPassApp(App[None]):
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
-            with Vertical(id="pass-map", classes="tab-page"):
-                yield Static("> PASS MAP", classes="page-title")
-                yield Static("Coming in a future milestone.")
             with Vertical(id="mesh", classes="tab-page"):
                 yield Static(
                     "> MESH · ACTIVE —",
@@ -1522,7 +1568,7 @@ class MeshtasticPassApp(App[None]):
                     markup=False,
                 )
                 yield MeshTopologyView()
-        yield Static("1-5 switch tabs    F4 quit", id="footer")
+        yield Static("1-4 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -1635,10 +1681,9 @@ class MeshtasticPassApp(App[None]):
             "left",
             "right",
         ):
-            if isinstance(self.focused, MeshNodeWidget):
-                self._move_mesh_focus(event.key)
-                event.stop()
-                return
+            self._move_mesh_focus(event.key)
+            event.stop()
+            return
 
         if self.current_tab == "connection" and event.key in ("up", "down"):
             controls = [
@@ -1672,8 +1717,7 @@ class MeshtasticPassApp(App[None]):
             "1": "connection",
             "2": "chat",
             "3": "profile",
-            "4": "pass-map",
-            "5": "mesh",
+            "4": "mesh",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -1793,7 +1837,6 @@ class MeshtasticPassApp(App[None]):
             self.query_one(FontSizeSelector).focus()
         elif tab_id == "mesh":
             self._refresh_mesh()
-            self.call_after_refresh(self.query_one(MeshTopologyView).focus_local)
         else:
             self.set_focus(None)
         self._update_footer()
@@ -2351,9 +2394,18 @@ class MeshtasticPassApp(App[None]):
                 favorites=self.settings,
                 theme=self._current_theme,
             )
+            # Rebuilding node widgets can transiently clear focus (the old
+            # widget was just removed) before set_nodes()'s own restoration
+            # callback runs. Check again only after that callback has had its
+            # turn, so a restored selection is never clobbered.
+            self.call_after_refresh(self._ensure_mesh_node_focus)
         else:
             view.clear_nodes()
             status.update("NO SYNCED NODE DATA")
+
+    def _ensure_mesh_node_focus(self) -> None:
+        if self.current_tab == "mesh" and not isinstance(self.focused, MeshNodeWidget):
+            self.query_one(MeshTopologyView).focus_local()
 
     def _move_mesh_focus(self, direction: str) -> None:
         focused = self.focused
@@ -3025,9 +3077,9 @@ class MeshtasticPassApp(App[None]):
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
             text = (
-                "↑↓←→ select    ENTER details    1-5 tabs    F4 quit"
+                "↑↓←→ select    ENTER details    1-4 tabs    F4 quit"
                 if self.current_tab == "mesh"
-                else "1-5 switch tabs    F4 quit"
+                else "1-4 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 

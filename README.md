@@ -93,7 +93,7 @@ Develop and test without radio hardware:
 python app.py --simulate
 ```
 
-Press `1` through `5` to open CONNECTION, CHAT, PROFILE, PASS MAP, or MESH. CHAT
+Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or MESH. CHAT
 shows and sends on the currently selected configured broadcast channel. Press
 `C` outside the input to open the channel dropdown; use Up/Down and Enter to
 select, or Escape to cancel. While the chat input is focused, normal text and
@@ -147,7 +147,7 @@ the second packet into chronological position and shows
 
 ### Passive MESH topology board
 
-Press `5` to open MESH. The board places `YOU` at its center, arranges nodes
+Press `4` to open MESH. The board places `YOU` at its center, arranges nodes
 with trustworthy Meshtastic `hopsAway` values in deterministic hop layers, and
 puts unknown-hop nodes in an outer layer. This is a topology view, not a map:
 positions do not imply GPS location or physical direction, and the app draws no
@@ -158,19 +158,33 @@ same exact five-minute window used by CHAT's ACTIVE count use DIM_BASE. An
 active Favorite uses ACCENT for its label; stale Favorites stay dim so activity
 truth remains visible. Long Name is preferred when it fits, then Short Name,
 then an abbreviated Node ID. Missing metadata is omitted rather than invented.
+Labels are truncated by measured terminal cell width rather than Python
+character count, and truncation never severs a multi-codepoint emoji sequence
+(joiners, skin-tone modifiers, flag pairs), so wide or emoji-containing names
+stay inside their node box instead of corrupting neighboring layout.
 
-Use all four arrow keys for spatial selection. Navigation does not wrap at the
-board edges, and the two-axis viewport scrolls only inside MESH to keep the
-selected node visible. Mouse selection uses the same focus state. Enter opens
-the shared node context menu used by CHAT; remote nodes show available identity,
-hop, receiver-age, and Favorite controls. `YOU` shows local identity only and
-cannot be favorited. Opening MESH and its menu only read the SDK's already
-synced node database—they do not request positions, probe nodes, or transmit
-LoRa packets. While disconnected, the board says
+Opening MESH selects and centers `YOU` in the viewport on both axes (clamped
+to the board's actual scroll bounds; a board smaller than the viewport never
+invents scrolling). Use all four arrow keys for spatial selection via the same
+node-navigation logic that owns arrow keys on this tab; they never fall back to
+plain viewport scrolling, even if focus is ever lost from a node. Navigation
+does not wrap at the board edges — no candidate in a direction is a no-op — and
+the two-axis viewport scrolls only as needed to keep the newly selected node
+visible. Mouse selection and the mouse wheel keep working normally. A
+metadata-only refresh (e.g. a renamed node) preserves the current selection
+instead of snapping back to `YOU`. Enter opens the shared node context menu
+used by CHAT; remote nodes show available identity, hop, receiver-age, and
+Favorite controls. `YOU` shows local identity only and cannot be favorited.
+Opening MESH and its menu only read the SDK's already synced node
+database—they do not request positions, probe nodes, or transmit LoRa
+packets. While disconnected, the board says
 `NO MESH DATA — RADIO DISCONNECTED` instead of displaying stale topology as
 current.
 
-For a hardware-free review, run `python app.py --simulate`, press `5`, navigate
+MESH's horizontal scrollbar uses the same thin single-cell renderer as its
+vertical scrollbar (and CHAT's), rather than Textual's thicker default.
+
+For a hardware-free review, run `python app.py --simulate`, press `4`, navigate
 the stable one-hop, two-hop, unknown-hop, active, stale, and missing-name nodes,
 and verify Favorite changes are also visible in CHAT.
 

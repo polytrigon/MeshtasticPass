@@ -130,7 +130,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape", "3")
             self.assertEqual(app.current_tab, "profile")
             await pilot.press("4")
-            self.assertEqual(app.current_tab, "pass-map")
+            self.assertEqual(app.current_tab, "mesh")
 
         self.assertTrue(radio.is_closed)
 
