@@ -93,7 +93,7 @@ Develop and test without radio hardware:
 python app.py --simulate
 ```
 
-Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or PASS MAP. CHAT
+Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or MESH. CHAT
 shows and sends on the currently selected configured broadcast channel. Press
 `C` outside the input to open the channel dropdown; use Up/Down and Enter to
 select, or Escape to cancel. While the chat input is focused, normal text and
@@ -144,6 +144,49 @@ without a second radio. The primary-channel message script also deliberately
 delivers a newer receiver-timestamped packet before an older one. CHAT inserts
 the second packet into chronological position and shows
 `1 OLDER MESSAGE RECEIVED`, so delayed ordering is visible without hardware.
+
+### Passive MESH topology board
+
+Press `4` to open MESH. The board places `YOU` at its center, arranges nodes
+with trustworthy Meshtastic `hopsAway` values in deterministic hop layers, and
+puts unknown-hop nodes in an outer layer. This is a topology view, not a map:
+positions do not imply GPS location or physical direction, and the app draws no
+link or route unless a future trustworthy data source can support one.
+
+Active nodes use the current theme's BASE color. Nodes not heard within the
+same exact five-minute window used by CHAT's ACTIVE count use DIM_BASE. An
+active Favorite uses ACCENT for its label; stale Favorites stay dim so activity
+truth remains visible. Long Name is preferred when it fits, then Short Name,
+then an abbreviated Node ID. Missing metadata is omitted rather than invented.
+Labels are truncated by measured terminal cell width rather than Python
+character count, and truncation never severs a multi-codepoint emoji sequence
+(joiners, skin-tone modifiers, flag pairs), so wide or emoji-containing names
+stay inside their node box instead of corrupting neighboring layout.
+
+Opening MESH selects and centers `YOU` in the viewport on both axes (clamped
+to the board's actual scroll bounds; a board smaller than the viewport never
+invents scrolling). Use all four arrow keys for spatial selection via the same
+node-navigation logic that owns arrow keys on this tab; they never fall back to
+plain viewport scrolling, even if focus is ever lost from a node. Navigation
+does not wrap at the board edges — no candidate in a direction is a no-op — and
+the two-axis viewport scrolls only as needed to keep the newly selected node
+visible. Mouse selection and the mouse wheel keep working normally. A
+metadata-only refresh (e.g. a renamed node) preserves the current selection
+instead of snapping back to `YOU`. Enter opens the shared node context menu
+used by CHAT; remote nodes show available identity, hop, receiver-age, and
+Favorite controls. `YOU` shows local identity only and cannot be favorited.
+Opening MESH and its menu only read the SDK's already synced node
+database—they do not request positions, probe nodes, or transmit LoRa
+packets. While disconnected, the board says
+`NO MESH DATA — RADIO DISCONNECTED` instead of displaying stale topology as
+current.
+
+MESH's horizontal scrollbar uses the same thin single-cell renderer as its
+vertical scrollbar (and CHAT's), rather than Textual's thicker default.
+
+For a hardware-free review, run `python app.py --simulate`, press `4`, navigate
+the stable one-hop, two-hop, unknown-hop, active, stale, and missing-name nodes,
+and verify Favorite changes are also visible in CHAT.
 
 CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
 thumb use the same right-aligned narrow Unicode `▕` glyph through Textual's
@@ -496,6 +539,7 @@ send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
 chat_store.py      Versioned SQLite CHAT history and send attempts
+mesh_topology.py   Pure deterministic MESH layout and arrow navigation
 geo.py             Position validation, Haversine distance, and mile formatting
 app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup

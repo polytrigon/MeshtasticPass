@@ -1,5 +1,6 @@
 # Python environments, caches, coverage, and build output
 .venv/
+.venv-py310/
 venv/
 __pycache__/
 *.py[cod]
@@ -39,5 +40,6 @@ config.json
 # Editors and operating systems
 .vscode/
 .idea/
+.claude/
 .DS_Store
 *~

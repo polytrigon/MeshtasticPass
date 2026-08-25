@@ -265,6 +265,50 @@ class RadioServiceTests(unittest.TestCase):
     def test_active_node_count_is_unavailable_while_disconnected(self) -> None:
         self.assertIsNone(RadioService().active_node_count(now=1_000))
 
+    def test_known_nodes_are_normalized_passively_and_include_local(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        interface.nodesByNum[0xABC12345] = {
+            "user": {
+                "id": "!abc12345",
+                "longName": "Alice Trail",
+                "shortName": "ALCE",
+            },
+            "hopsAway": 1,
+            "lastHeard": 900.0,
+        }
+        interface.nodesByNum[0xB0B00002] = {
+            "user": {"shortName": "BOB"},
+            "hopsAway": -1,
+            "lastHeard": "malformed",
+        }
+        interface.sendText = Mock()
+        service._interface = interface
+        service._activity_local_node_id = "!12345678"
+        service._direct_observations["!abc12345"] = 950.0
+        service._direct_observations["!new00004"] = 975.0
+
+        nodes = service.get_known_nodes()
+
+        self.assertEqual(len(nodes), 4)
+        local = next(node for node in nodes if node.is_local)
+        self.assertEqual(local.node_id, "!12345678")
+        alice = next(node for node in nodes if node.node_id == "!abc12345")
+        self.assertEqual(alice.long_name, "Alice Trail")
+        self.assertEqual(alice.hops_away, 1)
+        self.assertEqual(alice.last_heard, 950.0)
+        bob = next(node for node in nodes if node.short_name == "BOB")
+        self.assertEqual(bob.node_id, "!b0b00002")
+        self.assertIsNone(bob.hops_away)
+        self.assertIsNone(bob.last_heard)
+        observed = next(node for node in nodes if node.node_id == "!new00004")
+        self.assertIsNone(observed.hops_away)
+        self.assertEqual(observed.last_heard, 975.0)
+        interface.sendText.assert_not_called()
+
+        service._interface = None
+        self.assertEqual(service.get_known_nodes(), ())
+
     def test_received_text_updates_passive_activity_without_transmitting(self) -> None:
         service = RadioService()
         interface = make_interface()

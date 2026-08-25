@@ -15,12 +15,19 @@ from rich.style import Style
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import (
+    Container,
+    Horizontal,
+    ScrollableContainer,
+    Vertical,
+    VerticalScroll,
+)
 from textual.events import Click, Focus, Key
 from textual.message import Message
 from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Input, Static
+from textual.widget import Widget
 
 from app_controller import (
     ChatEntry,
@@ -39,6 +46,16 @@ from chat_store import (
 )
 from geo import format_distance_miles
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
+from mesh_topology import (
+    NODE_HEIGHT,
+    NODE_WIDTH,
+    PositionedNode,
+    TopologyLayout,
+    build_topology,
+    compact_node_label,
+    directional_target,
+)
+from node_activity import is_node_active
 from radio_service import (
     ChannelInfo,
     DeliveryState,
@@ -67,7 +84,7 @@ TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
     "profile": "PROFILE",
-    "pass-map": "PASS MAP",
+    "mesh": "MESH",
 }
 
 ANIMATED_STATUS = {
@@ -81,6 +98,7 @@ CONNECTION_ROW_PREFIX = "  "
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
+HORIZONTAL_SCROLLBAR_THUMB_GLYPH = "▁"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED)
 )
@@ -92,7 +110,12 @@ def can_manual_resend(entry: ChatEntry) -> bool:
 
 
 class ThinScrollBarRender(ScrollBarRender):
-    """Use one aligned narrow glyph for both track and draggable thumb."""
+    """Use one aligned narrow glyph for both track and draggable thumb.
+
+    Applies to both orientations so a horizontal scrollbar (e.g. MESH) matches
+    the same minimal style as a vertical one (e.g. CHAT), instead of falling
+    back to Textual's thicker default horizontal bar glyphs.
+    """
 
     @classmethod
     def render_bar(
@@ -116,19 +139,23 @@ class ThinScrollBarRender(ScrollBarRender):
             back_color=back_color,
             bar_color=bar_color,
         )
-        if not vertical:
-            return rendered
+        glyph = (
+            CHAT_SCROLLBAR_THUMB_GLYPH if vertical else HORIZONTAL_SCROLLBAR_THUMB_GLYPH
+        )
+        # Vertical segments are rows (thickness cells wide each); horizontal
+        # segments are single columns repeated across `thickness` rows.
+        glyph_width = thickness if vertical else 1
 
         segments = []
         for segment in rendered.segments:
-            if segment.text == "\n":
+            if segment.text in ("\n", ""):
                 segments.append(segment)
                 continue
             metadata = segment.style.meta if segment.style is not None else {}
             is_thumb = metadata.get("@mouse.down") == "grab"
             segments.append(
                 Segment(
-                    CHAT_SCROLLBAR_THUMB_GLYPH * thickness,
+                    glyph * glyph_width,
                     Style(color=bar_color if is_thumb else back_color, meta=metadata),
                 )
             )
@@ -359,6 +386,211 @@ class ConnectionPage(VerticalScroll):
 
     def on_mount(self) -> None:
         self.vertical_scrollbar.renderer = ThinScrollBarRender
+
+
+class MeshNodeWidget(Static):
+    """One keyboard- and mouse-selectable node on the topology board."""
+
+    can_focus = True
+
+    class MenuRequested(Message):
+        def __init__(self, widget: "MeshNodeWidget") -> None:
+            super().__init__()
+            self.widget = widget
+
+    def __init__(self, positioned: PositionedNode) -> None:
+        self.positioned = positioned
+        self.node = positioned.node
+        super().__init__(classes="mesh-node", markup=False)
+
+    def refresh_visual(self, *, now: float, favorite: bool, theme: str) -> None:
+        palette = THEME_PALETTES[theme]
+        active = self.node.is_local or is_node_active(self.node.last_heard, now)
+        label_color = (
+            palette.dim_base
+            if not active
+            else palette.accent
+            if favorite and not self.node.is_local
+            else palette.base
+        )
+        glyph_color = palette.base if active else palette.dim_base
+        content = Text(justify="center")
+        content.append(
+            compact_node_label(self.node),
+            style=Style(color=label_color, bold=active),
+        )
+        content.append("\n")
+        content.append("●" if active else "○", style=glyph_color)
+        self.update(content)
+
+    def on_click(self, _event: Click) -> None:
+        # A clicked node is already visible; absolute board offsets are handled
+        # by MeshTopologyView rather than Textual's ordinary flow geometry.
+        self.focus(scroll_visible=False)
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter" and getattr(self.app, "_user_menu", None) is None:
+            self.post_message(self.MenuRequested(self))
+            event.stop()
+
+
+class MeshTopologyView(ScrollableContainer, inherit_bindings=False):
+    """A two-axis viewport over the passive topology board.
+
+    Binding inheritance is disabled so ScrollableContainer's default arrow-key
+    scroll bindings never intercept node-navigation keys before the app-level
+    handler sees them; mouse wheel and scrollbar drag are unaffected since
+    those use a separate event path.
+    """
+
+    can_focus = True
+
+    def __init__(self) -> None:
+        super().__init__(Container(id="mesh-board"), id="mesh-view")
+        self.layout_model = TopologyLayout((), 1, 1)
+        self._layout_signature: tuple[object, ...] = ()
+
+    def on_mount(self) -> None:
+        self.vertical_scrollbar.renderer = ThinScrollBarRender
+        self.horizontal_scrollbar.renderer = ThinScrollBarRender
+
+    @property
+    def board(self) -> Container:
+        return self.query_one("#mesh-board", Container)
+
+    def set_nodes(
+        self,
+        nodes: tuple[NodeMetadata, ...],
+        *,
+        now: float,
+        favorites: object,
+        theme: str,
+    ) -> None:
+        layout = build_topology(nodes)
+        signature = tuple(
+            (
+                item.node.node_id,
+                item.node.long_name,
+                item.node.short_name,
+                item.node.hops_away,
+                item.node.is_local,
+                item.x,
+                item.y,
+            )
+            for item in layout.nodes
+        )
+        self.layout_model = layout
+        board = self.board
+        board.styles.width = layout.width
+        board.styles.height = layout.height
+        if signature != self._layout_signature:
+            selected_id = (
+                self.app.focused.node.node_id
+                if isinstance(self.app.focused, MeshNodeWidget)
+                else None
+            )
+            board.remove_children()
+            widgets: list[MeshNodeWidget] = []
+            for item in layout.nodes:
+                widget = MeshNodeWidget(item)
+                widget.styles.offset = (item.x, item.y)
+                widgets.append(widget)
+            if widgets:
+                board.mount_all(widgets)
+            self._layout_signature = signature
+            if selected_id:
+                self.app.call_after_refresh(self.focus_node, selected_id)
+        else:
+            by_id = {item.node.node_id: item for item in layout.nodes}
+            for widget in self.query(MeshNodeWidget):
+                item = by_id.get(widget.node.node_id)
+                if item is not None:
+                    widget.positioned = item
+                    widget.node = item.node
+        for widget in self.query(MeshNodeWidget):
+            checker = getattr(favorites, "is_favorite", None)
+            favorite = bool(callable(checker) and checker(widget.node.node_id))
+            widget.refresh_visual(now=now, favorite=favorite, theme=theme)
+
+    def clear_nodes(self) -> None:
+        self.layout_model = TopologyLayout((), 1, 1)
+        self._layout_signature = ()
+        self.board.remove_children()
+
+    def focus_node(self, node_id: str) -> None:
+        for widget in self.query(MeshNodeWidget):
+            if widget.node.node_id == node_id:
+                widget.focus(scroll_visible=False)
+                target_x = self.scroll_x
+                target_y = self.scroll_y
+                visible_width = max(1, self.size.width - 1)
+                visible_height = max(1, self.size.height - 1)
+                if widget.positioned.x < target_x:
+                    target_x = widget.positioned.x
+                elif widget.positioned.x + NODE_WIDTH > target_x + visible_width:
+                    target_x = widget.positioned.x + NODE_WIDTH - visible_width
+                if widget.positioned.y < target_y:
+                    target_y = widget.positioned.y
+                elif widget.positioned.y + NODE_HEIGHT > target_y + visible_height:
+                    target_y = widget.positioned.y + NODE_HEIGHT - visible_height
+                self.scroll_to(
+                    x=target_x,
+                    y=target_y,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                self.app.call_after_refresh(
+                    self.scroll_to,
+                    x=target_x,
+                    y=target_y,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                return
+
+    def center_node(self, node_id: str) -> None:
+        """Focus a node and center the viewport on it, clamped to scroll bounds."""
+        for widget in self.query(MeshNodeWidget):
+            if widget.node.node_id == node_id:
+                widget.focus(scroll_visible=False)
+                target_x, target_y = self._center_offsets(widget.positioned)
+                self.scroll_to(
+                    x=target_x,
+                    y=target_y,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                self.app.call_after_refresh(
+                    self.scroll_to,
+                    x=target_x,
+                    y=target_y,
+                    animate=False,
+                    force=True,
+                    immediate=True,
+                )
+                return
+
+    def _center_offsets(self, positioned: PositionedNode) -> tuple[float, float]:
+        visible_width = max(1, self.size.width)
+        visible_height = max(1, self.size.height)
+        target_x = positioned.x + NODE_WIDTH / 2 - visible_width / 2
+        target_y = positioned.y + NODE_HEIGHT / 2 - visible_height / 2
+        target_x = max(0.0, min(target_x, self.max_scroll_x))
+        target_y = max(0.0, min(target_y, self.max_scroll_y))
+        return target_x, target_y
+
+    def focus_local(self) -> None:
+        """Select YOU (or the first known node) and center it in the viewport."""
+        local = next(
+            (item for item in self.layout_model.nodes if item.node.is_local),
+            None,
+        )
+        target = local or next(iter(self.layout_model.nodes), None)
+        if target is not None:
+            self.center_node(target.node.node_id)
 
 
 class IdentityNameControl(Horizontal):
@@ -912,6 +1144,58 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
+    #mesh-title, #mesh-status {
+        height: 1;
+    }
+
+    #mesh-status {
+        color: $white_dim;
+    }
+
+    Screen.theme-green #mesh-status {
+        color: $green_dim;
+    }
+
+    Screen.theme-orange #mesh-status {
+        color: $orange_dim;
+    }
+
+    #mesh-view {
+        height: 1fr;
+        overflow-x: auto;
+        overflow-y: auto;
+        scrollbar-size: 1 1;
+        scrollbar-color: #d8d8d8;
+        scrollbar-background: $white_dim;
+    }
+
+    Screen.theme-green #mesh-view {
+        scrollbar-color: #39ff14;
+        scrollbar-background: $green_dim;
+    }
+
+    Screen.theme-orange #mesh-view {
+        scrollbar-color: #ff8c00;
+        scrollbar-background: $orange_dim;
+    }
+
+    #mesh-board {
+        position: relative;
+        min-width: 1;
+        min-height: 1;
+    }
+
+    .mesh-node {
+        position: absolute;
+        width: 18;
+        height: 3;
+        content-align: center middle;
+    }
+
+    .mesh-node:focus {
+        background: $selection_background;
+    }
+
     Screen.theme-green .identity-name-unavailable {
         color: $green_dim;
     }
@@ -1227,7 +1511,9 @@ class MeshtasticPassApp(App[None]):
         self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
         self._user_menu: ViewportMenu | None = None
-        self._user_menu_origin: ChatEntryWidget | None = None
+        self._user_menu_origin: Widget | None = None
+        self._user_menu_scroll_target: ScrollableContainer | None = None
+        self._user_menu_scroll_x: float | None = None
         self._user_menu_scroll_y: float | None = None
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
@@ -1270,9 +1556,18 @@ class MeshtasticPassApp(App[None]):
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
-            with Vertical(id="pass-map", classes="tab-page"):
-                yield Static("> PASS MAP", classes="page-title")
-                yield Static("Coming in a future milestone.")
+            with Vertical(id="mesh", classes="tab-page"):
+                yield Static(
+                    "> MESH · ACTIVE —",
+                    id="mesh-title",
+                    classes="page-title",
+                )
+                yield Static(
+                    "NO MESH DATA — RADIO DISCONNECTED",
+                    id="mesh-status",
+                    markup=False,
+                )
+                yield MeshTopologyView()
         yield Static("1-4 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
@@ -1380,6 +1675,16 @@ class MeshtasticPassApp(App[None]):
                 event.stop()
                 return
 
+        if self.current_tab == "mesh" and event.key in (
+            "up",
+            "down",
+            "left",
+            "right",
+        ):
+            self._move_mesh_focus(event.key)
+            event.stop()
+            return
+
         if self.current_tab == "connection" and event.key in ("up", "down"):
             controls = [
                 control
@@ -1412,7 +1717,7 @@ class MeshtasticPassApp(App[None]):
             "1": "connection",
             "2": "chat",
             "3": "profile",
-            "4": "pass-map",
+            "4": "mesh",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -1500,6 +1805,7 @@ class MeshtasticPassApp(App[None]):
     def identity_saved(self, event: IdentitySaved) -> None:
         self._radio_info = event.info
         self._render_identity(force_value=True)
+        self._refresh_mesh()
         status = self.query_one("#identity-status", Static)
         status.remove_class("setting-error")
         status.update(f"{event.field_label} SAVED")
@@ -1529,6 +1835,8 @@ class MeshtasticPassApp(App[None]):
         elif tab_id == "connection":
             self._refresh_device_options()
             self.query_one(FontSizeSelector).focus()
+        elif tab_id == "mesh":
+            self._refresh_mesh()
         else:
             self.set_focus(None)
         self._update_footer()
@@ -1611,6 +1919,8 @@ class MeshtasticPassApp(App[None]):
         if len(self.query("#identity-values")):
             self._render_connection_details()
             self._render_identity()
+        if len(self.query("#mesh-view")):
+            self._refresh_mesh()
 
     @on(Input.Submitted, "#chat-input")
     def send_chat_message(self, event: Input.Submitted) -> None:
@@ -1741,6 +2051,7 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
+        self._refresh_mesh()
         channel_index = message.channel_index or 0
         state = self._ensure_channel_loaded(channel_index)
         app_received_at = time()
@@ -2026,6 +2337,7 @@ class MeshtasticPassApp(App[None]):
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
         self._render_chat_heading(wall_now)
+        self._refresh_mesh(wall_now)
 
     def _render_chat_heading(self, wall_now: float | None = None) -> None:
         selectors = list(self.query(ChannelSelector))
@@ -2042,6 +2354,72 @@ class MeshtasticPassApp(App[None]):
                     active = None
         value = "—" if active is None else str(active)
         selectors[0].set_suffix(f"· ACTIVE {value}")
+
+    def _refresh_mesh(self, wall_now: float | None = None) -> None:
+        """Refresh passive topology data without causing Meshtastic traffic."""
+        views = list(self.query(MeshTopologyView))
+        titles = list(self.query("#mesh-title"))
+        statuses = list(self.query("#mesh-status"))
+        if not views or not titles or not statuses:
+            return
+        if self.current_tab != "mesh":
+            return
+        view = views[0]
+        title = titles[0]
+        status = statuses[0]
+        if self._radio_state is not RadioState.ONLINE:
+            view.clear_nodes()
+            title.update("> MESH · ACTIVE —")
+            status.update("NO MESH DATA — RADIO DISCONNECTED")
+            return
+        getter = getattr(self.radio, "get_known_nodes", None)
+        try:
+            nodes = tuple(getter()) if callable(getter) else ()
+        except Exception:
+            nodes = ()
+        if not all(isinstance(node, NodeMetadata) for node in nodes):
+            nodes = ()
+        current_time = time() if wall_now is None else wall_now
+        active = sum(
+            1
+            for node in nodes
+            if not node.is_local and is_node_active(node.last_heard, current_time)
+        )
+        title.update(f"> MESH · ACTIVE {active}")
+        if nodes:
+            status.update("")
+            view.set_nodes(
+                nodes,
+                now=current_time,
+                favorites=self.settings,
+                theme=self._current_theme,
+            )
+            # Rebuilding node widgets can transiently clear focus (the old
+            # widget was just removed) before set_nodes()'s own restoration
+            # callback runs. Check again only after that callback has had its
+            # turn, so a restored selection is never clobbered.
+            self.call_after_refresh(self._ensure_mesh_node_focus)
+        else:
+            view.clear_nodes()
+            status.update("NO SYNCED NODE DATA")
+
+    def _ensure_mesh_node_focus(self) -> None:
+        if self.current_tab == "mesh" and not isinstance(self.focused, MeshNodeWidget):
+            self.query_one(MeshTopologyView).focus_local()
+
+    def _move_mesh_focus(self, direction: str) -> None:
+        focused = self.focused
+        if not isinstance(focused, MeshNodeWidget):
+            self.query_one(MeshTopologyView).focus_local()
+            return
+        view = self.query_one(MeshTopologyView)
+        target = directional_target(
+            focused.node.node_id,
+            view.layout_model,
+            direction,  # type: ignore[arg-type]
+        )
+        if target is not None:
+            view.focus_node(target.node.node_id)
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
@@ -2248,7 +2626,34 @@ class MeshtasticPassApp(App[None]):
                     current.long_name or metadata.long_name,
                     current.short_name or metadata.short_name,
                     current.hops_away,
+                    current.last_heard,
+                    current.is_local,
                 )
+
+        self._open_node_menu(
+            metadata,
+            event.widget,
+            self.query_one(ChatTranscript),
+        )
+
+    @on(MeshNodeWidget.MenuRequested)
+    def open_mesh_node_menu(self, event: MeshNodeWidget.MenuRequested) -> None:
+        self._open_node_menu(
+            event.widget.node,
+            event.widget,
+            self.query_one(MeshTopologyView),
+            include_rx_age=True,
+        )
+
+    def _open_node_menu(
+        self,
+        metadata: NodeMetadata,
+        origin: Widget,
+        scroll_target: ScrollableContainer,
+        *,
+        include_rx_age: bool = False,
+    ) -> None:
+        """Open the shared CHAT/MESH node-details menu."""
 
         items: list[PopupItem] = []
         if metadata.long_name:
@@ -2263,33 +2668,44 @@ class MeshtasticPassApp(App[None]):
                     actionable=False,
                 )
             )
-        favorite = self.settings.is_favorite(entry.node_id)
-        action = "unfavorite" if favorite else "favorite"
-        items.append(PopupItem(action.upper(), action, actionable=True))
-        highlighted = len(items) - 1
+        if (
+            include_rx_age
+            and metadata.last_heard is not None
+            and metadata.last_heard <= time()
+        ):
+            items.append(
+                PopupItem(
+                    f"RX {format_relative_age(time() - metadata.last_heard)}",
+                    actionable=False,
+                )
+            )
+        if metadata.is_local:
+            items.append(PopupItem(metadata.node_id, actionable=False))
+            highlighted = 0
+        else:
+            favorite = self.settings.is_favorite(metadata.node_id)
+            action = "unfavorite" if favorite else "favorite"
+            items.append(PopupItem(action.upper(), action, actionable=True))
+            highlighted = len(items) - 1
         menu = ViewportMenu(
             items,
             highlighted_index=highlighted,
-            on_activate=lambda _index, item: self._activate_user_action(
-                event.widget,
-                str(item.value),
+            on_activate=lambda _index, item: self._activate_node_action(
+                metadata.node_id, str(item.value)
             ),
             menu_id="node-context-menu",
         )
         self._close_user_menu(restore_focus=False)
         self._user_menu = menu
-        self._user_menu_origin = event.widget
-        self._user_menu_scroll_y = self.query_one(ChatTranscript).scroll_y
-        width = max(len(item.label) for item in items) + 4
+        self._user_menu_origin = origin
+        self._user_menu_scroll_target = scroll_target
+        self._user_menu_scroll_x = scroll_target.scroll_x
+        self._user_menu_scroll_y = scroll_target.scroll_y
+        width = max(cell_len(item.label) for item in items) + 4
         self.screen.mount(menu)
-        menu.place(event.widget.region, self.screen.region, width)
+        menu.place(origin.region, self.screen.region, width)
 
-    def _activate_user_action(
-        self,
-        origin: ChatEntryWidget,
-        action: str,
-    ) -> None:
-        node_id = origin.entry.node_id
+    def _activate_node_action(self, node_id: str, action: str) -> None:
         if not node_id or action not in ("favorite", "unfavorite"):
             return
         self.settings.set_favorite(node_id, action == "favorite")
@@ -2301,23 +2717,38 @@ class MeshtasticPassApp(App[None]):
         for widget in self.query(ChatEntryWidget):
             if widget.entry.node_id and widget.entry.node_id.lower() == node_id.lower():
                 widget.set_favorite(self.settings.is_favorite(node_id))
+        self._refresh_mesh()
         self._close_user_menu()
+
+    def _activate_user_action(
+        self,
+        origin: ChatEntryWidget,
+        action: str,
+    ) -> None:
+        """Compatibility wrapper for the established CHAT action path."""
+        node_id = origin.entry.node_id
+        if node_id:
+            self._activate_node_action(node_id, action)
 
     def _close_user_menu(self, *, restore_focus: bool = True) -> None:
         menu = self._user_menu
         origin = self._user_menu_origin
+        scroll_target = self._user_menu_scroll_target
+        scroll_x = self._user_menu_scroll_x
         scroll_y = self._user_menu_scroll_y
         self._user_menu = None
         self._user_menu_origin = None
+        self._user_menu_scroll_target = None
+        self._user_menu_scroll_x = None
         self._user_menu_scroll_y = None
         if menu is not None:
             menu.remove()
         if restore_focus and origin is not None and origin.is_mounted:
-            origin.focus()
-            if scroll_y is not None:
-                transcript = self.query_one(ChatTranscript)
+            origin.focus(scroll_visible=not isinstance(origin, MeshNodeWidget))
+            if scroll_target is not None and scroll_y is not None:
                 self.call_after_refresh(
-                    transcript.scroll_to,
+                    scroll_target.scroll_to,
+                    x=scroll_x,
                     y=scroll_y,
                     animate=False,
                     force=True,
@@ -2645,7 +3076,11 @@ class MeshtasticPassApp(App[None]):
         elif self.current_tab == "chat":
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
-            text = "1-4 switch tabs    F4 quit"
+            text = (
+                "↑↓←→ select    ENTER details    1-4 tabs    F4 quit"
+                if self.current_tab == "mesh"
+                else "1-4 switch tabs    F4 quit"
+            )
         self.query_one("#footer", Static).update(text)
 
     def restore_terminal_cursor(self) -> None:
@@ -2692,6 +3127,7 @@ class MeshtasticPassApp(App[None]):
         self._render_connection_details()
         self._render_identity(force_value=True)
         self._render_chat_heading()
+        self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
 
     def _advance_connection_animation(self) -> None:
