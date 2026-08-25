@@ -404,20 +404,27 @@ class MeshFixtureNode:
     """One node in the fixed, hardcoded MESH fixture.
 
     row/column are the node's fixed logical grid position (1-indexed),
-    before whole-mesh translation/recentering is applied.
+    before whole-mesh translation/recentering is applied. The board itself
+    renders only a one-cell glyph per node -- no label -- so there is no
+    label field here; see MESH_FIXTURE_CONTEXT_LABELS for the separate
+    bottom-left context line text.
     """
 
     node_id: str
-    label: str
     row: int
     column: int
     is_local: bool
 
 
 MESH_FIXTURE_NODES = (
-    MeshFixtureNode("!you", "YOU", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True),
-    MeshFixtureNode("!alice", "ALICE", 3, 8, False),
+    MeshFixtureNode("!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True),
+    MeshFixtureNode("!alice", 3, 8, False),
 )
+
+# Bottom-left context-line text only -- the board itself never renders
+# these strings; see section 8/9 of the minimal-fixture spec this fixture
+# implements.
+MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {"!you": "YOU", "!alice": "ALICE"}
 
 
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
@@ -473,16 +480,15 @@ def _mesh_fixture_directional_target(current_node_id: str, direction: str) -> st
 
 
 class MeshNodeWidget(Static):
-    """One mouse-selectable node on the fixed MESH grid.
+    """One glyph-only node on the fixed MESH grid -- no label, one cell.
 
-    Selection state lives on MeshTopologyView, not Textual's focus system
-    (Widget.focus() defers the actual assignment via App.call_later, which
-    made a prior, richer version of this view's selection styling lag by
-    one event loop turn). Rendering always reflects the current selection
-    synchronously.
+    Selection state lives on MeshTopologyView, not Textual's focus system:
+    rendering always reflects the current selection synchronously, so there
+    is no second, focus-driven source of visual selection state to keep in
+    sync. Textual focus is not used here at all -- mouse clicks are routed
+    by position, not focus, and keyboard arrow routing is handled entirely
+    at the App level against MeshTopologyView.selected_node_id.
     """
-
-    can_focus = True
 
     def __init__(self, fixture: MeshFixtureNode) -> None:
         self.fixture = fixture
@@ -493,11 +499,7 @@ class MeshNodeWidget(Static):
         palette = THEME_PALETTES[theme]
         color = palette.accent if selected else palette.base
         glyph = CIRCLE_SOLID_LARGE if self.fixture.is_local else CIRCLE_STROKED_LARGE
-        content = Text(justify="center")
-        content.append(self.fixture.label, style=Style(color=color))
-        content.append("\n")
-        content.append(glyph, style=Style(color=color))
-        self.update(content)
+        self.update(Text(glyph, style=Style(color=color)))
 
     def on_click(self, _event: Click) -> None:
         view = self.app.query_one(MeshTopologyView)
@@ -625,15 +627,14 @@ class MeshTopologyView(Container):
         for widget in self.query(MeshNodeWidget):
             row, column = positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
-            width = max(1, cell_len(widget.fixture.label))
-            widget.styles.width = width
-            widget.styles.height = 2
-            widget.styles.offset = (grid_x - width // 2, grid_y - 1)
+            # One cell exactly: the glyph visually replaces/covers the
+            # background grid dot at (grid_x, grid_y), no label width.
+            widget.styles.width = 1
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
             selected = widget.node_id == self._selected_node_id
             widget.refresh_visual(selected=selected, theme=theme)
-            if selected:
-                widget.focus(scroll_visible=False)
 
         local_id = next(node.node_id for node in MESH_FIXTURE_NODES if node.is_local)
         remote_id = next(
@@ -2488,11 +2489,7 @@ class MeshtasticPassApp(App[None]):
             status_widget.update("")
             return
         selected_id = views[0].selected_node_id
-        fixture = next(
-            (node for node in MESH_FIXTURE_NODES if node.node_id == selected_id),
-            None,
-        )
-        status_widget.update(fixture.label if fixture else "")
+        status_widget.update(MESH_FIXTURE_CONTEXT_LABELS.get(selected_id, ""))
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1

@@ -549,6 +549,39 @@ class MeshFixtureModelTests(unittest.TestCase):
     def test_directional_target_with_no_candidate_is_none(self) -> None:
         self.assertIsNone(_mesh_fixture_directional_target(YOU_ID, "down"))
 
+    def test_background_grid_renders_a_dot_at_every_logical_position(self) -> None:
+        """Every one of the 7x17 logical grid positions must correspond to
+
+        exactly one visible background dot -- proven directly against the
+        procedural canvas renderer, independent of any node overlay.
+        """
+        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
+        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
+        self.assertEqual(len(rows), height)
+        for row in range(1, MESH_GRID_ROWS + 1):
+            for column in range(1, MESH_GRID_COLUMNS + 1):
+                x, y = _mesh_grid_pixel(row, column)
+                with self.subTest(row=row, column=column):
+                    self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
+
+    def test_background_dot_exists_at_you_grid_position(self) -> None:
+        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
+        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
+        x, y = _mesh_grid_pixel(4, 9)
+        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
+
+    def test_background_dot_exists_at_alice_grid_position(self) -> None:
+        width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
+        height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
+        x, y = _mesh_grid_pixel(3, 8)
+        self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
+
+    def test_fixture_nodes_have_no_label_field(self) -> None:
+        self.assertNotIn("label", MeshFixtureNode.__dataclass_fields__)
+
 
 class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
     """Headless app tests of the fixed YOU+ALICE MESH board: default
@@ -606,12 +639,10 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 str(alice_rendered).splitlines()[-1].strip(), CIRCLE_STROKED_LARGE
             )
 
-    async def test_labels_are_center_justified_over_the_grid_point(self) -> None:
-        """Each node's width is sized exactly to its label (see
+    async def test_node_widgets_render_glyph_only_no_labels(self) -> None:
+        """The board renders no node-name text anywhere -- only the
 
-        render_fixture), and content-align centers that content horizontally
-        within it -- together, the label sits centered over its grid point
-        rather than left-aligned beside it.
+        one-cell circle glyph, sized to exactly one cell wide and tall.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -619,10 +650,28 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("4")
             await pilot.pause()
             for widget in app.query(MeshNodeWidget):
-                self.assertEqual(widget.styles.content_align_horizontal, "center")
-                self.assertEqual(
-                    int(widget.styles.width.value), cell_len(widget.fixture.label)
+                expected_glyph = (
+                    CIRCLE_SOLID_LARGE if widget.fixture.is_local else CIRCLE_STROKED_LARGE
                 )
+                rendered = widget.render()
+                self.assertEqual(rendered.plain, expected_glyph)
+                self.assertNotIn("YOU", rendered.plain)
+                self.assertNotIn("ALICE", rendered.plain)
+                self.assertEqual(int(widget.styles.width.value), 1)
+                self.assertEqual(int(widget.styles.height.value), 1)
+
+    async def test_node_glyph_centers_align_exactly_to_grid_dot_coordinates(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
+            alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
+            self.assertEqual(offset_xy(you), _mesh_grid_pixel(4, 9))
+            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(3, 8))
 
     async def test_no_selection_background_rectangle_in_css_or_at_runtime(self) -> None:
         self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)
@@ -653,14 +702,8 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
             alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
 
-            alice_x, alice_y = _mesh_grid_pixel(4, 9)
-            you_x, you_y = _mesh_grid_pixel(5, 10)
-            alice_half_width = cell_len("ALICE") // 2
-            you_half_width = cell_len("YOU") // 2
-            self.assertEqual(
-                offset_xy(alice), (alice_x - alice_half_width, alice_y - 1)
-            )
-            self.assertEqual(offset_xy(you), (you_x - you_half_width, you_y - 1))
+            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(4, 9))
+            self.assertEqual(offset_xy(you), _mesh_grid_pixel(5, 10))
 
     async def test_left_from_you_makes_alice_accent_and_you_base(self) -> None:
         app = self._make_app()
