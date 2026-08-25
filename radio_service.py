@@ -118,6 +118,7 @@ class NodeMetadata:
     hops_away: int | None = None
     last_heard: float | None = None
     is_local: bool = False
+    position: GeoPosition | None = None
 
 
 @dataclass(frozen=True)
@@ -379,6 +380,7 @@ class RadioService:
             hops_away=hops,
             last_heard=last_heard,
             is_local=self._is_local_node(normalized, node_number),
+            position=self._position_from_record(record),
         )
 
     def get_known_nodes(self) -> tuple[NodeMetadata, ...]:
@@ -427,6 +429,7 @@ class RadioService:
                     hops_away=hops,
                     last_heard=last_heard,
                     is_local=self._is_local_node(node_id, number),
+                    position=self._position_from_record(record),
                 )
             )
 

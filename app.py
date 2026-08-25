@@ -434,6 +434,47 @@ class MeshNodeWidget(Static):
             event.stop()
 
 
+DOT_GRID_GLYPH = "·"
+DOT_GRID_SPACING_X = 6
+DOT_GRID_SPACING_Y = 3
+
+
+def _render_dot_grid(width: int, height: int, color: str) -> Text:
+    """Build one procedural Text covering the whole canvas, not one dot per cell."""
+    if width <= 1 and height <= 1:
+        return Text("")
+    dot_row = "".join(
+        DOT_GRID_GLYPH if x % DOT_GRID_SPACING_X == 0 else " " for x in range(width)
+    )
+    blank_row = " " * width
+    rows = (dot_row if y % DOT_GRID_SPACING_Y == 0 else blank_row for y in range(height))
+    return Text("\n".join(rows), style=Style(color=color))
+
+
+class MeshDotGrid(Static):
+    """Static, non-interactive background dot grid for the MESH canvas.
+
+    One widget covers the entire virtual canvas (never one widget per dot),
+    so it stays cheap at any topology size and scrolls naturally with the
+    board rather than behaving like a fixed viewport overlay.
+    """
+
+    can_focus = False
+
+    def __init__(self) -> None:
+        super().__init__(classes="mesh-dot-grid", markup=False)
+        self._signature: tuple[int, int, str] | None = None
+
+    def resize(self, width: int, height: int, theme: str) -> None:
+        signature = (width, height, theme)
+        if signature == self._signature:
+            return
+        self._signature = signature
+        self.styles.width = width
+        self.styles.height = height
+        self.update(_render_dot_grid(width, height, THEME_PALETTES[theme].grid_dot))
+
+
 class MeshTopologyView(ScrollableContainer, inherit_bindings=False):
     """A two-axis viewport over the passive topology board.
 
@@ -446,7 +487,10 @@ class MeshTopologyView(ScrollableContainer, inherit_bindings=False):
     can_focus = True
 
     def __init__(self) -> None:
-        super().__init__(Container(id="mesh-board"), id="mesh-view")
+        super().__init__(
+            Container(MeshDotGrid(), id="mesh-board"),
+            id="mesh-view",
+        )
         self.layout_model = TopologyLayout((), 1, 1)
         self._layout_signature: tuple[object, ...] = ()
 
@@ -483,13 +527,14 @@ class MeshTopologyView(ScrollableContainer, inherit_bindings=False):
         board = self.board
         board.styles.width = layout.width
         board.styles.height = layout.height
+        self.query_one(MeshDotGrid).resize(layout.width, layout.height, theme)
         if signature != self._layout_signature:
             selected_id = (
                 self.app.focused.node.node_id
                 if isinstance(self.app.focused, MeshNodeWidget)
                 else None
             )
-            board.remove_children()
+            board.remove_children(MeshNodeWidget)
             widgets: list[MeshNodeWidget] = []
             for item in layout.nodes:
                 widget = MeshNodeWidget(item)
@@ -515,7 +560,8 @@ class MeshTopologyView(ScrollableContainer, inherit_bindings=False):
     def clear_nodes(self) -> None:
         self.layout_model = TopologyLayout((), 1, 1)
         self._layout_signature = ()
-        self.board.remove_children()
+        self.board.remove_children(MeshNodeWidget)
+        self.query_one(MeshDotGrid).resize(1, 1, "white")
 
     def focus_node(self, node_id: str) -> None:
         for widget in self.query(MeshNodeWidget):
@@ -1167,25 +1213,36 @@ class MeshtasticPassApp(App[None]):
         scrollbar-size: 1 1;
         scrollbar-color: #d8d8d8;
         scrollbar-background: $white_dim;
+        scrollbar-corner-color: $white_dim;
     }
 
     Screen.theme-green #mesh-view {
         scrollbar-color: #39ff14;
         scrollbar-background: $green_dim;
+        scrollbar-corner-color: $green_dim;
     }
 
     Screen.theme-orange #mesh-view {
         scrollbar-color: #ff8c00;
         scrollbar-background: $orange_dim;
+        scrollbar-corner-color: $orange_dim;
     }
 
     #mesh-board {
         position: relative;
         min-width: 1;
         min-height: 1;
+        layers: grid nodes;
+    }
+
+    .mesh-dot-grid {
+        layer: grid;
+        position: absolute;
+        offset: 0 0;
     }
 
     .mesh-node {
+        layer: nodes;
         position: absolute;
         width: 18;
         height: 3;

@@ -13,14 +13,20 @@ from textual.events import MouseScrollDown
 
 from app import (
     CHAT_SCROLLBAR_THUMB_GLYPH,
+    DOT_GRID_GLYPH,
+    DOT_GRID_SPACING_X,
+    DOT_GRID_SPACING_Y,
     HORIZONTAL_SCROLLBAR_THUMB_GLYPH,
     ChatEntryWidget,
+    MeshDotGrid,
     MeshNodeWidget,
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
+    _render_dot_grid,
 )
 from app_settings import AppSettings
+from geo import GeoPosition
 from mesh_topology import (
     HORIZONTAL_GAP,
     NODE_HEIGHT,
@@ -35,6 +41,26 @@ from radio_service import NodeMetadata, RadioState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 from theme_palette import THEME_PALETTES
 from viewport_menu import ViewportMenu
+
+
+LOCAL_GEO = GeoPosition(0.0, 0.0)
+_MILES_PER_DEGREE_AT_EQUATOR = 69.0
+
+
+def west_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(0.0, -miles / _MILES_PER_DEGREE_AT_EQUATOR)
+
+
+def east_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(0.0, miles / _MILES_PER_DEGREE_AT_EQUATOR)
+
+
+def north_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
+
+
+def south_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(-miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
 
 
 def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
@@ -54,23 +80,170 @@ def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
 
 
 class MeshTopologyModelTests(unittest.TestCase):
-    def test_you_is_central_and_hop_layers_are_ordered(self) -> None:
-        layout = build_topology(sample_nodes())
+    def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
+        """The exact worked example: Jim < Alice < YOU < Bob on the x-axis."""
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        alice = NodeMetadata(
+            "!alice", "Alice", "ALCE", None, 1_000.0, False, position=west_of_local(1)
+        )
+        jim = NodeMetadata(
+            "!jim", "Jim", "JIM", None, 1_000.0, False, position=west_of_local(2)
+        )
+        bob = NodeMetadata(
+            "!bob", "Bob", "BOB", None, 1_000.0, False, position=east_of_local(4)
+        )
+        layout = build_topology([local, alice, jim, bob])
         by_id = {item.node.node_id: item for item in layout.nodes}
-        local = by_id["!00000000"]
-        one_hop = [item for item in layout.nodes if item.layer == 1]
-        two_hop = [item for item in layout.nodes if item.layer == 2]
-        unknown = [item for item in layout.nodes if item.layer is None]
 
-        def radius(item):
-            return max(
-                abs(item.x - local.x) // (NODE_WIDTH + HORIZONTAL_GAP),
-                abs(item.y - local.y) // (NODE_HEIGHT + VERTICAL_GAP),
+        self.assertEqual(by_id["!alice"].region, "W")
+        self.assertEqual(by_id["!jim"].region, "W")
+        self.assertEqual(by_id["!bob"].region, "E")
+        self.assertLess(by_id["!jim"].x, by_id["!alice"].x)
+        self.assertLess(by_id["!alice"].x, by_id["!local"].x)
+        self.assertLess(by_id["!local"].x, by_id["!bob"].x)
+
+        # Bob is 4x farther than Alice but must not sit 4x farther visually:
+        # one grid step per rank, regardless of the real-world mile gap.
+        alice_gap = by_id["!local"].x - by_id["!alice"].x
+        jim_gap = by_id["!alice"].x - by_id["!jim"].x
+        self.assertEqual(alice_gap, jim_gap)
+
+    def test_north_and_south_nodes_placed_up_and_down(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nora = NodeMetadata(
+            "!nora", "Nora", "NORA", None, 1_000.0, False, position=north_of_local(3)
+        )
+        sam = NodeMetadata(
+            "!sam", "Sam", "SAM", None, 1_000.0, False, position=south_of_local(2)
+        )
+        layout = build_topology([local, nora, sam])
+        by_id = {item.node.node_id: item for item in layout.nodes}
+
+        self.assertEqual(by_id["!nora"].region, "N")
+        self.assertEqual(by_id["!sam"].region, "S")
+        self.assertLess(by_id["!nora"].y, by_id["!local"].y)
+        self.assertLess(by_id["!local"].y, by_id["!sam"].y)
+
+    def test_distance_orders_outward_without_proportional_spacing(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        near = NodeMetadata(
+            "!near", "Near", "N", None, 1_000.0, False, position=west_of_local(1)
+        )
+        far = NodeMetadata(
+            "!far", "Far", "F", None, 1_000.0, False, position=west_of_local(500)
+        )
+        layout = build_topology([local, near, far])
+        by_id = {item.node.node_id: item for item in layout.nodes}
+        self.assertLess(by_id["!far"].x, by_id["!near"].x)
+        near_gap = by_id["!local"].x - by_id["!near"].x
+        far_gap = by_id["!near"].x - by_id["!far"].x
+        self.assertEqual(near_gap, far_gap)
+
+    def test_unknown_position_nodes_use_deterministic_fallback_region(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        known = NodeMetadata(
+            "!known", "Known", "K", None, 1_000.0, False, position=west_of_local(1)
+        )
+        close_hop_no_position = NodeMetadata(
+            "!close", "CloseHop", "CH", 1, 1_000.0, False, position=None
+        )
+        far_hop_no_position = NodeMetadata(
+            "!far", "FarHop", "FH", 9, 1_000.0, False, position=None
+        )
+        layout = build_topology(
+            [local, known, close_hop_no_position, far_hop_no_position]
+        )
+        by_id = {item.node.node_id: item for item in layout.nodes}
+        self.assertEqual(by_id["!known"].region, "W")
+        # hopsAway must never fabricate a direction/ordering, regardless of
+        # how close or far the hop count claims to be.
+        self.assertEqual(by_id["!close"].region, "UNKNOWN")
+        self.assertEqual(by_id["!far"].region, "UNKNOWN")
+
+    def test_missing_local_position_makes_every_remote_unknown(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=None)
+        remote = NodeMetadata(
+            "!remote", "Remote", "R", None, 1_000.0, False, position=west_of_local(1)
+        )
+        layout = build_topology([local, remote])
+        by_id = {item.node.node_id: item for item in layout.nodes}
+        self.assertEqual(by_id["!remote"].region, "UNKNOWN")
+
+    def test_directional_placement_is_arrival_order_independent(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nodes = [local]
+        for index in range(6):
+            nodes.append(
+                NodeMetadata(
+                    f"!w{index}",
+                    f"West {index}",
+                    f"W{index}",
+                    None,
+                    1_000.0,
+                    False,
+                    position=west_of_local(index + 1),
+                )
             )
+        forward = build_topology(nodes)
+        backward = build_topology(list(reversed(nodes)))
+        forward_positions = {
+            item.node.node_id: (item.x, item.y) for item in forward.nodes
+        }
+        backward_positions = {
+            item.node.node_id: (item.x, item.y) for item in backward.nodes
+        }
+        self.assertEqual(forward_positions, backward_positions)
 
-        self.assertTrue(one_hop and two_hop and unknown)
-        self.assertLess(max(map(radius, one_hop)), min(map(radius, two_hop)))
-        self.assertLess(max(map(radius, two_hop)), min(map(radius, unknown)))
+    def test_no_overlap_across_mixed_directions_and_unknown_region(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nodes = [local]
+        for index in range(10):
+            nodes.append(
+                NodeMetadata(
+                    f"!w{index}",
+                    f"West{index}",
+                    None,
+                    None,
+                    1_000.0,
+                    False,
+                    position=west_of_local(index + 1),
+                )
+            )
+            nodes.append(
+                NodeMetadata(
+                    f"!e{index}",
+                    f"East{index}",
+                    None,
+                    None,
+                    1_000.0,
+                    False,
+                    position=east_of_local(index + 1),
+                )
+            )
+            nodes.append(
+                NodeMetadata(
+                    f"!u{index}", f"Unknown{index}", None, None, 1_000.0, False
+                )
+            )
+        layout = build_topology(nodes)
+        rectangles = []
+        for item in layout.nodes:
+            rectangle = (item.x, item.y, item.x + NODE_WIDTH, item.y + NODE_HEIGHT)
+            for other in rectangles:
+                separated = (
+                    rectangle[2] <= other[0]
+                    or other[2] <= rectangle[0]
+                    or rectangle[3] <= other[1]
+                    or other[3] <= rectangle[1]
+                )
+                self.assertTrue(separated)
+            rectangles.append(rectangle)
+
+    def test_reserve_slot_falls_back_to_nearest_free_slot_on_collision(self) -> None:
+        occupied = {(2, 0)}
+        result = mesh_topology_module._reserve_slot(2, 0, occupied)
+        self.assertNotEqual(result, (2, 0))
+        self.assertIn(result, occupied)
 
     def test_layout_is_deterministic_collision_free_and_scales(self) -> None:
         nodes = sample_nodes(31)
@@ -104,12 +277,15 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertTrue(compact_node_label(fallback).startswith("…"))
 
     def test_spatial_navigation_has_no_edge_wrap(self) -> None:
-        layout = build_topology(sample_nodes())
-        local = next(item for item in layout.nodes if item.node.is_local)
-        target = directional_target(local.node.node_id, layout, "up")
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        north_node = NodeMetadata(
+            "!north", "North", "N", None, 1_000.0, False, position=north_of_local(1)
+        )
+        layout = build_topology([local, north_node])
+        target = directional_target("!local", layout, "up")
         self.assertIsNotNone(target)
         assert target is not None
-        self.assertLess(target.y, local.y)
+        self.assertEqual(target.node.node_id, "!north")
         top = min(layout.nodes, key=lambda item: item.y)
         self.assertIsNone(directional_target(top.node.node_id, layout, "up"))
 
@@ -183,6 +359,44 @@ class MeshTopologyModelTests(unittest.TestCase):
         emoji_layout = build_topology(emoji_nodes)
         self.assertEqual(plain_layout.width, emoji_layout.width)
         self.assertEqual(plain_layout.height, emoji_layout.height)
+
+    def test_emoji_labels_do_not_disturb_directional_grid_slots(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        plain_west = NodeMetadata(
+            "!west", "West Node", "W", None, 1_000.0, False, position=west_of_local(1)
+        )
+        emoji_west = NodeMetadata(
+            "!west", "🐔🍕👨‍👩‍👧‍👦 West Node", "W", None, 1_000.0, False,
+            position=west_of_local(1),
+        )
+        plain_layout = build_topology([local, plain_west])
+        emoji_layout = build_topology([local, emoji_west])
+        plain_positions = {item.node.node_id: (item.x, item.y) for item in plain_layout.nodes}
+        emoji_positions = {item.node.node_id: (item.x, item.y) for item in emoji_layout.nodes}
+        self.assertEqual(plain_positions, emoji_positions)
+
+
+class MeshDotGridRenderTests(unittest.TestCase):
+    def test_dot_grid_uses_regular_spacing_and_glyph(self) -> None:
+        width, height = 20, 9
+        text = _render_dot_grid(width, height, "#222222")
+        rows = str(text).split("\n")
+        self.assertEqual(len(rows), height)
+        for y, row in enumerate(rows):
+            self.assertEqual(len(row), width)
+            for x, character in enumerate(row):
+                expected = (
+                    DOT_GRID_GLYPH
+                    if x % DOT_GRID_SPACING_X == 0 and y % DOT_GRID_SPACING_Y == 0
+                    else " "
+                )
+                self.assertEqual(character, expected)
+
+    def test_dot_grid_is_empty_for_a_degenerate_canvas(self) -> None:
+        self.assertEqual(str(_render_dot_grid(1, 1, "#222222")), "")
+
+    def test_dot_grid_is_non_focusable(self) -> None:
+        self.assertFalse(MeshDotGrid.can_focus)
 
 
 class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
@@ -402,6 +616,11 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(42, 15)) as pilot:
             await pilot.pause()
             await pilot.press("4")
+            await pilot.pause()
+            # center_node() schedules a second, deferred scroll_to via
+            # call_after_refresh to handle layout that isn't settled after
+            # the first refresh; give it a second cycle to land before
+            # asserting, so this isn't sensitive to system/scheduler timing.
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             local_widget = next(
@@ -687,6 +906,85 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(view.styles.scrollbar_color.hex, palette.base)
                 self.assertEqual(
                     view.styles.scrollbar_background.hex, palette.dim_base
+                )
+                self.assertEqual(
+                    view.styles.scrollbar_corner_color.hex, palette.dim_base
+                )
+
+    async def test_scrollbar_geometry_is_one_cell_on_each_axis(self) -> None:
+        """Both bars must consume exactly one cell of thickness, not two."""
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(42, 15)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.vertical_scrollbar.size.width, 1)
+            self.assertEqual(view.horizontal_scrollbar.size.height, 1)
+
+    async def test_scrollbar_corner_matches_track_color_no_black_box(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(42, 15)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            # ScrollBarCorner.render() fills itself with self.parent.styles.
+            # scrollbar_corner_color, so proving that style resolves to the
+            # same color as the track (rather than Textual's unrelated
+            # ansi_default/#666666 fallback) proves the corner cannot render
+            # as a mismatched box.
+            corner = view.scrollbar_corner
+            self.assertIs(corner.parent, view)
+            for theme, palette in THEME_PALETTES.items():
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                self.assertEqual(
+                    view.styles.scrollbar_corner_color.hex, palette.dim_base
+                )
+                self.assertEqual(
+                    view.styles.scrollbar_corner_color.hex,
+                    view.styles.scrollbar_background.hex,
+                )
+
+    async def test_dot_grid_covers_canvas_matches_theme_and_renders_below_nodes(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(42, 15)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            grid = app.query_one(MeshDotGrid)
+            self.assertEqual(grid.styles.width.value, view.board.styles.width.value)
+            self.assertEqual(grid.styles.height.value, view.board.styles.height.value)
+            self.assertEqual(grid.styles.layer, "grid")
+            node = next(iter(app.query(MeshNodeWidget)))
+            self.assertEqual(node.styles.layer, "nodes")
+            self.assertEqual(view.board.styles.layers, ("grid", "nodes"))
+
+            for theme, palette in THEME_PALETTES.items():
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                self.assertEqual(
+                    grid.render().spans[0].style.foreground,
+                    Color.parse(palette.grid_dot),
                 )
 
     async def test_emoji_node_labels_render_without_corrupting_board_geometry(

@@ -190,6 +190,10 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         self.assertTrue(any(node.hops_away is None for node in nodes))
         self.assertTrue(any(node.long_name is None for node in nodes))
         self.assertTrue(any(node.short_name is None for node in nodes))
+        local = next(node for node in nodes if node.is_local)
+        self.assertEqual(local.position, SIMULATED_LOCAL_POSITION)
+        self.assertTrue(any(node.position is not None for node in nodes if not node.is_local))
+        self.assertTrue(any(node.position is None for node in nodes if not node.is_local))
         self.assertEqual(service.sent_messages, ())
 
     def test_direct_message_activity_and_identity_edit_are_deterministic(self) -> None:

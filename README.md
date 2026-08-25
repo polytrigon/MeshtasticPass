@@ -147,11 +147,27 @@ the second packet into chronological position and shows
 
 ### Passive MESH topology board
 
-Press `4` to open MESH. The board places `YOU` at its center, arranges nodes
-with trustworthy Meshtastic `hopsAway` values in deterministic hop layers, and
-puts unknown-hop nodes in an outer layer. This is a topology view, not a map:
-positions do not imply GPS location or physical direction, and the app draws no
-link or route unless a future trustworthy data source can support one.
+Press `4` to open MESH. The board places `YOU` at its center on a schematic
+relative spatial grid, not a literal map. When both YOU and a remote node have
+trustworthy Meshtastic position data, that node is placed by compass direction
+(one of eight 45° buckets) relative to YOU, and nodes in the same direction are
+ordered outward by real distance — nearer nodes occupy the first grid slot,
+farther nodes the next, and so on. Direction and near/far ordering are
+meaningful; exact spacing is not to scale, and it never attempts
+miles-per-cell proportionality (a node 4x farther away does not sit 4x farther
+out visually). A remote node without a resolvable bearing — either it or YOU
+lacks trustworthy position data — goes to a deterministic UNKNOWN region below
+the directional grid instead of being mixed in with a fabricated direction.
+Bearing is never inferred from `hopsAway`, RSSI, SNR, arrival order, or node
+ID. This remains a topology view, not a map: the app draws no lat/lon-derived
+screen coordinates, roads, or route lines unless a future trustworthy data
+source can support one.
+
+A subtle static dot grid (`·`, theme DIM_BASE at ~10% intensity, roughly every
+6 columns and 3 rows) renders procedurally behind the nodes as part of the
+MESH canvas — one background widget covering the whole virtual board, not one
+widget per dot — so it scrolls naturally with the topology instead of behaving
+like a fixed viewport overlay, and expands automatically as the canvas grows.
 
 Active nodes use the current theme's BASE color. Nodes not heard within the
 same exact five-minute window used by CHAT's ACTIVE count use DIM_BASE. An
@@ -182,11 +198,19 @@ packets. While disconnected, the board says
 current.
 
 MESH's horizontal scrollbar uses the same thin single-cell renderer as its
-vertical scrollbar (and CHAT's), rather than Textual's thicker default.
+vertical scrollbar (and CHAT's), rather than Textual's thicker default, and
+both bars are configured to exactly one terminal cell of thickness — a
+horizontal (row) cell and vertical (column) cell are inherently different
+physical sizes on most monospace terminal fonts, so the two may still look
+slightly different in absolute pixels even though their cell geometry matches.
+The small square where both scrollbars meet uses the same track color as the
+scrollbars themselves, instead of Textual's unrelated default corner color.
 
-For a hardware-free review, run `python app.py --simulate`, press `4`, navigate
-the stable one-hop, two-hop, unknown-hop, active, stale, and missing-name nodes,
-and verify Favorite changes are also visible in CHAT.
+For a hardware-free review, run `python app.py --simulate`, press `4`, and
+navigate the stable directional nodes (visible in simulation to the northeast
+and southeast of YOU), the unknown-position nodes in the fallback region
+below, active vs. stale coloring, and missing-name nodes; verify Favorite
+changes are also visible in CHAT.
 
 CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
 thumb use the same right-aligned narrow Unicode `▕` glyph through Textual's
