@@ -399,6 +399,13 @@ MESH_GRID_COLUMNS = 21
 MESH_GRID_CENTER_ROW = 5
 MESH_GRID_CENTER_COLUMN = 11
 MESH_STALE_THRESHOLD_SECONDS = 24 * 60 * 60
+# Selected-node "visually larger" treatment: a 3-cell-wide composite
+# (small dot + role glyph + small dot) replacing the ordinary 1-cell
+# glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
+# enough and why this stays a reliable-width text composite rather than
+# an ambiguous-width "big circle" Unicode glyph.
+MESH_SELECTED_GLYPH_WIDTH = 3
+MESH_SELECTED_HALO_GLYPH = "·"
 
 
 @dataclass(frozen=True)
@@ -667,16 +674,31 @@ class MeshNodeWidget(Static):
 
     def refresh_visual(self, *, selected: bool, theme: str) -> None:
         color = _mesh_node_color(self.node_id, selected=selected, theme=theme)
+        # The role glyph itself is never altered by selection -- CLIENT
+        # (solid) vs RELAY-only (stroked) stays the authoritative node
+        # semantic regardless of visual selection state.
         glyph = (
             CIRCLE_SOLID_LARGE
             if _mesh_glyph_is_solid(self.node_id, is_local=self.fixture.is_local)
             else CIRCLE_STROKED_LARGE
         )
-        # Selected glyphs render bold: the deterministic, cell-geometry-
-        # safe stand-in for "~50% larger" -- no character substitution
-        # (avoids unreliable-width Unicode) and no widget resize (so the
-        # glyph's anchor coordinate never moves).
-        self.update(Text(glyph, style=Style(color=color, bold=selected)))
+        style = Style(color=color, bold=selected)
+        if selected:
+            # Bold alone reads as barely-different on many terminals, so
+            # the anchor cell's role glyph is flanked by a small dot in
+            # each immediately neighboring cell on the same row -- a real,
+            # ~3x wider visual footprint, not a font-weight trick. The
+            # widget's own width/offset (set in render_fixture) keep the
+            # center *column* of this 3-cell composite exactly on the
+            # glyph's (grid_x, grid_y) anchor, so growing it can never
+            # move that coordinate.
+            content = Text(justify="center")
+            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+            content.append(glyph, style=style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+        else:
+            content = Text(glyph, style=style)
+        self.update(content)
 
     def on_click(self, _event: Click) -> None:
         _mesh_select_node(self.app, self.node_id)
@@ -853,11 +875,16 @@ class MeshTopologyView(Container):
         for widget in self.query(MeshNodeWidget):
             row, column = positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
-            widget.styles.width = 1
-            widget.styles.height = 1
-            widget.styles.offset = (grid_x, grid_y)
-            centers[widget.node_id] = (grid_x, grid_y)
             selected = widget.node_id == self._selected_node_id
+            # Selected nodes render a 3-cell-wide composite (see
+            # MeshNodeWidget.refresh_visual); centering that wider box on
+            # grid_x -- the same formula used for the label -- keeps its
+            # middle column, not just its left edge, on the anchor.
+            width = MESH_SELECTED_GLYPH_WIDTH if selected else 1
+            widget.styles.width = width
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x - width // 2, grid_y)
+            centers[widget.node_id] = (grid_x, grid_y)
             widget.refresh_visual(selected=selected, theme=theme)
 
         # The label is a separate, independently positioned overlay: its

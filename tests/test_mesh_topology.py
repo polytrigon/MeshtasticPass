@@ -30,6 +30,7 @@ from app import (
     MESH_GRID_CENTER_ROW,
     MESH_GRID_COLUMNS,
     MESH_GRID_ROWS,
+    MESH_SELECTED_GLYPH_WIDTH,
     MESH_STALE_THRESHOLD_SECONDS,
     MeshCanvas,
     MeshFixtureContext,
@@ -122,13 +123,17 @@ def expected_widget_offset(row: int, column: int, label: str) -> tuple[int, int]
 
 
 def glyph_screen_position(widget) -> tuple[int, int]:
-    """The glyph widget's own on-screen (x, y).
+    """The glyph's own anchor (x, y): the center column of its box.
 
-    MeshNodeWidget (the glyph) is always a 1x1 widget offset directly to
-    its grid coordinate -- independent of the separately positioned
-    MeshNodeLabelWidget, so this is simply its own offset.
+    Unselected, MeshNodeWidget is a 1-cell-wide box, so its offset IS the
+    anchor. Selected, it widens to a 3-cell composite (small dot / role
+    glyph / small dot) for the "larger" treatment -- the anchor is still
+    the box's center column, never its left edge, so this must account
+    for width rather than assume width == 1.
     """
-    return offset_xy(widget)
+    offset_x, offset_y = offset_xy(widget)
+    width = int(widget.styles.width.value)
+    return (offset_x + width // 2, offset_y)
 
 
 class MeshTopologyModelTests(unittest.TestCase):
@@ -983,9 +988,10 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 Color.parse(palette.dim_base),
             )
             for rendered in (you_rendered, alice_rendered, bob_rendered, nine_a4b_rendered):
-                self.assertEqual(
-                    str(rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE
-                )
+                # YOU is selected by default and renders the wider
+                # composite ("·●·"), so check the role glyph is present
+                # rather than requiring an exact single-character match.
+                self.assertIn(CIRCLE_SOLID_LARGE, rendered.plain)
 
     async def test_node_labels_render_you_alice_bob_9a4b(self) -> None:
         app = self._make_app()
@@ -1094,7 +1100,10 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 # Both regions are in the same (absolute, on-screen)
                 # coordinate space -- unlike glyph_screen_position(), which
                 # is board-local, so they can be compared directly here.
-                glyph_x = self._widget(app, node_id).region.x
+                # YOU is selected by default, so its glyph box is 3 cells
+                # wide; its anchor is still that box's center column.
+                glyph_region = self._widget(app, node_id).region
+                glyph_x = glyph_region.x + glyph_region.width // 2
                 label_region = self._label_widget(app, node_id).region
                 left_margin = glyph_x - label_region.x
                 right_margin = (label_region.x + label_region.width) - glyph_x - 1
@@ -1218,9 +1227,9 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_selected_glyph_enlargement_does_not_perturb_its_own_anchor(
         self,
     ) -> None:
-        """Applying the bold "larger" treatment to the selected glyph must
+        """Applying the composite "larger" treatment to the selected glyph
 
-        not add any extra offset beyond the ordinary translated grid
+        must not add any extra offset beyond the ordinary translated grid
         position -- re-rendering with the same selection is idempotent.
         """
         app = self._make_app()
@@ -1231,13 +1240,129 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             view.render_fixture(theme=app._current_theme)
             await pilot.pause()
             bob = self._widget(app, BOB_ID)
-            first_offset = offset_xy(bob)
+            first_anchor = glyph_screen_position(bob)
             self.assertTrue(bob.render().spans[0].style.bold)
 
             view.render_fixture(theme=app._current_theme)
             await pilot.pause()
-            self.assertEqual(offset_xy(bob), first_offset)
+            self.assertEqual(glyph_screen_position(bob), first_anchor)
             self.assertTrue(bob.render().spans[0].style.bold)
+
+    async def test_selected_representation_occupies_more_area_than_unselected(
+        self,
+    ) -> None:
+        """Real proof that selection is not "bold alone": the selected
+
+        glyph widget is measurably wider (3 cells vs 1) and its rendered
+        content has more visible characters, not just a style flag.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            for node_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
+                view = app.query_one(MeshTopologyView)
+                view.select_node(node_id)
+                view.render_fixture(theme=app._current_theme)
+                await pilot.pause()
+                selected_widget = self._widget(app, node_id)
+                selected_area = int(selected_widget.styles.width.value) * int(
+                    selected_widget.styles.height.value
+                )
+                selected_visible_chars = len(selected_widget.render().plain.strip())
+                with self.subTest(node=node_id):
+                    self.assertGreater(selected_area, 1)
+                    self.assertGreater(selected_visible_chars, 1)
+                    for other_id in (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID):
+                        if other_id == node_id:
+                            continue
+                        unselected_widget = self._widget(app, other_id)
+                        unselected_area = int(
+                            unselected_widget.styles.width.value
+                        ) * int(unselected_widget.styles.height.value)
+                        with self.subTest(node=node_id, unselected=other_id):
+                            self.assertGreater(selected_area, unselected_area)
+
+    async def test_selection_does_not_alter_role_glyph_semantics(self) -> None:
+        """Selection is a visual overlay/state only: the underlying role
+
+        glyph (CLIENT/CLIENT+RELAY = solid, RELAY-only = stroked) must be
+        the same character selected or not -- the composite treatment
+        adds decoration around it, never replaces or reinterprets it.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            expected_glyph = {
+                YOU_ID: CIRCLE_SOLID_LARGE,
+                ALICE_ID: CIRCLE_SOLID_LARGE,
+                BOB_ID: CIRCLE_SOLID_LARGE,
+                NINE_A4B_ID: CIRCLE_SOLID_LARGE,
+            }
+            view = app.query_one(MeshTopologyView)
+            for node_id, glyph in expected_glyph.items():
+                view.select_node(node_id)
+                view.render_fixture(theme=app._current_theme)
+                await pilot.pause()
+                with self.subTest(selected=node_id):
+                    self.assertIn(glyph, self._widget(app, node_id).render().plain)
+                    for other_id, other_glyph in expected_glyph.items():
+                        if other_id == node_id:
+                            continue
+                        self.assertEqual(
+                            self._widget(app, other_id).render().plain, other_glyph
+                        )
+
+    async def test_deselection_restores_the_ordinary_one_cell_representation(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            you = self._widget(app, YOU_ID)
+            self.assertEqual(int(you.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
+
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(int(you.styles.width.value), 1)
+            self.assertEqual(you.render().plain, CIRCLE_SOLID_LARGE)
+            self.assertFalse(you.render().spans[0].style.bold)
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(int(you.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
+            self.assertTrue(you.render().spans[0].style.bold)
+
+    async def test_only_the_selected_node_widget_widens_others_stay_one_cell(
+        self,
+    ) -> None:
+        """The composite "larger" treatment is confined to the selected
+
+        node's own glyph widget -- every other node's glyph widget stays
+        exactly 1 cell wide and unbolded, regardless of which node is
+        currently selected. (Their absolute screen positions do shift
+        when selection changes -- that is whole-mesh recentering,
+        covered by the LEFT/RIGHT/UP/DOWN recenter tests -- but their
+        widget width and bold state must never follow suit.)
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node_ids = (YOU_ID, ALICE_ID, BOB_ID, NINE_A4B_ID)
+            for node_id in node_ids:
+                view.select_node(node_id)
+                view.render_fixture(theme=app._current_theme)
+                await pilot.pause()
+                with self.subTest(selected=node_id):
+                    for other_id in node_ids:
+                        if other_id == node_id:
+                            continue
+                        other_widget = self._widget(app, other_id)
+                        with self.subTest(unselected=other_id):
+                            self.assertEqual(int(other_widget.styles.width.value), 1)
+                            self.assertFalse(
+                                other_widget.render().spans[0].style.bold
+                            )
 
     async def test_unselected_stale_9a4b_is_dim_glyph_dim_label_dim_connector(
         self,
