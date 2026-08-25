@@ -43,6 +43,7 @@ from radio_service import (
     ChannelInfo,
     DeliveryState,
     LONG_NAME_MAX_UTF8_BYTES,
+    SHORT_NAME_MAX_UTF8_BYTES,
     RadioEvent,
     RadioIdentityError,
     RadioInfo,
@@ -53,6 +54,7 @@ from radio_service import (
     SendStatus,
     SentMessage,
     validate_long_name,
+    validate_short_name,
 )
 from relative_time import format_relative_age
 from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
@@ -73,6 +75,9 @@ ANIMATED_STATUS = {
     RadioState.OFFLINE: "OFFLINE — RETRYING",
     RadioState.ERROR: "CONNECTION ERROR — RETRYING",
 }
+
+CONNECTION_LABEL_WIDTH = 12
+CONNECTION_ROW_PREFIX = "  "
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
@@ -138,6 +143,8 @@ class FontSizeSelector(KeyboardDropdown):
             (DropdownOption(name, value) for name, value in FONT_SIZE_CHOICES),
             font_size,
             widget_id="font-size-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
         )
 
     @property
@@ -153,6 +160,8 @@ class ColorSelector(KeyboardDropdown):
             (DropdownOption(name, value) for name, value in COLOR_CHOICES),
             color,
             widget_id="color-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
         )
 
     @property
@@ -168,6 +177,8 @@ class DeviceSelector(KeyboardDropdown):
             (DropdownOption(path, path) for path in options),
             device_path,
             widget_id="device-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
         )
 
 
@@ -241,15 +252,16 @@ class DeliveryStatusReceived(Message):
 
 
 class IdentitySaved(Message):
-    """The radio accepted an advertised Long Name update."""
+    """The radio accepted an advertised identity-name update."""
 
-    def __init__(self, info: RadioInfo) -> None:
+    def __init__(self, info: RadioInfo, field_label: str) -> None:
         super().__init__()
         self.info = info
+        self.field_label = field_label
 
 
 class IdentitySaveFailed(Message):
-    """A Long Name update failed validation or radio submission."""
+    """An identity-name update failed validation or radio submission."""
 
     def __init__(self, detail: str) -> None:
         super().__init__()
@@ -349,42 +361,51 @@ class ConnectionPage(VerticalScroll):
         self.vertical_scrollbar.renderer = ThinScrollBarRender
 
 
-class LongNameControl(Horizontal):
-    """Two-state Long Name control for keyboard navigation and editing."""
+class IdentityNameControl(Horizontal):
+    """Shared two-state identity field for navigation and text editing."""
 
     can_focus = True
     MIN_FIELD_WIDTH = 8
-    FIXED_ROW_WIDTH = 17  # 13-cell label plus the two bracket widgets.
+    MAX_UTF8_BYTES = LONG_NAME_MAX_UTF8_BYTES
+    LABEL = "NAME"
+    INPUT_ID = "identity-name-input"
+    UNAVAILABLE_ID = "identity-name-unavailable"
+    FIXED_ROW_WIDTH = 19  # two-cell gutter, 13-cell label, two brackets.
 
-    def __init__(self) -> None:
-        super().__init__(id="identity-long-name")
+    def __init__(self, *, widget_id: str) -> None:
+        super().__init__(
+            id=widget_id,
+            classes="identity-name-control connection-action-row",
+        )
         self.editing = False
         self._pre_edit_value = ""
 
     def compose(self) -> ComposeResult:
-        yield Static("  LONG NAME", classes="identity-label", markup=False)
+        yield Static(" ", classes="connection-selection-gutter", markup=False)
+        yield Static(self.LABEL, classes="connection-label", markup=False)
         yield Static("[ ", classes="identity-bracket", markup=False)
         yield Input(
-            id="long-name-input",
-            max_length=LONG_NAME_MAX_UTF8_BYTES,
+            id=self.INPUT_ID,
+            max_length=self.MAX_UTF8_BYTES,
             disabled=True,
         )
         yield Static(" ]", classes="identity-bracket", markup=False)
         yield Static(
             "...",
-            id="identity-long-name-unavailable",
+            id=self.UNAVAILABLE_ID,
+            classes="identity-name-unavailable",
             markup=False,
         )
 
     @property
     def editor(self) -> Input:
-        return self.query_one("#long-name-input", Input)
+        return self.query_one(f"#{self.INPUT_ID}", Input)
 
     def set_available(self, value: str, *, force_value: bool = False) -> None:
         """Show a confirmed value while keeping navigation mode arrow-safe."""
         self.disabled = False
         self.editor.display = True
-        self.query_one("#identity-long-name-unavailable", Static).display = False
+        self.query_one(f"#{self.UNAVAILABLE_ID}", Static).display = False
         for bracket in self.query(".identity-bracket"):
             bracket.display = True
         if force_value or not self.editing:
@@ -402,7 +423,7 @@ class LongNameControl(Horizontal):
         self.editor.display = False
         for bracket in self.query(".identity-bracket"):
             bracket.display = False
-        unavailable = self.query_one("#identity-long-name-unavailable", Static)
+        unavailable = self.query_one(f"#{self.UNAVAILABLE_ID}", Static)
         unavailable.update(placeholder)
         unavailable.display = True
         self.disabled = True
@@ -414,6 +435,7 @@ class LongNameControl(Horizontal):
             return
         self._pre_edit_value = self.editor.value
         self.editing = True
+        self.add_class("editing")
         self.editor.disabled = False
         self._update_label()
         self.editor.focus()
@@ -424,6 +446,7 @@ class LongNameControl(Horizontal):
         """Commit the displayed value and return to navigation mode."""
         self.editor.value = value
         self.editing = False
+        self.remove_class("editing")
         self.editor.disabled = True
         self._update_label()
         self.focus()
@@ -434,6 +457,7 @@ class LongNameControl(Horizontal):
         if self.editing:
             self.editor.value = self._pre_edit_value
         self.editing = False
+        self.remove_class("editing")
         self.editor.disabled = True
         self._update_label()
         if not self.disabled:
@@ -443,13 +467,13 @@ class LongNameControl(Horizontal):
     def _update_label(self, *, focused: bool | None = None) -> None:
         navigation_focus = self.has_focus if focused is None else focused
         marker = ">" if (navigation_focus or self.editing) and not self.disabled else " "
-        self.query_one(".identity-label", Static).update(f"{marker} LONG NAME")
+        self.query_one(".connection-selection-gutter", Static).update(marker)
 
     def _resize_field(self) -> None:
         if not self.is_mounted:
             return
         desired = max(self.MIN_FIELD_WIDTH, cell_len(self.editor.value))
-        desired = min(desired, LONG_NAME_MAX_UTF8_BYTES)
+        desired = min(desired, self.MAX_UTF8_BYTES)
         available = max(1, self.size.width - self.FIXED_ROW_WIDTH)
         self.editor.styles.width = min(desired, available)
 
@@ -462,7 +486,7 @@ class LongNameControl(Horizontal):
     def on_resize(self) -> None:
         self._resize_field()
 
-    @on(Input.Changed, "#long-name-input")
+    @on(Input.Changed)
     def resize_for_value(self) -> None:
         self._resize_field()
 
@@ -470,6 +494,35 @@ class LongNameControl(Horizontal):
         if event.key == "enter" and not self.editing and not self.disabled:
             self.begin_edit()
             event.stop()
+
+    @on(Click)
+    def clicked(self) -> None:
+        if not self.editing and not self.disabled:
+            self.focus()
+
+
+class LongNameControl(IdentityNameControl):
+    """Meshtastic Long Name navigation/edit control."""
+
+    LABEL = "LONG NAME"
+    INPUT_ID = "long-name-input"
+    UNAVAILABLE_ID = "identity-long-name-unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(widget_id="identity-long-name")
+
+
+class ShortNameControl(IdentityNameControl):
+    """Meshtastic Short Name navigation/edit control."""
+
+    LABEL = "SHORT NAME"
+    INPUT_ID = "short-name-input"
+    UNAVAILABLE_ID = "identity-short-name-unavailable"
+    MIN_FIELD_WIDTH = 4
+    MAX_UTF8_BYTES = SHORT_NAME_MAX_UTF8_BYTES
+
+    def __init__(self) -> None:
+        super().__init__(widget_id="identity-short-name")
 
 
 class ChatEntryWidget(Vertical):
@@ -624,6 +677,7 @@ class MeshtasticPassApp(App[None]):
     $green_accent: {THEME_PALETTES["green"].accent};
     $orange_accent: {THEME_PALETTES["orange"].accent};
     $error: {ERROR};
+    $selection_background: #181818;
     """ + """
     Screen {
         background: #101010;
@@ -672,21 +726,28 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #connection-status, #connection-details {
+    #connection-status, #connection-details, #identity-values {
         height: auto;
+        min-height: 1;
+        overflow-x: hidden;
     }
 
     #style-title {
         margin-top: 1;
     }
 
-    #identity-long-name {
+    .identity-name-control {
         height: 1;
         width: 1fr;
         overflow-x: hidden;
     }
 
-    .identity-label {
+    .connection-selection-gutter {
+        width: 2;
+        height: 1;
+    }
+
+    .connection-label {
         width: 13;
         height: 1;
     }
@@ -696,13 +757,13 @@ class MeshtasticPassApp(App[None]):
         height: 1;
     }
 
-    #identity-long-name-unavailable {
+    .identity-name-unavailable {
         width: auto;
         height: 1;
         color: $white_dim;
     }
 
-    #long-name-input {
+    #long-name-input, #short-name-input {
         width: 8;
         height: 1;
         border: none;
@@ -711,12 +772,12 @@ class MeshtasticPassApp(App[None]):
         color: #d8d8d8;
     }
 
-    #long-name-input:disabled {
+    #long-name-input:disabled, #short-name-input:disabled {
         color: $white_dim;
         opacity: 1;
     }
 
-    #identity-values, #identity-status {
+    #identity-status {
         height: auto;
         min-height: 1;
     }
@@ -729,11 +790,13 @@ class MeshtasticPassApp(App[None]):
         color: $error;
     }
 
-    Screen.theme-green #long-name-input {
+    Screen.theme-green #long-name-input,
+    Screen.theme-green #short-name-input {
         color: #39ff14;
     }
 
-    Screen.theme-orange #long-name-input {
+    Screen.theme-orange #long-name-input,
+    Screen.theme-orange #short-name-input {
         color: #ff8c00;
     }
 
@@ -745,6 +808,19 @@ class MeshtasticPassApp(App[None]):
 
     .keyboard-dropdown:focus {
         color: #f2f2f2;
+    }
+
+    #connection .connection-action-row {
+        height: 1;
+        min-height: 1;
+        width: 1fr;
+        overflow-x: hidden;
+    }
+
+    .chat-entry:focus,
+    #connection .connection-action-row:focus,
+    #connection .identity-name-control.editing {
+        background: $selection_background;
     }
 
     Screen.theme-green .keyboard-dropdown,
@@ -836,11 +912,11 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
-    Screen.theme-green #identity-long-name-unavailable {
+    Screen.theme-green .identity-name-unavailable {
         color: $green_dim;
     }
 
-    Screen.theme-orange #identity-long-name-unavailable {
+    Screen.theme-orange .identity-name-unavailable {
         color: $orange_dim;
     }
 
@@ -961,10 +1037,6 @@ class MeshtasticPassApp(App[None]):
 
     .message-action {
         margin-left: 2;
-    }
-
-    .chat-entry:focus {
-        background: #181818;
     }
 
     .chat-entry-header {
@@ -1178,6 +1250,7 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
                 yield LongNameControl()
+                yield ShortNameControl()
                 yield Static(id="identity-values", markup=False)
                 yield Static(id="identity-status", markup=False)
                 yield Static("STYLE", id="style-title", classes="page-title")
@@ -1269,6 +1342,9 @@ class MeshtasticPassApp(App[None]):
             elif self.focused.id == "long-name-input" and event.key == "escape":
                 self.query_one(LongNameControl).cancel_edit()
                 event.stop()
+            elif self.focused.id == "short-name-input" and event.key == "escape":
+                self.query_one(ShortNameControl).cancel_edit()
+                event.stop()
             return
 
         if self.current_tab == "chat":
@@ -1310,6 +1386,7 @@ class MeshtasticPassApp(App[None]):
                 for control in (
                     self.query_one(DeviceSelector),
                     self.query_one(LongNameControl),
+                    self.query_one(ShortNameControl),
                     self.query_one(FontSizeSelector),
                     self.query_one(ColorSelector),
                 )
@@ -1378,7 +1455,46 @@ class MeshtasticPassApp(App[None]):
             detail = str(error).strip() or error.__class__.__name__
             self.post_message(IdentitySaveFailed(f"Could not save Long Name: {detail}"))
         else:
-            self.post_message(IdentitySaved(info))
+            self.post_message(IdentitySaved(info, "LONG NAME"))
+
+    @on(Input.Submitted, "#short-name-input")
+    def save_short_name(self, event: Input.Submitted) -> None:
+        """Apply a Short Name edit through the active radio service."""
+        status = self.query_one("#identity-status", Static)
+        control = self.query_one(ShortNameControl)
+        if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
+            control.cancel_edit()
+            status.add_class("setting-error")
+            status.update("SHORT NAME UNAVAILABLE — RADIO NOT CONNECTED")
+            return
+        try:
+            short_name = validate_short_name(event.value)
+        except RadioIdentityError as error:
+            control.cancel_edit()
+            status.add_class("setting-error")
+            status.update(str(error))
+            return
+        control.finish_edit(short_name)
+        status.remove_class("setting-error")
+        status.update("SAVING SHORT NAME...")
+        self.run_worker(
+            lambda: self._save_short_name_from_thread(short_name),
+            thread=True,
+            name="save-radio-short-name",
+            exclusive=True,
+        )
+
+    def _save_short_name_from_thread(self, short_name: str) -> None:
+        try:
+            info = self.radio.set_short_name(short_name)
+        except (RadioIdentityError, AttributeError) as error:
+            detail = str(error).strip() or "The radio identity could not be saved."
+            self.post_message(IdentitySaveFailed(detail))
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            self.post_message(IdentitySaveFailed(f"Could not save Short Name: {detail}"))
+        else:
+            self.post_message(IdentitySaved(info, "SHORT NAME"))
 
     @on(IdentitySaved)
     def identity_saved(self, event: IdentitySaved) -> None:
@@ -1386,7 +1502,7 @@ class MeshtasticPassApp(App[None]):
         self._render_identity(force_value=True)
         status = self.query_one("#identity-status", Static)
         status.remove_class("setting-error")
-        status.update("NAME SAVED")
+        status.update(f"{event.field_label} SAVED")
 
     @on(IdentitySaveFailed)
     def identity_save_failed(self, event: IdentitySaveFailed) -> None:
@@ -1493,6 +1609,7 @@ class MeshtasticPassApp(App[None]):
                 palette.dim_base,
             )
         if len(self.query("#identity-values")):
+            self._render_connection_details()
             self._render_identity()
 
     @on(Input.Submitted, "#chat-input")
@@ -2594,7 +2711,22 @@ class MeshtasticPassApp(App[None]):
             if self._radio_state is RadioState.ONLINE
             else ANIMATED_STATUS[self._radio_state] + "." * self._status_dot_count
         )
-        statuses[0].update(f"{'STATUS':<12} {status}")
+        palette = THEME_PALETTES[self._current_theme]
+        status_style = (
+            palette.base
+            if self._radio_state is RadioState.ONLINE
+            else palette.error
+            if self._radio_state is RadioState.ERROR
+            else palette.accent
+        )
+        status_text = Text()
+        status_text.append(
+            f"{CONNECTION_ROW_PREFIX}{'STATUS':<{CONNECTION_LABEL_WIDTH}}",
+            style=palette.base,
+        )
+        status_text.append(" ", style=palette.base)
+        status_text.append(status, style=status_style)
+        statuses[0].update(status_text)
         values = []
         if self._radio_state is RadioState.ONLINE and self._radio_info is not None:
             info = self._radio_info
@@ -2604,37 +2736,58 @@ class MeshtasticPassApp(App[None]):
                 ]
             )
         if values:
-            details = "\n".join(f"{label:<12} {value}" for label, value in values)
+            details = Text()
+            for index, (label, value) in enumerate(values):
+                if index:
+                    details.append("\n")
+                details.append(
+                    f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
+                    style=palette.base,
+                )
+                details.append(" ", style=palette.base)
+                details.append(value, style=palette.base)
             detail_widgets[0].update(details)
         else:
             placeholder = "..." if self._radio_state is RadioState.CONNECTING else "—"
-            palette = THEME_PALETTES[self._current_theme]
             details = Text()
-            details.append(f"{'NODES':<12} ")
+            details.append(
+                f"{CONNECTION_ROW_PREFIX}{'NODES':<{CONNECTION_LABEL_WIDTH}}",
+                style=palette.base,
+            )
+            details.append(" ", style=palette.base)
             details.append(placeholder, style=palette.dim_base)
             detail_widgets[0].update(details)
 
     def _render_identity(self, force_value: bool = False) -> None:
-        control = self.query_one(LongNameControl)
+        long_name = self.query_one(LongNameControl)
+        short_name = self.query_one(ShortNameControl)
         values = self.query_one("#identity-values", Static)
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
+        palette = THEME_PALETTES[self._current_theme]
         if online:
             info = self._radio_info
             assert info is not None
-            control.set_available(info.long_name, force_value=force_value)
-            values.update(
-                f"{'SHORT NAME':<12} {info.short_name}\n"
-                f"{'NODE ID':<12} {info.node_id}"
+            long_name.set_available(info.long_name, force_value=force_value)
+            short_name.set_available(info.short_name, force_value=force_value)
+            identity_text = Text()
+            identity_text.append(
+                f"{CONNECTION_ROW_PREFIX}{'NODE ID':<{CONNECTION_LABEL_WIDTH}}",
+                style=palette.base,
             )
+            identity_text.append(" ", style=palette.base)
+            identity_text.append(info.node_id, style=palette.base)
+            values.update(identity_text)
         else:
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
-            control.set_unavailable(placeholder)
-            palette = THEME_PALETTES[self._current_theme]
+            long_name.set_unavailable(placeholder)
+            short_name.set_unavailable(placeholder)
             identity_text = Text()
-            identity_text.append(f"{'SHORT NAME':<12} ")
-            identity_text.append(placeholder, style=palette.dim_base)
-            identity_text.append(f"\n{'NODE ID':<12} ")
+            identity_text.append(
+                f"{CONNECTION_ROW_PREFIX}{'NODE ID':<{CONNECTION_LABEL_WIDTH}}",
+                style=palette.base,
+            )
+            identity_text.append(" ", style=palette.base)
             identity_text.append(placeholder, style=palette.dim_base)
             values.update(identity_text)
 

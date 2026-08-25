@@ -332,6 +332,31 @@ class RadioServiceTests(unittest.TestCase):
                 service.set_long_name(invalid)
         interface.localNode.setOwner.assert_not_called()
 
+    def test_set_short_name_uses_sdk_and_enforces_four_utf8_bytes(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        interface.localNode = SimpleNamespace(channels=(), setOwner=Mock())
+        service._interface = interface
+
+        info = service.set_short_name("  MHU  ")
+
+        interface.localNode.setOwner.assert_called_once_with(short_name="MHU")
+        self.assertEqual(info.short_name, "MHU")
+        self.assertEqual(
+            interface.nodesByNum[interface.myInfo.my_node_num]["user"]["shortName"],
+            "MHU",
+        )
+
+        interface.localNode.setOwner.reset_mock()
+        for invalid in ("", "   ", "ABCDE", "ééé", "🚲A"):
+            with self.subTest(invalid=invalid), self.assertRaises(RadioIdentityError):
+                service.set_short_name(invalid)
+        interface.localNode.setOwner.assert_not_called()
+
+        # Four payload bytes are accepted even when they are not four glyphs.
+        self.assertEqual(service.set_short_name("éé").short_name, "éé")
+        interface.localNode.setOwner.assert_called_once_with(short_name="éé")
+
 
 if __name__ == "__main__":
     unittest.main()

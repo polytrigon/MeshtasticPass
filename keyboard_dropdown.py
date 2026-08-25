@@ -45,12 +45,15 @@ class KeyboardDropdown(Static):
         widget_id: str,
         prefix: str = "",
         suffix: str = "",
+        label_width: int | None = None,
+        classes: str = "keyboard-dropdown",
     ) -> None:
-        super().__init__(id=widget_id, classes="keyboard-dropdown", markup=False)
+        super().__init__(id=widget_id, classes=classes, markup=False)
         self.setting_name = name
         self.label = label
         self.prefix = prefix
         self.suffix = suffix
+        self.label_width = label_width
         self.options = tuple(options)
         self.value = value
         self.is_open = False
@@ -179,7 +182,12 @@ class KeyboardDropdown(Static):
 
     def _render_dropdown(self, *, focused: bool | None = None) -> None:
         marker = ">" if (self.has_focus if focused is None else focused) else " "
-        heading = f"{marker} {self.prefix}{self.label} [ {self.selected_label} ▾ ]"
+        label = f"{self.prefix}{self.label}"
+        if self.label_width is not None:
+            label = f"{label:<{self.label_width}}"
+            heading = f"{marker} {label} [ {self.selected_label} ▾ ]"
+        else:
+            heading = f"{marker} {label} [ {self.selected_label} ▾ ]"
         if self.suffix:
             heading += f" {self.suffix}"
         text = Text(heading, style=self._base_color)

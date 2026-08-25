@@ -343,10 +343,13 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
 
             app._show_connection(RadioState.CONNECTING)
             self.assertIn("NODES        ...", str(app.query_one("#connection-details", Static).render()))
-            self.assertIn("SHORT NAME   ...", str(app.query_one("#identity-values", Static).render()))
+            self.assertEqual(
+                str(app.query_one("#identity-short-name-unavailable", Static).render()),
+                "...",
+            )
             app._show_connection(RadioState.ONLINE, radio.info)
             self.assertIn("NODES        8", str(app.query_one("#connection-details", Static).render()))
-            self.assertIn("SHORT NAME   SIM", str(app.query_one("#identity-values", Static).render()))
+            self.assertEqual(app.query_one("#short-name-input", Input).value, "SIM")
             app._show_connection(RadioState.OFFLINE)
             self.assertIn("NODES        —", str(app.query_one("#connection-details", Static).render()))
             self.assertIn("NODE ID      —", str(app.query_one("#identity-values", Static).render()))

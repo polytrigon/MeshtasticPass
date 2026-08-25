@@ -27,6 +27,7 @@ from app import (
     FontSizeSelector,
     LoadOlderControl,
     LongNameControl,
+    ShortNameControl,
     MessageActionControl,
     MeshtasticPassApp,
     ThinScrollBarRender,
@@ -233,11 +234,14 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             unavailable = app.query_one(
                 "#identity-long-name-unavailable", Static
             )
+            short_unavailable = app.query_one(
+                "#identity-short-name-unavailable", Static
+            )
             connecting = str(status.render())
             self.assertIn("STATUS       CONNECTING.", connecting)
             self.assertEqual(str(unavailable.render()), "...")
             self.assertIn("NODES        ...", str(details.render()))
-            self.assertIn("SHORT NAME   ...", str(app.query_one("#identity-values", Static).render()))
+            self.assertEqual(str(short_unavailable.render()), "...")
             self.assertIn(
                 "/dev/ttyUSB0",
                 str(app.query_one("#device-selector", Static).render()),
@@ -248,13 +252,17 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("STATUS       CONNECTED", str(status.render()))
             self.assertIn("NODES        100", online)
             identity = str(app.query_one("#identity-values", Static).render())
-            self.assertIn("SHORT NAME   9a3c", identity)
             self.assertIn("NODE ID      !433a9a3c", identity)
             self.assertEqual(
                 app.query_one("#long-name-input", Input).value,
                 "@Polytrigon",
             )
+            self.assertEqual(
+                app.query_one("#short-name-input", Input).value,
+                "9a3c",
+            )
             self.assertFalse(unavailable.display)
+            self.assertFalse(short_unavailable.display)
 
             app._show_connection(RadioState.OFFLINE, info)
             offline = str(details.render())
@@ -262,6 +270,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("!433a9a3c", offline)
             self.assertNotIn("FIRMWARE", offline)
             self.assertEqual(str(unavailable.render()), "—")
+            self.assertEqual(str(short_unavailable.render()), "—")
             self.assertIn("NODE ID      —", str(app.query_one("#identity-values", Static).render()))
 
             app._show_connection(RadioState.ERROR, info, "raw SDK exception")
@@ -281,12 +290,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(unavailable.render()), "...")
             self.assertNotIn(
                 "@Polytrigon",
-                str(app.query_one("#identity-values", Static).render()),
+                app.query_one("#long-name-input", Input).value,
             )
             for name, palette in THEME_PALETTES.items():
                 app._apply_color_theme(name)
                 self.assertEqual(
                     unavailable.visual_style.foreground.hex6,
+                    palette.dim_base,
+                )
+                self.assertEqual(
+                    short_unavailable.visual_style.foreground.hex6,
                     palette.dim_base,
                 )
 
@@ -311,11 +324,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             editor = app.query_one("#long-name-input", Input)
             control = app.query_one(LongNameControl)
             identity = app.query_one("#identity-values", Static)
+            short_editor = app.query_one("#short-name-input", Input)
             status = app.query_one("#identity-status", Static)
             self.assertEqual(editor.value, "Simulated Node")
             self.assertTrue(editor.disabled)
             self.assertFalse(control.disabled)
-            self.assertIn("SHORT NAME   SIM", str(identity.render()))
+            self.assertEqual(short_editor.value, "SIM")
             self.assertIn("NODE ID      !51a00001", str(identity.render()))
 
             control.focus()
@@ -381,6 +395,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             control = app.query_one(LongNameControl)
             editor = control.editor
+            short_name = app.query_one(ShortNameControl)
             font = app.query_one(FontSizeSelector)
 
             control.focus()
@@ -391,7 +406,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(editor.cursor_position, original_cursor)
 
             await pilot.press("down")
-            self.assertIs(app.focused, font)
+            self.assertIs(app.focused, short_name)
             await pilot.press("up", "enter")
             self.assertIs(app.focused, editor)
             self.assertTrue(control.editing)
@@ -435,9 +450,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             device = app.query_one(DeviceSelector)
             long_name = app.query_one(LongNameControl)
+            short_name = app.query_one(ShortNameControl)
             font = app.query_one(FontSizeSelector)
             color = app.query_one(ColorSelector)
-            controls = (device, long_name, font, color)
+            controls = (device, long_name, short_name, font, color)
 
             def caret_count() -> int:
                 dropdowns = (device, font, color)
@@ -445,8 +461,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     str(control.render()).startswith("> ")
                     for control in dropdowns
                 )
-                label = long_name.query_one(".identity-label", Static)
-                return count + str(label.render()).startswith("> ")
+                gutters = (
+                    long_name.query_one(".connection-selection-gutter", Static),
+                    short_name.query_one(".connection-selection-gutter", Static),
+                )
+                return count + sum(str(gutter.render()) == ">" for gutter in gutters)
 
             def assert_selected(expected: object) -> None:
                 self.assertIs(app.focused, expected)
@@ -455,15 +474,21 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     1,
                 )
                 self.assertEqual(caret_count(), 1)
+                self.assertEqual(expected.styles.background.hex, "#181818")
+                for control in controls:
+                    if control is not expected:
+                        self.assertEqual(control.styles.background.hex, "#00000000")
 
             device.focus()
             await pilot.pause()
             assert_selected(device)
             for key, expected in (
                 ("down", long_name),
+                ("down", short_name),
                 ("down", font),
                 ("down", color),
                 ("up", font),
+                ("up", short_name),
                 ("up", long_name),
                 ("up", device),
             ):
@@ -480,12 +505,144 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             assert_selected(long_name)
             await pilot.press("down")
             await pilot.pause()
-            assert_selected(font)
+            assert_selected(short_name)
             self.assertFalse(
                 str(
-                    long_name.query_one(".identity-label", Static).render()
-                ).startswith("> ")
+                    long_name.query_one(
+                        ".connection-selection-gutter", Static
+                    ).render()
+                ) == ">"
             )
+
+    async def test_short_name_navigation_cancel_save_and_utf8_validation(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(52, 22)) as pilot:
+            await pilot.pause()
+            control = app.query_one(ShortNameControl)
+            editor = control.editor
+            font = app.query_one(FontSizeSelector)
+            status = app.query_one("#identity-status", Static)
+            node_id = app.query_one("#identity-values", Static)
+
+            control.focus()
+            self.assertEqual(editor.value, "SIM")
+            await pilot.press("left", "right")
+            self.assertIs(app.focused, control)
+            await pilot.press("down")
+            self.assertIs(app.focused, font)
+            await pilot.press("up", "enter")
+            self.assertTrue(control.editing)
+            self.assertIs(app.focused, editor)
+            self.assertEqual(control.styles.background.hex, "#181818")
+
+            editor.value = "NOPE"
+            await pilot.press("escape")
+            self.assertEqual(editor.value, "SIM")
+            self.assertFalse(control.editing)
+            self.assertIs(app.focused, control)
+
+            await pilot.press("enter")
+            editor.value = "MHU"
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if radio.info.short_name == "MHU":
+                    break
+            self.assertEqual(radio.info.short_name, "MHU")
+            self.assertEqual(app._radio_info.short_name, "MHU")
+            self.assertEqual(editor.value, "MHU")
+            self.assertIn("SHORT NAME SAVED", str(status.render()))
+            self.assertIs(app.focused, control)
+
+            for invalid, feedback in (("", "cannot be empty"), ("ééA", "4 UTF-8 bytes")):
+                await pilot.press("enter")
+                editor.value = invalid
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIn(feedback, str(status.render()))
+                self.assertEqual(editor.value, "MHU")
+                self.assertEqual(radio.info.short_name, "MHU")
+                self.assertIs(app.focused, control)
+
+            await pilot.press("enter")
+            editor.value = "éé"
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if radio.info.short_name == "éé":
+                    break
+            self.assertEqual(radio.info.short_name, "éé")
+            self.assertFalse(node_id.can_focus)
+
+    async def test_connection_rows_share_gutter_columns_and_no_horizontal_scroll(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(35, 12)) as pilot:
+            await pilot.pause()
+            page = app.query_one(ConnectionPage)
+            status = str(app.query_one("#connection-status", Static).render())
+            device = str(app.query_one(DeviceSelector).render())
+            nodes = str(app.query_one("#connection-details", Static).render())
+            node_id = str(app.query_one("#identity-values", Static).render())
+            long_name = app.query_one(LongNameControl)
+            short_name = app.query_one(ShortNameControl)
+
+            self.assertTrue(status.startswith("  STATUS"))
+            self.assertTrue(nodes.startswith("  NODES"))
+            self.assertTrue(node_id.startswith("  NODE ID"))
+            self.assertEqual(status.index("CONNECTED"), 15)
+            self.assertEqual(device.index("["), 15)
+            self.assertEqual(nodes.index(str(radio.info.known_nodes)), 15)
+            self.assertEqual(node_id.index("!"), 15)
+            self.assertEqual(
+                long_name.query_one(".identity-bracket", Static).region.x
+                - long_name.region.x,
+                15,
+            )
+            self.assertEqual(
+                short_name.query_one(".identity-bracket", Static).region.x
+                - short_name.region.x,
+                15,
+            )
+            self.assertFalse(page.allow_horizontal_scroll)
+            self.assertEqual(page.max_scroll_x, 0)
+
+    async def test_connection_status_value_uses_semantic_theme_colors(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(70, 22)):
+            status = app.query_one("#connection-status", Static)
+            for theme, palette in THEME_PALETTES.items():
+                app._apply_color_theme(theme)
+                for state, expected in (
+                    (RadioState.CONNECTING, palette.accent),
+                    (RadioState.ONLINE, palette.base),
+                    (RadioState.OFFLINE, palette.accent),
+                    (RadioState.ERROR, palette.error),
+                ):
+                    app._show_connection(state, radio.info)
+                    rendered = status.render()
+                    self.assertEqual(
+                        rendered.spans[0].style.foreground.hex.upper(),
+                        palette.base.upper(),
+                    )
+                    self.assertEqual(
+                        rendered.spans[-1].style.foreground.hex.upper(),
+                        expected.upper(),
+                    )
 
     async def test_long_name_field_resizes_without_horizontal_page_scroll(self) -> None:
         app = MeshtasticPassApp(

@@ -45,6 +45,7 @@ class RadioIdentityError(Exception):
 
 
 LONG_NAME_MAX_UTF8_BYTES = 39
+SHORT_NAME_MAX_UTF8_BYTES = 4
 
 
 def validate_long_name(long_name: str) -> str:
@@ -57,6 +58,24 @@ def validate_long_name(long_name: str) -> str:
     if len(normalized.encode("utf-8")) > LONG_NAME_MAX_UTF8_BYTES:
         raise RadioIdentityError(
             f"Long Name must be at most {LONG_NAME_MAX_UTF8_BYTES} UTF-8 bytes."
+        )
+    return normalized
+
+
+def validate_short_name(short_name: str) -> str:
+    """Apply the Meshtastic User.short_name nanopb string constraints.
+
+    Meshtastic 2.7.11's protobuf declares ``max_size: 5`` for this field:
+    four UTF-8 payload bytes plus nanopb's terminating null byte.
+    """
+    if not isinstance(short_name, str):
+        raise RadioIdentityError("Short Name must be text.")
+    normalized = short_name.strip()
+    if not normalized:
+        raise RadioIdentityError("Short Name cannot be empty.")
+    if len(normalized.encode("utf-8")) > SHORT_NAME_MAX_UTF8_BYTES:
+        raise RadioIdentityError(
+            f"Short Name must be at most {SHORT_NAME_MAX_UTF8_BYTES} UTF-8 bytes."
         )
     return normalized
 
@@ -379,6 +398,33 @@ class RadioService:
                 if isinstance(user, dict):
                     user["longName"] = normalized
         return replace(self._read_radio_info(), long_name=normalized)
+
+    def set_short_name(self, short_name: str) -> RadioInfo:
+        """Update the local Meshtastic owner's advertised Short Name."""
+        normalized = validate_short_name(short_name)
+        interface = self._interface
+        if interface is None:
+            raise RadioIdentityError("The radio is not connected.")
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            raise RadioIdentityError("The connected radio identity is unavailable.")
+
+        try:
+            local_node.setOwner(short_name=normalized)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            raise RadioIdentityError(f"Could not save Short Name: {detail}") from error
+
+        my_info = getattr(interface, "myInfo", None)
+        local_number = getattr(my_info, "my_node_num", None)
+        nodes_by_number = getattr(interface, "nodesByNum", None)
+        if isinstance(nodes_by_number, dict) and local_number in nodes_by_number:
+            record = nodes_by_number.get(local_number)
+            if isinstance(record, dict):
+                user = record.setdefault("user", {})
+                if isinstance(user, dict):
+                    user["shortName"] = normalized
+        return replace(self._read_radio_info(), short_name=normalized)
 
     def remove_message_handler(
         self,
