@@ -358,6 +358,62 @@ class ChatStore:
             has_older,
         )
 
+    def load_oldest_incoming_by_ids(
+        self,
+        message_ids: set[int],
+        *,
+        channel_index: int,
+    ) -> StoredMessage | None:
+        """Return the oldest matching incoming row without loading history."""
+        valid_ids = sorted(
+            message_id
+            for message_id in message_ids
+            if isinstance(message_id, int)
+            and not isinstance(message_id, bool)
+            and message_id > 0
+        )
+        if not valid_ids:
+            return None
+
+        oldest: StoredMessage | None = None
+        try:
+            with self._lock:
+                self._ensure_open()
+                # Stay below SQLite's common host-parameter limit while allowing
+                # a long-running session to accumulate more than one page of NEW.
+                for offset in range(0, len(valid_ids), 500):
+                    chunk = valid_ids[offset : offset + 500]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    row = self._connection.execute(
+                        f"""
+                        SELECT id, direction, packet_id, node_id, sender_name,
+                            sender_short_name, channel_index, text, origin_sent_at,
+                            radio_rx_at, received_at, local_sent_at, delivery_state,
+                            created_at
+                        FROM messages
+                        WHERE channel_index = ?
+                            AND direction = 'incoming'
+                            AND id IN ({placeholders})
+                        ORDER BY
+                            COALESCE(
+                                origin_sent_at, radio_rx_at, local_sent_at, received_at
+                            ) ASC,
+                            received_at ASC,
+                            id ASC
+                        LIMIT 1
+                        """,
+                        (channel_index, *chunk),
+                    ).fetchone()
+                    if row is not None:
+                        candidate = StoredMessage(**dict(row))
+                        if oldest is None or candidate.order_key < oldest.order_key:
+                            oldest = candidate
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(
+                f"Could not locate unread CHAT history: {error}"
+            ) from error
+        return oldest
+
     def load_send_attempts(self, message_id: int) -> list[StoredSendAttempt]:
         """Return transmission attempts for one logical outgoing message."""
         try:
