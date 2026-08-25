@@ -386,18 +386,19 @@ CIRCLE_STROKED_LARGE = "○"
 #
 # MESH is being rebuilt one component at a time. This pass establishes only
 # the visual/interaction foundation: a fixed 8x21 grid holding a hardcoded
-# YOU + ALICE + BOB fixture, arrow-key selection, and whole-mesh recentering
-# translation. It intentionally does NOT do relevance ranking, staleness
-# classification, Favorites, real relay/message classification, GPS-derived
-# placement, a dynamic node count, or scrolling -- see mesh_state.py and
-# mesh_topology.build_topology()/route_connector() for the pure, still-
-# importable pieces that implement richer behavior; they are simply not
-# wired into this view right now so a future pass can reintroduce them
-# deliberately.
+# YOU + ALICE + BOB + 9A4B fixture, arrow-key selection, and whole-mesh
+# recentering translation. It intentionally does NOT do relevance ranking,
+# production staleness/history tracking, Favorites, real relay/message
+# classification, GPS-derived placement, a dynamic node count, or
+# scrolling -- see mesh_state.py and mesh_topology.build_topology()/
+# route_connector() for the pure, still-importable pieces that implement
+# richer behavior; they are simply not wired into this view right now so a
+# future pass can reintroduce them deliberately.
 MESH_GRID_ROWS = 8
 MESH_GRID_COLUMNS = 21
 MESH_GRID_CENTER_ROW = 5
 MESH_GRID_CENTER_COLUMN = 11
+MESH_STALE_THRESHOLD_SECONDS = 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -407,11 +408,10 @@ class MeshFixtureNode:
     row/column are the node's fixed logical grid position (1-indexed),
     before whole-mesh translation/recentering is applied. `label` is a
     board-level visual overlay only -- it never affects the glyph's own
-    grid coordinate. `solid` selects the glyph shape independent of
-    `is_local`: for this fixture-only pass, a solid dot marks a node that
-    sent a message the user received (YOU, BOB), a stroked dot marks a
-    hop/relay node that did not itself send one (ALICE) -- see
-    MESH_FIXTURE_CONTEXT_LABELS for the separate bottom-left context text.
+    grid coordinate. Glyph shape (solid vs stroked) and stale styling are
+    NOT stored here: they are derived from the node's OBSERVED
+    COMMUNICATION ROLE (see MeshFixtureContext, _mesh_glyph_is_solid) so
+    the rule stays general rather than an as-needed per-node exception.
     """
 
     node_id: str
@@ -419,18 +419,24 @@ class MeshFixtureNode:
     column: int
     is_local: bool
     label: str
-    solid: bool
 
 
 MESH_FIXTURE_NODES = (
-    MeshFixtureNode(
-        "!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True, "YOU", True
-    ),
-    MeshFixtureNode("!alice", 4, 10, False, "ALICE", False),
+    MeshFixtureNode("!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True, "YOU"),
+    MeshFixtureNode("!alice", 4, 10, False, "ALICE"),
     # BOB is defined relative to ALICE's fixed base position: two columns
     # left, one row down -- see MESH_FIXTURE_CONNECTORS for the connector
     # that traces exactly that displacement.
-    MeshFixtureNode("!bob", 4 + 1, 10 - 2, False, "Bob", True),
+    MeshFixtureNode("!bob", 4 + 1, 10 - 2, False, "Bob"),
+    # 9A4B is defined relative to YOU's fixed base position: two columns
+    # left, two rows down.
+    MeshFixtureNode(
+        "!9a4b",
+        MESH_GRID_CENTER_ROW + 2,
+        MESH_GRID_CENTER_COLUMN - 2,
+        False,
+        "9A4B",
+    ),
 )
 
 # (near, far) node-id pairs -- each drawn near-to-far with route_connector,
@@ -440,6 +446,7 @@ MESH_FIXTURE_NODES = (
 MESH_FIXTURE_CONNECTORS: tuple[tuple[str, str], ...] = (
     ("!you", "!alice"),
     ("!alice", "!bob"),
+    ("!you", "!9a4b"),
 )
 
 # Bottom-left context-line text only -- the board itself renders each
@@ -448,6 +455,7 @@ MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {
     "!you": "YOU",
     "!alice": "ALICE",
     "!bob": "BOB",
+    "!9a4b": "9A4B",
 }
 
 
@@ -455,9 +463,9 @@ MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {
 class MeshFixtureContext:
     """A remote node's OBSERVED COMMUNICATION ROLE for the bottom-left
 
-    status line -- deliberately distinct from a node's configured
-    Meshtastic device role, and not (yet) backed by trustworthy radio
-    evidence. For this deterministic fixture pass:
+    status line and glyph styling -- deliberately distinct from a node's
+    configured Meshtastic device role, and not (yet) backed by
+    trustworthy radio evidence. For this deterministic fixture pass:
 
     - CLIENT: this node has originated a message we received.
     - RELAY: we have trustworthy evidence this node relayed/hopped
@@ -466,15 +474,25 @@ class MeshFixtureContext:
     Neither implies the other -- a node can be CLIENT, RELAY, or both
     (CLIENT+RELAY) -- and RELAY must never be inferred merely from a
     configured role or from hop count alone, here or once this fixture is
-    replaced with real radio data. `last_interaction` is a pre-formatted,
-    deterministic display string (not a timestamp) so tests never depend
-    on wall-clock time; the full activity/history model is a later pass.
+    replaced with real radio data. `last_interaction_seconds` is a
+    deterministic fixture duration (not a timestamp), so tests never
+    depend on wall-clock time; the full activity/history model is a
+    later pass. `last_interaction` and `stale` are both derived from it.
     """
 
     is_client: bool
     is_relay: bool
     hops: int
-    last_interaction: str
+    last_interaction_seconds: float
+
+    @property
+    def last_interaction(self) -> str:
+        return format_relative_age(self.last_interaction_seconds)
+
+    @property
+    def stale(self) -> bool:
+        """>24h since last interaction; exactly 24h still counts as recent."""
+        return self.last_interaction_seconds > MESH_STALE_THRESHOLD_SECONDS
 
 
 # YOU is intentionally absent: it has no observed communication role, and
@@ -484,12 +502,18 @@ MESH_FIXTURE_CONTEXTS: dict[str, MeshFixtureContext] = {
     # message of her own that we received (CLIENT) -- both are true, so
     # she is CLIENT+RELAY, not just RELAY.
     "!alice": MeshFixtureContext(
-        is_client=True, is_relay=True, hops=0, last_interaction="30m"
+        is_client=True, is_relay=True, hops=0, last_interaction_seconds=30 * 60
     ),
     # BOB originated a message we received (CLIENT); no evidence he
     # relayed anything, so he is CLIENT only.
     "!bob": MeshFixtureContext(
-        is_client=True, is_relay=False, hops=1, last_interaction="30m"
+        is_client=True, is_relay=False, hops=1, last_interaction_seconds=30 * 60
+    ),
+    # 9A4B originated a message we received in the past (CLIENT), but
+    # that was over 24h ago -- a stale client, not a relay. Fixture age:
+    # 48h (2 days), well past the 24h stale threshold.
+    "!9a4b": MeshFixtureContext(
+        is_client=True, is_relay=False, hops=1, last_interaction_seconds=48 * 60 * 60
     ),
 }
 
@@ -511,6 +535,46 @@ def _mesh_context_line(node_id: str) -> str:
         if present
     )
     return f"{label} / {role} / {context.hops} HOPS / {context.last_interaction}"
+
+
+def _mesh_glyph_is_solid_for_context(context: MeshFixtureContext | None) -> bool:
+    """CLIENT appearance (solid) takes priority over RELAY-only (stroked).
+
+    Pure decision rule, isolated from node lookup, so it can be tested
+    directly against any role combination -- including RELAY-only, which
+    no current fixture node exercises on its own.
+    """
+    if context is None:
+        return True
+    if context.is_client:
+        return True
+    return not context.is_relay
+
+
+def _mesh_glyph_is_solid(node_id: str, *, is_local: bool) -> bool:
+    """CLIENT appearance (solid) takes priority over RELAY-only (stroked).
+
+    Based on the MESH visualization's OBSERVED COMMUNICATION ROLE (see
+    MeshFixtureContext) -- never the node's configured Meshtastic device
+    role. YOU has no observed role and is always solid.
+    """
+    if is_local:
+        return True
+    return _mesh_glyph_is_solid_for_context(MESH_FIXTURE_CONTEXTS.get(node_id))
+
+
+def _mesh_node_color(node_id: str, *, selected: bool, theme: str) -> str:
+    """Selection (ACCENT) always overrides the stale (DIM_BASE) treatment;
+
+    a node with no context, or a non-stale one, uses ordinary BASE.
+    """
+    palette = THEME_PALETTES[theme]
+    if selected:
+        return palette.accent
+    context = MESH_FIXTURE_CONTEXTS.get(node_id)
+    if context is not None and context.stale:
+        return palette.dim_base
+    return palette.base
 
 
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
@@ -544,22 +608,28 @@ def _mesh_fixture_directional_target(current_node_id: str, direction: str) -> st
     """Pick the fixture node reached by an arrow press, reusing the shared
 
     spatial-navigation rule (mesh_topology.directional_target) against the
-    fixture's fixed, untranslated positions -- direction is a property of
-    the mesh's actual geometry, not of wherever the selection happens to be
-    recentered on screen.
+    fixture's fixed, untranslated LOGICAL (row, column) positions -- not
+    their rendered pixel positions. DOT_GRID_SPACING_X/Y (4x2) make one
+    logical row-step visually shorter than one column-step on screen, a
+    purely cosmetic choice; ranking by pixel distance would let that
+    asymmetry distort "sensible direction" (e.g. a relationship defined
+    as "2 columns left, 2 rows down" is a clean logical diagonal, but a
+    lopsided one in pixel space). Direction is a property of the mesh's
+    logical geometry, not of wherever the selection happens to be
+    recentered on screen or how wide a screen dot happens to be.
     """
     layout = TopologyLayout(
         tuple(
             PositionedNode(
                 node=NodeMetadata(node_id=node.node_id, is_local=node.is_local),
-                x=_mesh_grid_pixel(node.row, node.column)[0],
-                y=_mesh_grid_pixel(node.row, node.column)[1],
+                x=node.column,
+                y=node.row,
                 region="LOCAL" if node.is_local else "UNKNOWN",
             )
             for node in MESH_FIXTURE_NODES
         ),
-        width=MESH_GRID_COLUMNS * DOT_GRID_SPACING_X,
-        height=MESH_GRID_ROWS * DOT_GRID_SPACING_Y,
+        width=MESH_GRID_COLUMNS,
+        height=MESH_GRID_ROWS,
     )
     target = directional_target(current_node_id, layout, direction)  # type: ignore[arg-type]
     return target.node.node_id if target is not None else None
@@ -596,10 +666,17 @@ class MeshNodeWidget(Static):
         super().__init__(classes="mesh-node", markup=False)
 
     def refresh_visual(self, *, selected: bool, theme: str) -> None:
-        palette = THEME_PALETTES[theme]
-        color = palette.accent if selected else palette.base
-        glyph = CIRCLE_SOLID_LARGE if self.fixture.solid else CIRCLE_STROKED_LARGE
-        self.update(Text(glyph, style=Style(color=color)))
+        color = _mesh_node_color(self.node_id, selected=selected, theme=theme)
+        glyph = (
+            CIRCLE_SOLID_LARGE
+            if _mesh_glyph_is_solid(self.node_id, is_local=self.fixture.is_local)
+            else CIRCLE_STROKED_LARGE
+        )
+        # Selected glyphs render bold: the deterministic, cell-geometry-
+        # safe stand-in for "~50% larger" -- no character substitution
+        # (avoids unreliable-width Unicode) and no widget resize (so the
+        # glyph's anchor coordinate never moves).
+        self.update(Text(glyph, style=Style(color=color, bold=selected)))
 
     def on_click(self, _event: Click) -> None:
         _mesh_select_node(self.app, self.node_id)
@@ -620,8 +697,7 @@ class MeshNodeLabelWidget(Static):
         super().__init__(classes="mesh-node", markup=False)
 
     def refresh_visual(self, *, selected: bool, theme: str) -> None:
-        palette = THEME_PALETTES[theme]
-        color = palette.accent if selected else palette.base
+        color = _mesh_node_color(self.node_id, selected=selected, theme=theme)
         self.update(Text(self.fixture.label, style=Style(color=color)))
 
     def on_click(self, _event: Click) -> None:
