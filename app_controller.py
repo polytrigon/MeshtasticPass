@@ -45,6 +45,24 @@ class ChatEntry:
     active_attempt_id: int | None = None
     confirmation_deadline: float | None = None
     send_generation: int = 0
+    arrival_order: int = 0
+
+    @property
+    def message_time(self) -> float | None:
+        """A trustworthy radio/local message time, when one is available."""
+        if self.outgoing:
+            return self.local_sent_at
+        return self.origin_sent_at or self.radio_rx_at
+
+    @property
+    def order_key(self) -> tuple[float, float, int]:
+        """Stable display order with local arrival fallback for untimed packets."""
+        stable_id = self.message_id or self.arrival_order
+        return (
+            self.message_time or self.app_received_at,
+            self.app_received_at,
+            stable_id,
+        )
 
 
 def received_chat_entry(
@@ -133,7 +151,7 @@ def stored_chat_entry(
     if outgoing:
         age_time = stored.local_sent_at or stored.received_at
     else:
-        age_time = stored.radio_rx_at or stored.received_at
+        age_time = stored.origin_sent_at or stored.radio_rx_at or stored.received_at
     initial_age = max(0.0, current_wall - age_time)
     state = None
     if outgoing and stored.delivery_state:
@@ -151,7 +169,7 @@ def stored_chat_entry(
             or "unknown"
         ),
         text=stored.text,
-        origin_sent_at=None,
+        origin_sent_at=stored.origin_sent_at,
         radio_rx_at=stored.radio_rx_at,
         local_sent_at=stored.local_sent_at,
         app_received_at=stored.received_at,
@@ -167,6 +185,7 @@ def stored_chat_entry(
         sender_short_name=stored.sender_short_name,
         channel_index=stored.channel_index,
         delivery_state=state,
+        arrival_order=stored.id,
     )
 
 

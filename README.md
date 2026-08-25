@@ -129,7 +129,10 @@ Simulation includes the local node, two recent nodes, one stale node, and nodes
 with malformed or missing activity timestamps. It initially displays
 `ACTIVE 2`; one node reaches the exact five-minute boundary after one second,
 leaving `ACTIVE 1`. This deterministic transition makes activity aging testable
-without a second radio.
+without a second radio. The primary-channel message script also deliberately
+delivers a newer receiver-timestamped packet before an older one. CHAT inserts
+the second packet into chronological position and briefly shows
+`1 OLDER MESSAGE RECEIVED`, so delayed ordering is visible without hardware.
 
 CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
 thumb use the same right-aligned narrow Unicode `▕` glyph through Textual's
@@ -194,12 +197,13 @@ firmware behavior.
 
 CHAT history is stored in SQLite at
 `~/.local/share/meshtasticpass/chat.db`, or under `$XDG_DATA_HOME` when that
-variable is set. The app creates the parent directory and version-1 schema on
+variable is set. The app creates the parent directory and version-2 schema on
 first launch. Each channel transcript mounts only its newest 100 messages in
 chronological order. When older rows exist, focus `[ LOAD OLDER ]` at the top
 of CHAT and press Enter to prepend the next 50. SQLite uses the oldest loaded
-message ID as a stable cursor and never loads the whole archive for Python-side
-slicing. After the final page, the top control is replaced by a passive,
+message ID as a stable cursor, resolves that row's chronological key, and never
+loads the whole archive for Python-side slicing or uses OFFSET. After the final
+page, the top control is replaced by a passive,
 non-focusable `END OF CHAT HISTORY` marker. The marker appears only when at
 least one message exists and SQLite confirms that no older row remains; it is
 not an action and arrow navigation skips it. Prepending
@@ -214,13 +218,35 @@ entries exist. Explicitly loading an older page expands the mounted target by
 that page's size.
 
 The `messages` table stores logical incoming/outgoing entries, packet and node
-identity, channel, text, receiver-side `radio_rx_at`, local acceptance/send
-times, and the last known delivery state. The `send_attempts` table stores each
+identity, channel, text, optional trustworthy sender-origin time,
+receiver-side `radio_rx_at`, local acceptance/send times, and the last known
+delivery state. Version-1 databases are migrated in place without deleting
+history. The `send_attempts` table stores each
 intentional transmission attempt separately. Incoming packets with an ID are
 deduplicated by `(node_id, packet_id, channel_index)`; packets without an ID
 are retained because they have no safe stable deduplication key. Monotonic
 values are never persisted. Runtime age references are reconstructed from the
 stored wall clock values at startup.
+
+Within each channel, CHAT orders rows by trustworthy message time, then local
+acceptance time, then stable SQLite message ID. For outgoing entries, message
+time is the local accepted-send time. For incoming entries, a genuine protocol
+origin time is preferred when available; ordinary Meshtastic text instead uses
+the receiver-side `rxTime` described below. An incoming packet with neither
+time remains untimed: its local acceptance time is used only as a deterministic
+arrival-order fallback and is not presented as an invented send time. Equal
+timestamps therefore remain stable across restarts.
+
+When a newly received timed packet sorts before the current chronological tail,
+CHAT inserts it in place and briefly shows `1 OLDER MESSAGE RECEIVED` (or the
+plural count when several arrive). The notice is per channel, uses one shared
+timer, and yields to send/history errors. Startup loading, LOAD OLDER paging,
+channel switching, duplicates, and normally ordered packets do not trigger it.
+Delayed entries keep normal NEW/unread semantics. An entry older than the
+mounted window remains safely in SQLite until LOAD OLDER reaches it; the app
+does not expand the whole archive or jump away from the user's reading position.
+Here, NEW means newly received by this MeshtasticPass client, not necessarily
+newly sent across the mesh; delayed and out-of-order delivery is expected.
 
 If the database cannot be opened or one history write fails, the app reports a
 CHAT history error and keeps the radio/UI running. It never deletes or silently
@@ -253,8 +279,9 @@ Alice Trail / RX 5m / 5.1miles
 
 If a future protocol provides a trustworthy origin time, the application
 model can display that age without `RX`; no current packet field is promoted
-to origin time. No speculative `DELAYED` marker is shown, and no SQLite schema
-migration was added because there is no real origin timestamp to persist.
+to origin time. No speculative `DELAYED` marker is shown. The optional persisted
+origin field exists for a future protocol that can supply one truthfully; it is
+not populated from ordinary Meshtastic `rxTime`.
 
 When both nodes have usable positions, an incoming header also shows the
 straight-line Haversine distance in miles:

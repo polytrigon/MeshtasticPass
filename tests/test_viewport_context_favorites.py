@@ -184,7 +184,16 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             app.show_tab("chat")
             app._accept_received_message(SIMULATED_MESSAGES[0])
             app._accept_received_message(SIMULATED_MESSAGES[1])
-            first, unrelated = list(app.query(ChatEntryWidget))[-2:]
+            first = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.entry.node_id == "!a11ce001"
+            )
+            unrelated = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.entry.node_id != "!a11ce001"
+            )
             first.focus()
             await pilot.press("enter", "enter")
             await pilot.pause()
