@@ -176,6 +176,22 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         service.close()
         self.assertIsNone(service.active_node_count(now=1_002))
 
+    def test_known_nodes_are_stable_diverse_and_hardware_free(self) -> None:
+        service = self.make_service()
+        self.assertEqual(service.get_known_nodes(), ())
+        with patch("simulated_radio_service.time.time", return_value=1_000):
+            service.connect()
+
+        nodes = service.get_known_nodes()
+        self.assertEqual(len(nodes), 8)
+        self.assertEqual(sum(node.is_local for node in nodes), 1)
+        self.assertGreaterEqual(sum(node.hops_away == 1 for node in nodes), 2)
+        self.assertTrue(any(node.hops_away == 2 for node in nodes))
+        self.assertTrue(any(node.hops_away is None for node in nodes))
+        self.assertTrue(any(node.long_name is None for node in nodes))
+        self.assertTrue(any(node.short_name is None for node in nodes))
+        self.assertEqual(service.sent_messages, ())
+
     def test_direct_message_activity_and_identity_edit_are_deterministic(self) -> None:
         service = self.make_service()
         with patch("simulated_radio_service.time.time", return_value=1_000):

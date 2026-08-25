@@ -93,7 +93,7 @@ Develop and test without radio hardware:
 python app.py --simulate
 ```
 
-Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or PASS MAP. CHAT
+Press `1` through `5` to open CONNECTION, CHAT, PROFILE, PASS MAP, or MESH. CHAT
 shows and sends on the currently selected configured broadcast channel. Press
 `C` outside the input to open the channel dropdown; use Up/Down and Enter to
 select, or Escape to cancel. While the chat input is focused, normal text and
@@ -144,6 +144,35 @@ without a second radio. The primary-channel message script also deliberately
 delivers a newer receiver-timestamped packet before an older one. CHAT inserts
 the second packet into chronological position and shows
 `1 OLDER MESSAGE RECEIVED`, so delayed ordering is visible without hardware.
+
+### Passive MESH topology board
+
+Press `5` to open MESH. The board places `YOU` at its center, arranges nodes
+with trustworthy Meshtastic `hopsAway` values in deterministic hop layers, and
+puts unknown-hop nodes in an outer layer. This is a topology view, not a map:
+positions do not imply GPS location or physical direction, and the app draws no
+link or route unless a future trustworthy data source can support one.
+
+Active nodes use the current theme's BASE color. Nodes not heard within the
+same exact five-minute window used by CHAT's ACTIVE count use DIM_BASE. An
+active Favorite uses ACCENT for its label; stale Favorites stay dim so activity
+truth remains visible. Long Name is preferred when it fits, then Short Name,
+then an abbreviated Node ID. Missing metadata is omitted rather than invented.
+
+Use all four arrow keys for spatial selection. Navigation does not wrap at the
+board edges, and the two-axis viewport scrolls only inside MESH to keep the
+selected node visible. Mouse selection uses the same focus state. Enter opens
+the shared node context menu used by CHAT; remote nodes show available identity,
+hop, receiver-age, and Favorite controls. `YOU` shows local identity only and
+cannot be favorited. Opening MESH and its menu only read the SDK's already
+synced node database—they do not request positions, probe nodes, or transmit
+LoRa packets. While disconnected, the board says
+`NO MESH DATA — RADIO DISCONNECTED` instead of displaying stale topology as
+current.
+
+For a hardware-free review, run `python app.py --simulate`, press `5`, navigate
+the stable one-hop, two-hop, unknown-hop, active, stale, and missing-name nodes,
+and verify Favorite changes are also visible in CHAT.
 
 CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
 thumb use the same right-aligned narrow Unicode `▕` glyph through Textual's
@@ -496,6 +525,7 @@ send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
 chat_store.py      Versioned SQLite CHAT history and send attempts
+mesh_topology.py   Pure deterministic MESH layout and arrow navigation
 geo.py             Position validation, Haversine distance, and mile formatting
 app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup

@@ -68,7 +68,7 @@ SIMULATED_NODES = (
         30.0,
         1,
     ),
-    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None, 299.0, 5),
+    SimulatedNode("!b0b00002", "Bob Basecamp", "BOB", None, 299.0, 1),
     SimulatedNode(
         "!cafe0003",
         "Cafe Relay",
@@ -278,8 +278,45 @@ class SimulatedRadioService:
                     node.long_name,
                     node.short_name,
                     node.hops_away,
+                    self._node_last_heard(node),
                 )
         return NodeMetadata(node_id.strip())
+
+    def get_known_nodes(self) -> tuple[NodeMetadata, ...]:
+        """Return stable fake topology data without hardware or transmissions."""
+        if not self._online or self._activity_reference_time is None:
+            return ()
+        local = NodeMetadata(
+            self.info.node_id,
+            self.info.long_name,
+            self.info.short_name,
+            0,
+            self._activity_reference_time,
+            True,
+        )
+        remotes = tuple(
+            NodeMetadata(
+                node.node_id,
+                node.long_name,
+                node.short_name,
+                node.hops_away,
+                self._node_last_heard(node),
+            )
+            for node in SIMULATED_NODES
+        )
+        return (local, *remotes)
+
+    def _node_last_heard(self, node: SimulatedNode) -> float | None:
+        reference = self._activity_reference_time
+        age = node.last_heard_age_seconds
+        if (
+            reference is None
+            or not isinstance(age, (int, float))
+            or isinstance(age, bool)
+            or age < 0
+        ):
+            return None
+        return reference - float(age)
 
     def set_long_name(self, long_name: str) -> RadioInfo:
         """Update the deterministic local identity while simulated online."""

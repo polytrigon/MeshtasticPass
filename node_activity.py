@@ -9,6 +9,22 @@ from typing import Any, Iterable, Mapping
 ACTIVE_WINDOW_SECONDS = 300.0
 
 
+def is_node_active(last_heard: object, now: object) -> bool:
+    """Return whether a trustworthy receive time is inside the active window."""
+    if (
+        not isinstance(now, (int, float))
+        or isinstance(now, bool)
+        or not isfinite(now)
+        or not isinstance(last_heard, (int, float))
+        or isinstance(last_heard, bool)
+        or not isfinite(last_heard)
+        or last_heard <= 0
+    ):
+        return False
+    age = float(now) - float(last_heard)
+    return 0 <= age < ACTIVE_WINDOW_SECONDS
+
+
 def count_active_other_nodes(
     nodes: Iterable[tuple[Any, Any]],
     *,
@@ -44,31 +60,14 @@ def count_active_other_nodes(
         if node_id is None or node_id == normalized_local_id:
             continue
 
-        last_heard = record.get("lastHeard")
-        if (
-            not isinstance(last_heard, (int, float))
-            or isinstance(last_heard, bool)
-            or not isfinite(last_heard)
-            or last_heard <= 0
-        ):
-            continue
-        age = float(now) - float(last_heard)
-        if 0 <= age < ACTIVE_WINDOW_SECONDS:
+        if is_node_active(record.get("lastHeard"), now):
             active_ids.add(node_id)
 
     for raw_node_id, observed_at in (direct_observations or {}).items():
         node_id = _normalize_node_id(raw_node_id)
         if node_id is None or node_id == normalized_local_id:
             continue
-        if (
-            not isinstance(observed_at, (int, float))
-            or isinstance(observed_at, bool)
-            or not isfinite(observed_at)
-            or observed_at <= 0
-        ):
-            continue
-        age = float(now) - float(observed_at)
-        if 0 <= age < ACTIVE_WINDOW_SECONDS:
+        if is_node_active(observed_at, now):
             active_ids.add(node_id)
 
     return len(active_ids)

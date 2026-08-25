@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from math import isfinite
 import os
 from pathlib import Path
 from threading import Event
@@ -115,6 +116,8 @@ class NodeMetadata:
     long_name: str | None = None
     short_name: str | None = None
     hops_away: int | None = None
+    last_heard: float | None = None
+    is_local: bool = False
 
 
 @dataclass(frozen=True)
@@ -365,12 +368,106 @@ class RadioService:
         hops = self._optional_int(record.get("hopsAway"))
         if hops is not None and hops < 0:
             hops = None
+        last_heard = self._valid_timestamp(record.get("lastHeard"))
+        observed_at = self._direct_observations.get(normalized.lower())
+        if self._valid_timestamp(observed_at) is not None:
+            last_heard = max(last_heard or 0.0, float(observed_at))
         return NodeMetadata(
             node_id=normalized,
             long_name=self._optional_string(user.get("longName")),
             short_name=self._optional_string(user.get("shortName")),
             hops_away=hops,
+            last_heard=last_heard,
+            is_local=self._is_local_node(normalized, node_number),
         )
+
+    def get_known_nodes(self) -> tuple[NodeMetadata, ...]:
+        """Return the synced node database as normalized, read-only app values."""
+        interface = self._interface
+        if interface is None:
+            return ()
+        nodes_by_number = getattr(interface, "nodesByNum", None)
+        if not isinstance(nodes_by_number, dict):
+            return ()
+        try:
+            records = tuple(nodes_by_number.items())
+            observations = dict(self._direct_observations)
+        except RuntimeError:
+            return ()
+
+        result: list[NodeMetadata] = []
+        seen: set[str] = set()
+        for raw_number, record in records:
+            if not isinstance(record, dict):
+                continue
+            number = (
+                raw_number
+                if isinstance(raw_number, int) and not isinstance(raw_number, bool)
+                else None
+            )
+            user = self._user_from_record(record)
+            node_id = self._optional_string(user.get("id"))
+            if node_id is None and number is not None:
+                node_id = f"!{number:08x}"
+            if node_id is None or node_id.lower() in seen:
+                continue
+            seen.add(node_id.lower())
+            hops = self._optional_int(record.get("hopsAway"))
+            if hops is not None and hops < 0:
+                hops = None
+            last_heard = self._valid_timestamp(record.get("lastHeard"))
+            observed_at = self._valid_timestamp(observations.get(node_id.lower()))
+            if observed_at is not None:
+                last_heard = max(last_heard or 0.0, observed_at)
+            result.append(
+                NodeMetadata(
+                    node_id=node_id,
+                    long_name=self._optional_string(user.get("longName")),
+                    short_name=self._optional_string(user.get("shortName")),
+                    hops_away=hops,
+                    last_heard=last_heard,
+                    is_local=self._is_local_node(node_id, number),
+                )
+            )
+
+        for node_id, raw_observed_at in observations.items():
+            if node_id in seen or (
+                self._activity_local_node_id
+                and node_id == self._activity_local_node_id.lower()
+            ):
+                continue
+            observed_at = self._valid_timestamp(raw_observed_at)
+            if observed_at is not None:
+                seen.add(node_id)
+                result.append(NodeMetadata(node_id, last_heard=observed_at))
+
+        local_id = self._activity_local_node_id
+        if local_id and local_id.lower() not in seen:
+            result.append(NodeMetadata(local_id, is_local=True))
+        return tuple(result)
+
+    def _is_local_node(self, node_id: str, node_number: int | None) -> bool:
+        interface = self._interface
+        my_info = getattr(interface, "myInfo", None)
+        local_number = getattr(my_info, "my_node_num", None)
+        return bool(
+            (node_number is not None and node_number == local_number)
+            or (
+                self._activity_local_node_id
+                and node_id.lower() == self._activity_local_node_id.lower()
+            )
+        )
+
+    @staticmethod
+    def _valid_timestamp(value: Any) -> float | None:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not isfinite(value)
+            or value <= 0
+        ):
+            return None
+        return float(value)
 
     def set_long_name(self, long_name: str) -> RadioInfo:
         """Update the local Meshtastic owner's advertised Long Name."""
