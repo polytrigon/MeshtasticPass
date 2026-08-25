@@ -1125,8 +1125,6 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             transcript = app.query_one(ChatTranscript)
             self.assertIs(app.focused, transcript)
             await pilot.press("right")
-            self.assertIs(app.focused, transcript)
-            await pilot.press("down")
             self.assertIs(app.focused, chat_input)
 
             chat_input.value = "still here"
@@ -1145,7 +1143,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, targets[1])
             self.assertIsNot(app.focused, chat_input)
             await pilot.press("right")
-            self.assertIsNot(app.focused, chat_input)
+            self.assertIs(app.focused, chat_input)
             self.assertEqual(chat_input.value, "still here")
 
     async def test_f4_exit_runs_normal_cursor_cleanup(self) -> None:

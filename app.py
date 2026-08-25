@@ -331,7 +331,13 @@ class ChatTranscript(VerticalScroll):
             self.scroll_relative(y=-step if event.key == "pageup" else step)
             app.call_after_refresh(app._clear_indicator_if_at_bottom)
             event.stop()
-        elif event.key in ("end", "right"):
+        elif event.key == "left":
+            app._focus_oldest_new_message()
+            event.stop()
+        elif event.key == "right":
+            app._return_to_present_and_type()
+            event.stop()
+        elif event.key == "end":
             app._jump_to_newest()
             event.stop()
 
@@ -1257,6 +1263,9 @@ class MeshtasticPassApp(App[None]):
             if self.focused.id == "chat-input" and event.key == "escape":
                 self.query_one("#chat-log", ChatTranscript).focus()
                 event.stop()
+            elif self.focused.id == "chat-input" and event.key == "up":
+                self._move_chat_focus(-1)
+                event.stop()
             elif self.focused.id == "long-name-input" and event.key == "escape":
                 self.query_one(LongNameControl).cancel_edit()
                 event.stop()
@@ -1282,7 +1291,15 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
-            if event.key in ("end", "right"):
+            if event.key == "left":
+                self._focus_oldest_new_message()
+                event.stop()
+                return
+            if event.key == "right":
+                self._return_to_present_and_type()
+                event.stop()
+                return
+            if event.key == "end":
                 self._jump_to_newest()
                 event.stop()
                 return
@@ -1934,6 +1951,11 @@ class MeshtasticPassApp(App[None]):
         self.transcript_new_count = 0
         self._update_transcript_indicator()
 
+    def _return_to_present_and_type(self) -> None:
+        """Jump to the chronological edge and resume the preserved draft."""
+        self._jump_to_newest()
+        self._focus_chat_composer()
+
     def _chat_entry_widget(self, entry: ChatEntry) -> ChatEntryWidget:
         return ChatEntryWidget(
             entry,
@@ -1969,6 +1991,104 @@ class MeshtasticPassApp(App[None]):
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
+
+    def _oldest_new_entry(self) -> ChatEntry | None:
+        """Resolve the current channel's oldest actual NEW incoming entry."""
+        state = self._state_for(self.current_channel_index)
+        mounted_by_id = {
+            entry.message_id: entry
+            for entry in state.entries
+            if entry.message_id is not None
+        }
+        candidates = [
+            entry
+            for entry in state.entries
+            if entry.is_new and not entry.outgoing
+        ]
+        unmounted_ids = state.new_message_ids.difference(mounted_by_id)
+        if state.new_message_ids and self.chat_store is not None:
+            try:
+                stored = self.chat_store.load_oldest_incoming_by_ids(
+                    state.new_message_ids,
+                    channel_index=self.current_channel_index,
+                )
+            except ChatStoreError:
+                # A mounted candidate is only truthful if no older NEW identity
+                # is known to exist outside the bounded window.
+                if unmounted_ids:
+                    return None
+            else:
+                if stored is not None:
+                    candidate = mounted_by_id.get(stored.id)
+                    if candidate is None:
+                        candidate = stored_chat_entry(stored)
+                        candidate.is_new = True
+                        candidate.unread = stored.id in state.unread_message_ids
+                    candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda entry: entry.order_key)
+
+    def _focus_oldest_new_message(self) -> None:
+        """Select the oldest NEW incoming message in the current channel."""
+        entry = self._oldest_new_entry()
+        if entry is None:
+            return
+        identity = self._entry_review_identity(entry)
+        widget = next(
+            (
+                candidate
+                for candidate in self.query(ChatEntryWidget)
+                if self._entry_review_identity(candidate.entry) == identity
+            ),
+            None,
+        )
+        if widget is not None:
+            self._focus_chat_widget(widget)
+            return
+        if entry.message_id is None or self.chat_store is None:
+            return
+        self.run_worker(
+            self._page_to_new_message(entry.message_id, self.current_channel_index),
+            name="chat-unread-navigation",
+            group="chat-unread-navigation",
+            exclusive=True,
+        )
+
+    async def _page_to_new_message(
+        self,
+        message_id: int,
+        channel_index: int,
+    ) -> None:
+        """Load bounded 50-row pages only until one known NEW row is mounted."""
+        while (
+            self.current_tab == "chat"
+            and self.current_channel_index == channel_index
+            and self._has_older_history
+        ):
+            before = len(self.chat_history)
+            await self.load_older_chat_history(LoadOlderControl.Activated())
+            widget = next(
+                (
+                    candidate
+                    for candidate in self.query(ChatEntryWidget)
+                    if candidate.entry.message_id == message_id
+                ),
+                None,
+            )
+            if widget is not None:
+                self._focus_chat_widget(widget)
+                return
+            if len(self.chat_history) == before:
+                return
+
+    def _focus_chat_widget(self, widget: ChatEntryWidget) -> None:
+        """Focus one entry and bring it fully into the visible transcript."""
+        widget.focus()
+        widget.scroll_visible(animate=False)
+        # A preceding bounded prepend may have queued scroll restoration; run
+        # this once more afterward so the selected target is not edge-clipped.
+        self.call_after_refresh(widget.scroll_visible, animate=False)
 
     def _focus_chat_composer(self) -> None:
         """Return to typing without changing the current draft or read state."""

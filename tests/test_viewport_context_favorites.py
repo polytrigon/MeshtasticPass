@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock
 
 from textual.geometry import Region
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 from app import (
     ChannelSelector,
@@ -314,12 +314,15 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.transcript_new_count, 0)
             self.assertTrue(transcript.is_vertical_scroll_end)
+            self.assertIs(app.focused, app.query_one("#chat-input", Input))
 
             transcript.scroll_to(y=0, animate=False)
             app.transcript_new_count = 2
+            transcript.focus()
             await pilot.press("end")
             await pilot.pause()
             self.assertEqual(app.transcript_new_count, 0)
+            self.assertIs(app.focused, transcript)
             footer = str(app.query_one("#footer", Static).render())
             self.assertNotIn("END", footer.upper())
             self.assertNotIn("RIGHT", footer.upper())

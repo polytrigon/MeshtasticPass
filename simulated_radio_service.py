@@ -127,6 +127,35 @@ SIMULATED_MESSAGES = (
         local_position=SIMULATED_LOCAL_POSITION,
         sender_position=SIMULATED_NODES[2].position,
     ),
+    # Two more channel-0 arrivals are older than the first message but newer
+    # than Bob. Together these provide three deterministic older NEW entries
+    # for exercising Left Arrow catch-up in simulation.
+    ReceivedMessage(
+        sender_node_id=SIMULATED_NODES[2].node_id,
+        sender_long_name=SIMULATED_NODES[2].long_name,
+        sender_short_name=SIMULATED_NODES[2].short_name,
+        channel_index=0,
+        text="Cafe relay heard the primary channel.",
+        rssi=-96,
+        snr=3.5,
+        packet_id=350000004,
+        radio_rx_at=_SIMULATED_REFERENCE_TIME - 20 * 60,
+        local_position=SIMULATED_LOCAL_POSITION,
+        sender_position=SIMULATED_NODES[2].position,
+    ),
+    ReceivedMessage(
+        sender_node_id=SIMULATED_NODES[3].node_id,
+        sender_long_name=SIMULATED_NODES[3].long_name,
+        sender_short_name=SIMULATED_NODES[3].short_name,
+        channel_index=0,
+        text="Clock check from the ridge.",
+        rssi=-91,
+        snr=4.0,
+        packet_id=350000005,
+        radio_rx_at=_SIMULATED_REFERENCE_TIME - 15 * 60,
+        local_position=SIMULATED_LOCAL_POSITION,
+        sender_position=SIMULATED_NODES[3].position,
+    ),
 )
 
 

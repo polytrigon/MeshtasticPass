@@ -106,9 +106,13 @@ only when the transcript is already near the bottom. If you are reading older
 messages, `↓ n NEW` counts messages below the viewport; either newest shortcut
 clears that indicator. Neither shortcut is advertised in the deliberately
 minimal CHAT footer. There is no visible END OF CHAT control;
-Down moves through the newest meaningful message or action, then returns to the
-composer without clearing its draft. Right Arrow and End remain newest-edge
-shortcuts and do not enter typing mode. Press `F4` to quit from
+Up from the single-line composer enters transcript navigation at its final
+message/action target. Up/Down explore sequential targets and Down past the
+final target returns to the composer. In transcript navigation, Left selects the
+oldest actual NEW incoming message in the current channel, while Right returns
+to newest and resumes the preserved draft. Left/Right continue editing the text
+caret while the composer is focused. End remains an unadvertised newest-only
+shortcut. Press `F4` to quit from
 any normal app context;
 `q` is ordinary input and is not a quit shortcut. Radio
 monitoring, CHAT storage, and the radio service close during shutdown.
