@@ -25,6 +25,7 @@ from app import (
     DOT_GRID_SPACING_Y,
     MESH_FIXTURE_CONNECTORS,
     MESH_FIXTURE_CONTEXT_LABELS,
+    MESH_FIXTURE_CONTEXTS,
     MESH_FIXTURE_NODES,
     MESH_GRID_CENTER_COLUMN,
     MESH_GRID_CENTER_ROW,
@@ -37,6 +38,7 @@ from app import (
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
+    _mesh_context_line,
     _mesh_fixture_directional_target,
     _mesh_grid_pixel,
     _mesh_translated_positions,
@@ -594,17 +596,17 @@ class MeshFixtureModelTests(unittest.TestCase):
                     (you_row2 - ref_row2, you_col2 - ref_col2),
                 )
 
-    def test_directional_target_from_you_moving_left_is_bob(self) -> None:
-        """BOB sits on YOU's own row (5,8 vs 5,11), directly left with zero
+    def test_directional_target_from_you_moving_left_is_alice(self) -> None:
+        """ALICE (4,10) is diagonally closer to YOU (5,11) than BOB (5,8),
 
-        vertical deviation, while ALICE is diagonal (4,10) -- the existing
-        nearest-node rule (mesh_topology.directional_target) picks the more
-        directionally-pure candidate over the merely-closer one, so LEFT
-        from YOU reaches BOB. ALICE is reached via UP instead (see below).
-        This is the current spatial rule applied faithfully to this
+        which sits on YOU's own row with zero vertical deviation but much
+        farther away. mesh_topology.directional_target ranks candidates by
+        actual distance first (direction-purity only breaks ties), so LEFT
+        from YOU reaches the nearer ALICE, not the farther but axis-aligned
+        BOB. This is the general spatial rule applied faithfully to this
         fixture's geometry, not a hardcoded key map.
         """
-        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "left"), BOB_ID)
+        self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "left"), ALICE_ID)
 
     def test_directional_target_from_you_moving_up_is_alice(self) -> None:
         self.assertEqual(_mesh_fixture_directional_target(YOU_ID, "up"), ALICE_ID)
@@ -615,8 +617,16 @@ class MeshFixtureModelTests(unittest.TestCase):
     def test_directional_target_from_alice_moving_down_is_you(self) -> None:
         self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "down"), YOU_ID)
 
-    def test_directional_target_from_bob_moving_right_is_you(self) -> None:
-        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "right"), YOU_ID)
+    def test_directional_target_from_alice_moving_right_is_you(self) -> None:
+        self.assertEqual(_mesh_fixture_directional_target(ALICE_ID, "right"), YOU_ID)
+
+    def test_directional_target_from_bob_moving_right_is_alice(self) -> None:
+        """The reverse of LEFT-LEFT (YOU -> ALICE -> BOB): RIGHT from BOB
+
+        reaches the nearer ALICE first, not YOU -- symmetric traversal,
+        not a shortcut back to YOU.
+        """
+        self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "right"), ALICE_ID)
 
     def test_directional_target_from_bob_moving_up_is_alice(self) -> None:
         self.assertEqual(_mesh_fixture_directional_target(BOB_ID, "up"), ALICE_ID)
@@ -691,6 +701,45 @@ class MeshFixtureModelTests(unittest.TestCase):
             self.assertEqual(x, bob_x)
         last_x, last_y, _glyph = route[-1]
         self.assertEqual((last_x, last_y), (bob_x, bob_y - 1))
+
+    def test_you_has_no_observed_communication_role_context(self) -> None:
+        self.assertNotIn(YOU_ID, MESH_FIXTURE_CONTEXTS)
+
+    def test_alice_is_client_and_relay(self) -> None:
+        """ALICE originated a message we received (CLIENT) and separately
+
+        relayed BOB's message (RELAY) -- both true, independently.
+        """
+        alice = MESH_FIXTURE_CONTEXTS[ALICE_ID]
+        self.assertTrue(alice.is_client)
+        self.assertTrue(alice.is_relay)
+
+    def test_bob_is_client_only(self) -> None:
+        bob = MESH_FIXTURE_CONTEXTS[BOB_ID]
+        self.assertTrue(bob.is_client)
+        self.assertFalse(bob.is_relay)
+
+    def test_alice_and_bob_fixture_hops_and_last_interaction(self) -> None:
+        self.assertEqual(MESH_FIXTURE_CONTEXTS[ALICE_ID].hops, 0)
+        self.assertEqual(MESH_FIXTURE_CONTEXTS[BOB_ID].hops, 1)
+        self.assertEqual(MESH_FIXTURE_CONTEXTS[ALICE_ID].last_interaction, "30m")
+        self.assertEqual(MESH_FIXTURE_CONTEXTS[BOB_ID].last_interaction, "30m")
+
+    def test_context_line_exact_fixture_strings(self) -> None:
+        self.assertEqual(_mesh_context_line(YOU_ID), "YOU")
+        self.assertEqual(
+            _mesh_context_line(ALICE_ID), "ALICE / CLIENT+RELAY / 0 HOPS / 30m"
+        )
+        self.assertEqual(_mesh_context_line(BOB_ID), "BOB / CLIENT / 1 HOPS / 30m")
+
+    def test_context_line_uses_hops_plural_form_even_for_one(self) -> None:
+        """The fixture's HOPS value is intentionally not singularized --
+
+        "1 HOPS", not "1 HOP" -- these are the intended fixture values for
+        this pass, not a grammar bug to fix.
+        """
+        self.assertIn("1 HOPS", _mesh_context_line(BOB_ID))
+        self.assertNotIn("1 HOP ", _mesh_context_line(BOB_ID))
 
 
 class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
@@ -962,10 +1011,35 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(left_margin, right_margin)
 
-    async def test_left_from_you_selects_bob_and_recenters_the_whole_mesh(self) -> None:
+    async def test_left_from_you_selects_alice_and_recenters_the_whole_mesh(
+        self,
+    ) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
+            await pilot.press("left")
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, ALICE_ID)
+
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(5, 11))
+            self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(6, 12))
+            self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(6, 9))
+
+    async def test_left_left_from_you_selects_bob_and_recenters_the_whole_mesh(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            await pilot.press("left")
+            await pilot.pause()
             await pilot.press("left")
             await pilot.pause()
 
@@ -981,7 +1055,14 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(5, 14))
             self.assertEqual(glyph_screen_position(alice), _mesh_grid_pixel(4, 13))
 
-    async def test_up_from_you_selects_alice_and_recenters_the_whole_mesh(self) -> None:
+    async def test_up_from_you_also_selects_alice_and_recenters_the_whole_mesh(
+        self,
+    ) -> None:
+        """ALICE remains reachable via UP too -- the ranking change only
+
+        affects which candidate wins a tie/competition, not this
+        single-candidate case.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
@@ -1000,10 +1081,50 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(glyph_screen_position(you), _mesh_grid_pixel(6, 12))
             self.assertEqual(glyph_screen_position(bob), _mesh_grid_pixel(6, 9))
 
-    async def test_left_from_you_makes_bob_accent_you_base_alice_base(self) -> None:
+    async def test_left_from_you_makes_alice_accent_you_base_bob_base(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
+            await pilot.press("left")
+            await pilot.pause()
+
+            palette = THEME_PALETTES[app._current_theme]
+            you, alice, bob = (
+                self._widget(app, YOU_ID),
+                self._widget(app, ALICE_ID),
+                self._widget(app, BOB_ID),
+            )
+            self.assertEqual(
+                alice.render().spans[0].style.foreground, Color.parse(palette.accent)
+            )
+            self.assertEqual(
+                you.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+            self.assertEqual(
+                bob.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+            you_label, alice_label, bob_label = (
+                self._label_widget(app, YOU_ID),
+                self._label_widget(app, ALICE_ID),
+                self._label_widget(app, BOB_ID),
+            )
+            self.assertEqual(
+                alice_label.render().spans[0].style.foreground,
+                Color.parse(palette.accent),
+            )
+            self.assertEqual(
+                you_label.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+            self.assertEqual(
+                bob_label.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+
+    async def test_left_left_from_you_makes_bob_accent_alice_you_base(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            await pilot.press("left")
+            await pilot.pause()
             await pilot.press("left")
             await pilot.pause()
 
@@ -1023,7 +1144,7 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 alice.render().spans[0].style.foreground, Color.parse(palette.base)
             )
 
-    async def test_left_from_you_turns_alice_bob_connector_accent_you_alice_dim(
+    async def test_left_from_you_turns_you_alice_connector_accent_alice_bob_dim(
         self,
     ) -> None:
         app = self._make_app()
@@ -1040,6 +1161,19 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             after_colors = {color for *_pos, color in canvas._signature[2]}
             self.assertEqual(after_colors, {palette.dim_base, palette.accent})
 
+    async def test_left_left_from_you_turns_alice_bob_connector_accent(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            palette = THEME_PALETTES[app._current_theme]
+            await pilot.press("left")
+            await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            canvas = app.query_one(MeshCanvas)
+            colors = {color for *_pos, color in canvas._signature[2]}
+            self.assertEqual(colors, {palette.dim_base, palette.accent})
+
     async def test_up_from_you_turns_you_alice_connector_accent(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1051,9 +1185,14 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             colors = {color for *_pos, color in canvas._signature[2]}
             self.assertEqual(colors, {palette.dim_base, palette.accent})
 
-    async def test_right_from_bob_reselects_you_and_restores_original_positions(
+    async def test_right_right_from_bob_reselects_you_and_restores_original_positions(
         self,
     ) -> None:
+        """The exact reverse of LEFT, LEFT: BOB -> ALICE -> YOU, restoring
+
+        every node to its original on-screen position -- proves the
+        whole-mesh translation round-trips losslessly.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
@@ -1068,22 +1207,33 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                 BOB_ID: glyph_screen_position(bob),
             }
 
+            view = app.query_one(MeshTopologyView)
             await pilot.press("left")
             await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, BOB_ID)
+
             await pilot.press("right")
             await pilot.pause()
+            self.assertEqual(view.selected_node_id, ALICE_ID)
 
-            view = app.query_one(MeshTopologyView)
+            await pilot.press("right")
+            await pilot.pause()
             self.assertEqual(view.selected_node_id, YOU_ID)
             self.assertEqual(glyph_screen_position(you), original[YOU_ID])
             self.assertEqual(glyph_screen_position(alice), original[ALICE_ID])
             self.assertEqual(glyph_screen_position(bob), original[BOB_ID])
 
-    async def test_right_from_bob_returns_connectors_to_dim_base(self) -> None:
+    async def test_right_right_from_bob_returns_connectors_to_dim_base(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             await pilot.press("left")
+            await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            await pilot.press("right")
             await pilot.pause()
             await pilot.press("right")
             await pilot.pause()
@@ -1093,24 +1243,45 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             colors = {color for *_pos, color in canvas._signature[2]}
             self.assertEqual(colors, {palette.dim_base})
 
-    async def test_context_status_line_updates_for_you_alice_bob(self) -> None:
+    async def test_context_status_line_shows_exact_fixture_strings(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             status = str(app.query_one("#mesh-context-status").render())
             self.assertEqual(status, "YOU")
 
-            await pilot.press("up")
+            await pilot.press("left")
             await pilot.pause()
             status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "ALICE")
+            self.assertEqual(status, "ALICE / CLIENT+RELAY / 0 HOPS / 30m")
 
-            await pilot.press("down")
+            await pilot.press("left")
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(status, "BOB / CLIENT / 1 HOPS / 30m")
+
+    async def test_context_status_line_updates_immediately_as_selection_reverses(
+        self,
+    ) -> None:
+        """The context is selection-driven, not viewport-position-driven:
+
+        it must update on every arrow press, including the reverse
+        traversal back through ALICE to YOU.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            await pilot.press("left")
             await pilot.pause()
             await pilot.press("left")
             await pilot.pause()
             status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "BOB")
+            self.assertEqual(status, "BOB / CLIENT / 1 HOPS / 30m")
+
+            await pilot.press("right")
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(status, "ALICE / CLIENT+RELAY / 0 HOPS / 30m")
 
             await pilot.press("right")
             await pilot.pause()
@@ -1151,6 +1322,9 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, ALICE_ID)
             await pilot.press("left")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, BOB_ID)

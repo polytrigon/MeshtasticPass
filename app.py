@@ -451,6 +451,68 @@ MESH_FIXTURE_CONTEXT_LABELS: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class MeshFixtureContext:
+    """A remote node's OBSERVED COMMUNICATION ROLE for the bottom-left
+
+    status line -- deliberately distinct from a node's configured
+    Meshtastic device role, and not (yet) backed by trustworthy radio
+    evidence. For this deterministic fixture pass:
+
+    - CLIENT: this node has originated a message we received.
+    - RELAY: we have trustworthy evidence this node relayed/hopped
+      traffic originated by another node.
+
+    Neither implies the other -- a node can be CLIENT, RELAY, or both
+    (CLIENT+RELAY) -- and RELAY must never be inferred merely from a
+    configured role or from hop count alone, here or once this fixture is
+    replaced with real radio data. `last_interaction` is a pre-formatted,
+    deterministic display string (not a timestamp) so tests never depend
+    on wall-clock time; the full activity/history model is a later pass.
+    """
+
+    is_client: bool
+    is_relay: bool
+    hops: int
+    last_interaction: str
+
+
+# YOU is intentionally absent: it has no observed communication role, and
+# its context line is always just its bare label (see _mesh_context_line).
+MESH_FIXTURE_CONTEXTS: dict[str, MeshFixtureContext] = {
+    # ALICE relayed BOB's message (RELAY) and has separately originated a
+    # message of her own that we received (CLIENT) -- both are true, so
+    # she is CLIENT+RELAY, not just RELAY.
+    "!alice": MeshFixtureContext(
+        is_client=True, is_relay=True, hops=0, last_interaction="30m"
+    ),
+    # BOB originated a message we received (CLIENT); no evidence he
+    # relayed anything, so he is CLIENT only.
+    "!bob": MeshFixtureContext(
+        is_client=True, is_relay=False, hops=1, last_interaction="30m"
+    ),
+}
+
+
+def _mesh_context_line(node_id: str) -> str:
+    """Build the bottom-left status text for a selected fixture node.
+
+    YOU has no observed communication role, so its line is just its bare
+    label. A remote node's line is "LABEL / ROLE / N HOPS / AGE", with
+    ROLE one of CLIENT, RELAY, or CLIENT+RELAY per MeshFixtureContext.
+    """
+    label = MESH_FIXTURE_CONTEXT_LABELS.get(node_id, "")
+    context = MESH_FIXTURE_CONTEXTS.get(node_id)
+    if context is None:
+        return label
+    role = "+".join(
+        role_name
+        for role_name, present in (("CLIENT", context.is_client), ("RELAY", context.is_relay))
+        if present
+    )
+    return f"{label} / {role} / {context.hops} HOPS / {context.last_interaction}"
+
+
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
     """Convert a 1-indexed logical grid position to a pixel coordinate,
 
@@ -571,12 +633,6 @@ def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view.select_node(node_id)
     view.render_fixture(theme=app._current_theme)
     app._update_mesh_context_status()
-
-    def on_click(self, _event: Click) -> None:
-        view = self.app.query_one(MeshTopologyView)
-        view.select_node(self.node_id)
-        view.render_fixture(theme=self.app._current_theme)
-        self.app._update_mesh_context_status()
 
 
 DOT_GRID_GLYPH = "·"
@@ -2599,7 +2655,7 @@ class MeshtasticPassApp(App[None]):
             status_widget.update("")
             return
         selected_id = views[0].selected_node_id
-        status_widget.update(MESH_FIXTURE_CONTEXT_LABELS.get(selected_id, ""))
+        status_widget.update(_mesh_context_line(selected_id))
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1

@@ -234,14 +234,21 @@ def directional_target(
     layout: TopologyLayout,
     direction: Direction,
 ) -> PositionedNode | None:
-    """Choose the nearest directionally sensible node without wrapping."""
+    """Choose the nearest directionally sensible node without wrapping.
+
+    Ranked primarily by actual Euclidean distance (in the candidate's own
+    direction, i.e. `primary > 0`), not by direction-purity alone: a much
+    closer node that is somewhat off-axis is preferred over a far node
+    that happens to have zero perpendicular offset. Direction-purity
+    (`cross / primary`) only breaks a tie between equidistant candidates.
+    """
     current = next(
         (item for item in layout.nodes if item.node.node_id == current_node_id),
         None,
     )
     if current is None:
         return None
-    candidates: list[tuple[tuple[float, int, int, str], PositionedNode]] = []
+    candidates: list[tuple[tuple[float, float, str], PositionedNode]] = []
     for candidate in layout.nodes:
         if candidate is current:
             continue
@@ -251,9 +258,8 @@ def directional_target(
         if primary <= 0:
             continue
         score = (
+            primary * primary + cross * cross,
             cross / primary,
-            primary + cross,
-            cross,
             candidate.node.node_id.lower(),
         )
         candidates.append((score, candidate))
