@@ -18,8 +18,7 @@ HORIZONTAL_GAP = 4
 VERTICAL_GAP = 1
 BOARD_MARGIN_X = 2
 BOARD_MARGIN_Y = 1
-UNKNOWN_REGION_COLUMNS = 5
-UNKNOWN_REGION_GAP = 2
+DEFAULT_MAX_GRID_RADIUS = 3
 
 Direction = Literal["up", "down", "left", "right"]
 
@@ -79,16 +78,26 @@ def compact_node_label(node: NodeMetadata, max_cells: int = NODE_WIDTH - 2) -> s
     return f"…{node_id[-(max_cells - 1):]}"
 
 
-def build_topology(nodes: Iterable[NodeMetadata]) -> TopologyLayout:
-    """Arrange YOU centrally, then a relative spatial grid outward.
+def build_topology(
+    nodes: Iterable[NodeMetadata],
+    *,
+    max_radius: int = DEFAULT_MAX_GRID_RADIUS,
+) -> TopologyLayout:
+    """Arrange YOU centrally, then a bounded relative spatial grid outward.
 
     A remote node is placed by compass direction only when both YOU and that
     node have trustworthy position data; distance only orders nodes outward
-    within their direction bucket, it is never proportional to real distance.
-    Nodes without a resolvable bearing go to a deterministic UNKNOWN region
-    instead of being mixed into the directional grid. Coordinates never imply
-    literal geography, routing edges, or exact scale.
+    within their direction bucket as a discrete grid-step rank, clamped to
+    `max_radius` so one very distant node can never explode the board -- it
+    is never proportional to real distance. Nodes without a resolvable
+    bearing are placed deterministically around the outer ring instead of
+    being mixed into the directional grid with a fabricated direction.
+    Coordinates never imply literal geography, routing edges, or exact scale.
+    The result is bounded by construction (the caller is expected to pass a
+    working set of a handful of nodes, not the full node database), so there
+    is no scrolling: the whole board is meant to fit one viewport.
     """
+    max_radius = max(1, max_radius)
     unique: dict[str, NodeMetadata] = {}
     for node in nodes:
         key = node.node_id.strip().lower()
@@ -115,7 +124,6 @@ def build_topology(nodes: Iterable[NodeMetadata]) -> TopologyLayout:
         bearing, distance = resolved
         buckets.setdefault(_direction_bucket(bearing), []).append((distance, node))
 
-    max_extent = 0
     for direction in _DIRECTION_ORDER:
         entries = buckets.get(direction)
         if not entries:
@@ -123,20 +131,16 @@ def build_topology(nodes: Iterable[NodeMetadata]) -> TopologyLayout:
         entries.sort(key=lambda item: (item[0], item[1].node_id.casefold()))
         dx, dy = _DIRECTION_VECTORS[direction]
         for rank, (_distance, node) in enumerate(entries, start=1):
-            slot_x, slot_y = _reserve_slot(dx * rank, dy * rank, occupied)
+            clamped_rank = min(rank, max_radius)
+            slot_x, slot_y = _reserve_slot(dx * clamped_rank, dy * clamped_rank, occupied)
             logical.append((node, slot_x, slot_y, direction))
-            max_extent = max(max_extent, abs(slot_x), abs(slot_y))
 
     unknown.sort(key=_node_sort_key)
     if unknown:
-        row_y = max_extent + UNKNOWN_REGION_GAP
-        half_width = UNKNOWN_REGION_COLUMNS // 2
+        outer_ring = _square_ring(max_radius)
         for index, node in enumerate(unknown):
-            column = index % UNKNOWN_REGION_COLUMNS
-            row = index // UNKNOWN_REGION_COLUMNS
-            slot_x, slot_y = _reserve_slot(
-                column - half_width, row_y + row, occupied
-            )
+            grid_x, grid_y = outer_ring[index % len(outer_ring)]
+            slot_x, slot_y = _reserve_slot(grid_x, grid_y, occupied)
             logical.append((node, slot_x, slot_y, "UNKNOWN"))
 
     if not logical:
@@ -186,6 +190,43 @@ def _reserve_slot(
         radius += 1
     occupied.add((x, y))  # pragma: no cover - unreachable in practice
     return x, y
+
+
+def route_connector(
+    from_x: int, from_y: int, to_x: int, to_y: int
+) -> tuple[tuple[int, int, str], ...]:
+    """Return (x, y, glyph) cells for a simple orthogonal YOU-to-node connector.
+
+    A horizontal run along the origin's row, then a vertical run along the
+    target's column -- one elbow at most -- degenerating to a straight
+    segment when the two points already share a row or column. Endpoints
+    are excluded: a node widget renders on top of and occludes its own
+    cell regardless of what the background layer drew underneath it.
+    """
+    if from_x == to_x and from_y == to_y:
+        return ()
+    cells: list[tuple[int, int, str]] = []
+    step_x = 1 if to_x > from_x else -1
+    step_y = 1 if to_y > from_y else -1
+
+    if from_y == to_y:
+        return tuple((x, from_y, "─") for x in range(from_x + step_x, to_x, step_x))
+    if from_x == to_x:
+        return tuple((from_x, y, "│") for y in range(from_y + step_y, to_y, step_y))
+
+    for x in range(from_x + step_x, to_x, step_x):
+        cells.append((x, from_y, "─"))
+    cells.append((to_x, from_y, _elbow_glyph(step_x, step_y)))
+    for y in range(from_y + step_y, to_y, step_y):
+        cells.append((to_x, y, "│"))
+    return tuple(cells)
+
+
+def _elbow_glyph(step_x: int, step_y: int) -> str:
+    """Box-drawing corner for a horizontal run turning into a vertical one."""
+    if step_x > 0:
+        return "┐" if step_y > 0 else "┘"
+    return "┌" if step_y > 0 else "└"
 
 
 def directional_target(

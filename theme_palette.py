@@ -9,6 +9,7 @@ from textual.color import Color
 
 BACKGROUND = "#101010"
 ERROR = "#FF1744"
+FAVORITE_ACCENT = "#FFD700"
 DIM_BASE_ALPHA = 0.35
 GRID_DOT_ALPHA = 0.10
 
@@ -41,6 +42,7 @@ class ThemePalette:
     dim_base: str
     grid_dot: str
     error: str = ERROR
+    favorite_accent: str = FAVORITE_ACCENT
 
 
 def _palette(base: str, accent: str) -> ThemePalette:
