@@ -832,6 +832,61 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.selected_node_id, YOU_ID)
 
+    async def test_grid_dots_nodes_and_connector_fit_inside_the_uconsole_viewport(
+        self,
+    ) -> None:
+        """At the actual small/uConsole-like viewport (90x28, the size used
+
+        by every other MESH test in this module and the stated supported
+        terminal size), the fixed 7x17 board must never clip: all 119
+        background dots, both node glyphs, and the connector must render
+        entirely inside the visible MESH region -- MESH has no scrolling
+        to fall back on if the board is too big for the viewport.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            viewport = view.region
+            board = view.board
+            canvas = app.query_one(MeshCanvas)
+
+            # The board container and its background canvas (dots plus
+            # connector) must both render fully inside the visible region.
+            self.assertTrue(viewport.contains_region(board.region))
+            self.assertTrue(viewport.contains_region(canvas.region))
+
+            # All 119 (7x17) logical grid-dot positions, individually.
+            dot_count = 0
+            for row in range(1, MESH_GRID_ROWS + 1):
+                for column in range(1, MESH_GRID_COLUMNS + 1):
+                    x, y = _mesh_grid_pixel(row, column)
+                    screen_x = board.region.x + x
+                    screen_y = board.region.y + y
+                    with self.subTest(row=row, column=column):
+                        self.assertTrue(viewport.contains_point((screen_x, screen_y)))
+                    dot_count += 1
+            self.assertEqual(dot_count, 7 * 17)
+
+            # YOU and ALICE.
+            for widget in app.query(MeshNodeWidget):
+                with self.subTest(node=widget.node_id):
+                    self.assertTrue(viewport.contains_region(widget.region))
+
+            # The connector between YOU (4,9) and ALICE (3,8), cell by cell.
+            you_x, you_y = _mesh_grid_pixel(4, 9)
+            alice_x, alice_y = _mesh_grid_pixel(3, 8)
+            connector = route_connector(you_x, you_y, alice_x, alice_y)
+            self.assertTrue(connector)
+            for x, y, _glyph in connector:
+                screen_x = board.region.x + x
+                screen_y = board.region.y + y
+                with self.subTest(connector_cell=(x, y)):
+                    self.assertTrue(viewport.contains_point((screen_x, screen_y)))
+
 
 class ThinScrollBarRenderTests(unittest.TestCase):
     def test_vertical_thin_render_uses_the_thin_glyph(self) -> None:

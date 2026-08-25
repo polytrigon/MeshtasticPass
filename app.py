@@ -509,8 +509,15 @@ class MeshNodeWidget(Static):
 
 
 DOT_GRID_GLYPH = "·"
-DOT_GRID_SPACING_X = 6
-DOT_GRID_SPACING_Y = 3
+# The fixed 7x17 MESH grid must fit entirely inside the MESH viewport on the
+# supported uConsole/test terminal size (~90 columns) with no scrolling --
+# at spacing 6x3 the 17-column board was 102 cells wide (and 21 rows tall,
+# one row taller than that viewport's own 20-row MESH region), clipping the
+# outer columns. 4x2 keeps the original 2:1 x:y ratio (so the grid still
+# reads as roughly square against typical terminal cell proportions) while
+# fitting the whole 7x17 board -- 68x14 -- with margin inside that viewport.
+DOT_GRID_SPACING_X = 4
+DOT_GRID_SPACING_Y = 2
 
 
 def _render_mesh_canvas(
