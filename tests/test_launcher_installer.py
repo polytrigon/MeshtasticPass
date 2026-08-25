@@ -85,6 +85,17 @@ class LauncherInstallerTests(unittest.TestCase):
             self.assertIn("Name=MeshtasticPass", desktop)
             self.assertIn("Categories=Utility;", desktop)
 
+            installer = INSTALLER.read_text(encoding="utf-8")
+            self.assertNotIn("sudo", installer)
+            self.assertNotIn("curl", installer)
+            self.assertNotIn("wget", installer)
+            begin_count = installer.count(
+                "<!-- BEGIN MeshtasticPass launcher -->"
+            )
+            end_count = installer.count("<!-- END MeshtasticPass launcher -->")
+            self.assertGreaterEqual(begin_count, 1)
+            self.assertEqual(begin_count, end_count)
+
 
 if __name__ == "__main__":
     unittest.main()

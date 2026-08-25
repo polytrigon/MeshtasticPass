@@ -1,13 +1,28 @@
 # MeshtasticPass
 
-A Nintendo StreetPass-inspired app for the ClockworkPi uConsole. The current
-milestone maintains a resilient USB serial connection to a Meshtastic ESP32.
+A Nintendo StreetPass-inspired, keyboard-first Meshtastic companion for the
+ClockworkPi uConsole. It currently supports a Meshtastic ESP32 over selectable
+USB serial devices using the official Python SDK; `/dev/ttyUSB0` is the default,
+not the only supported device. Automatic reconnect, channel CHAT, local history,
+delivery-state feedback, node favorites, and a deterministic hardware-free
+simulation mode are implemented.
+
+MeshtasticPass is early-stage software. The current hardware path is a directly
+attached USB serial radio; `meshtasticd` and HackerGadgets integration are not
+implemented. MeshtasticPass is an independent project and is not affiliated
+with or endorsed by Meshtastic.
+
+Local settings are stored under `${XDG_CONFIG_HOME:-$HOME/.config}` and CHAT
+data under `${XDG_DATA_HOME:-$HOME/.local/share}`. See [Privacy](PRIVACY.md) for
+exact paths and data details, [Security](SECURITY.md) for private-reporting
+guidance, and [Contributing](CONTRIBUTING.md) before preparing a change.
 
 ## Milestone 1: connect to the radio
 
-Run these commands on the uConsole from `/home/mt/meshtasticPass`:
+Run these commands from your MeshtasticPass checkout on the uConsole:
 
 ```bash
+cd /path/to/MeshtasticPass
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -20,11 +35,11 @@ Confirm that Linux can see the radio:
 ls -l /dev/ttyUSB0
 ```
 
-If that command shows the device but Python reports permission denied, add the
-`mt` user to the serial-device group, then log out and back in:
+If that command shows the device but Python reports permission denied, add your
+current user to the serial-device group, then log out and back in:
 
 ```bash
-sudo usermod -aG dialout mt
+sudo usermod -aG dialout "$USER"
 ```
 
 With the virtual environment active, start the radio monitor:
@@ -411,7 +426,7 @@ manager the app will still launch, but fullscreen behavior is not guaranteed.
 To launch manually without the menu or launcher-specific presentation:
 
 ```bash
-cd /home/mt/meshtasticPass
+cd /path/to/MeshtasticPass
 source .venv/bin/activate
 python app.py
 ```
@@ -430,7 +445,7 @@ app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup
 radio_service.py   All Meshtastic connection and device-info logic
 simulated_radio_service.py  Deterministic radio simulator
-requirements.txt   Python dependency
+requirements.txt   Intentionally pinned supported Python dependencies
 tests/             Hardware-free connection resilience tests
 ```
 

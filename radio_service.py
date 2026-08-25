@@ -587,15 +587,15 @@ class RadioService:
         if not self._device_exists():
             raise RadioConnectionError(
                 f"Serial device {self.device_path} was not found. "
-                "Check the USB cable and run: ls -l /dev/ttyUSB0",
+                "Check the USB cable and the selected device path.",
                 state=RadioState.OFFLINE,
             )
 
         if not os.access(path, os.R_OK | os.W_OK):
             raise RadioConnectionError(
                 f"Permission denied for {self.device_path}. "
-                "Add user 'mt' to the dialout group, then log out and back in: "
-                "sudo usermod -aG dialout mt"
+                "Add your current user to the serial-device access group "
+                "(commonly dialout), then log out and back in."
             )
 
     def _device_exists(self) -> bool:
