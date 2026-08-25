@@ -46,6 +46,23 @@ class RadioServiceTests(unittest.TestCase):
         service.close.assert_called_once_with()
         self.assertEqual(service.device_path, "/dev/ttyACM0")
 
+    def test_device_errors_do_not_assume_one_path_or_username(self) -> None:
+        service = RadioService("/dev/ttyACM7")
+        with patch.object(service, "_device_exists", return_value=False):
+            with self.assertRaises(RadioConnectionError) as missing:
+                service._check_device()
+        self.assertIn("/dev/ttyACM7", str(missing.exception))
+        self.assertNotIn("/dev/ttyUSB0", str(missing.exception))
+
+        with (
+            patch.object(service, "_device_exists", return_value=True),
+            patch("radio_service.os.access", return_value=False),
+        ):
+            with self.assertRaises(RadioConnectionError) as denied:
+                service._check_device()
+        self.assertIn("current user", str(denied.exception))
+        self.assertNotIn("sudo usermod", str(denied.exception))
+
     def test_reads_enabled_channel_names_and_configured_primary_preset(self) -> None:
         channels = [
             SimpleNamespace(

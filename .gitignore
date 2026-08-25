@@ -1,4 +1,43 @@
+# Python environments, caches, coverage, and build output
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# MeshtasticPass runtime and user data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+config.json
+*.log
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+*~
