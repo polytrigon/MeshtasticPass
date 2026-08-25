@@ -483,28 +483,28 @@ class MeshCanvasRenderTests(unittest.TestCase):
 
 
 class MeshFixtureModelTests(unittest.TestCase):
-    """Pure tests of the fixed 7x17 grid and its two-node fixture, with no
+    """Pure tests of the fixed 9x21 grid and its two-node fixture, with no
 
     running app: grid dimensions, logical positions, and the whole-mesh
     translation/recentering math from the exact worked example in spec.
     """
 
-    def test_grid_is_exactly_seven_rows_by_seventeen_columns(self) -> None:
-        self.assertEqual(MESH_GRID_ROWS, 7)
-        self.assertEqual(MESH_GRID_COLUMNS, 17)
+    def test_grid_is_exactly_nine_rows_by_twenty_one_columns(self) -> None:
+        self.assertEqual(MESH_GRID_ROWS, 9)
+        self.assertEqual(MESH_GRID_COLUMNS, 21)
 
-    def test_center_position_is_row_four_column_nine(self) -> None:
-        self.assertEqual(MESH_GRID_CENTER_ROW, 4)
-        self.assertEqual(MESH_GRID_CENTER_COLUMN, 9)
+    def test_center_position_is_row_five_column_eleven(self) -> None:
+        self.assertEqual(MESH_GRID_CENTER_ROW, 5)
+        self.assertEqual(MESH_GRID_CENTER_COLUMN, 11)
 
-    def test_you_fixed_logical_position_is_row_four_column_nine(self) -> None:
+    def test_you_fixed_logical_position_is_row_five_column_eleven(self) -> None:
         you = next(node for node in MESH_FIXTURE_NODES if node.node_id == YOU_ID)
-        self.assertEqual((you.row, you.column), (4, 9))
+        self.assertEqual((you.row, you.column), (5, 11))
         self.assertTrue(you.is_local)
 
-    def test_alice_fixed_logical_position_is_row_three_column_eight(self) -> None:
+    def test_alice_fixed_logical_position_is_row_four_column_ten(self) -> None:
         alice = next(node for node in MESH_FIXTURE_NODES if node.node_id == ALICE_ID)
-        self.assertEqual((alice.row, alice.column), (3, 8))
+        self.assertEqual((alice.row, alice.column), (4, 10))
         self.assertFalse(alice.is_local)
 
     def test_only_two_fixture_nodes_exist(self) -> None:
@@ -512,16 +512,16 @@ class MeshFixtureModelTests(unittest.TestCase):
 
     def test_you_selected_leaves_positions_untranslated(self) -> None:
         positions = _mesh_translated_positions(YOU_ID)
-        self.assertEqual(positions[YOU_ID], (4, 9))
-        self.assertEqual(positions[ALICE_ID], (3, 8))
+        self.assertEqual(positions[YOU_ID], (5, 11))
+        self.assertEqual(positions[ALICE_ID], (4, 10))
 
     def test_alice_selected_recenters_alice_and_shifts_you_by_the_same_delta(
         self,
     ) -> None:
-        """The exact worked example: ALICE -> (4,9), YOU -> (5,10)."""
+        """The exact worked example: ALICE -> (5,11), YOU -> (6,12)."""
         positions = _mesh_translated_positions(ALICE_ID)
-        self.assertEqual(positions[ALICE_ID], (4, 9))
-        self.assertEqual(positions[YOU_ID], (5, 10))
+        self.assertEqual(positions[ALICE_ID], (5, 11))
+        self.assertEqual(positions[YOU_ID], (6, 12))
 
     def test_translation_is_a_pure_whole_mesh_shift(self) -> None:
         """Every node moves by the identical row/column delta -- relative
@@ -550,7 +550,7 @@ class MeshFixtureModelTests(unittest.TestCase):
         self.assertIsNone(_mesh_fixture_directional_target(YOU_ID, "down"))
 
     def test_background_grid_renders_a_dot_at_every_logical_position(self) -> None:
-        """Every one of the 7x17 logical grid positions must correspond to
+        """Every one of the 9x21 logical grid positions must correspond to
 
         exactly one visible background dot -- proven directly against the
         procedural canvas renderer, independent of any node overlay.
@@ -569,14 +569,14 @@ class MeshFixtureModelTests(unittest.TestCase):
         width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
         height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
         rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        x, y = _mesh_grid_pixel(4, 9)
+        x, y = _mesh_grid_pixel(5, 11)
         self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
 
     def test_background_dot_exists_at_alice_grid_position(self) -> None:
         width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
         height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
         rows = str(_render_mesh_canvas(width, height, (), "#222222")).split("\n")
-        x, y = _mesh_grid_pixel(3, 8)
+        x, y = _mesh_grid_pixel(4, 10)
         self.assertEqual(rows[y][x], DOT_GRID_GLYPH)
 
     def test_fixture_nodes_have_no_label_field(self) -> None:
@@ -670,8 +670,8 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
             alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
-            self.assertEqual(offset_xy(you), _mesh_grid_pixel(4, 9))
-            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(3, 8))
+            self.assertEqual(offset_xy(you), _mesh_grid_pixel(5, 11))
+            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(4, 10))
 
     async def test_no_selection_background_rectangle_in_css_or_at_runtime(self) -> None:
         self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)
@@ -702,8 +702,8 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             you = next(w for w in app.query(MeshNodeWidget) if w.node_id == YOU_ID)
             alice = next(w for w in app.query(MeshNodeWidget) if w.node_id == ALICE_ID)
 
-            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(4, 9))
-            self.assertEqual(offset_xy(you), _mesh_grid_pixel(5, 10))
+            self.assertEqual(offset_xy(alice), _mesh_grid_pixel(5, 11))
+            self.assertEqual(offset_xy(you), _mesh_grid_pixel(6, 12))
 
     async def test_left_from_you_makes_alice_accent_and_you_base(self) -> None:
         app = self._make_app()
@@ -838,7 +838,7 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
         """At the actual small/uConsole-like viewport (90x28, the size used
 
         by every other MESH test in this module and the stated supported
-        terminal size), the fixed 7x17 board must never clip: all 119
+        terminal size), the fixed 9x21 board must never clip: all 189
         background dots, both node glyphs, and the connector must render
         entirely inside the visible MESH region -- MESH has no scrolling
         to fall back on if the board is too big for the viewport.
@@ -859,7 +859,7 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(viewport.contains_region(board.region))
             self.assertTrue(viewport.contains_region(canvas.region))
 
-            # All 119 (7x17) logical grid-dot positions, individually.
+            # All 189 (9x21) logical grid-dot positions, individually.
             dot_count = 0
             for row in range(1, MESH_GRID_ROWS + 1):
                 for column in range(1, MESH_GRID_COLUMNS + 1):
@@ -869,16 +869,16 @@ class MeshFixtureAppTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(row=row, column=column):
                         self.assertTrue(viewport.contains_point((screen_x, screen_y)))
                     dot_count += 1
-            self.assertEqual(dot_count, 7 * 17)
+            self.assertEqual(dot_count, 9 * 21)
 
             # YOU and ALICE.
             for widget in app.query(MeshNodeWidget):
                 with self.subTest(node=widget.node_id):
                     self.assertTrue(viewport.contains_region(widget.region))
 
-            # The connector between YOU (4,9) and ALICE (3,8), cell by cell.
-            you_x, you_y = _mesh_grid_pixel(4, 9)
-            alice_x, alice_y = _mesh_grid_pixel(3, 8)
+            # The connector between YOU (5,11) and ALICE (4,10), cell by cell.
+            you_x, you_y = _mesh_grid_pixel(5, 11)
+            alice_x, alice_y = _mesh_grid_pixel(4, 10)
             connector = route_connector(you_x, you_y, alice_x, alice_y)
             self.assertTrue(connector)
             for x, y, _glyph in connector:

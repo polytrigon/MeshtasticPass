@@ -385,7 +385,7 @@ CIRCLE_STROKED_LARGE = "○"
 # --- MESH minimal fixed-grid interaction fixture ---------------------------
 #
 # MESH is being rebuilt one component at a time. This pass establishes only
-# the visual/interaction foundation: a fixed 7x17 grid holding a hardcoded
+# the visual/interaction foundation: a fixed 9x21 grid holding a hardcoded
 # YOU + ALICE fixture, arrow-key selection, and whole-mesh recentering
 # translation. It intentionally does NOT do relevance ranking, staleness
 # classification, Favorites, relay state, GPS-derived placement, a dynamic
@@ -393,10 +393,10 @@ CIRCLE_STROKED_LARGE = "○"
 # build_topology()/route_connector() for the pure, still-importable pieces
 # that implement richer behavior; they are simply not wired into this view
 # right now so a future pass can reintroduce them deliberately.
-MESH_GRID_ROWS = 7
-MESH_GRID_COLUMNS = 17
-MESH_GRID_CENTER_ROW = 4
-MESH_GRID_CENTER_COLUMN = 9
+MESH_GRID_ROWS = 9
+MESH_GRID_COLUMNS = 21
+MESH_GRID_CENTER_ROW = 5
+MESH_GRID_CENTER_COLUMN = 11
 
 
 @dataclass(frozen=True)
@@ -418,7 +418,7 @@ class MeshFixtureNode:
 
 MESH_FIXTURE_NODES = (
     MeshFixtureNode("!you", MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN, True),
-    MeshFixtureNode("!alice", 3, 8, False),
+    MeshFixtureNode("!alice", 4, 10, False),
 )
 
 # Bottom-left context-line text only -- the board itself never renders
@@ -509,13 +509,11 @@ class MeshNodeWidget(Static):
 
 
 DOT_GRID_GLYPH = "·"
-# The fixed 7x17 MESH grid must fit entirely inside the MESH viewport on the
-# supported uConsole/test terminal size (~90 columns) with no scrolling --
-# at spacing 6x3 the 17-column board was 102 cells wide (and 21 rows tall,
-# one row taller than that viewport's own 20-row MESH region), clipping the
-# outer columns. 4x2 keeps the original 2:1 x:y ratio (so the grid still
-# reads as roughly square against typical terminal cell proportions) while
-# fitting the whole 7x17 board -- 68x14 -- with margin inside that viewport.
+# The fixed MESH grid must fit entirely inside the MESH viewport on the
+# supported uConsole/test terminal size (~90 columns) with no scrolling.
+# 4x2 keeps a 2:1 x:y ratio (so the grid reads as roughly square against
+# typical terminal cell proportions); at the current 9x21 grid that renders
+# an 84x18 board, with margin inside that viewport.
 DOT_GRID_SPACING_X = 4
 DOT_GRID_SPACING_Y = 2
 
@@ -592,7 +590,7 @@ class MeshCanvas(Static):
 
 
 class MeshTopologyView(Container):
-    """A fixed 7x17 grid MESH board: the minimal two-node interaction fixture.
+    """A fixed 9x21 grid MESH board: the minimal two-node interaction fixture.
 
     No scrolling, no scrollbars, no dynamic node count -- see the module-
     level comment above MESH_GRID_ROWS for what this pass intentionally
