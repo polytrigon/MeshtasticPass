@@ -399,7 +399,7 @@ Node ID sit directly below the connection rows. If the
 radio disappears or a recoverable connection error occurs, the status clearly
 says that automatic retry is active and stale node metadata is hidden. The full
 CONNECTION / STYLE surface scrolls vertically on short terminals;
-keyboard controls, dropdown operation, Long Name editing, mouse-wheel scrolling,
+keyboard controls, dropdown operation, identity editing, mouse-wheel scrolling,
 and the one-cell themed scrollbar remain available instead of compressing the
 sections.
 
@@ -408,26 +408,34 @@ serial ports. Selecting a different port saves it, closes the old connection,
 and immediately starts the normal reconnect flow. Simulation offers the stable
 fake choices `/dev/ttyUSB0` and `/dev/ttyUSB1` without enumerating host ports.
 
-Long Name is a two-state keyboard control: use Up/Down to reach its
+Long Name and Short Name are two-state keyboard controls: use Up/Down to reach a
 bracketed value, press Enter to edit, then press Enter to validate/save or Escape
 to restore the value from before editing. Arrow keys belong to the text caret
-only while edit mode is active. USB DEVICE, LONG NAME, FONT SIZE, and COLOR use
-Textual focus as their single navigation-selection source, so exactly one row
-shows the `>` caret while moving through CONNECTION/CONFIG. The field follows
-its content without creating
-horizontal page scrolling. A saved name is applied to the actual radio through
-Meshtastic Python SDK 2.7.11's supported
-`interface.localNode.setOwner(long_name=...)` path. It is not a local app-only
-preference. The protobuf's 40-byte nanopb string buffer permits at most 39 UTF-8
-bytes plus its terminator; MeshtasticPass rejects empty or oversized names
-instead of silently truncating them. Short Name and Node ID are read-only.
+only while edit mode is active. USB DEVICE, LONG NAME, SHORT NAME, FONT SIZE,
+and COLOR use Textual focus as their single navigation-selection source, so
+exactly one row shows both the `>` caret and the same subtle selected-row
+background used in CHAT. Passive STATUS, NODES, and NODE ID rows reserve the
+same two-cell gutter, and all CONNECTION values share a compact aligned column.
+The fields follow their content without creating horizontal page scrolling.
+
+Saved identity values use Meshtastic Python SDK 2.7.11's supported
+`interface.localNode.setOwner(long_name=...)` and
+`interface.localNode.setOwner(short_name=...)` paths; they are not local-only
+preferences. The Long Name protobuf buffer permits 39 UTF-8 payload bytes plus
+its terminator. The Short Name field declares nanopb `max_size: 5`, permitting
+four UTF-8 payload bytes plus its terminator. MeshtasticPass rejects empty or
+oversized values before the SDK can truncate them, including multibyte values
+that fit by character count but not by encoded size. Node ID remains read-only.
 Identity fields are unavailable while disconnected, and the simulator provides
-the same deterministic edit behavior without touching hardware. The supported
-SDK operation may cause the firmware's normal identity propagation; the app
+the same deterministic edit behavior without touching hardware. These supported
+SDK operations may cause the firmware's normal identity propagation; the app
 does not add a separate announcement packet. During an active CONNECTING state,
 NODES and the three identity values use dimmed `...`.
 Offline/error retry intervals use unavailable dashes instead of leaking the
 previous radio identity; the next active attempt returns to the connecting state.
+The STATUS value uses semantic colors: CONNECTING and OFFLINE/retry use ACCENT,
+CONNECTED uses BASE, and ERROR uses the theme-independent electric ERROR red.
+The STATUS label itself remains BASE.
 
 The STYLE section has FONT SIZE and COLOR dropdowns. Focus a dropdown and press
 Enter, then use Up/Down and Enter to select or Escape to cancel. Font choices

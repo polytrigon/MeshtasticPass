@@ -192,12 +192,17 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         info = service.set_long_name("Clockwork Nomad")
         self.assertEqual(info.long_name, "Clockwork Nomad")
         self.assertEqual(service.info.long_name, "Clockwork Nomad")
+        info = service.set_short_name("MHU")
+        self.assertEqual(info.short_name, "MHU")
+        self.assertEqual(service.info.short_name, "MHU")
         self.assertEqual(service.sent_messages, ())
 
         service.set_device_path("/dev/ttyUSB1")
         self.assertEqual(service._direct_observations, {})
         with self.assertRaises(RadioIdentityError):
             service.set_long_name("Offline Name")
+        with self.assertRaises(RadioIdentityError):
+            service.set_short_name("OFF")
 
 
 if __name__ == "__main__":

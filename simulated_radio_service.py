@@ -25,6 +25,7 @@ from radio_service import (
     SendStatus,
     validate_send_request,
     validate_long_name,
+    validate_short_name,
 )
 
 
@@ -286,6 +287,14 @@ class SimulatedRadioService:
         if not self._online or self._stop_event.is_set():
             raise RadioIdentityError("The simulated radio is not connected.")
         self.info = replace(self.info, long_name=normalized)
+        return self.info
+
+    def set_short_name(self, short_name: str) -> RadioInfo:
+        """Update the deterministic Short Name without touching hardware."""
+        normalized = validate_short_name(short_name)
+        if not self._online or self._stop_event.is_set():
+            raise RadioIdentityError("The simulated radio is not connected.")
+        self.info = replace(self.info, short_name=normalized)
         return self.info
 
     def connection_events(
