@@ -9,7 +9,7 @@ import sqlite3
 from threading import RLock
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
 
@@ -28,11 +28,24 @@ class StoredMessage:
     sender_short_name: str | None
     channel_index: int
     text: str
+    origin_sent_at: float | None
     radio_rx_at: float | None
     received_at: float
     local_sent_at: float | None
     delivery_state: str | None
     created_at: float
+
+    @property
+    def message_time(self) -> float | None:
+        """Return a truthful message clock, separate from local receipt time."""
+        if self.direction == "outgoing":
+            return self.local_sent_at
+        return self.origin_sent_at or self.radio_rx_at
+
+    @property
+    def order_key(self) -> tuple[float, float, int]:
+        """Stable chronology; untimed packets fall back to arrival order."""
+        return (self.message_time or self.received_at, self.received_at, self.id)
 
 
 @dataclass(frozen=True)
@@ -105,15 +118,16 @@ class ChatStore:
         text: str,
         radio_rx_at: float | None,
         received_at: float,
+        origin_sent_at: float | None = None,
     ) -> InsertResult:
         """Persist one incoming packet, deduplicating stable packet identities."""
         created_at = received_at
         sql = """
             INSERT OR IGNORE INTO messages (
                 direction, packet_id, node_id, sender_name, sender_short_name,
-                channel_index, text, radio_rx_at, received_at, local_sent_at,
+                channel_index, text, origin_sent_at, radio_rx_at, received_at, local_sent_at,
                 delivery_state, created_at
-            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
         """
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -125,6 +139,7 @@ class ChatStore:
                     sender_short_name,
                     channel_index,
                     text,
+                    origin_sent_at,
                     radio_rx_at,
                     received_at,
                     created_at,
@@ -157,9 +172,9 @@ class ChatStore:
                 """
                 INSERT INTO messages (
                     direction, packet_id, node_id, sender_name,
-                    sender_short_name, channel_index, text, radio_rx_at,
+                    sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
                     received_at, local_sent_at, delivery_state, created_at
-                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, ?, ?, ?, ?)
+                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?)
                 """,
                 (
                     channel_index,
@@ -246,15 +261,21 @@ class ChatStore:
                 rows = self._connection.execute(
                     """
                     SELECT id, direction, packet_id, node_id, sender_name,
-                        sender_short_name, channel_index, text, radio_rx_at,
-                        received_at, local_sent_at, delivery_state, created_at
+                    sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
+                    received_at, local_sent_at, delivery_state, created_at
                     FROM (
                         SELECT * FROM messages
                         WHERE channel_index = ?
-                        ORDER BY id DESC
+                        ORDER BY
+                            COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
+                            received_at DESC,
+                            id DESC
                         LIMIT ?
                     )
-                    ORDER BY id ASC
+                    ORDER BY
+                        COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) ASC,
+                        received_at ASC,
+                        id ASC
                     """,
                     (channel_index, limit + 1),
                 ).fetchall()
@@ -286,15 +307,47 @@ class ChatStore:
                 self._ensure_open()
                 rows = self._connection.execute(
                     """
-                    SELECT id, direction, packet_id, node_id, sender_name,
-                        sender_short_name, channel_index, text, radio_rx_at,
-                        received_at, local_sent_at, delivery_state, created_at
-                    FROM messages
-                    WHERE channel_index = ? AND id < ?
-                    ORDER BY id DESC
+                    WITH cursor AS (
+                        SELECT
+                            COALESCE(
+                                origin_sent_at, radio_rx_at, local_sent_at, received_at
+                            ) AS order_time,
+                            received_at AS cursor_received_at,
+                            id AS cursor_id
+                        FROM messages
+                        WHERE id = ? AND channel_index = ?
+                    )
+                    SELECT messages.id, direction, packet_id, node_id, sender_name,
+                        sender_short_name, messages.channel_index, text, origin_sent_at,
+                        radio_rx_at, received_at, local_sent_at, delivery_state, created_at
+                    FROM messages CROSS JOIN cursor
+                    WHERE messages.channel_index = ? AND (
+                        COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
+                            < cursor.order_time
+                        OR (
+                            COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
+                                = cursor.order_time
+                            AND received_at < cursor.cursor_received_at
+                        )
+                        OR (
+                            COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
+                                = cursor.order_time
+                            AND received_at = cursor.cursor_received_at
+                            AND messages.id < cursor.cursor_id
+                        )
+                    )
+                    ORDER BY
+                        COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
+                        received_at DESC,
+                        id DESC
                     LIMIT ?
                     """,
-                    (channel_index, before_message_id, limit + 1),
+                    (
+                        before_message_id,
+                        channel_index,
+                        channel_index,
+                        limit + 1,
+                    ),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load older CHAT history: {error}") from error
@@ -351,6 +404,7 @@ class ChatStore:
                         sender_short_name TEXT,
                         channel_index INTEGER NOT NULL,
                         text TEXT NOT NULL,
+                        origin_sent_at REAL,
                         radio_rx_at REAL,
                         received_at REAL NOT NULL,
                         local_sent_at REAL,
@@ -379,6 +433,21 @@ class ChatStore:
                 if row is None:
                     connection.execute(
                         "INSERT INTO schema_version(version) VALUES (?)",
+                        (SCHEMA_VERSION,),
+                    )
+                elif int(row["version"]) == 1:
+                    columns = {
+                        column["name"]
+                        for column in connection.execute(
+                            "PRAGMA table_info(messages)"
+                        ).fetchall()
+                    }
+                    if "origin_sent_at" not in columns:
+                        connection.execute(
+                            "ALTER TABLE messages ADD COLUMN origin_sent_at REAL"
+                        )
+                    connection.execute(
+                        "UPDATE schema_version SET version = ?",
                         (SCHEMA_VERSION,),
                     )
                 elif int(row["version"]) != SCHEMA_VERSION:

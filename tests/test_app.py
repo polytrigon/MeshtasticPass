@@ -147,14 +147,18 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
 
             self.assertEqual(len(app.chat_history), len(primary_messages))
-            self.assertEqual(app.chat_history[0].author, "Alice Trail")
+            expected = sorted(
+                primary_messages,
+                key=lambda message: message.radio_rx_at or 0,
+            )
+            self.assertEqual(app.chat_history[0].author, "Bob Basecamp")
             self.assertEqual(
                 [entry.text for entry in app.chat_history],
-                [message.text for message in primary_messages],
+                [message.text for message in expected],
             )
             self.assertEqual(
                 [entry.radio_rx_at for entry in app.chat_history],
-                [message.radio_rx_at for message in primary_messages],
+                [message.radio_rx_at for message in expected],
             )
             self.assertTrue(
                 all(
@@ -1029,7 +1033,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
             app._accept_received_message(SIMULATED_MESSAGES[1])
             await pilot.pause()
-            without_position = list(app.query(ChatEntryWidget))[-1]
+            without_position = next(
+                widget
+                for widget in app.query(ChatEntryWidget)
+                if widget.entry.node_id == SIMULATED_MESSAGES[1].sender_node_id
+            )
             self.assertIsNone(without_position.distance_label)
             self.assertEqual(
                 len(list(without_position.query(".chat-entry-header Static"))),

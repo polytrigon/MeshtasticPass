@@ -86,6 +86,8 @@ _SIMULATED_REFERENCE_TIME = time.time()
 
 
 SIMULATED_MESSAGES = (
+    # Channel 0 deliberately delivers a newer receiver timestamp first, then
+    # an older one. This makes chronological insertion and its notice visible.
     ReceivedMessage(
         sender_node_id=SIMULATED_NODES[0].node_id,
         sender_long_name=SIMULATED_NODES[0].long_name,

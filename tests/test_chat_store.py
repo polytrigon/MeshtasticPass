@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -69,6 +70,115 @@ class ChatStoreTests(unittest.TestCase):
             ["message 2", "message 3", "message 4"],
         )
 
+    def test_out_of_order_equal_and_untimed_rows_have_stable_restart_order(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a",
+            sender_name="A",
+            sender_short_name="A",
+            channel_index=0,
+            text="newer first",
+            radio_rx_at=300.0,
+            received_at=500.0,
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!b",
+            sender_name="B",
+            sender_short_name="B",
+            channel_index=0,
+            text="older second",
+            radio_rx_at=100.0,
+            received_at=501.0,
+        )
+        self.store.add_incoming(
+            packet_id=3,
+            node_id="!c",
+            sender_name="C",
+            sender_short_name="C",
+            channel_index=0,
+            text="equal one",
+            radio_rx_at=300.0,
+            received_at=502.0,
+        )
+        self.store.add_incoming(
+            packet_id=4,
+            node_id="!d",
+            sender_name="D",
+            sender_short_name="D",
+            channel_index=0,
+            text="untimed arrival",
+            radio_rx_at=None,
+            received_at=503.0,
+        )
+        self.store.add_outgoing(
+            text="local send",
+            channel_index=0,
+            local_sent_at=400.0,
+            delivery_state="SENT",
+        )
+
+        before = [message.text for message in self.store.load_recent(limit=10)]
+        self.store.close()
+        self.store = ChatStore.open(self.path)
+        after = [message.text for message in self.store.load_recent(limit=10)]
+
+        self.assertEqual(
+            before,
+            [
+                "older second",
+                "newer first",
+                "equal one",
+                "local send",
+                "untimed arrival",
+            ],
+        )
+        self.assertEqual(after, before)
+
+    def test_version_one_database_migrates_without_losing_history(self) -> None:
+        self.store.close()
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """
+            DROP TABLE IF EXISTS send_attempts;
+            DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS schema_version;
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (1);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                packet_id INTEGER,
+                node_id TEXT,
+                sender_name TEXT,
+                sender_short_name TEXT,
+                channel_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                radio_rx_at REAL,
+                received_at REAL NOT NULL,
+                local_sent_at REAL,
+                delivery_state TEXT,
+                created_at REAL NOT NULL
+            );
+            INSERT INTO messages VALUES (
+                1, 'incoming', 77, '!old', 'Old Node', 'OLD', 0,
+                'preserved', 100, 101, NULL, NULL, 101
+            );
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        self.store = ChatStore.open(self.path)
+        messages = self.store.load_recent()
+        version = self.store._connection.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+
+        self.assertEqual(version, 2)
+        self.assertEqual([message.text for message in messages], ["preserved"])
+        self.assertIsNone(messages[0].origin_sent_at)
+
     def test_cursor_pages_are_bounded_and_chronological(self) -> None:
         for index in range(175):
             self.add_incoming(index + 1, f"message {index}", 100.0 + index)
@@ -102,6 +212,35 @@ class ChatStoreTests(unittest.TestCase):
         self.assertTrue(page_queries)
         self.assertTrue(all("LIMIT" in statement.upper() for statement in page_queries))
         self.assertTrue(all("OFFSET" not in statement.upper() for statement in page_queries))
+
+    def test_out_of_order_cursor_pages_are_duplicate_free(self) -> None:
+        for index in range(175):
+            self.add_incoming(index + 1, f"message {index}", 100.0 + index)
+        self.store.add_incoming(
+            packet_id=999,
+            node_id="!late",
+            sender_name="Late",
+            sender_short_name="LATE",
+            channel_index=0,
+            text="late middle",
+            radio_rx_at=148.5,
+            received_at=1000.0,
+        )
+
+        page = self.store.load_recent_page(limit=100)
+        all_messages = list(page.messages)
+        while page.has_older:
+            page = self.store.load_older_page(all_messages[0].id, limit=50)
+            all_messages[0:0] = page.messages
+
+        ids = [message.id for message in all_messages]
+        self.assertEqual(len(ids), 176)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(
+            [message.order_key for message in all_messages],
+            sorted(message.order_key for message in all_messages),
+        )
+        self.assertIn("late middle", [message.text for message in all_messages])
 
     def test_outgoing_attempt_and_delivery_state_persist(self) -> None:
         message_id = self.store.add_outgoing(
