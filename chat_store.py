@@ -288,6 +288,45 @@ class ChatStore:
             has_older,
         )
 
+    def latest_incoming_message_at(self) -> dict[str, float]:
+        """Most recent truthful incoming-message timestamp per node ID.
+
+        Persisted history is authoritative for this, not whatever page is
+        currently mounted in memory: a node's last message may be far older
+        than any bounded/loaded CHAT window. Returns one aggregated
+        (node_id, MAX(timestamp)) row per node via SQL -- it never loads
+        message rows into memory, so this stays cheap regardless of history
+        size. Timestamp precedence matches StoredMessage.message_time for
+        incoming messages (origin_sent_at, else radio_rx_at); a message with
+        neither is excluded rather than guessed from local receipt time.
+        Node IDs are lowercased to match the app's case-insensitive
+        node-ID comparison convention.
+        """
+        try:
+            with self._lock:
+                self._ensure_open()
+                rows = self._connection.execute(
+                    """
+                    SELECT
+                        LOWER(node_id) AS node_id,
+                        MAX(COALESCE(origin_sent_at, radio_rx_at)) AS message_time
+                    FROM messages
+                    WHERE direction = 'incoming'
+                        AND node_id IS NOT NULL
+                        AND COALESCE(origin_sent_at, radio_rx_at) IS NOT NULL
+                    GROUP BY LOWER(node_id)
+                    """
+                ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(
+                f"Could not load latest message activity: {error}"
+            ) from error
+        return {
+            str(row["node_id"]): float(row["message_time"])
+            for row in rows
+            if str(row["node_id"]).strip()
+        }
+
     def load_older_page(
         self,
         before_message_id: int,
@@ -510,6 +549,17 @@ class ChatStore:
                     raise ChatStoreError(
                         f"Unsupported CHAT schema version {row['version']}."
                     )
+                # Only after any v1->v2 migration above is origin_sent_at
+                # guaranteed to exist on every database this app has ever
+                # created, so this index (which references it) is created
+                # last rather than in the main script above.
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS incoming_node_message_time
+                    ON messages(node_id, origin_sent_at, radio_rx_at)
+                    WHERE direction = 'incoming'
+                    """
+                )
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not initialize CHAT history: {error}") from error
 

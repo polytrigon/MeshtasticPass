@@ -1,4 +1,4 @@
-"""Pure and headless tests for the passive MESH topology board."""
+"""Pure and headless tests for the bounded, YOU-centered MESH board."""
 
 from __future__ import annotations
 
@@ -7,21 +7,31 @@ import tempfile
 import unittest
 
 from rich.cells import cell_len
-from rich.color import Color as RichColor
 from textual.color import Color
 from textual.events import MouseScrollDown
 
 from app import (
     CHAT_SCROLLBAR_THUMB_GLYPH,
-    HORIZONTAL_SCROLLBAR_THUMB_GLYPH,
+    CIRCLE_SOLID_LARGE,
+    CIRCLE_STROKED_LARGE,
+    CIRCLE_STROKED_SMALL,
+    DOT_GRID_GLYPH,
+    DOT_GRID_SPACING_X,
+    DOT_GRID_SPACING_Y,
     ChatEntryWidget,
+    MeshCanvas,
     MeshNodeWidget,
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
+    _render_mesh_canvas,
 )
 from app_settings import AppSettings
+from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
+from geo import GeoPosition
+from mesh_state import DEFAULT_MAX_REMOTE_NODES
 from mesh_topology import (
+    DEFAULT_MAX_GRID_RADIUS,
     HORIZONTAL_GAP,
     NODE_HEIGHT,
     NODE_WIDTH,
@@ -29,12 +39,33 @@ from mesh_topology import (
     build_topology,
     compact_node_label,
     directional_target,
+    route_connector,
 )
 import mesh_topology as mesh_topology_module
 from radio_service import NodeMetadata, RadioState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 from theme_palette import THEME_PALETTES
 from viewport_menu import ViewportMenu
+
+
+LOCAL_GEO = GeoPosition(0.0, 0.0)
+_MILES_PER_DEGREE_AT_EQUATOR = 69.0
+
+
+def west_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(0.0, -miles / _MILES_PER_DEGREE_AT_EQUATOR)
+
+
+def east_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(0.0, miles / _MILES_PER_DEGREE_AT_EQUATOR)
+
+
+def north_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
+
+
+def south_of_local(miles: float) -> GeoPosition:
+    return GeoPosition(-miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
 
 
 def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
@@ -54,23 +85,192 @@ def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
 
 
 class MeshTopologyModelTests(unittest.TestCase):
-    def test_you_is_central_and_hop_layers_are_ordered(self) -> None:
-        layout = build_topology(sample_nodes())
+    def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
+        """The exact worked example: Jim < Alice < YOU < Bob on the x-axis."""
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        alice = NodeMetadata(
+            "!alice", "Alice", "ALCE", None, 1_000.0, False, position=west_of_local(1)
+        )
+        jim = NodeMetadata(
+            "!jim", "Jim", "JIM", None, 1_000.0, False, position=west_of_local(2)
+        )
+        bob = NodeMetadata(
+            "!bob", "Bob", "BOB", None, 1_000.0, False, position=east_of_local(4)
+        )
+        layout = build_topology([local, alice, jim, bob])
         by_id = {item.node.node_id: item for item in layout.nodes}
-        local = by_id["!00000000"]
-        one_hop = [item for item in layout.nodes if item.layer == 1]
-        two_hop = [item for item in layout.nodes if item.layer == 2]
-        unknown = [item for item in layout.nodes if item.layer is None]
 
-        def radius(item):
-            return max(
-                abs(item.x - local.x) // (NODE_WIDTH + HORIZONTAL_GAP),
-                abs(item.y - local.y) // (NODE_HEIGHT + VERTICAL_GAP),
+        self.assertEqual(by_id["!alice"].region, "W")
+        self.assertEqual(by_id["!jim"].region, "W")
+        self.assertEqual(by_id["!bob"].region, "E")
+        self.assertLess(by_id["!jim"].x, by_id["!alice"].x)
+        self.assertLess(by_id["!alice"].x, by_id["!local"].x)
+        self.assertLess(by_id["!local"].x, by_id["!bob"].x)
+
+        # Bob is 4x farther than Alice but must not sit 4x farther visually:
+        # one grid step per rank, regardless of the real-world mile gap.
+        alice_gap = by_id["!local"].x - by_id["!alice"].x
+        jim_gap = by_id["!alice"].x - by_id["!jim"].x
+        self.assertEqual(alice_gap, jim_gap)
+
+    def test_north_and_south_nodes_placed_up_and_down(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nora = NodeMetadata(
+            "!nora", "Nora", "NORA", None, 1_000.0, False, position=north_of_local(3)
+        )
+        sam = NodeMetadata(
+            "!sam", "Sam", "SAM", None, 1_000.0, False, position=south_of_local(2)
+        )
+        layout = build_topology([local, nora, sam])
+        by_id = {item.node.node_id: item for item in layout.nodes}
+
+        self.assertEqual(by_id["!nora"].region, "N")
+        self.assertEqual(by_id["!sam"].region, "S")
+        self.assertLess(by_id["!nora"].y, by_id["!local"].y)
+        self.assertLess(by_id["!local"].y, by_id["!sam"].y)
+
+    def test_distance_orders_outward_without_proportional_spacing(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        near = NodeMetadata(
+            "!near", "Near", "N", None, 1_000.0, False, position=west_of_local(1)
+        )
+        far = NodeMetadata(
+            "!far", "Far", "F", None, 1_000.0, False, position=west_of_local(500)
+        )
+        layout = build_topology([local, near, far])
+        by_id = {item.node.node_id: item for item in layout.nodes}
+        self.assertLess(by_id["!far"].x, by_id["!near"].x)
+        near_gap = by_id["!local"].x - by_id["!near"].x
+        far_gap = by_id["!near"].x - by_id["!far"].x
+        self.assertEqual(near_gap, far_gap)
+
+    def test_grid_radius_is_clamped_and_never_explodes_the_board(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nodes = [local]
+        for index in range(6):
+            nodes.append(
+                NodeMetadata(
+                    f"!w{index}",
+                    f"West{index}",
+                    None,
+                    None,
+                    1_000.0,
+                    False,
+                    position=west_of_local(index + 1),
+                )
             )
+        layout = build_topology(nodes, max_radius=3)
+        cell_width = NODE_WIDTH + HORIZONTAL_GAP
+        max_extent_cells = max(abs(item.x - layout.nodes[0].x) for item in layout.nodes)
+        # A single very-distant node (rank 6) must not push any node beyond a
+        # small multiple of the clamped radius, regardless of how far it is.
+        self.assertLessEqual(max_extent_cells, cell_width * (3 + 2))
 
-        self.assertTrue(one_hop and two_hop and unknown)
-        self.assertLess(max(map(radius, one_hop)), min(map(radius, two_hop)))
-        self.assertLess(max(map(radius, two_hop)), min(map(radius, unknown)))
+    def test_unknown_position_nodes_use_deterministic_fallback_region(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        known = NodeMetadata(
+            "!known", "Known", "K", None, 1_000.0, False, position=west_of_local(1)
+        )
+        close_hop_no_position = NodeMetadata(
+            "!close", "CloseHop", "CH", 1, 1_000.0, False, position=None
+        )
+        far_hop_no_position = NodeMetadata(
+            "!far", "FarHop", "FH", 9, 1_000.0, False, position=None
+        )
+        layout = build_topology(
+            [local, known, close_hop_no_position, far_hop_no_position]
+        )
+        by_id = {item.node.node_id: item for item in layout.nodes}
+        self.assertEqual(by_id["!known"].region, "W")
+        # hopsAway must never fabricate a direction/ordering, regardless of
+        # how close or far the hop count claims to be.
+        self.assertEqual(by_id["!close"].region, "UNKNOWN")
+        self.assertEqual(by_id["!far"].region, "UNKNOWN")
+
+    def test_missing_local_position_makes_every_remote_unknown(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=None)
+        remote = NodeMetadata(
+            "!remote", "Remote", "R", None, 1_000.0, False, position=west_of_local(1)
+        )
+        layout = build_topology([local, remote])
+        by_id = {item.node.node_id: item for item in layout.nodes}
+        self.assertEqual(by_id["!remote"].region, "UNKNOWN")
+
+    def test_directional_placement_is_arrival_order_independent(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nodes = [local]
+        for index in range(6):
+            nodes.append(
+                NodeMetadata(
+                    f"!w{index}",
+                    f"West {index}",
+                    f"W{index}",
+                    None,
+                    1_000.0,
+                    False,
+                    position=west_of_local(index + 1),
+                )
+            )
+        forward = build_topology(nodes)
+        backward = build_topology(list(reversed(nodes)))
+        forward_positions = {
+            item.node.node_id: (item.x, item.y) for item in forward.nodes
+        }
+        backward_positions = {
+            item.node.node_id: (item.x, item.y) for item in backward.nodes
+        }
+        self.assertEqual(forward_positions, backward_positions)
+
+    def test_no_overlap_across_mixed_directions_and_unknown_region(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        nodes = [local]
+        for index in range(8):
+            nodes.append(
+                NodeMetadata(
+                    f"!w{index}",
+                    f"West{index}",
+                    None,
+                    None,
+                    1_000.0,
+                    False,
+                    position=west_of_local(index + 1),
+                )
+            )
+            nodes.append(
+                NodeMetadata(
+                    f"!e{index}",
+                    f"East{index}",
+                    None,
+                    None,
+                    1_000.0,
+                    False,
+                    position=east_of_local(index + 1),
+                )
+            )
+            nodes.append(
+                NodeMetadata(
+                    f"!u{index}", f"Unknown{index}", None, None, 1_000.0, False
+                )
+            )
+        layout = build_topology(nodes)
+        rectangles = []
+        for item in layout.nodes:
+            rectangle = (item.x, item.y, item.x + NODE_WIDTH, item.y + NODE_HEIGHT)
+            for other in rectangles:
+                separated = (
+                    rectangle[2] <= other[0]
+                    or other[2] <= rectangle[0]
+                    or rectangle[3] <= other[1]
+                    or other[3] <= rectangle[1]
+                )
+                self.assertTrue(separated)
+            rectangles.append(rectangle)
+
+    def test_reserve_slot_falls_back_to_nearest_free_slot_on_collision(self) -> None:
+        occupied = {(2, 0)}
+        result = mesh_topology_module._reserve_slot(2, 0, occupied)
+        self.assertNotEqual(result, (2, 0))
+        self.assertIn(result, occupied)
 
     def test_layout_is_deterministic_collision_free_and_scales(self) -> None:
         nodes = sample_nodes(31)
@@ -104,12 +304,15 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertTrue(compact_node_label(fallback).startswith("…"))
 
     def test_spatial_navigation_has_no_edge_wrap(self) -> None:
-        layout = build_topology(sample_nodes())
-        local = next(item for item in layout.nodes if item.node.is_local)
-        target = directional_target(local.node.node_id, layout, "up")
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        north_node = NodeMetadata(
+            "!north", "North", "N", None, 1_000.0, False, position=north_of_local(1)
+        )
+        layout = build_topology([local, north_node])
+        target = directional_target("!local", layout, "up")
         self.assertIsNotNone(target)
         assert target is not None
-        self.assertLess(target.y, local.y)
+        self.assertEqual(target.node.node_id, "!north")
         top = min(layout.nodes, key=lambda item: item.y)
         self.assertIsNone(directional_target(top.node.node_id, layout, "up"))
 
@@ -184,6 +387,85 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertEqual(plain_layout.width, emoji_layout.width)
         self.assertEqual(plain_layout.height, emoji_layout.height)
 
+    def test_emoji_labels_do_not_disturb_directional_grid_slots(self) -> None:
+        local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
+        plain_west = NodeMetadata(
+            "!west", "West Node", "W", None, 1_000.0, False, position=west_of_local(1)
+        )
+        emoji_west = NodeMetadata(
+            "!west", "🐔🍕👨‍👩‍👧‍👦 West Node", "W", None, 1_000.0, False,
+            position=west_of_local(1),
+        )
+        plain_layout = build_topology([local, plain_west])
+        emoji_layout = build_topology([local, emoji_west])
+        plain_positions = {item.node.node_id: (item.x, item.y) for item in plain_layout.nodes}
+        emoji_positions = {item.node.node_id: (item.x, item.y) for item in emoji_layout.nodes}
+        self.assertEqual(plain_positions, emoji_positions)
+
+
+class RouteConnectorTests(unittest.TestCase):
+    def test_straight_lines_use_a_single_glyph_no_elbow(self) -> None:
+        horizontal = route_connector(0, 0, 5, 0)
+        self.assertTrue(all(glyph == "─" for _x, _y, glyph in horizontal))
+        vertical = route_connector(0, 0, 0, 5)
+        self.assertTrue(all(glyph == "│" for _x, _y, glyph in vertical))
+
+    def test_same_point_has_no_cells(self) -> None:
+        self.assertEqual(route_connector(3, 3, 3, 3), ())
+
+    def test_endpoints_are_excluded(self) -> None:
+        cells = route_connector(0, 0, 4, 0)
+        points = {(x, y) for x, y, _glyph in cells}
+        self.assertNotIn((0, 0), points)
+        self.assertNotIn((4, 0), points)
+
+    def test_all_four_elbow_quadrants_use_distinct_correct_corners(self) -> None:
+        # East+South: arrives from the left, turns down.
+        se = route_connector(0, 0, 4, 3)
+        self.assertEqual(se[-3], (4, 0, "┐"))
+        # East+North: arrives from the left, turns up.
+        ne = route_connector(0, 3, 4, 0)
+        self.assertEqual(ne[-3], (4, 3, "┘"))
+        # West+South: arrives from the right, turns down.
+        sw = route_connector(4, 0, 0, 3)
+        self.assertEqual(sw[-3], (0, 0, "┌"))
+        # West+North: arrives from the right, turns up.
+        nw = route_connector(4, 3, 0, 0)
+        self.assertEqual(nw[-3], (0, 3, "└"))
+
+    def test_route_is_deterministic(self) -> None:
+        self.assertEqual(route_connector(1, 1, 9, 6), route_connector(1, 1, 9, 6))
+
+
+class MeshCanvasRenderTests(unittest.TestCase):
+    def test_dot_grid_uses_regular_spacing_and_glyph(self) -> None:
+        width, height = 20, 9
+        text = _render_mesh_canvas(width, height, (), "#222222")
+        rows = str(text).split("\n")
+        self.assertEqual(len(rows), height)
+        for y, row in enumerate(rows):
+            self.assertEqual(len(row), width)
+            for x, character in enumerate(row):
+                expected = (
+                    DOT_GRID_GLYPH
+                    if x % DOT_GRID_SPACING_X == 0 and y % DOT_GRID_SPACING_Y == 0
+                    else " "
+                )
+                self.assertEqual(character, expected)
+
+    def test_canvas_is_empty_for_a_degenerate_board(self) -> None:
+        self.assertEqual(str(_render_mesh_canvas(1, 1, (), "#222222")), "")
+
+    def test_connectors_override_the_dot_grid_at_their_cells(self) -> None:
+        connectors = ((3, 3, "─", "#ff0000"), (9, 3, "┐", "#ff0000"))
+        text = _render_mesh_canvas(20, 9, connectors, "#222222")
+        rows = str(text).split("\n")
+        self.assertEqual(rows[3][3], "─")
+        self.assertEqual(rows[3][9], "┐")
+
+    def test_canvas_is_non_focusable(self) -> None:
+        self.assertFalse(MeshCanvas.can_focus)
+
 
 class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -195,7 +477,163 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             profile_path=root / "terminal.conf",
         )
 
-    async def test_tab_renders_simulated_nodes_and_shared_local_menu(self) -> None:
+    async def test_message_older_than_mounted_chat_window_still_influences_mesh(
+        self,
+    ) -> None:
+        """A node's true last-message time must count even when CHAT's
+
+        bounded history window never loaded that old message into memory.
+        """
+        root = Path(self.temporary_directory.name)
+        db_path = root / "chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 30 * 24 * 60 * 60  # a month ago
+
+        store = ChatStore.open(db_path)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="a message from a month ago",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        for index in range(DEFAULT_HISTORY_LIMIT):
+            store.add_incoming(
+                packet_id=1000 + index,
+                node_id="!f177e001",
+                sender_name="Filler",
+                sender_short_name="FIL",
+                channel_index=0,
+                text=f"filler {index}",
+                radio_rx_at=now - index,
+                received_at=now - index,
+            )
+        store.close()
+
+        store = ChatStore.open(db_path)
+        self.addCleanup(store.close)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            # Confirm the old message genuinely fell outside CHAT's mounted
+            # window -- otherwise this test would not be exercising anything.
+            mounted_ids = {
+                entry.node_id for entry in app.chat_history if entry.node_id
+            }
+            self.assertNotIn("!a11ce001", mounted_ids)
+
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity["!a11ce001"], old_timestamp)
+
+            await pilot.press("4")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            alice = next(
+                widget
+                for widget in app.query(MeshNodeWidget)
+                if widget.node.node_id == "!a11ce001"
+            )
+            self.assertEqual(alice.display_node.last_message_at, old_timestamp)
+            self.assertEqual(alice.display_node.recency_bucket, "very_stale")
+
+    async def test_message_activity_survives_a_fresh_app_instance(self) -> None:
+        """Simulates a process restart: a new ChatStore/App reading the same
+
+        database file must still see message activity from "before".
+        """
+        root = Path(self.temporary_directory.name)
+        db_path = root / "restart_chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 10 * 24 * 60 * 60
+
+        first_process_store = ChatStore.open(db_path)
+        first_process_store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="before restart",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        first_process_store.close()
+
+        second_process_store = ChatStore.open(db_path)
+        self.addCleanup(second_process_store.close)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=second_process_store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity["!a11ce001"], old_timestamp)
+
+    async def test_mesh_query_does_not_mass_load_chat_history(self) -> None:
+        root = Path(self.temporary_directory.name)
+        db_path = root / "bounded_chat.db"
+        store = ChatStore.open(db_path)
+        for index in range(300):
+            store.add_incoming(
+                packet_id=index,
+                node_id=f"!n{index % 10:07x}",
+                sender_name="X",
+                sender_short_name="X",
+                channel_index=0,
+                text="m",
+                radio_rx_at=float(index),
+                received_at=float(index),
+            )
+        self.addCleanup(store.close)
+        calls = {"recent": 0, "older": 0}
+        original_recent = store.load_recent_page
+        original_older = store.load_older_page
+
+        def spy_recent(*args, **kwargs):
+            calls["recent"] += 1
+            return original_recent(*args, **kwargs)
+
+        def spy_older(*args, **kwargs):
+            calls["older"] += 1
+            return original_older(*args, **kwargs)
+
+        store.load_recent_page = spy_recent
+        store.load_older_page = spy_older
+
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            calls_before_query = dict(calls)
+            activity = app._mesh_last_message_activity()
+            # The aggregated per-node query must not trigger any additional
+            # bulk page load beyond whatever CHAT itself already did on mount.
+            self.assertEqual(calls, calls_before_query)
+            self.assertEqual(len(activity), 10)
+
+    async def test_outgoing_messages_never_count_as_mesh_activity(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accepted_send("hello from me")
+            await pilot.pause()
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity, {})
+
+    async def test_tab_renders_bounded_working_set_and_shared_local_menu(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -238,6 +676,80 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             only_node = list(app.query(MeshNodeWidget))
             self.assertEqual(len(only_node), 1)
             self.assertTrue(only_node[0].node.is_local)
+
+    async def test_working_set_is_bounded_and_never_shows_all_historical_nodes(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            many = [
+                NodeMetadata(
+                    radio.info.node_id,
+                    radio.info.long_name,
+                    radio.info.short_name,
+                    0,
+                    1_000.0,
+                    True,
+                )
+            ]
+            for index in range(25):
+                many.append(
+                    NodeMetadata(
+                        f"!n{index:04x}", f"Node{index}", None, None, 1_000.0 - index
+                    )
+                )
+            radio.get_known_nodes = lambda: tuple(many)
+            await pilot.press("4")
+            await pilot.pause()
+            await pilot.pause()
+            widgets = list(app.query(MeshNodeWidget))
+            self.assertEqual(len(widgets), DEFAULT_MAX_REMOTE_NODES + 1)
+
+    async def test_favorite_is_preserved_in_working_set_despite_being_oldest(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            many = [
+                NodeMetadata(
+                    radio.info.node_id,
+                    radio.info.long_name,
+                    radio.info.short_name,
+                    0,
+                    1_000.0,
+                    True,
+                )
+            ]
+            for index in range(12):
+                many.append(
+                    NodeMetadata(
+                        f"!n{index:04x}",
+                        f"Node{index}",
+                        None,
+                        None,
+                        1_000.0 - (index + 1) * 100_000,
+                    )
+                )
+            oldest_id = "!n000b"
+            self.settings.set_favorite(oldest_id, True)
+            radio.get_known_nodes = lambda: tuple(many)
+            await pilot.press("4")
+            await pilot.pause()
+            await pilot.pause()
+            ids = {widget.node.node_id for widget in app.query(MeshNodeWidget)}
+            self.assertIn(oldest_id, ids)
 
     async def test_arrow_selection_context_favorite_and_disconnected_state(self) -> None:
         radio = SimulatedRadioService(
@@ -282,7 +794,34 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
                 "NO MESH DATA — RADIO DISCONNECTED",
             )
 
-    async def test_activity_favorite_theme_and_chat_share_one_node_state(self) -> None:
+    async def test_you_solid_base_and_accent_when_selected(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            you = app.focused
+            assert isinstance(you, MeshNodeWidget)
+            self.assertTrue(you.node.is_local)
+            palette = THEME_PALETTES["white"]
+            rendered = you.render()
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent))
+            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE)
+
+            # Move away, then back, to see YOU in its unselected state.
+            await pilot.press("up")
+            await pilot.pause()
+            you.refresh_visual(selected=False, theme="white")
+            rendered = you.render()
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.base))
+            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE)
+
+    async def test_recency_and_favorite_styling_states(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -294,177 +833,65 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             app._accept_received_message(SIMULATED_MESSAGES[0])
             await pilot.press("4")
             await pilot.pause()
+            await pilot.pause()
             alice = next(
                 widget
                 for widget in app.query(MeshNodeWidget)
                 if widget.node.node_id == "!a11ce001"
             )
-            stale = next(
-                widget
-                for widget in app.query(MeshNodeWidget)
-                if widget.node.node_id == "!10a60006"
-            )
-            self.settings.set_favorite(alice.node.node_id, True)
-            self.settings.set_favorite(stale.node.node_id, True)
-            app._refresh_mesh()
-
+            self.assertEqual(alice.display_node.recency_bucket, "recent")
             palette = THEME_PALETTES["white"]
-            alice_text = alice.render()
-            stale_text = stale.render()
-            self.assertEqual(
-                alice_text.spans[0].style.foreground,
-                Color.parse(palette.accent),
-            )
-            self.assertEqual(
-                stale_text.spans[0].style.foreground,
-                Color.parse(palette.dim_base),
-            )
 
-            app._activate_node_action(alice.node.node_id, "favorite")
-            chat_alice = next(
-                widget
-                for widget in app.query(ChatEntryWidget)
-                if widget.entry.node_id == alice.node.node_id
-            )
-            self.assertTrue(chat_alice.has_class("favorite-sender"))
+            # Recent, not favorited: BASE, large stroked circle.
+            rendered = alice.render()
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.base))
+            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_STROKED_LARGE)
 
-            app._activate_user_action(chat_alice, "unfavorite")
-            self.assertFalse(self.settings.is_favorite(alice.node.node_id))
-            self.assertEqual(
-                alice.render().spans[0].style.foreground,
-                Color.parse(palette.base),
-            )
-
-            alice.refresh_visual(
-                now=(alice.node.last_heard or 0) + 300,
-                favorite=False,
-                theme="white",
-            )
-            self.assertEqual(
-                alice.render().spans[0].style.foreground,
-                Color.parse(palette.dim_base),
-            )
-
-            app._activate_node_action(alice.node.node_id, "favorite")
-
-            app._apply_color_theme("green")
-            self.assertEqual(
-                alice.render().spans[0].style.foreground,
-                Color.parse(THEME_PALETTES["green"].accent),
-            )
-
-    async def test_large_board_scrolls_both_axes_to_selected_node(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+            # Recent and favorited: FAVORITE_ACCENT, distinct from selection ACCENT.
+            self.settings.set_favorite(alice.node.node_id, True)
+            app._refresh_mesh()
             await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            rightmost = max(view.layout_model.nodes, key=lambda item: item.x)
-            bottommost = max(view.layout_model.nodes, key=lambda item: item.y)
-            view.focus_node(rightmost.node.node_id)
-            await pilot.pause()
-            right_widget = next(
+            alice = next(
                 widget
                 for widget in app.query(MeshNodeWidget)
-                if widget.node.node_id == rightmost.node.node_id
+                if widget.node.node_id == "!a11ce001"
             )
-            self.assertGreater(
-                view.scroll_x,
-                0,
-                (
-                    view.size,
-                    view.virtual_size,
-                    view.max_scroll_x,
-                    view.max_scroll_y,
-                    view.board.size,
-                    right_widget.region,
-                    right_widget.virtual_region,
-                    view.layout_model.width,
-                ),
+            rendered = alice.render()
+            self.assertEqual(
+                rendered.spans[0].style.foreground, Color.parse(palette.favorite_accent)
             )
-            view.focus_node(bottommost.node.node_id)
-            await pilot.pause()
-            self.assertGreater(view.scroll_y, 0)
+            self.assertNotEqual(palette.favorite_accent, palette.accent)
 
-    async def test_opening_mesh_centers_local_node_in_viewport(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            local_widget = next(
-                widget for widget in app.query(MeshNodeWidget) if widget.node.is_local
-            )
-            widget_center_x = local_widget.region.x + local_widget.region.width / 2
-            widget_center_y = local_widget.region.y + local_widget.region.height / 2
-            viewport_center_x = view.region.x + view.region.width / 2
-            viewport_center_y = view.region.y + view.region.height / 2
-            # Real scrolling must have been necessary for this to be meaningful.
-            self.assertGreater(view.max_scroll_x, 0)
-            self.assertLessEqual(abs(widget_center_x - viewport_center_x), NODE_WIDTH)
-            self.assertLessEqual(abs(widget_center_y - viewport_center_y), NODE_HEIGHT)
+            # Force a >48h very-stale reading: name only, no circle line.
+            far_future = SIMULATED_MESSAGES[0].radio_rx_at + 3 * 24 * 60 * 60
+            alice.refresh_visual(selected=False, theme="white")
+            from mesh_state import MeshDisplayNode
 
-    async def test_center_offsets_respect_scroll_bounds(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            rightmost = max(view.layout_model.nodes, key=lambda item: item.x)
-            view.center_node(rightmost.node.node_id)
-            await pilot.pause()
-            self.assertGreaterEqual(view.scroll_x, 0)
-            self.assertLessEqual(view.scroll_x, view.max_scroll_x)
-            bottommost = max(view.layout_model.nodes, key=lambda item: item.y)
-            view.center_node(bottommost.node.node_id)
-            await pilot.pause()
-            self.assertGreaterEqual(view.scroll_y, 0)
-            self.assertLessEqual(view.scroll_y, view.max_scroll_y)
-
-    async def test_small_topology_does_not_invent_scrolling_when_centered(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            radio.get_known_nodes = lambda: (
-                NodeMetadata(
-                    radio.info.node_id,
-                    radio.info.long_name,
-                    radio.info.short_name,
-                    0,
-                    1_000.0,
-                    True,
-                ),
+            very_stale = MeshDisplayNode(
+                node=alice.node,
+                last_message_at=SIMULATED_MESSAGES[0].radio_rx_at,
+                reference_activity=SIMULATED_MESSAGES[0].radio_rx_at,
+                favorite=True,
+                relationship_kind="direct",
+                recency_bucket="very_stale",
             )
-            await pilot.press("4")
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            self.assertEqual(view.max_scroll_x, 0)
-            self.assertEqual(view.max_scroll_y, 0)
-            self.assertEqual(view.scroll_x, 0)
-            self.assertEqual(view.scroll_y, 0)
+            alice.display_node = very_stale
+            alice.refresh_visual(selected=False, theme="white")
+            rendered = alice.render()
+            # Label plus a lone trailing newline: no second-line glyph at all.
+            self.assertEqual(rendered.plain, "Alice Trail\n")
+            self.assertEqual(
+                rendered.spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+            # Selection always overrides Favorite/staleness, and always shows
+            # a circle even for an otherwise glyph-less very-stale node.
+            alice.refresh_visual(selected=True, theme="white")
+            rendered = alice.render()
+            self.assertEqual(
+                rendered.spans[0].style.foreground, Color.parse(palette.accent)
+            )
+            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_STROKED_LARGE)
 
     async def test_refresh_preserves_selected_remote_node_metadata_change(self) -> None:
         radio = SimulatedRadioService(
@@ -485,9 +912,6 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             selected_id = selected.node.node_id
             self.assertFalse(selected.node.is_local)
 
-            # A long_name-only change is a metadata change that forces
-            # set_nodes() to rebuild widgets (it is part of the rebuild
-            # signature), without moving any node's hop layer/grid slot.
             base_nodes = radio.get_known_nodes()
             changed_nodes = tuple(
                 NodeMetadata(
@@ -567,18 +991,14 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
 
             # Move to the topmost node, where "up" has no candidate.
             top = min(view.layout_model.nodes, key=lambda item: item.y)
-            view.focus_node(top.node.node_id)
+            view.select_node(top.node.node_id)
             await pilot.pause()
             focused_before = app.focused
-            scroll_before = (view.scroll_x, view.scroll_y)
             await pilot.press("up")
             await pilot.pause()
             self.assertIs(app.focused, focused_before)
-            self.assertEqual((view.scroll_x, view.scroll_y), scroll_before)
 
-    async def test_focus_node_does_not_scroll_when_target_already_visible(
-        self,
-    ) -> None:
+    async def test_mouse_wheel_does_not_pan_mesh(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -590,45 +1010,41 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("4")
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
-            local = next(
-                item for item in view.layout_model.nodes if item.node.is_local
-            )
-            view.center_node(local.node.node_id)
-            await pilot.pause()
-            scroll_before = (view.scroll_x, view.scroll_y)
-            # The node is already fully visible (just centered), so refocusing
-            # it via the plain (non-centering) navigation path must not scroll.
-            view.focus_node(local.node.node_id)
-            await pilot.pause()
-            self.assertEqual((view.scroll_x, view.scroll_y), scroll_before)
-
-    async def test_mouse_wheel_still_scrolls_mesh_view(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            view.scroll_to(x=0, y=0, animate=False, force=True, immediate=True)
-            await pilot.pause()
+            board_offset_before = view.board.styles.offset
+            # A plain Container has no functional scroll/overflow behavior,
+            # so a wheel event is simply a no-op -- the board never moves.
             view._on_mouse_scroll_down(
                 MouseScrollDown(view, 1, 1, 0, 1, 0, False, False, False)
             )
             await pilot.pause()
-            self.assertGreater(view.scroll_y, 0)
+            self.assertEqual(view.board.styles.offset, board_offset_before)
 
-    async def test_container_focus_recovers_to_node_on_arrow_press(self) -> None:
-        """Regression test: the ScrollableContainer must never win arrow keys.
+    async def test_no_scrollbars_are_present_on_mesh(self) -> None:
+        from textual.containers import ScrollableContainer
 
-        This reproduces the root cause of the uConsole bug: if MeshTopologyView
-        itself ever holds keyboard focus (rather than a node), pressing an
-        arrow key must recover focus onto a node instead of silently scrolling
-        via the container's inherited ScrollableContainer bindings.
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(42, 15)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertNotIsInstance(view, ScrollableContainer)
+            self.assertFalse(view.show_vertical_scrollbar)
+            self.assertFalse(view.show_horizontal_scrollbar)
+            self.assertEqual(view.styles.overflow_x, "hidden")
+            self.assertEqual(view.styles.overflow_y, "hidden")
+
+    async def test_board_size_is_bounded_regardless_of_working_set(self) -> None:
+        """The grid radius is fixed, so board size never grows past a fixed
+
+        bound even with the maximum working set and no scrolling exists to
+        reach anything beyond it -- see MeshTopologyView's docstring for why
+        radius is fixed rather than adapted from live viewport size.
         """
         radio = SimulatedRadioService(
             connect_delay=0,
@@ -636,58 +1052,112 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             scripted_messages=(),
         )
         app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             await pilot.press("4")
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
-            view.focus()
-            await pilot.pause()
-            self.assertIsInstance(app.focused, MeshTopologyView)
-            await pilot.press("down")
-            await pilot.pause()
-            self.assertIsInstance(app.focused, MeshNodeWidget)
+            cell_width = NODE_WIDTH + HORIZONTAL_GAP
+            cell_height = NODE_HEIGHT + VERTICAL_GAP
+            max_span = 2 * DEFAULT_MAX_GRID_RADIUS + 3  # radius + collision slack
+            self.assertLessEqual(view.layout_model.width, cell_width * max_span)
+            self.assertLessEqual(view.layout_model.height, cell_height * max_span)
 
-    async def test_horizontal_and_vertical_scrollbar_use_matching_thin_renderer(
-        self,
-    ) -> None:
+    async def test_you_to_node_connectors_are_you_origin_only(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
             scripted_messages=(),
         )
         app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             await pilot.press("4")
             await pilot.pause()
+            await pilot.pause()
             view = app.query_one(MeshTopologyView)
-            self.assertIs(view.vertical_scrollbar.renderer, ThinScrollBarRender)
-            self.assertIs(view.horizontal_scrollbar.renderer, ThinScrollBarRender)
+            local_item = next(
+                item for item in view.layout_model.nodes if item.node.is_local
+            )
+            local_center = (
+                local_item.x + NODE_WIDTH // 2,
+                local_item.y + NODE_HEIGHT // 2,
+            )
+            canvas = app.query_one(MeshCanvas)
+            signature = canvas._signature
+            assert signature is not None
+            connectors = signature[2]
+            self.assertTrue(connectors)
+            # Every connector must trace back to a straight/elbow path that
+            # actually originates or ends at YOU's center -- never a
+            # fabricated node-to-node edge.
+            for item in view.layout_model.nodes:
+                if item.node.is_local:
+                    continue
+                node_center = (item.x + NODE_WIDTH // 2, item.y + NODE_HEIGHT // 2)
+                expected = route_connector(*local_center, *node_center)
+                if not expected:
+                    continue
+                for x, y, glyph in expected:
+                    self.assertTrue(
+                        any(cx == x and cy == y and cg == glyph for cx, cy, cg, _c in connectors)
+                    )
 
-    async def test_mesh_scrollbar_theme_colors_match_palette_on_both_axes(
-        self,
-    ) -> None:
+    async def test_selected_connector_uses_accent_others_use_dim_base(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
             scripted_messages=(),
         )
         app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             await pilot.press("4")
             await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.pause()
+            canvas = app.query_one(MeshCanvas)
+            signature = canvas._signature
+            assert signature is not None
+            connectors = signature[2]
+            palette = THEME_PALETTES["white"]
+            colors = {color for _x, _y, _glyph, color in connectors}
+            self.assertIn(palette.accent, colors)
+            self.assertTrue(colors - {palette.accent} <= {palette.dim_base})
+
+    async def test_context_status_line_you_and_remote(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.press("4")
+            await pilot.pause()
+            await pilot.pause()
+            you_status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(you_status.startswith("YOU · CONNECTED TO "))
+            self.assertNotIn("--", you_status)
+
+            alice = next(
+                widget
+                for widget in app.query(MeshNodeWidget)
+                if widget.node.node_id == "!a11ce001"
+            )
             view = app.query_one(MeshTopologyView)
-            for theme, palette in THEME_PALETTES.items():
-                app._apply_color_theme(theme)
-                await pilot.pause()
-                self.assertEqual(view.styles.scrollbar_size_vertical, 1)
-                self.assertEqual(view.styles.scrollbar_size_horizontal, 1)
-                self.assertEqual(view.styles.scrollbar_color.hex, palette.base)
-                self.assertEqual(
-                    view.styles.scrollbar_background.hex, palette.dim_base
-                )
+            view.select_node(alice.node.node_id)
+            await pilot.pause()
+            await pilot.pause()
+            remote_status = str(app.query_one("#mesh-context-status").render())
+            self.assertIn("Alice Trail", remote_status)
+            self.assertIn(" · ", remote_status)
+            self.assertNotIn(" - ", remote_status)
+            self.assertIn("HOP", remote_status)
+            self.assertIn("LAST MESSAGE", remote_status)
 
     async def test_emoji_node_labels_render_without_corrupting_board_geometry(
         self,
@@ -698,7 +1168,7 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             scripted_messages=(),
         )
         app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             base_nodes = radio.get_known_nodes()
             emoji_labels = (
@@ -724,62 +1194,17 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("4")
             await pilot.pause()
 
-            view = app.query_one(MeshTopologyView)
             widgets = list(app.query(MeshNodeWidget))
             self.assertEqual(len(widgets), len(emoji_nodes))
             for widget in widgets:
                 label_line = str(widget.render()).splitlines()[0]
                 self.assertLessEqual(cell_len(label_line), NODE_WIDTH)
-            self.assertGreaterEqual(view.max_scroll_x, 0)
-            self.assertGreaterEqual(view.max_scroll_y, 0)
-            self.assertIs(view.horizontal_scrollbar.renderer, ThinScrollBarRender)
-            self.assertIs(view.vertical_scrollbar.renderer, ThinScrollBarRender)
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):
-    def test_horizontal_thin_render_matches_vertical_glyph_style(self) -> None:
-        rendered = ThinScrollBarRender.render_bar(
-            size=10,
-            virtual_size=30,
-            window_size=10,
-            position=5,
-            thickness=1,
-            vertical=False,
-            back_color=RichColor.parse(THEME_PALETTES["white"].dim_base),
-            bar_color=RichColor.parse("#39ff14"),
-        )
-        thumb_segments = [
-            segment
-            for segment in rendered.segments
-            if segment.style is not None
-            and segment.style.meta.get("@mouse.down") == "grab"
-        ]
-        track_segments = [
-            segment
-            for segment in rendered.segments
-            if segment.text != "\n" and segment not in thumb_segments
-        ]
-        self.assertTrue(thumb_segments)
-        self.assertTrue(track_segments)
-        self.assertTrue(
-            all(
-                segment.text == HORIZONTAL_SCROLLBAR_THUMB_GLYPH
-                for segment in thumb_segments
-            )
-        )
-        self.assertTrue(
-            all(
-                segment.text == HORIZONTAL_SCROLLBAR_THUMB_GLYPH
-                for segment in track_segments
-            )
-        )
-        self.assertTrue(all(segment.cell_length == 1 for segment in thumb_segments))
-        self.assertTrue(all(segment.cell_length == 1 for segment in track_segments))
-        self.assertNotEqual(
-            HORIZONTAL_SCROLLBAR_THUMB_GLYPH, CHAT_SCROLLBAR_THUMB_GLYPH
-        )
+    def test_vertical_thin_render_uses_the_thin_glyph(self) -> None:
+        from rich.color import Color as RichColor
 
-    def test_vertical_thin_render_is_unchanged_by_horizontal_support(self) -> None:
         rendered = ThinScrollBarRender.render_bar(
             size=10,
             virtual_size=30,

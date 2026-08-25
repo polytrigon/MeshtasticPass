@@ -5,6 +5,7 @@ from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
+from geo import GeoPosition
 from radio_service import (
     ChannelInfo,
     RadioConnectionError,
@@ -276,6 +277,11 @@ class RadioServiceTests(unittest.TestCase):
             },
             "hopsAway": 1,
             "lastHeard": 900.0,
+            "position": {
+                "latitude": 40.7736,
+                "longitude": -73.9566,
+                "time": 1_700_000_100.0,
+            },
         }
         interface.nodesByNum[0xB0B00002] = {
             "user": {"shortName": "BOB"},
@@ -297,10 +303,14 @@ class RadioServiceTests(unittest.TestCase):
         self.assertEqual(alice.long_name, "Alice Trail")
         self.assertEqual(alice.hops_away, 1)
         self.assertEqual(alice.last_heard, 950.0)
+        self.assertEqual(
+            alice.position, GeoPosition(40.7736, -73.9566, 1_700_000_100.0)
+        )
         bob = next(node for node in nodes if node.short_name == "BOB")
         self.assertEqual(bob.node_id, "!b0b00002")
         self.assertIsNone(bob.hops_away)
         self.assertIsNone(bob.last_heard)
+        self.assertIsNone(bob.position)
         observed = next(node for node in nodes if node.node_id == "!new00004")
         self.assertIsNone(observed.hops_away)
         self.assertEqual(observed.last_heard, 975.0)

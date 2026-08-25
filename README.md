@@ -145,48 +145,101 @@ delivers a newer receiver-timestamped packet before an older one. CHAT inserts
 the second packet into chronological position and shows
 `1 OLDER MESSAGE RECEIVED`, so delayed ordering is visible without hardware.
 
-### Passive MESH topology board
+### Passive MESH board: a bounded, YOU-centered working set
 
-Press `4` to open MESH. The board places `YOU` at its center, arranges nodes
-with trustworthy Meshtastic `hopsAway` values in deterministic hop layers, and
-puts unknown-hop nodes in an outer layer. This is a topology view, not a map:
-positions do not imply GPS location or physical direction, and the app draws no
-link or route unless a future trustworthy data source can support one.
+Press `4` to open MESH. MESH is **not** an all-time catalog of every node the
+radio has ever seen — it shows a bounded, deliberately small working set (YOU
+plus up to 8 remote nodes) of the mesh context most relevant right now. A
+larger known population is ranked, not dumped onto the board; the ranking, in
+order, is: recent (within 24h) received-message activity, then Favorite
+state, then last-known-activity recency, then a stable Node ID tie-break.
+(Trustworthy relay/routing relevance would sit between the first two tiers,
+but the Meshtastic Python SDK integration this app uses does not expose a
+trustworthy per-hop relay path — only `hopsAway`, a proximity count — so that
+signal is not used; see `mesh_state.py`'s module docstring.) When nothing
+recent has happened, the board still shows something useful: ranking falls
+through to Favorites and then last-heard recency rather than going blank, so
+MESH reflects the most recently useful known state instead of an empty board.
+It never renders the full historical node database.
 
-Active nodes use the current theme's BASE color. Nodes not heard within the
-same exact five-minute window used by CHAT's ACTIVE count use DIM_BASE. An
-active Favorite uses ACCENT for its label; stale Favorites stay dim so activity
-truth remains visible. Long Name is preferred when it fits, then Short Name,
-then an abbreviated Node ID. Missing metadata is omitted rather than invented.
-Labels are truncated by measured terminal cell width rather than Python
-character count, and truncation never severs a multi-codepoint emoji sequence
-(joiners, skin-tone modifiers, flag pairs), so wide or emoji-containing names
-stay inside their node box instead of corrupting neighboring layout.
+`YOU` is fixed at the board's visual center and is always selected on entry.
+Layout is a schematic relative grid, not a literal map. When both YOU and a
+remote node have trustworthy position data, that node is placed by compass
+direction (one of eight 45° buckets) relative to YOU, and nodes in the same
+direction are ordered outward by real distance as a discrete grid-step rank
+(nearest = 1 step, next = 2, and so on) rather than proportional miles — a
+node 4x farther away does not sit 4x farther out visually, and the grid
+radius is clamped so one very distant node can never explode the board. A
+remote node without a resolvable bearing — either it or YOU lacks trustworthy
+position data — goes to a deterministic slot around the board's outer ring
+instead of a fabricated direction; its context menu can reveal that position
+is unavailable, but the board never labels it "UNKNOWN". Bearing is never
+inferred from `hopsAway`, RSSI, SNR, arrival order, or node ID. MESH remains
+a topology view, not a map: no lat/lon-derived screen coordinates, roads, or
+exact scale.
 
-Opening MESH selects and centers `YOU` in the viewport on both axes (clamped
-to the board's actual scroll bounds; a board smaller than the viewport never
-invents scrolling). Use all four arrow keys for spatial selection via the same
-node-navigation logic that owns arrow keys on this tab; they never fall back to
-plain viewport scrolling, even if focus is ever lost from a node. Navigation
-does not wrap at the board edges — no candidate in a direction is a no-op — and
-the two-axis viewport scrolls only as needed to keep the newly selected node
-visible. Mouse selection and the mouse wheel keep working normally. A
-metadata-only refresh (e.g. a renamed node) preserves the current selection
-instead of snapping back to `YOU`. Enter opens the shared node context menu
-used by CHAT; remote nodes show available identity, hop, receiver-age, and
-Favorite controls. `YOU` shows local identity only and cannot be favorited.
-Opening MESH and its menu only read the SDK's already synced node
-database—they do not request positions, probe nodes, or transmit LoRa
+MESH does not scroll or pan, and has no scrollbars — CHAT and CONNECTION's
+scrollbars are unchanged. The working set is small enough, and the grid
+radius fixed enough, that the whole board is designed to fit one viewport;
+arrow keys are the only navigation. Up/Down/Left/Right move node-to-node
+selection using the same spatial logic in either direction; no candidate in
+that direction is a no-op, never a scroll. Mouse click still selects a node,
+but the mouse wheel does not pan the canvas. A metadata-only refresh (e.g. a
+renamed node) preserves the current selection instead of snapping back to
+`YOU`.
+
+A subtle static dot grid (`·`, theme DIM_BASE at ~10% intensity, roughly every
+6 columns and 3 rows) renders procedurally behind the nodes and behind simple
+orthogonal connector lines from YOU to each currently relevant node — one
+background widget for the whole board, never one widget per dot or per line
+segment. A connector means "this node is currently part of the relevant local
+mesh context," not proven RF adjacency or a routing edge; MESH never draws a
+fabricated node-to-node edge, only YOU-to-node. Every node center sits exactly
+on a grid dot, and the node glyph visually covers the dot underneath it.
+
+Node visual state communicates freshness and role at a glance:
+
+- `YOU`: large solid circle, BASE (ACCENT when selected).
+- Recent (message activity within 24h): large stroked circle, BASE — or
+  FAVORITE_ACCENT if favorited, a color distinct from selection ACCENT.
+- Stale (24–48h): the same stroked circle, DIM_BASE — including a stale
+  Favorite, so staleness truth is never hidden by Favorite emphasis.
+- Very stale (>48h): name only — no circle, no connector — a "ghost/history
+  context" state, unless selected (selection always shows a clear circle so
+  the current focus is never ambiguous).
+- Relay/helper (only when the app has trustworthy evidence a node relayed
+  recent traffic without sending a message itself): smaller circle,
+  DIM_BASE. No current Meshtastic SDK data proves this, so nothing produces
+  this state yet; the architecture (`relationship_kind`) is ready for a
+  future trustworthy source without a model change.
+
+Selection (ACCENT) always overrides Favorite and staleness styling for
+clarity, without erasing the freshness truth shown elsewhere (e.g. the
+context line below). Long Name is preferred when it fits, then Short Name,
+then an abbreviated Node ID, shown above the node glyph. Labels are truncated
+by measured terminal cell width rather than Python character count, and
+truncation never severs a multi-codepoint emoji sequence (joiners, skin-tone
+modifiers, flag pairs) or disturbs a node's grid alignment.
+
+A minimal context line above the footer summarizes the current selection
+using only fields MESH actually knows, middle-dot separated:
+`YOU · CONNECTED TO 5` or `ALICE · 2 HOPS AWAY · LAST MESSAGE 15m`. Enter
+opens the shared node context menu used by CHAT; remote nodes show available
+identity, hop, receiver-age, and Favorite controls. `YOU` shows local
+identity only and cannot be favorited. `MESH · ACTIVE N` in the header keeps
+CHAT's five-minute activity semantics over the full known-node population —
+a different concept from the 24h/48h freshness styling above, which applies
+only to the bounded working set actually on the board. Opening MESH and its
+menu only read the SDK's already synced node database and CHAT's own receive
+history — they do not request positions, probe nodes, or transmit LoRa
 packets. While disconnected, the board says
 `NO MESH DATA — RADIO DISCONNECTED` instead of displaying stale topology as
 current.
 
-MESH's horizontal scrollbar uses the same thin single-cell renderer as its
-vertical scrollbar (and CHAT's), rather than Textual's thicker default.
-
-For a hardware-free review, run `python app.py --simulate`, press `4`, navigate
-the stable one-hop, two-hop, unknown-hop, active, stale, and missing-name nodes,
-and verify Favorite changes are also visible in CHAT.
+For a hardware-free review, run `python app.py --simulate`, press `4`, and
+navigate the working set: directional nodes to the northeast and southeast of
+YOU, unknown-position nodes around the outer ring, and active vs. stale
+coloring; verify Favorite changes are also visible in CHAT.
 
 CHAT keeps its one-cell scrollbar allocation. Both the darker track and BASE
 thumb use the same right-aligned narrow Unicode `▕` glyph through Textual's
@@ -539,8 +592,9 @@ send_message.py    One-shot real or simulated text sender
 app.py             Keyboard-first Textual application
 app_controller.py  Non-visual chat state and radio monitor
 chat_store.py      Versioned SQLite CHAT history and send attempts
-mesh_topology.py   Pure deterministic MESH layout and arrow navigation
-geo.py             Position validation, Haversine distance, and mile formatting
+mesh_topology.py   Pure deterministic MESH grid layout and arrow navigation
+mesh_state.py      MESH bounded working-set ranking and freshness classification
+geo.py             Position validation, Haversine distance, bearing, and mile formatting
 app_settings.py    Persistent user settings and LXTerminal profile updates
 install-launcher.sh  Reproducible uConsole menu/fullscreen setup
 radio_service.py   All Meshtastic connection and device-info logic

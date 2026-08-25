@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import asin, cos, isfinite, radians, sin, sqrt
+from math import asin, atan2, cos, degrees, isfinite, radians, sin, sqrt
 from typing import Any
 
 
@@ -55,6 +55,32 @@ def haversine_miles(first: GeoPosition, second: GeoPosition) -> float:
     )
     central_angle = 2 * asin(min(1.0, sqrt(haversine)))
     return EARTH_RADIUS_MILES * central_angle
+
+
+def bearing_degrees(origin: GeoPosition, target: GeoPosition) -> float:
+    """Return the initial great-circle bearing from origin to target.
+
+    0 = north, 90 = east, 180 = south, 270 = west.
+    """
+    origin_latitude = radians(origin.latitude)
+    target_latitude = radians(target.latitude)
+    longitude_delta = radians(target.longitude - origin.longitude)
+
+    x = sin(longitude_delta) * cos(target_latitude)
+    y = cos(origin_latitude) * sin(target_latitude) - sin(origin_latitude) * cos(
+        target_latitude
+    ) * cos(longitude_delta)
+    return degrees(atan2(x, y)) % 360.0
+
+
+def bearing_and_distance(
+    origin: GeoPosition | None,
+    target: GeoPosition | None,
+) -> tuple[float, float] | None:
+    """Return (bearing degrees, distance miles), only when both positions exist."""
+    if origin is None or target is None:
+        return None
+    return bearing_degrees(origin, target), haversine_miles(origin, target)
 
 
 def distance_between(

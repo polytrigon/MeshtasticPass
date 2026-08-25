@@ -279,6 +279,7 @@ class SimulatedRadioService:
                     node.short_name,
                     node.hops_away,
                     self._node_last_heard(node),
+                    position=node.position,
                 )
         return NodeMetadata(node_id.strip())
 
@@ -293,6 +294,7 @@ class SimulatedRadioService:
             0,
             self._activity_reference_time,
             True,
+            position=SIMULATED_LOCAL_POSITION,
         )
         remotes = tuple(
             NodeMetadata(
@@ -301,6 +303,7 @@ class SimulatedRadioService:
                 node.short_name,
                 node.hops_away,
                 self._node_last_heard(node),
+                position=node.position,
             )
             for node in SIMULATED_NODES
         )
