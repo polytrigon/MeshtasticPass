@@ -1977,6 +1977,68 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(still_reloaded.delivery_state, DeliveryState.INTERRUPTED)
             self.assertEqual(third_radio.sent_messages, ())
 
+    async def test_legacy_sending_row_seeded_outside_the_app_is_interrupted_on_fresh_start(
+        self,
+    ) -> None:
+        """The closest reproduction of the real uConsole report: a
+
+        SENDING row that predates this app instance entirely -- seeded
+        directly against the database, never through an app that then
+        shuts down -- must already read INTERRUPTED by the time CHAT
+        hydrates it, because ChatStore.open() itself repairs the
+        persisted row before any history load happens (see
+        ChatStore.reconcile_abandoned_sending()). Also proves the fix
+        survives a normal history refresh/tab switch and a second
+        restart, and that reopening never causes a retransmission.
+        """
+        seeding_store = ChatStore.open(self.chat_db_path)
+        legacy_message_id = seeding_store.add_outgoing(
+            text="abandoned before this app version existed",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENDING",
+        )
+        seeding_store.add_send_attempt(legacy_message_id, 100.0, "SENDING")
+        seeding_store.close()
+
+        store = ChatStore.open(self.chat_db_path)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app.chat_history[-1]
+            self.assertEqual(entry.delivery_state, DeliveryState.INTERRUPTED)
+            widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry is entry
+            )
+            self.assertIn("INTERRUPTED", str(widget.delivery_label.render()))
+            self.assertEqual(radio.sent_messages, ())
+
+            app.show_tab("connection")
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertEqual(app.chat_history[-1].delivery_state, DeliveryState.INTERRUPTED)
+
+        check = ChatStore.open(self.chat_db_path)
+        raw_state = check.load_recent()[-1].delivery_state
+        check.close()
+        self.assertEqual(raw_state, "INTERRUPTED")
+
+        second_store = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(
+                second_app.chat_history[-1].delivery_state, DeliveryState.INTERRUPTED
+            )
+            self.assertEqual(second_radio.sent_messages, ())
+
     # ---- RECONNECTING message bar --------------------------------------
 
     async def test_reconnecting_disables_chat_input_and_shows_status(self) -> None:

@@ -2172,20 +2172,23 @@ class MeshtasticPassApp(App[None]):
 
         this process owns, before the store closes.
 
-        stored_chat_entry() already reconciles a stale SENDING row to
-        INTERRUPTED whenever it is loaded from disk -- but that is a
-        read-time, in-memory-only correction; the persisted row itself
-        still says SENDING until something writes over it. Doing that
-        write here, at the one point this process definitely knows a
-        message will never resolve on its own again (its own send
-        lifecycle -- the ACK/NAK callback, the confirmation-deadline
-        timer -- is about to stop existing along with the process),
-        makes the persisted data itself correct rather than relying
-        solely on every future reader to re-derive it. Runs after
-        _monitor.stop() so no late radio callback can race a write in
-        after this pass runs. Every channel's entries are checked, not
-        just the currently displayed one -- a send can be left in
-        flight in a channel the user has since switched away from.
+        This is additional cleanup, not the authoritative fix:
+        correctness no longer depends on it. ChatStore.open() now
+        rewrites any abandoned SENDING row to INTERRUPTED directly in
+        SQLite the moment a store is opened -- covering every row in
+        the database regardless of channel, pagination, or whether
+        anything is currently loaded into memory (see
+        ChatStore.reconcile_abandoned_sending()), which is what actually
+        repairs a row this process never even loads. What this method
+        adds on top: while this process is still running, catching a
+        send up front (before the NEXT process's startup reconciliation
+        would) means a row this process gives up on shows INTERRUPTED
+        immediately rather than sitting as SENDING until the next
+        restart. Runs after _monitor.stop() so no late radio callback
+        can race a write in after this pass runs. Every channel's
+        entries are checked, not just the currently displayed one -- a
+        send can be left in flight in a channel the user has since
+        switched away from.
         """
         if self.chat_store is None:
             return
