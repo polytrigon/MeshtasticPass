@@ -19,6 +19,7 @@ from textual.events import MouseScrollDown
 from textual.widgets import Input, Static
 
 from app import (
+    ANIMATED_STATUS,
     TAB_NAMES,
     ConnectionPage,
     ChatTranscript,
@@ -2531,7 +2532,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 [e.text for e in app.chat_history],
             )
 
-    # ---- RECONNECTING message bar --------------------------------------
+    # ---- Connection-status consistency (CHAT top heading) --------------
 
     async def test_reconnecting_disables_chat_input_and_shows_status(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -2543,8 +2544,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._show_connection(RadioState.OFFLINE, message="lost")
             await pilot.pause()
             self.assertTrue(chat_input.disabled)
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", heading)
+            # Connection status no longer appears at the bottom at all.
             status = str(app.query_one("#send-error", Static).render())
-            self.assertIn("RECONNECTING", status)
+            self.assertNotIn("RECONNECTING", status)
+            self.assertNotIn("STATUS", status)
+            self.assertNotIn("CONNECTING", status)
 
     async def test_reconnecting_blocks_send_even_if_submitted_is_forced(self) -> None:
         """Belt-and-suspenders: even if an Input.Submitted event somehow
@@ -2605,8 +2611,74 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertFalse(chat_input.disabled)
             self.assertEqual(chat_input.value, "Meet at 8?")
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn("CHAT ·", heading)
+            self.assertNotIn("STATUS", heading)
             status = str(app.query_one("#send-error", Static).render())
             self.assertNotIn("RECONNECTING", status)
+
+    async def test_chat_never_shows_reconnecting_while_connection_shows_connecting(
+        self,
+    ) -> None:
+        """The exact bug report: CONNECTION/CONFIG and CHAT must never
+
+        describe the same radio state differently. There is no
+        RECONNECTING state in RadioState at all -- a dropped connection
+        re-enters RadioState.CONNECTING exactly like the first attempt
+        (see radio_service.connection_events()) -- so both must show
+        the identical "STATUS CONNECTING..." wording, never "CONNECTING"
+        in one place and "RECONNECTING" in another.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+
+            connection_status = str(app.query_one("#connection-status", Static).render())
+            chat_heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn("CONNECTING", connection_status)
+            self.assertIn("STATUS CONNECTING", chat_heading)
+            self.assertNotIn("RECONNECTING", chat_heading)
+            self.assertNotIn("RECONNECTING", connection_status)
+
+    async def test_chat_and_connection_agree_for_every_non_online_state(self) -> None:
+        """Every RadioState CONNECTION/CONFIG can show, CHAT must echo
+
+        verbatim (as "STATUS <value>...") -- proving they share one
+        source (_connection_status_text) rather than each interpreting
+        self._radio_state on its own.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for state in (RadioState.CONNECTING, RadioState.OFFLINE, RadioState.ERROR):
+                with self.subTest(state=state):
+                    app._show_connection(state, message="detail")
+                    await pilot.pause()
+                    chat_heading = str(app.query_one("#chat-title", Static).render())
+                    self.assertIn(f"STATUS {ANIMATED_STATUS[state]}", chat_heading)
+
+    async def test_chat_dot_animation_advances_in_sync_with_connection_page(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            first = str(app.query_one("#chat-title", Static).render())
+
+            app._advance_connection_animation()
+            await pilot.pause()
+            second = str(app.query_one("#chat-title", Static).render())
+            self.assertNotEqual(first, second)
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", second)
 
     async def test_displaying_reconnecting_generates_no_radio_traffic(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -2618,6 +2690,76 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._show_connection(RadioState.CONNECTING)
             await pilot.pause()
             self.assertEqual(radio.sent_messages, ())
+
+    async def test_chat_heading_restores_actual_current_channel_not_hardcoded(
+        self,
+    ) -> None:
+        """Startup -> connected -> connection lost -> reconnected, using
+
+        the app's REAL connect flow throughout (never a hand-built
+        RadioInfo) -- the restored heading must reflect the actual
+        current channel through the existing channel-heading logic, not
+        a hardcoded string.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            for _ in range(5):
+                await pilot.pause()
+                if app._radio_state is RadioState.ONLINE:
+                    break
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertNotIn("STATUS", heading)
+
+            radio.simulate_disconnect()
+            for _ in range(10):
+                await pilot.pause()
+                if app._radio_state is RadioState.OFFLINE:
+                    break
+            self.assertEqual(app._radio_state, RadioState.OFFLINE)
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", heading)
+            self.assertNotIn("LongFast", heading)
+
+            radio.simulate_reconnect()
+            for _ in range(10):
+                await pilot.pause()
+                if app._radio_state is RadioState.ONLINE:
+                    break
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertNotIn("STATUS", heading)
+
+    async def test_switching_tabs_during_connecting_shows_identical_status(
+        self,
+    ) -> None:
+        """If the user switches tabs while connecting, CHAT and MESH must
+
+        show the exact same status text -- proving both derive from the
+        one shared source rather than each independently formatting it.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            chat_heading = str(app.query_one("#chat-title", Static).render())
+
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            mesh_heading = str(app.query_one("#mesh-connection-status", Static).render())
+
+            self.assertEqual(chat_heading, mesh_heading)
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", mesh_heading)
 
     # ---- Empty-message error lifecycle ---------------------------------
 

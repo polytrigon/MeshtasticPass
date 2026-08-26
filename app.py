@@ -2112,11 +2112,14 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
             with Vertical(id="mesh", classes="tab-page"):
-                yield Static(
-                    "NO MESH DATA — RADIO DISCONNECTED",
-                    id="mesh-status",
-                    markup=False,
-                )
+                # Shown/hidden and populated by _update_chat_connection_state()
+                # with the exact same _connection_status_text() CHAT's
+                # heading uses -- never MESH-specific terminology. Not the
+                # removed permanent "> MESH · ACTIVE N" heading: this
+                # exists ONLY while a connection state needs to be
+                # communicated, and collapses to nothing otherwise.
+                yield Static(id="mesh-connection-status", classes="page-title", markup=False)
+                yield Static(id="mesh-status", markup=False)
                 yield MeshTopologyView()
                 yield Static(id="mesh-context-status", markup=False)
         yield Static("1-3 switch tabs    F4 quit", id="footer")
@@ -3061,13 +3064,20 @@ class MeshtasticPassApp(App[None]):
             return
         if self.current_tab != "mesh":
             return
+        if self._radio_state is not RadioState.ONLINE:
+            # Stale topology intentionally stays visible while
+            # connecting/reconnecting -- the shared top-of-view
+            # connection status (see _update_chat_connection_state/
+            # _connection_status_text) already communicates "not live
+            # right now"; clearing or rebuilding the board here would be
+            # a needless reshuffle of useful stale data over a
+            # connection-status change alone. Never MESH-specific
+            # wording like the old "RADIO DISCONNECTED" either -- that
+            # was exactly the kind of independent reinterpretation this
+            # is meant to eliminate.
+            return
         view = views[0]
         status = statuses[0]
-        if self._radio_state is not RadioState.ONLINE:
-            view.clear_nodes()
-            status.update("NO MESH DATA — RADIO DISCONNECTED")
-            self._update_mesh_context_status()
-            return
         current_time = time() if wall_now is None else wall_now
         working_set = self._mesh_working_set()
         if not working_set:
@@ -3907,28 +3917,66 @@ class MeshtasticPassApp(App[None]):
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
 
-    def _update_chat_connection_state(self) -> None:
-        """Disable CHAT message entry/sending while the radio isn't ONLINE.
+    def _connection_status_text(self) -> str:
+        """The single authoritative connection-status line CHAT and MESH
 
-        Purely observational: reacts to the already-authoritative
-        self._radio_state (see _show_connection) and never triggers a
-        new connection attempt or any other radio traffic on its own.
-        The input's own `.value` (the draft) is never touched here --
-        Textual's `disabled` only affects focus/interaction, so a draft
-        typed before a drop survives completely untouched and is
-        exactly what the user sees once connection is restored.
+        show at the top of their view while the radio isn't ONLINE.
+
+        Built from the EXACT SAME ANIMATED_STATUS mapping and
+        _status_dot_count animation counter CONNECTION/CONFIG's own
+        status row already uses (see _render_connection_details) --
+        never a tab-specific reinterpretation. This is why CHAT could
+        previously show "RECONNECTING..." while CONNECTION/CONFIG showed
+        "CONNECTING...": CHAT's old _render_chat_status() hardcoded its
+        own literal string instead of reading this shared value. There
+        is no separate RECONNECTING state in RadioState -- a dropped
+        connection re-enters RadioState.CONNECTING exactly like the
+        first attempt (see radio_service.connection_events()), so both
+        report identically here too. Returns "" when ONLINE (nothing to
+        show; callers should hide/restore their normal presentation).
         """
-        widgets = list(self.query("#chat-input"))
-        if not widgets:
-            return
-        widgets[0].disabled = self._radio_state is not RadioState.ONLINE
+        if self._radio_state is RadioState.ONLINE:
+            return ""
+        return f"STATUS {ANIMATED_STATUS[self._radio_state]}" + "." * self._status_dot_count
+
+    def _update_chat_connection_state(self) -> None:
+        """Keep CHAT and MESH's connection-status presentation in sync
+
+        with the authoritative self._radio_state (see _show_connection)
+        -- purely observational, never triggers a new connection
+        attempt or any other radio traffic on its own.
+
+        Disables CHAT message entry/sending while the radio isn't
+        ONLINE (Textual's `disabled` only affects focus/interaction, so
+        a draft typed before a drop survives completely untouched and
+        is exactly what the user sees once connection is restored).
+        Also overrides CHAT's channel heading and shows/hides MESH's
+        top connection-status line with _connection_status_text() --
+        the same shared value, so the two can never disagree.
+        """
+        status_text = self._connection_status_text()
+
+        chat_inputs = list(self.query("#chat-input"))
+        if chat_inputs:
+            chat_inputs[0].disabled = self._radio_state is not RadioState.ONLINE
         self._render_chat_status()
+
+        selectors = list(self.query(ChannelSelector))
+        if selectors:
+            selectors[0].set_status_override(status_text or None)
+
+        mesh_status_widgets = list(self.query("#mesh-connection-status"))
+        if mesh_status_widgets:
+            widget = mesh_status_widgets[0]
+            widget.update(status_text)
+            widget.display = bool(status_text)
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:
             return
         self._status_dot_count = self._status_dot_count % 3 + 1
         self._render_connection_details()
+        self._update_chat_connection_state()
 
     def _render_connection_details(self) -> None:
         statuses = list(self.query("#connection-status"))
@@ -4056,19 +4104,19 @@ class MeshtasticPassApp(App[None]):
         self._render_chat_status()
 
     def _render_chat_status(self) -> None:
+        """Send-error / older-message notice only -- connection status
+
+        lives solely in CHAT's top heading now (see
+        _update_chat_connection_state/_connection_status_text), never
+        duplicated here. Message entry is disabled while not ONLINE
+        (see _update_chat_connection_state), so this renders whatever
+        it normally would regardless of connection state -- there is
+        nothing connection-specific left for it to say.
+        """
         widgets = list(self.query("#send-error"))
         if not widgets:
             return
         widget = widgets[0]
-        if self._radio_state is not RadioState.ONLINE:
-            # Reconnecting is the most operationally important thing to
-            # tell the user here -- message entry is disabled regardless
-            # (see _update_chat_connection_state), so a stale send error
-            # or older-message notice underneath it is never actionable
-            # right now anyway.
-            widget.set_class(False, "older-message-notice")
-            widget.update("RECONNECTING…")
-            return
         state = self._state_for(self.current_channel_index)
         count = len(state.pending_older_ids)
         show_notice = not self._send_error_message and count > 0

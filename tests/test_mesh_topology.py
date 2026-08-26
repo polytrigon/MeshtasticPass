@@ -19,6 +19,7 @@ from textual.color import Color
 from textual.containers import ScrollableContainer
 
 from app import (
+    ANIMATED_STATUS,
     CIRCLE_SOLID_LARGE,
     CIRCLE_STROKED_LARGE,
     DOT_GRID_GLYPH,
@@ -73,7 +74,7 @@ from mesh_topology import (
 )
 import mesh_topology as mesh_topology_module
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
-from radio_service import NodeMetadata
+from radio_service import NodeMetadata, RadioState
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
@@ -2442,6 +2443,95 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("> MESH", text)
             # The board and bottom-left context are untouched.
             self.assertIsNotNone(app.query_one(MeshTopologyView))
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertIsNotNone(widget)
+
+    async def test_mesh_shows_shared_status_while_connecting(self) -> None:
+        """MESH's top status must use the exact same normalized value
+
+        CONNECTION/CONFIG and CHAT use -- never MESH-specific wording
+        like the old "NO MESH DATA -- RADIO DISCONNECTED".
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+
+            status_widget = app.query_one("#mesh-connection-status")
+            self.assertTrue(status_widget.display)
+            text = str(status_widget.render())
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", text)
+            self.assertNotIn("RADIO DISCONNECTED", text)
+            self.assertNotIn("RECONNECTING", text)
+
+    async def test_mesh_connection_status_disappears_once_connected(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            for _ in range(5):
+                await pilot.pause()
+                if app._radio_state is RadioState.ONLINE:
+                    break
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+
+            status_widget = app.query_one("#mesh-connection-status")
+            self.assertFalse(status_widget.display)
+            self.assertEqual(str(status_widget.render()), "")
+
+    async def test_mesh_topology_not_rebuilt_by_connection_status_change(
+        self,
+    ) -> None:
+        """Stale topology intentionally remains visible during a
+
+        connection drop -- only the shared top status communicates
+        "not live right now"; the board itself must not be cleared or
+        rebuilt by the status change alone.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            node_id = "!sta1e001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(node_id, "Stale", last_heard=now - 5),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Stale",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.working_set), 2)
+            before_positions = dict(view.base_positions)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertEqual(app.current_tab, "mesh")
+            status_widget = app.query_one("#mesh-connection-status")
+            self.assertTrue(status_widget.display)
+            self.assertEqual(len(view.working_set), 2)
+            self.assertEqual(dict(view.base_positions), before_positions)
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
             self.assertIsNotNone(widget)
 

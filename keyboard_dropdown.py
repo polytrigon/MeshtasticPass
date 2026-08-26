@@ -57,6 +57,7 @@ class KeyboardDropdown(Static):
         self.options = tuple(options)
         self.value = value
         self.is_open = False
+        self._status_override: str | None = None
         self._highlighted_index = self._selected_index()
         default_palette = THEME_PALETTES["white"]
         self._base_color = default_palette.base
@@ -90,6 +91,25 @@ class KeyboardDropdown(Static):
         self.suffix = suffix
         self._render_dropdown()
 
+    def set_status_override(self, text: str | None) -> None:
+        """Temporarily replace this dropdown's normal heading with a
+
+        plain, non-interactive status line (e.g. "STATUS CONNECTING...")
+        -- used while the underlying value can't meaningfully be shown
+        or changed. `value`/`options` are never touched, so the normal
+        heading (built from them) reappears exactly as it was the
+        moment `None` is passed to restore it. Also closes and blocks
+        the dropdown menu while overridden, so a stray open menu or
+        keypress can never edit a setting the UI is telling the user is
+        currently unavailable.
+        """
+        self._status_override = text
+        self.disabled = text is not None
+        if text is not None:
+            self.close_menu()
+        else:
+            self._render_dropdown()
+
     def set_palette(self, base: str, accent: str, subdued: str) -> None:
         """Apply the app's current semantic BASE/ACCENT palette immediately."""
         self._base_color = base
@@ -98,7 +118,7 @@ class KeyboardDropdown(Static):
         self._render_dropdown()
 
     def open_menu(self) -> None:
-        if not self.options:
+        if not self.options or self._status_override is not None:
             return
         self.is_open = True
         self._highlighted_index = self._selected_index()
@@ -181,6 +201,9 @@ class KeyboardDropdown(Static):
         )
 
     def _render_dropdown(self, *, focused: bool | None = None) -> None:
+        if self._status_override is not None:
+            self.update(Text(self._status_override, style=self._base_color))
+            return
         marker = ">" if (self.has_focus if focused is None else focused) else " "
         label = f"{self.prefix}{self.label}"
         if self.label_width is not None:
