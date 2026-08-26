@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Mapping
 import unicodedata
 
 from rich.cells import cell_len
@@ -61,6 +61,125 @@ class TopologyLayout:
     height: int
 
 
+@dataclass(frozen=True)
+class RelayStage:
+    """An anonymous, unidentified intermediate relay hop on one real
+    client's observed path back to YOU -- see build_relay_stages().
+
+    Meshtastic gives this app a hop COUNT for a remote node, never the
+    identities of the nodes that actually relayed its traffic (see
+    mesh_state.MeshNodeState's docstring). A RelayStage represents
+    exactly "an intermediate relay stage existed here" -- never "we
+    discovered another Meshtastic node" -- so it deliberately carries no
+    name, no ID resembling a real node's, no position, no activity, and
+    no role.
+
+    `node_id` is an internal-only synthetic identifier
+    ("relay:<source_node_id>:<index>") used purely for rendering,
+    navigation, and selection bookkeeping; it must never be shown to the
+    user (the UI always displays exactly "RELAY" for a selected relay
+    stage). `is_local` is always False, present only so a RelayStage can
+    be duck-typed alongside NodeMetadata (both expose node_id/is_local)
+    by generic, node-kind-agnostic code such as the arrow-navigation
+    layout. `source_node_id` is the real client this stage belongs to;
+    `index` is this stage's 1-indexed position counting outward from
+    YOU (1 = nearest YOU, N = nearest the client for an N-hop client).
+    Together, source_node_id and index guarantee that two different
+    clients -- even ones truthfully reporting the identical hop count --
+    always get numerically independent stages that are never merged or
+    treated as the same physical relay (see build_relay_stages and
+    "MULTIPLE CLIENT PATHS" in the MESH spec).
+    """
+
+    node_id: str
+    source_node_id: str
+    index: int
+    is_local: bool = False
+
+
+def build_relay_stages(
+    real_positions: Mapping[str, tuple[int, int]],
+    *,
+    you_id: str,
+    hop_counts: Mapping[str, int],
+    row_count: int,
+    column_count: int,
+) -> tuple[tuple[RelayStage, ...], dict[str, tuple[int, int]]]:
+    """Generate anonymous relay-stage placeholders for every real CLIENT
+
+    with a trustworthy, nonzero hop count, and place them on interior
+    grid cells along the straight line between YOU and that client.
+
+    Exactly `hop_counts[client_id]` stages are generated per client --
+    never fewer, never more (a `? HOPS` client -- absent from
+    `hop_counts` entirely -- gets none: an unknown hop count must never
+    be treated as zero or imply any specific path depth). A client's
+    stages always carry that client's own node_id baked into their
+    synthetic node_id, so two clients reporting the same hop count are
+    never merged into shared stages even if a placement collision seats
+    them on the same or an adjacent cell.
+
+    Placement is a straight-line interpolation between YOU's and the
+    client's already-fixed grid cell, rounded to the nearest integer
+    grid step -- geography sets the rough direction the chain extends
+    in, never its exact route. Collisions with real nodes, YOU, or
+    another client's stages are resolved with the same bounded
+    ring-search-then-full-grid-scan fallback place_within_bounds uses
+    (_reserve_bounded_cell), so a stage is never silently dropped as
+    long as the fixed grid has any free cell left. Clients are processed
+    in deterministic node_id order so placement never depends on
+    working-set iteration/arrival order.
+    """
+    you_position = real_positions.get(you_id)
+    if you_position is None:
+        return (), {}
+    occupied: set[tuple[int, int]] = set(real_positions.values())
+    stages: list[RelayStage] = []
+    positions: dict[str, tuple[int, int]] = {}
+    for client_id in sorted(hop_counts):
+        count = hop_counts[client_id]
+        client_position = real_positions.get(client_id)
+        if count <= 0 or client_position is None:
+            continue
+        for step in range(1, count + 1):
+            fraction = step / (count + 1)
+            row = round(
+                you_position[0] + (client_position[0] - you_position[0]) * fraction
+            )
+            column = round(
+                you_position[1] + (client_position[1] - you_position[1]) * fraction
+            )
+            row, column = _reserve_bounded_cell(
+                _clamp(row, 1, row_count),
+                _clamp(column, 1, column_count),
+                occupied,
+                row_count=row_count,
+                column_count=column_count,
+            )
+            occupied.add((row, column))
+            node_id = f"relay:{client_id}:{step}"
+            stages.append(RelayStage(node_id, client_id, step))
+            positions[node_id] = (row, column)
+    return tuple(stages), positions
+
+
+def route_chain(
+    points: tuple[tuple[int, int], ...]
+) -> tuple[tuple[int, int, str], ...]:
+    """Concatenate route_connector() across consecutive (x, y) pixel points.
+
+    Draws a multi-segment YOU -> relay -> relay -> ... -> node connector
+    chain as one continuous path, each segment routed by the same
+    single-elbow orthogonal rule as a direct two-point connector. A
+    two-point chain (a 0-hop client, or any direct link) degenerates to
+    exactly what route_connector() alone would draw.
+    """
+    cells: list[tuple[int, int, str]] = []
+    for start, end in zip(points, points[1:]):
+        cells.extend(route_connector(start[0], start[1], end[0], end[1]))
+    return tuple(cells)
+
+
 def compact_node_label(node: NodeMetadata, max_cells: int = NODE_WIDTH - 2) -> str:
     """Choose a readable compact label without exposing transport records."""
     if node.is_local:
@@ -82,6 +201,7 @@ def assign_grid_slots(
     nodes: Iterable[NodeMetadata],
     *,
     max_radius: int = DEFAULT_MAX_GRID_RADIUS,
+    min_radius_by_id: Mapping[str, int] | None = None,
 ) -> tuple[PositionedNode, ...]:
     """Place YOU at (0, 0), then a bounded relative spatial grid outward.
 
@@ -96,12 +216,25 @@ def assign_grid_slots(
     fabricated direction. Coordinates never imply literal geography,
     routing edges, or exact scale.
 
+    `min_radius_by_id` (default: none) raises a specific node's grid-step
+    rank to at least the given value, overriding `max_radius` for that
+    node only -- everything else about its placement (direction bucket,
+    ordering against its bucket-mates) is unchanged. Every other caller,
+    and every node not named in the mapping, sees identical behavior to
+    before this parameter existed. MESH's real-data pipeline uses this
+    so a real client with a truthful nonzero hop count is placed far
+    enough from YOU to leave room for its own anonymous relay-stage
+    placeholders as genuinely interior cells (see build_relay_stages) --
+    hop depth, not just geography, legitimately extends how far out a
+    node's chain (and so the node itself) renders.
+
     This is the shared core reused both by build_topology() (which scales
     these steps into pixel positions for its own auto-sized board) and by
     any caller mapping them directly onto a different, e.g. fixed-size,
     grid.
     """
     max_radius = max(1, max_radius)
+    min_radius_by_id = min_radius_by_id or {}
     unique: dict[str, NodeMetadata] = {}
     for node in nodes:
         key = node.node_id.strip().lower()
@@ -135,7 +268,9 @@ def assign_grid_slots(
         entries.sort(key=lambda item: (item[0], item[1].node_id.casefold()))
         dx, dy = _DIRECTION_VECTORS[direction]
         for rank, (_distance, node) in enumerate(entries, start=1):
-            clamped_rank = min(rank, max_radius)
+            clamped_rank = max(
+                min(rank, max_radius), min_radius_by_id.get(node.node_id, 0)
+            )
             slot_x, slot_y = _reserve_slot(dx * clamped_rank, dy * clamped_rank, occupied)
             logical.append((node, slot_x, slot_y, direction))
 

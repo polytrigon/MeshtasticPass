@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from geo import GeoPosition
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
     MESH_STALE_THRESHOLD_SECONDS,
@@ -17,6 +18,7 @@ from radio_service import NodeMetadata
 
 NOW = 1_000_000.0
 YOU = NodeMetadata("!you", "Local", "ME", 0, NOW, True)
+YOU_POSITION = GeoPosition(40.7128, -74.0060)
 
 
 class NormalizeMeshNodeIdTests(unittest.TestCase):
@@ -272,13 +274,32 @@ class FormatMeshContextLineTests(unittest.TestCase):
         self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
 
     def test_client_only_format(self) -> None:
+        """Long Name / Short Name / ROLE / N HOPS / AGE / DISTANCE -- the
+
+        full new format (spec section 21/37). No distance_miles was set
+        on this state, so distance renders "? mi", never a fabricated
+        figure.
+        """
         state = client_state(
             NodeMetadata("!bob", "Bob Basecamp", "BOB", 1, NOW),
             last_interaction_at=NOW - 30 * 60,
         )
         self.assertEqual(
             format_mesh_context_line(state, now=NOW),
-            "Bob Basecamp / CLIENT / 1 HOPS / 30m",
+            "Bob Basecamp / BOB / CLIENT / 1 HOPS / 30m / ? mi",
+        )
+
+    def test_client_with_known_distance_format(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob Basecamp", "BOB", 1, NOW),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=4.23,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW),
+            "Bob Basecamp / BOB / CLIENT / 1 HOPS / 30m / 4.2 mi",
         )
 
     def test_client_and_relay_format(self) -> None:
@@ -287,13 +308,18 @@ class FormatMeshContextLineTests(unittest.TestCase):
             is_client=True,
             is_relay=True,
             last_interaction_at=NOW - 30 * 60,
+            distance_miles=1.8,
         )
         self.assertEqual(
             format_mesh_context_line(state, now=NOW),
-            "Alice Trail / CLIENT+RELAY / 0 HOPS / 30m",
+            "Alice Trail / ALC / CLIENT+RELAY / 0 HOPS / 30m / 1.8 mi",
         )
 
     def test_relay_only_format(self) -> None:
+        """No Short Name on this node -- that segment is omitted entirely,
+
+        never rendered as a fabricated "?"/"UNKNOWN"/"NONE".
+        """
         state = MeshNodeState(
             node=NodeMetadata("!r", "Relay Only", None, 2, NOW),
             is_client=False,
@@ -301,8 +327,53 @@ class FormatMeshContextLineTests(unittest.TestCase):
             last_interaction_at=NOW - 60,
         )
         self.assertEqual(
-            format_mesh_context_line(state, now=NOW), "Relay Only / RELAY / 2 HOPS / 1m"
+            format_mesh_context_line(state, now=NOW),
+            "Relay Only / RELAY / 2 HOPS / 1m / ? mi",
         )
+
+    def test_short_name_omitted_when_absent(self) -> None:
+        """No Short Name -> exactly 5 segments (name/role/hops/time/
+
+        distance), never a fabricated 6th "?"/"UNKNOWN"/"NONE" segment.
+        """
+        state = client_state(
+            NodeMetadata("!nick", "Long Only", None, 1, NOW), last_interaction_at=NOW - 10
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertTrue(line.startswith("Long Only / CLIENT"))
+        self.assertEqual(len(line.split(" / ")), 5)
+
+    def test_short_name_not_duplicated_when_identical_to_long_name(self) -> None:
+        state = client_state(
+            NodeMetadata("!same", "SAME", "SAME", 1, NOW), last_interaction_at=NOW - 10
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertEqual(line.count("SAME"), 1)
+        self.assertTrue(line.startswith("SAME / CLIENT"))
+
+    def test_long_name_missing_falls_back_to_short_name(self) -> None:
+        state = client_state(
+            NodeMetadata("!shortonly", None, "SHRT", 1, NOW), last_interaction_at=NOW - 10
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertTrue(line.startswith("SHRT / CLIENT"))
+
+    def test_both_names_missing_falls_back_to_node_id(self) -> None:
+        state = client_state(NodeMetadata("!bareid"), last_interaction_at=NOW - 10)
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertTrue(line.startswith("!bareid / CLIENT"))
+
+    def test_non_string_name_field_does_not_crash_and_is_ignored(self) -> None:
+        """Defensive: a stray non-string value in a name field (should never
+
+        happen from RadioService, but nothing here should assume it) is
+        treated as absent, never passed to str.strip() directly.
+        """
+        state = client_state(
+            NodeMetadata("!weird", "Weird Name", 0), last_interaction_at=NOW - 10  # type: ignore[arg-type]
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertTrue(line.startswith("Weird Name / CLIENT"))
 
     def test_unknown_hops_renders_question_mark_not_zero(self) -> None:
         state = client_state(
@@ -318,7 +389,23 @@ class FormatMeshContextLineTests(unittest.TestCase):
             is_relay=False,
             last_interaction_at=None,
         )
-        self.assertEqual(format_mesh_context_line(state, now=NOW), "X / CLIENT / 1 HOPS / ?")
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "X / CLIENT / 1 HOPS / ? / ? mi"
+        )
+
+    def test_you_context_never_gains_appended_segments(self) -> None:
+        """Section 28: YOU stays exactly "YOU" -- never a Short Name, role,
+
+        hop count, time, or distance, even if the local NodeMetadata
+        happens to carry a position (distance would otherwise be 0 mi).
+        """
+        you_with_position = NodeMetadata(
+            "!you", "Local", "ME", 0, NOW, True, position=YOU_POSITION
+        )
+        state = MeshNodeState(
+            node=you_with_position, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
 
 
 if __name__ == "__main__":

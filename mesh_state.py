@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
+from geo import distance_between
 from mesh_topology import compact_node_label
 from radio_service import NodeMetadata
 from relative_time import format_relative_age
@@ -77,6 +78,7 @@ class MeshNodeState:
     is_client: bool
     is_relay: bool
     last_interaction_at: float | None
+    distance_miles: float | None = None
 
     def is_stale(self, *, now: float) -> bool:
         """>24h since the last interaction; exactly 24h still counts as
@@ -168,6 +170,7 @@ def build_mesh_working_set(
         ):
             normalized_interactions[node_id] = interaction_at
 
+    local_position = local.position if local is not None else None
     candidates: list[MeshNodeState] = []
     for node_id, interaction_at in normalized_interactions.items():
         node = known_by_id.get(node_id) or NodeMetadata(node_id)
@@ -177,6 +180,12 @@ def build_mesh_working_set(
                 is_client=True,
                 is_relay=False,
                 last_interaction_at=interaction_at,
+                # Straight-line geographic distance from YOU, derived only
+                # from stored GPS coordinates -- never from grid position,
+                # hop count, or relay-chain length (see RelayStage). "? mi"
+                # (distance_miles=None) whenever either position is
+                # unknown, never a fabricated figure.
+                distance_miles=distance_between(local_position, node.position),
             )
         )
 
@@ -196,30 +205,82 @@ def build_mesh_working_set(
     return (you_state, *bounded)
 
 
-def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
-    """Build the bottom-left status text for a selected MESH node.
+def _clean_text(value: object) -> str | None:
+    """Defensive optional-string coercion for a NodeMetadata name field.
 
-    YOU has no observed communication role, so its line is just its
-    compact label. A remote node's line is "LABEL / ROLE / N HOPS / AGE";
-    ROLE is CLIENT, RELAY, or CLIENT+RELAY. Unknown hop count or unknown
-    interaction age render as "?" rather than a fabricated number.
+    Only a genuine, non-blank ``str`` counts -- never a stray non-string
+    field value, and never a string that is blank once trimmed. Guards
+    against ever calling ``.strip()`` on something that is not text.
     """
-    label = compact_node_label(state.node)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
+    """Long Name first, then Short Name, per the context-line name rule.
+
+    Short Name is included only when it is real and distinct from Long
+    Name -- never fabricated as "?"/"UNKNOWN"/"NONE" when absent, and
+    never duplicated when the two happen to be the same displayed value.
+    If Long Name is unavailable, the sole surviving segment falls back
+    to Short Name, then to the node ID itself -- never a blank segment.
+    """
+    long_name = _clean_text(node.long_name)
+    short_name = _clean_text(node.short_name)
+    if long_name and short_name and long_name != short_name:
+        return (long_name, short_name)
+    if long_name:
+        return (long_name,)
+    if short_name:
+        return (short_name,)
+    return (node.node_id,)
+
+
+def _format_distance(distance_miles: float | None) -> str:
+    return "? mi" if distance_miles is None else f"{distance_miles:.1f} mi"
+
+
+def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
+    """Build the bottom-left status text for a selected REAL MESH node.
+
+    (An anonymous relay-stage placeholder is not a MeshNodeState at all
+    -- see mesh_topology.RelayStage -- and always displays the literal
+    string "RELAY"; callers must special-case that themselves rather
+    than pass a relay stage here.)
+
+    YOU has no observed communication role, hop count, interaction
+    time, or distance of its own, so its line is just its compact label
+    ("YOU"). A remote node's line is:
+
+        LONG NAME [/ SHORT NAME] / ROLE / N HOPS / AGE / DISTANCE
+
+    ROLE is CLIENT, RELAY, or CLIENT+RELAY. Unknown hop count,
+    interaction age, or distance each render as "?" rather than a
+    fabricated value -- see _remote_name_segments, MeshNodeState.
+    distance_miles, and build_mesh_working_set for how each is derived.
+    """
     if state.node.is_local:
-        return label
+        return compact_node_label(state.node)
+
+    segments: list[str] = list(_remote_name_segments(state.node))
 
     role = "+".join(
         name
         for name, present in (("CLIENT", state.is_client), ("RELAY", state.is_relay))
         if present
     ) or "?"
+    segments.append(role)
 
     hops = state.node.hops_away
-    hops_text = f"{hops} HOPS" if hops is not None else "? HOPS"
+    segments.append(f"{hops} HOPS" if hops is not None else "? HOPS")
 
     if state.last_interaction_at is None or state.last_interaction_at > now:
-        age_text = "?"
+        segments.append("?")
     else:
-        age_text = format_relative_age(now - state.last_interaction_at)
+        segments.append(format_relative_age(now - state.last_interaction_at))
 
-    return f"{label} / {role} / {hops_text} / {age_text}"
+    segments.append(_format_distance(state.distance_miles))
+
+    return " / ".join(segments)

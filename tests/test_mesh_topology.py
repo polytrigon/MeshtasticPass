@@ -32,18 +32,22 @@ from app import (
     MeshCanvas,
     MeshNodeLabelWidget,
     MeshNodeWidget,
+    MeshRelayWidget,
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
     _mesh_directional_target,
     _mesh_grid_pixel,
+    _mesh_hop_counts,
     _mesh_node_color,
+    _mesh_relay_color,
+    _mesh_select_node,
     _mesh_translated_positions,
     _render_mesh_canvas,
 )
 from app_settings import AppSettings
 from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
-from geo import GeoPosition
+from geo import GeoPosition, distance_between
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
     MESH_STALE_THRESHOLD_SECONDS,
@@ -56,14 +60,18 @@ from mesh_topology import (
     HORIZONTAL_GAP,
     NODE_HEIGHT,
     NODE_WIDTH,
+    RelayStage,
     assign_grid_slots,
+    build_relay_stages,
     build_topology,
     compact_node_label,
     directional_target,
     place_within_bounds,
+    route_chain,
     route_connector,
 )
 import mesh_topology as mesh_topology_module
+from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
 from radio_service import NodeMetadata
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
@@ -620,21 +628,188 @@ class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
         """No hardcoded node IDs: the same general nearest-candidate rule
 
         used by mesh_topology.directional_target, just fed the current
-        working set's own positions.
+        rendered layout's own positions -- real nodes and anonymous
+        relay stages alike, since both are just entries in this dict.
         """
-        you = MeshNodeState(node=YOU, is_client=False, is_relay=False, last_interaction_at=None)
-        near = client_state(NodeMetadata("!near", "Near"), last_interaction_at=1.0)
-        far = client_state(NodeMetadata("!far", "Far"), last_interaction_at=1.0)
-        working_set = (you, near, far)
         base_positions = {"!you": (5, 11), "!near": (4, 10), "!far": (1, 8)}
         self.assertEqual(
-            _mesh_directional_target(working_set, base_positions, "!you", "left"), "!near"
+            _mesh_directional_target(base_positions, "!you", "left"), "!near"
         )
 
     def test_directional_target_with_no_candidate_is_none(self) -> None:
-        you = MeshNodeState(node=YOU, is_client=False, is_relay=False, last_interaction_at=None)
-        target = _mesh_directional_target((you,), {"!you": (5, 11)}, "!you", "left")
+        target = _mesh_directional_target({"!you": (5, 11)}, "!you", "left")
         self.assertIsNone(target)
+
+
+class RelayStageGeometryTests(unittest.TestCase):
+    """Pure tests for mesh_topology's anonymous-relay-stage placement:
+
+    exact stage counts per hop depth, independence between clients, and
+    collision-free placement -- no app, no widgets.
+    """
+
+    def _positions(self, *, target_hops: int) -> tuple[dict, dict]:
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        target = NodeMetadata(
+            "!target", "Target", "TGT", target_hops, position=GeoPosition(9 / 69.0, 0.0)
+        )
+        min_radius = {"!target": target_hops + 1} if target_hops > 0 else {}
+        slots = assign_grid_slots(
+            (you, target), max_radius=DEFAULT_MAX_GRID_RADIUS, min_radius_by_id=min_radius
+        )
+        base = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        return base, {"!target": target_hops} if target_hops > 0 else {}
+
+    def test_zero_hops_generates_no_relay_stages(self) -> None:
+        base, hop_counts = self._positions(target_hops=0)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(stages, ())
+        self.assertEqual(positions, {})
+
+    def test_one_hop_generates_exactly_one_relay_stage(self) -> None:
+        base, hop_counts = self._positions(target_hops=1)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(len(positions), 1)
+
+    def test_two_hops_generates_exactly_two_relay_stages(self) -> None:
+        base, hop_counts = self._positions(target_hops=2)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(len(stages), 2)
+        self.assertEqual({s.index for s in stages}, {1, 2})
+
+    def test_three_hops_generates_exactly_three_relay_stages(self) -> None:
+        base, hop_counts = self._positions(target_hops=3)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(len(stages), 3)
+        self.assertEqual({s.index for s in stages}, {1, 2, 3})
+        self.assertEqual(len(positions.values()), len(set(positions.values())))
+
+    def test_unknown_hops_client_absent_from_hop_counts_gets_no_stages(self) -> None:
+        """A `? HOPS` client is never passed into hop_counts at all (see
+
+        app._mesh_hop_counts) -- proving build_relay_stages never
+        fabricates stages for a client it isn't told about.
+        """
+        base, _ = self._positions(target_hops=0)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts={}, row_count=8, column_count=21
+        )
+        self.assertEqual(stages, ())
+        self.assertEqual(positions, {})
+
+    def test_no_you_position_produces_no_stages(self) -> None:
+        stages, positions = build_relay_stages(
+            {"!target": (4, 11)},
+            you_id="!you",
+            hop_counts={"!target": 2},
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(stages, ())
+        self.assertEqual(positions, {})
+
+    def test_relay_stage_ids_are_never_shared_between_clients_with_equal_hops(
+        self,
+    ) -> None:
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        alice = NodeMetadata(
+            "!alice", "Alice", position=GeoPosition(0.0, 9 / 69.0)
+        )  # east
+        bob = NodeMetadata(
+            "!bob", "Bob", position=GeoPosition(0.0, -9 / 69.0)
+        )  # west
+        slots = assign_grid_slots(
+            (you, alice, bob),
+            max_radius=DEFAULT_MAX_GRID_RADIUS,
+            min_radius_by_id={"!alice": 3, "!bob": 3},
+        )
+        base = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        stages, positions = build_relay_stages(
+            base,
+            you_id="!you",
+            hop_counts={"!alice": 2, "!bob": 2},
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(len(stages), 4)
+        alice_ids = {s.node_id for s in stages if s.source_node_id == "!alice"}
+        bob_ids = {s.node_id for s in stages if s.source_node_id == "!bob"}
+        self.assertEqual(len(alice_ids), 2)
+        self.assertEqual(len(bob_ids), 2)
+        self.assertEqual(alice_ids & bob_ids, set())
+        # No fabricated real-node shape leaks onto a placeholder.
+        for stage in stages:
+            self.assertFalse(stage.is_local)
+            self.assertTrue(stage.node_id.startswith("relay:"))
+        self.assertEqual(len(positions.values()), len(set(positions.values())))
+
+    def test_relay_stage_node_id_encodes_source_and_index_internally_only(
+        self,
+    ) -> None:
+        """The synthetic ID format is internal bookkeeping -- proven here
+
+        directly -- and never surfaces in any user-facing string (the
+        app-level tests prove the UI always shows exactly "RELAY").
+        """
+        base, hop_counts = self._positions(target_hops=2)
+        stages, _ = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        ids = {s.node_id for s in stages}
+        self.assertEqual(ids, {"relay:!target:1", "relay:!target:2"})
+
+    def test_min_radius_by_id_does_not_affect_unlisted_nodes(self) -> None:
+        """assign_grid_slots' new optional parameter is fully backward
+
+        compatible: omitting it (as every non-MESH-hop caller does)
+        reproduces the exact prior placement.
+        """
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        node = NodeMetadata("!n", "N", position=GeoPosition(9 / 69.0, 0.0))
+        without = assign_grid_slots((you, node), max_radius=DEFAULT_MAX_GRID_RADIUS)
+        with_empty = assign_grid_slots(
+            (you, node), max_radius=DEFAULT_MAX_GRID_RADIUS, min_radius_by_id={}
+        )
+        self.assertEqual(without, with_empty)
+
+    def test_min_radius_by_id_boosts_only_the_named_node(self) -> None:
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        node = NodeMetadata("!n", "N", position=GeoPosition(9 / 69.0, 0.0))
+        boosted = assign_grid_slots(
+            (you, node), max_radius=DEFAULT_MAX_GRID_RADIUS, min_radius_by_id={"!n": 3}
+        )
+        entry = next(item for item in boosted if item.node.node_id == "!n")
+        self.assertEqual((entry.x, entry.y), (0, -3))
+
+
+class RouteChainTests(unittest.TestCase):
+    """Pure tests for the multi-segment connector-chain helper."""
+
+    def test_two_point_chain_matches_plain_route_connector(self) -> None:
+        self.assertEqual(
+            route_chain(((0, 0), (4, 3))), route_connector(0, 0, 4, 3)
+        )
+
+    def test_chain_concatenates_each_segment_in_order(self) -> None:
+        chain = route_chain(((0, 0), (0, 3), (4, 3)))
+        expected = route_connector(0, 0, 0, 3) + route_connector(0, 3, 4, 3)
+        self.assertEqual(chain, expected)
+
+    def test_single_point_chain_is_empty(self) -> None:
+        self.assertEqual(route_chain(((2, 2),)), ())
 
 
 class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
@@ -1239,7 +1414,11 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         RadioService.get_known_nodes() returns) in every cardinal
         direction, proving the full navigation contract holds against
         live-shaped data, not just the clean synthetic IDs used
-        elsewhere in this file.
+        elsewhere in this file. Hop count is 0 for all four so no
+        anonymous relay stage is generated -- this test is specifically
+        about ID handling in the real-node navigation path, not the
+        separate relay-stage-traversal contract proven by
+        test_navigation_walks_through_relay_stages_and_back.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1253,10 +1432,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata(north_id, "North Real", "NORT", 2, position=north_of_local(3)),
-                NodeMetadata(south_id, "South Real", "SOUT", 1, position=south_of_local(3)),
-                NodeMetadata(east_id, "East Real", "EAST", 1, position=east_of_local(3)),
-                NodeMetadata(west_id, "West Real", "WEST", 3, position=west_of_local(3)),
+                NodeMetadata(north_id, "North Real", "NORT", 0, position=north_of_local(3)),
+                NodeMetadata(south_id, "South Real", "SOUT", 0, position=south_of_local(3)),
+                NodeMetadata(east_id, "East Real", "EAST", 0, position=east_of_local(3)),
+                NodeMetadata(west_id, "West Real", "WEST", 0, position=west_of_local(3)),
             )
             for index, node_id in enumerate((north_id, south_id, east_id, west_id)):
                 app._accept_received_message(
@@ -1389,14 +1568,15 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         number while get_known_nodes() reports the same physical node in
         the standard "!hex" form, arrow navigation must still reach the
         real, positioned, rendered node -- not silently fail or land on
-        a nameless duplicate.
+        a nameless duplicate. Hop count is 0 so no relay stage sits
+        between YOU and it, keeping this test focused on ID handling.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata("!075bcd15", "North Node", "NORTH", 1, position=north_of_local(3)),
+                NodeMetadata("!075bcd15", "North Node", "NORTH", 0, position=north_of_local(3)),
             )
             app._accept_received_message(
                 SIMULATED_MESSAGES[0].__class__(
@@ -1422,6 +1602,504 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(view.selected_node_id, "!075bcd15")
             status = str(app.query_one("#mesh-context-status").render())
             self.assertTrue(status.startswith("North Node"))
+
+    # ---- Anonymous relay-stage topology (hop-count based) --------------
+
+    async def _open_mesh_with_directional_clients(
+        self, pilot, *, hops: dict
+    ) -> "MeshtasticPassApp":
+        """Wire up to four clients, one per cardinal direction, each with
+
+        the given hops_away -- avoiding same-bucket contention so each
+        client's own relay chain has genuinely interior grid cells.
+        """
+        app = pilot.app
+        directions = {
+            "north": ("!d0000001", north_of_local(3)),
+            "south": ("!d0000002", south_of_local(3)),
+            "east": ("!d0000003", east_of_local(3)),
+            "west": ("!d0000004", west_of_local(3)),
+        }
+        nodes = [NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)]
+        for name, (node_id, position) in directions.items():
+            nodes.append(
+                NodeMetadata(node_id, name.title(), name[:4].upper(), hops.get(name), position=position)
+            )
+        app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+        for name, (node_id, _position) in directions.items():
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name=name.title(),
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=hash(node_id) & 0xFFFF,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+        await self._open_mesh(pilot)
+        return directions
+
+    async def test_hop_count_topology_generates_correct_relay_stage_counts(
+        self,
+    ) -> None:
+        """0/1/2/3 HOPS -> exactly that many anonymous relay stages each
+
+        (spec section 2/32), never fewer, never more, one client per
+        compass direction so counts can't be confused across clients.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            directions = await self._open_mesh_with_directional_clients(
+                pilot, hops={"north": 0, "south": 1, "east": 2, "west": 3}
+            )
+            view = app.query_one(MeshTopologyView)
+            for name, expected_count in (
+                ("north", 0),
+                ("south", 1),
+                ("east", 2),
+                ("west", 3),
+            ):
+                node_id = directions[name][0]
+                with self.subTest(direction=name):
+                    stage_count = sum(
+                        1 for stage in view.relay_stages if stage.source_node_id == node_id
+                    )
+                    self.assertEqual(stage_count, expected_count)
+            self.assertEqual(len(view.relay_stages), 0 + 1 + 2 + 3)
+            self.assertEqual(
+                {w.node_id for w in app.query(MeshRelayWidget)},
+                {stage.node_id for stage in view.relay_stages},
+            )
+
+    async def test_unknown_hops_client_has_no_relay_stages_but_stays_visible(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            directions = await self._open_mesh_with_directional_clients(
+                pilot, hops={"north": None, "south": None, "east": None, "west": None}
+            )
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.relay_stages, ())
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
+            north_id = directions["north"][0]
+            self.assertIn(north_id, {w.node_id for w in app.query(MeshNodeWidget)})
+
+    async def test_relay_stages_never_count_toward_active_or_working_set_bound(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            await self._open_mesh_with_directional_clients(
+                pilot, hops={"north": 3, "south": 3, "east": 3, "west": 3}
+            )
+            view = app.query_one(MeshTopologyView)
+            remote_count = sum(1 for state in view.working_set if not state.node.is_local)
+            self.assertEqual(remote_count, 4)
+            self.assertGreater(len(view.relay_stages), 0)
+
+    async def test_navigation_walks_through_relay_stages_and_back(self) -> None:
+        """The exact "YOU -> RELAY -> RELAY -> ALICE and back" contract
+
+        (spec section 16): a single 2-hop client leaves two genuinely
+        interior cells (see the min_radius_by_id boost in _refresh_mesh),
+        so sequential single-key presses visit both relay stages before
+        the real node, and the same sequence in reverse returns to YOU --
+        no wrapping, no scrolling, context text flips correctly at each
+        stop.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!ta4be701"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Target Node", "TGT", 2, position=north_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Target Node",
+                    sender_short_name="TGT",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertEqual(len(view.relay_stages), 2)
+            board_offset_before = view.board.styles.offset
+
+            expected_forward = [
+                stage.node_id
+                for stage in sorted(view.relay_stages, key=lambda stage: stage.index)
+            ] + [target_id]
+            visited = []
+            for _ in expected_forward:
+                await pilot.press("up")
+                await pilot.pause()
+                visited.append(view.selected_node_id)
+            self.assertEqual(visited, expected_forward)
+
+            # No wrapping: one more "up" from the real node changes nothing.
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("Target Node"))
+
+            visited_back = []
+            for _ in expected_forward:
+                await pilot.press("down")
+                await pilot.pause()
+                visited_back.append(view.selected_node_id)
+            self.assertEqual(visited_back, list(reversed(expected_forward[:-1])) + [you_id])
+            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
+
+            # Context reads exactly "RELAY" while a relay stage is selected.
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "RELAY")
+
+            self.assertEqual(view.board.styles.offset, board_offset_before)
+            self.assertFalse(view.show_vertical_scrollbar)
+            self.assertFalse(view.show_horizontal_scrollbar)
+
+    async def test_relay_stage_selection_styling_and_context(self) -> None:
+        """Stroked + DIM_BASE unselected, ACCENT + wider composite
+
+        selected, never labeled, bottom context exactly "RELAY" (spec
+        sections 6/8).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!re1a5001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Relay Target", "RLT", 1, position=east_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Relay Target",
+                    sender_short_name="RLT",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 1)
+            stage_id = view.relay_stages[0].node_id
+            palette = THEME_PALETTES[app._current_theme]
+
+            relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
+            self.assertEqual(
+                relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertEqual(int(relay_widget.styles.width.value), 1)
+            self.assertEqual(str(relay_widget.render()), CIRCLE_STROKED_LARGE)
+            self.assertEqual(
+                next((w for w in app.query(MeshNodeLabelWidget) if w.node_id == stage_id), None),
+                None,
+            )
+
+            _mesh_select_node(app, stage_id)
+            await pilot.pause()
+            relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
+            self.assertEqual(
+                relay_widget.render().spans[0].style.foreground, Color.parse(palette.accent)
+            )
+            self.assertEqual(int(relay_widget.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
+            self.assertEqual(
+                str(app.query_one("#mesh-context-status").render()), "RELAY"
+            )
+
+            _mesh_select_node(app, you_id)
+            await pilot.pause()
+            relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
+            self.assertEqual(
+                relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertEqual(int(relay_widget.styles.width.value), 1)
+
+    async def test_multiple_clients_same_hop_count_get_independent_relay_stages(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!a11cebbb", "!b0bbbbbb"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(alice_id, "Alice", "ALC", 2, position=east_of_local(9)),
+                NodeMetadata(bob_id, "Bob", "BOB", 2, position=west_of_local(9)),
+            )
+            for node_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=name,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 4)
+            alice_stage_ids = {
+                s.node_id for s in view.relay_stages if s.source_node_id == alice_id
+            }
+            bob_stage_ids = {s.node_id for s in view.relay_stages if s.source_node_id == bob_id}
+            self.assertEqual(len(alice_stage_ids), 2)
+            self.assertEqual(len(bob_stage_ids), 2)
+            self.assertEqual(alice_stage_ids & bob_stage_ids, set())
+            positions = list(view.base_positions.values())
+            self.assertEqual(len(positions), len(set(positions)))
+
+    # ---- ACTIVE / brightness predicate unification (spec section 17-20) --
+
+    async def test_active_count_and_node_brightness_use_same_predicate(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            client_ids = [f"!ac00000{i}" for i in range(8)]
+            active_ids = set(client_ids[:4])
+            nodes = [NodeMetadata(app.radio.info.node_id, is_local=True)]
+            for index, node_id in enumerate(client_ids):
+                last_heard = (
+                    now - 10
+                    if node_id in active_ids
+                    else now - ACTIVE_WINDOW_SECONDS - 100
+                )
+                nodes.append(NodeMetadata(node_id, f"Node{index}", last_heard=last_heard))
+            app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+            for index, node_id in enumerate(client_ids):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=f"Node{index}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_500_000 + index,
+                        radio_rx_at=now - index,
+                    )
+                )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            title = str(app.query_one("#mesh-title").render())
+            self.assertEqual(title, "> MESH · ACTIVE 4")
+
+            view = app.query_one(MeshTopologyView)
+            self.assertNotIn(view.selected_node_id, client_ids)
+            palette = THEME_PALETTES[app._current_theme]
+            for node_id in client_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                color = widget.render().spans[0].style.foreground
+                with self.subTest(node_id=node_id, active=node_id in active_ids):
+                    if node_id in active_ids:
+                        self.assertEqual(color, Color.parse(palette.base))
+                    else:
+                        self.assertEqual(color, Color.parse(palette.dim_base))
+
+    async def test_relay_stage_brightness_ignores_activity_and_is_never_counted(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!d1d0007f"
+            now = 1_700_000_000.0
+            # A recently-heard (ACTIVE) client, but its relay stage must
+            # still always render DIM_BASE unless selected -- it has no
+            # identity of its own to be "heard" from.
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    target_id, "DimTarget", "DIM", 1, last_heard=now - 5, position=north_of_local(9)
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="DimTarget",
+                    sender_short_name="DIM",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 1)
+            palette = THEME_PALETTES[app._current_theme]
+            stage_widget = next(iter(app.query(MeshRelayWidget)))
+            self.assertEqual(
+                stage_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            title = str(app.query_one("#mesh-title").render())
+            self.assertEqual(title, "> MESH · ACTIVE 1")
+
+    # ---- Expanded selected-node context (spec section 21-27) -----------
+
+    async def test_selected_context_full_format_with_distance(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee01"
+            target_position = north_of_local(4.2)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    target_id, "Bob Basecamp", "BOB", 1, position=target_position
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Bob Basecamp",
+                    sender_short_name="BOB",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_699_999_970.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            # _update_mesh_context_status() formats AGE against real
+            # wall-clock time() (see app.py), so -- like the pre-existing
+            # test_context_line_for_client -- this cannot pin an exact
+            # AGE string; only the name/short-name/role/hops/distance
+            # segments, which are wall-clock-independent, are asserted
+            # exactly (spec section 37: no test may depend on
+            # uncontrolled wall-clock timing).
+            segments = status.split(" / ")
+            self.assertEqual(len(segments), 6)
+            expected_distance = distance_between(LOCAL_GEO, target_position)
+            self.assertEqual(
+                [segments[0], segments[1], segments[2], segments[3], segments[5]],
+                ["Bob Basecamp", "BOB", "CLIENT", "1 HOPS", f"{expected_distance:.1f} mi"],
+            )
+            self.assertNotEqual(segments[4], "?")
+
+    async def test_selected_context_missing_short_name_and_distance(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee02"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True),  # no position -> "? mi"
+                NodeMetadata(target_id, "No Short Name", None, 1),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="No Short Name",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(len(status.split(" / ")), 5)  # no Short Name segment
+            self.assertTrue(status.endswith("? mi"))
+            self.assertTrue(status.startswith("No Short Name / CLIENT"))
+
+    async def test_distance_unchanged_by_recentering(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!a1a1a1a1", "!b2b2b2b2"
+            alice_position = north_of_local(3.7)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(alice_id, "Alice", "ALC", 1, position=alice_position),
+                NodeMetadata(bob_id, "Bob", "BOB", 1, position=south_of_local(5)),
+            )
+            for node_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=name,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            first_status = str(app.query_one("#mesh-context-status").render())
+            first_distance = first_status.rsplit(" / ", 1)[-1]
+
+            # Selecting Bob recenters the whole board on him.
+            _mesh_select_node(app, bob_id)
+            await pilot.pause()
+            self.assertNotEqual(
+                str(app.query_one("#mesh-context-status").render()), first_status
+            )
+
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            second_status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(second_status, first_status)
+            self.assertEqual(second_status.rsplit(" / ", 1)[-1], first_distance)
 
     async def test_no_scrollbars_on_mesh(self) -> None:
         app = self._make_app()

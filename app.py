@@ -50,12 +50,14 @@ from mesh_state import MeshNodeState, build_mesh_working_set, format_mesh_contex
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
     PositionedNode,
+    RelayStage,
     TopologyLayout,
     assign_grid_slots,
+    build_relay_stages,
     compact_node_label,
     directional_target,
     place_within_bounds,
-    route_connector,
+    route_chain,
 )
 from node_activity import is_node_active
 from radio_service import (
@@ -413,17 +415,38 @@ MESH_SELECTED_HALO_GLYPH = "·"
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
-    """Selection (ACCENT) always overrides the stale (DIM_BASE) treatment.
+    """Selection (ACCENT) always overrides active/inactive styling.
 
-    YOU has no staleness concept (it is not an observed-interaction
-    record) and always uses ordinary ACCENT/BASE.
+    A real remote node's brightness uses the EXACT SAME predicate as the
+    MESH header's "ACTIVE N" count -- node_activity.is_node_active,
+    keyed on RadioService's passive last_heard -- so the two always
+    visually agree: if the header says ACTIVE 4, exactly the working
+    set's real remote nodes satisfying this same predicate render BASE.
+    This is deliberately a different concept from MeshNodeState.
+    is_stale() (>24h since the last CHAT interaction), which decides
+    which nodes are worth ranking into the working set at all (see
+    mesh_state.build_mesh_working_set) -- not how bright an already-
+    displayed node looks. A node can therefore show a merely-old
+    interaction time ("2h") while still rendering dim, and that is
+    expected. YOU has no activity concept and always uses ordinary
+    ACCENT/BASE.
     """
     palette = THEME_PALETTES[theme]
     if selected:
         return palette.accent
-    if not state.node.is_local and state.is_stale(now=now):
+    if not state.node.is_local and not is_node_active(state.node.last_heard, now):
         return palette.dim_base
     return palette.base
+
+
+def _mesh_relay_color(*, selected: bool, theme: str) -> str:
+    """An anonymous relay-stage placeholder is never active/inactive --
+
+    it has no identity to be "heard" from, so it is always DIM_BASE
+    unless selected (ACCENT), regardless of any client's activity.
+    """
+    palette = THEME_PALETTES[theme]
+    return palette.accent if selected else palette.dim_base
 
 
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
@@ -457,40 +480,56 @@ def _mesh_translated_positions(
 
 
 def _mesh_directional_target(
-    working_set: tuple[MeshNodeState, ...],
     base_positions: Mapping[str, tuple[int, int]],
     current_node_id: str,
     direction: str,
 ) -> str | None:
-    """Pick the working-set node reached by an arrow press, reusing the
+    """Pick the ID reached by an arrow press, reusing the shared
 
-    shared spatial-navigation rule (mesh_topology.directional_target)
-    against the CURRENT working set's fixed, untranslated LOGICAL
-    (row, column) positions -- not their rendered pixel positions.
-    DOT_GRID_SPACING_X/Y (4x2) make one logical row-step visually shorter
-    than one column-step on screen, a purely cosmetic choice; ranking by
-    pixel distance would let that asymmetry distort "sensible direction".
-    Direction is a property of the mesh's logical geometry, not of
-    wherever the selection happens to be recentered on screen. No node
-    IDs are hardcoded: this is the same general nearest-candidate rule
-    for any working set the model produces.
+    spatial-navigation rule (mesh_topology.directional_target) against
+    the CURRENT fixed, untranslated LOGICAL (row, column) positions --
+    not rendered pixel positions. DOT_GRID_SPACING_X/Y (4x2) make one
+    logical row-step visually shorter than one column-step on screen, a
+    purely cosmetic choice; ranking by pixel distance would let that
+    asymmetry distort "sensible direction". Direction is a property of
+    the mesh's logical geometry, not of wherever the selection happens
+    to be recentered on screen.
+
+    Candidates come directly from `base_positions` -- MeshTopologyView's
+    own merged real-node-plus-relay-stage layout, i.e. exactly what is
+    currently rendered -- rather than from any node-role data, so a real
+    node and an anonymous relay stage are equally navigable and neither
+    needs a special case here. No node IDs are hardcoded: this is the
+    same general nearest-candidate rule for whatever layout the model
+    produces.
     """
     layout = TopologyLayout(
         tuple(
-            PositionedNode(
-                node=state.node,
-                x=base_positions[state.node.node_id][1],
-                y=base_positions[state.node.node_id][0],
-                region="LOCAL" if state.node.is_local else "UNKNOWN",
-            )
-            for state in working_set
-            if state.node.node_id in base_positions
+            PositionedNode(node=NodeMetadata(node_id), x=column, y=row, region="UNKNOWN")
+            for node_id, (row, column) in base_positions.items()
         ),
         width=MESH_GRID_COLUMNS,
         height=MESH_GRID_ROWS,
     )
     target = directional_target(current_node_id, layout, direction)  # type: ignore[arg-type]
     return target.node.node_id if target is not None else None
+
+
+def _mesh_hop_counts(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
+    """Real remote CLIENTs with a trustworthy, nonzero hop count -- the
+
+    number of anonymous relay-stage placeholders each needs (see
+    mesh_topology.RelayStage). A `? HOPS` client (hops_away is None) is
+    deliberately absent: an unknown hop count must never be treated as
+    zero or imply any specific path depth.
+    """
+    return {
+        state.node.node_id: state.node.hops_away
+        for state in working_set
+        if not state.node.is_local
+        and state.node.hops_away is not None
+        and state.node.hops_away > 0
+    }
 
 
 class MeshNodeWidget(Static):
@@ -578,10 +617,41 @@ class MeshNodeLabelWidget(Static):
         _mesh_select_node(self.app, self.node_id)
 
 
+class MeshRelayWidget(Static):
+    """An anonymous relay-stage placeholder glyph: always stroked, never
+
+    labeled, never active/inactive -- see mesh_topology.RelayStage. Only
+    ever DIM_BASE or (selected) ACCENT, using the same enlarged 3-cell
+    composite treatment as a selected real node (see MeshNodeWidget).
+    """
+
+    can_focus = False
+
+    def __init__(self, stage: RelayStage) -> None:
+        self.stage = stage
+        self.node_id = stage.node_id
+        super().__init__(classes="mesh-node", markup=False)
+
+    def refresh_visual(self, *, selected: bool, theme: str) -> None:
+        color = _mesh_relay_color(selected=selected, theme=theme)
+        style = Style(color=color, bold=selected)
+        if selected:
+            content = Text(justify="center")
+            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+            content.append(CIRCLE_STROKED_LARGE, style=style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+        else:
+            content = Text(CIRCLE_STROKED_LARGE, style=style)
+        self.update(content)
+
+    def on_click(self, _event: Click) -> None:
+        _mesh_select_node(self.app, self.node_id)
+
+
 def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
-    view.render_layout(theme=app._current_theme, now=time())
+    view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
     app._update_mesh_context_status()
 
 
@@ -687,6 +757,7 @@ class MeshTopologyView(Container):
         self._selected_node_id = ""
         self._working_set: tuple[MeshNodeState, ...] = ()
         self._base_positions: dict[str, tuple[int, int]] = {}
+        self._relay_stages: tuple[RelayStage, ...] = ()
 
     @property
     def board(self) -> Container:
@@ -702,7 +773,16 @@ class MeshTopologyView(Container):
 
     @property
     def base_positions(self) -> dict[str, tuple[int, int]]:
+        """Real-node AND anonymous-relay-stage logical (row, column)
+
+        positions, merged -- the full set of currently rendered,
+        arrow-navigable coordinates (see set_nodes/_mesh_directional_target).
+        """
         return self._base_positions
+
+    @property
+    def relay_stages(self) -> tuple[RelayStage, ...]:
+        return self._relay_stages
 
     def set_nodes(
         self,
@@ -741,18 +821,42 @@ class MeshTopologyView(Container):
             )
 
         self._working_set = working_set
-        self._base_positions = dict(base_positions)
         current_ids = {state.node.node_id for state in working_set}
-        if self._selected_node_id not in current_ids:
-            local_id = next(
-                (state.node.node_id for state in working_set if state.node.is_local),
-                None,
-            )
+        you_id = next(
+            (state.node.node_id for state in working_set if state.node.is_local),
+            None,
+        )
+        # `base_positions` is expected to carry only real-node positions
+        # (exactly what place_within_bounds() produces), but is filtered
+        # against `current_ids` regardless -- so passing back a previous
+        # call's already-merged view.base_positions (which also contains
+        # relay-stage entries) is harmless: those extra keys are simply
+        # ignored here and relay stages are recomputed fresh below, never
+        # accumulated across calls.
+        real_positions = {
+            node_id: position
+            for node_id, position in base_positions.items()
+            if node_id in current_ids
+        }
+        hop_counts = _mesh_hop_counts(working_set)
+        relay_stages, relay_positions = build_relay_stages(
+            real_positions,
+            you_id=you_id or "",
+            hop_counts=hop_counts,
+            row_count=MESH_GRID_ROWS,
+            column_count=MESH_GRID_COLUMNS,
+        )
+        self._relay_stages = relay_stages
+        self._base_positions = {**real_positions, **relay_positions}
+        relay_ids = {stage.node_id for stage in relay_stages}
+        if self._selected_node_id not in current_ids and self._selected_node_id not in relay_ids:
+            local_id = you_id
             self._selected_node_id = local_id or (
                 working_set[0].node.node_id if working_set else ""
             )
 
         states_by_id = {state.node.node_id: state for state in working_set}
+        stages_by_id = {stage.node_id: stage for stage in relay_stages}
         # Widget.remove() only schedules removal -- it does not take effect
         # before the next refresh -- so every query below must keep
         # filtering by `current_ids` itself rather than assume a removed
@@ -762,6 +866,9 @@ class MeshTopologyView(Container):
                 widget.remove()
         for widget in list(self.query(MeshNodeLabelWidget)):
             if widget.node_id not in current_ids:
+                widget.remove()
+        for widget in list(self.query(MeshRelayWidget)):
+            if widget.node_id not in relay_ids:
                 widget.remove()
         existing_glyph_ids = {
             widget.node_id
@@ -773,6 +880,11 @@ class MeshTopologyView(Container):
             for widget in self.query(MeshNodeLabelWidget)
             if widget.node_id in current_ids
         }
+        existing_relay_ids = {
+            widget.node_id
+            for widget in self.query(MeshRelayWidget)
+            if widget.node_id in relay_ids
+        }
         new_glyphs = [
             MeshNodeWidget(states_by_id[node_id])
             for node_id in states_by_id
@@ -783,10 +895,19 @@ class MeshTopologyView(Container):
             for node_id in states_by_id
             if node_id not in existing_label_ids
         ]
+        # Anonymous relay-stage placeholders are never labeled -- no
+        # MeshRelayLabelWidget counterpart exists (see RelayStage).
+        new_relays = [
+            MeshRelayWidget(stages_by_id[node_id])
+            for node_id in stages_by_id
+            if node_id not in existing_relay_ids
+        ]
         if new_glyphs:
             board.mount_all(new_glyphs)
         if new_labels:
             board.mount_all(new_labels)
+        if new_relays:
+            board.mount_all(new_relays)
         glyph_widgets = [
             widget for widget in self.query(MeshNodeWidget) if widget.node_id in current_ids
         ]
@@ -795,10 +916,15 @@ class MeshTopologyView(Container):
             for widget in self.query(MeshNodeLabelWidget)
             if widget.node_id in current_ids
         ]
+        relay_widgets = [
+            widget for widget in self.query(MeshRelayWidget) if widget.node_id in relay_ids
+        ]
         for widget in glyph_widgets:
             widget.state = states_by_id[widget.node_id]
         for widget in label_widgets:
             widget.state = states_by_id[widget.node_id]
+        for widget in relay_widgets:
+            widget.stage = stages_by_id[widget.node_id]
 
         positions = _mesh_translated_positions(
             self._base_positions, self._selected_node_id
@@ -824,6 +950,20 @@ class MeshTopologyView(Container):
             centers[widget.node_id] = (grid_x, grid_y)
             widget.refresh_visual(selected=selected, theme=theme, now=now)
 
+        # Relay-stage placeholders share the exact same anchor/composite
+        # rules as a real node's glyph (see MeshNodeWidget above) -- only
+        # the color/never-labeled rule differs (MeshRelayWidget).
+        for widget in relay_widgets:
+            row, column = positions[widget.node_id]
+            grid_x, grid_y = _mesh_grid_pixel(row, column)
+            selected = widget.node_id == self._selected_node_id
+            width = MESH_SELECTED_GLYPH_WIDTH if selected else 1
+            widget.styles.width = width
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x - width // 2, grid_y)
+            centers[widget.node_id] = (grid_x, grid_y)
+            widget.refresh_visual(selected=selected, theme=theme)
+
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
         # over the glyph's fixed (grid_x, grid_y) by offsetting the whole
@@ -837,33 +977,49 @@ class MeshTopologyView(Container):
             selected = widget.node_id == self._selected_node_id
             widget.refresh_visual(selected=selected, theme=theme, now=now)
 
-        # Connector semantics: a YOU-to-node edge means "we have observed
+        # Connector semantics: a YOU-to-node path means "we have observed
         # communication with this node" (it is CLIENT), never proven RF
-        # adjacency or a routing edge. A relay-chain edge (node-to-node,
-        # not via YOU) would require trustworthy relay evidence this app
-        # cannot currently obtain (see mesh_state.MeshNodeState) and is
-        # therefore never drawn.
+        # adjacency. It is drawn through exactly that client's own
+        # anonymous relay stages (hops_away of them, in order -- see
+        # RelayStage/build_relay_stages), representing observed path
+        # DEPTH, never discovered relay identity: "Alice is 3 relay
+        # stages away", never "these are three identified radios". A
+        # `? HOPS` client gets no path at all -- any line, direct or
+        # through relay stages, would imply a specific, unverified hop
+        # depth, which is never fabricated (see the MESH spec's
+        # "UNKNOWN HOPS" / "? HOPS CONNECTORS" sections).
         palette = THEME_PALETTES[theme]
-        you_id = next(
-            (state.node.node_id for state in working_set if state.node.is_local),
-            None,
-        )
+        stages_by_client: dict[str, list[RelayStage]] = {}
+        for stage in relay_stages:
+            stages_by_client.setdefault(stage.source_node_id, []).append(stage)
+        for stages in stages_by_client.values():
+            stages.sort(key=lambda stage: stage.index)
+
         connector_cells: list[tuple[int, int, str, str]] = []
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
-                if state.node.is_local or remote_id not in centers:
+                hops = state.node.hops_away
+                if state.node.is_local or remote_id not in centers or hops is None:
                     continue
+                chain_stages = stages_by_client.get(remote_id, ())
+                chain_ids = {remote_id, *(stage.node_id for stage in chain_stages)}
+                chain_points = (
+                    centers[you_id],
+                    *(
+                        centers[stage.node_id]
+                        for stage in chain_stages
+                        if stage.node_id in centers
+                    ),
+                    centers[remote_id],
+                )
                 color = (
                     palette.accent
-                    if self._selected_node_id == remote_id
+                    if self._selected_node_id in chain_ids
                     else palette.dim_base
                 )
                 connector_cells.extend(
-                    (x, y, glyph, color)
-                    for x, y, glyph in route_connector(
-                        *centers[you_id], *centers[remote_id]
-                    )
+                    (x, y, glyph, color) for x, y, glyph in route_chain(chain_points)
                 )
         self.board.query_one(MeshCanvas).render_scene(
             board_width, board_height, tuple(connector_cells), theme
@@ -872,8 +1028,10 @@ class MeshTopologyView(Container):
     def clear_nodes(self) -> None:
         self.board.remove_children(MeshNodeWidget)
         self.board.remove_children(MeshNodeLabelWidget)
+        self.board.remove_children(MeshRelayWidget)
         self._working_set = ()
         self._base_positions = {}
+        self._relay_stages = ()
         self._selected_node_id = ""
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
@@ -2741,9 +2899,19 @@ class MeshtasticPassApp(App[None]):
             self._update_mesh_context_status()
             return
         status.update("")
+        # A real CLIENT with a truthful nonzero hop count is placed at
+        # least hops_away+1 grid steps out -- never closer -- so its own
+        # anonymous relay-stage placeholders have genuinely interior
+        # cells to occupy along the YOU-to-client line (see RelayStage/
+        # build_relay_stages); geography alone would otherwise often
+        # place it immediately adjacent to YOU, leaving no room at all.
+        min_radius_by_id = {
+            node_id: hops + 1 for node_id, hops in _mesh_hop_counts(working_set).items()
+        }
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
             max_radius=DEFAULT_MAX_GRID_RADIUS,
+            min_radius_by_id=min_radius_by_id,
         )
         base_positions = place_within_bounds(
             slots,
@@ -2758,7 +2926,7 @@ class MeshtasticPassApp(App[None]):
     def _move_mesh_focus(self, direction: str) -> None:
         view = self.query_one(MeshTopologyView)
         target_id = _mesh_directional_target(
-            view.working_set, view.base_positions, view.selected_node_id, direction
+            view.base_positions, view.selected_node_id, direction
         )
         if target_id is not None:
             view.select_node(target_id)
@@ -2792,9 +2960,16 @@ class MeshtasticPassApp(App[None]):
             ),
             None,
         )
-        status_widget.update(
-            format_mesh_context_line(state, now=time()) if state is not None else ""
-        )
+        if state is not None:
+            status_widget.update(format_mesh_context_line(state, now=time()))
+            return
+        # An anonymous relay-stage placeholder is not a MeshNodeState (see
+        # mesh_topology.RelayStage) and always displays exactly "RELAY" --
+        # never its internal synthetic ID, hop count, time, or distance.
+        if any(stage.node_id == view.selected_node_id for stage in view.relay_stages):
+            status_widget.update("RELAY")
+            return
+        status_widget.update("")
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
