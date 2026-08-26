@@ -1002,7 +1002,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("4")
+        await pilot.press("3")
         await pilot.pause()
         await pilot.pause()
 
@@ -1120,7 +1120,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             mounted_ids = {entry.node_id for entry in app.chat_history if entry.node_id}
             self.assertNotIn("!a11ce001", mounted_ids)
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
@@ -1216,7 +1216,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     radio_rx_at=very_old,
                 )
             )
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             app._refresh_mesh(wall_now=1_700_000_000.0)
             await pilot.pause()
@@ -2630,7 +2630,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     radio_rx_at=very_old,
                 )
             )
-            await pilot.press("4")
+            await pilot.press("3")
             await pilot.pause()
             app._refresh_mesh(wall_now=1_700_000_000.0)
             await pilot.pause()

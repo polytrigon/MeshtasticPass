@@ -140,6 +140,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_error_wins_over_notice_then_notice_clears(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause()
             app._accept_received_message(
                 self.message(3001, "newer", self.base_time + 200)
             )
@@ -376,6 +377,94 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(len(app.query(ViewportMenu)), 1)
 
+    async def test_reselecting_an_already_acknowledged_message_does_nothing(
+        self,
+    ) -> None:
+        """Extends test_keyboard_selection_acknowledges_only_selected_
+
+        older_messages with the one case it doesn't cover: navigating
+        away from an already-acknowledged OLDER message and back must
+        not decrement the (already-authoritative, already-zeroed-out-
+        for-that-message) count a second time -- this reuses the
+        existing seen/BASE selection machinery (_mark_message_read /
+        pending_older_ids.discard, which is naturally idempotent on an
+        identity no longer present in the set) rather than a new,
+        separately-tracked acknowledgement flag.
+        """
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            for packet_id, text, offset in (
+                (7201, "newest", 400),
+                (7202, "older one", 300),
+                (7203, "older two", 200),
+            ):
+                app._accept_received_message(
+                    self.message(packet_id, text, self.base_time + offset)
+                )
+            app.show_tab("chat")
+            await pilot.pause()
+            status = app.query_one("#send-error", Static)
+            self.assertEqual(str(status.render()), "2 OLDER MESSAGES RECEIVED")
+            widgets = list(app.query(ChatEntryWidget))
+
+            widgets[0].focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "1 OLDER MESSAGE RECEIVED")
+
+            # Navigate away, then back onto the same, already-acknowledged
+            # message -- the count must not move at all.
+            widgets[1].focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "")
+            widgets[0].focus()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "")
+
+            # Re-focusing it directly, repeatedly, is equally inert.
+            for _ in range(3):
+                widgets[0].blur()
+                await pilot.pause()
+                widgets[0].focus()
+                await pilot.pause()
+                self.assertEqual(str(status.render()), "")
+
+    async def test_old_messages_count_derives_from_authoritative_state_not_a_counter(
+        self,
+    ) -> None:
+        """The displayed count is len(state.pending_older_ids), recomputed
+
+        fresh by _render_chat_status() every time -- proven here by
+        mutating that authoritative set directly (as the app's own
+        machinery does) and confirming the displayed text tracks it
+        exactly, with no separate counter that could drift.
+        """
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            for packet_id, text, offset in (
+                (7301, "newest", 400),
+                (7302, "older one", 300),
+                (7303, "older two", 200),
+                (7304, "older three", 100),
+            ):
+                app._accept_received_message(
+                    self.message(packet_id, text, self.base_time + offset)
+                )
+            app.show_tab("chat")
+            await pilot.pause()
+            status = app.query_one("#send-error", Static)
+            state = app._state_for(0)
+            self.assertEqual(len(state.pending_older_ids), 3)
+            self.assertEqual(str(status.render()), "3 OLDER MESSAGES RECEIVED")
+
+            identity = next(iter(state.pending_older_ids))
+            state.pending_older_ids.discard(identity)
+            app._render_chat_status()
+            self.assertEqual(str(status.render()), "2 OLDER MESSAGES RECEIVED")
+
+            state.pending_older_ids.clear()
+            app._render_chat_status()
+            self.assertEqual(str(status.render()), "")
+
     async def test_mouse_selection_matches_keyboard_without_scroll_acknowledgement(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 18)) as pilot:
@@ -492,6 +581,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_delayed_notice_and_order_are_isolated_per_channel(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 22)) as pilot:
+            await pilot.pause()
             app._accept_received_message(
                 self.message(6001, "channel zero", self.base_time + 100)
             )

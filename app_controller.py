@@ -159,6 +159,20 @@ def stored_chat_entry(
             state = DeliveryState(stored.delivery_state)
         except ValueError:
             state = DeliveryState.FAILED
+        if state is DeliveryState.SENDING:
+            # This row was left SENDING by a process that is no longer
+            # running -- that process's in-memory send lifecycle (the
+            # ACK callback, the confirmation-timeout timer, active_
+            # attempt_id) is gone, so nothing will ever move it out of
+            # SENDING on its own. Reconcile it to INTERRUPTED on load
+            # rather than let it display SENDING forever, and rather
+            # than claim the untrue SENT/HEARD. This only ever fires for
+            # a freshly-loaded row from disk: an actively SENDING entry
+            # from THIS process is a live ChatEntry object already
+            # tracked in memory (see _start_outgoing/_rebroadcast) and is
+            # never round-tripped back through this function while the
+            # process that owns it is still running.
+            state = DeliveryState.INTERRUPTED
     return ChatEntry(
         author=(
             "YOU"
