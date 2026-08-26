@@ -12,11 +12,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from rich.cells import cell_len
 from textual.color import Color
 from textual.containers import ScrollableContainer
+from textual.widgets import Input
 
 from app import (
     ANIMATED_STATUS,
@@ -466,6 +468,141 @@ class MeshTopologyModelTests(unittest.TestCase):
         plain_positions = {item.node.node_id: (item.x, item.y) for item in plain_layout.nodes}
         emoji_positions = {item.node.node_id: (item.x, item.y) for item in emoji_layout.nodes}
         self.assertEqual(plain_positions, emoji_positions)
+
+
+class MeshRemoteRelativeGeographyTests(unittest.TestCase):
+    """MODE B: when YOU has no GPS but 2+ displayed remotes do, they are
+
+    placed via their own relative geography (see
+    mesh_topology._project_remote_gps_cluster) instead of the
+    fabricated-direction-free outer-ring fallback. YOU is never assigned
+    a fake position and never assumed to sit at the cluster's centroid.
+    """
+
+    def test_relative_cluster_preserves_shape_when_local_has_no_gps(self) -> None:
+        """Case A: ALICE (NW) / BOB (NE) / CHARLIE (S), YOU with no GPS."""
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        offset = 3.0 / _MILES_PER_DEGREE_AT_EQUATOR
+        alice = NodeMetadata(
+            "!alice", "Alice", "ALC", None, position=GeoPosition(offset, -offset)
+        )
+        bob = NodeMetadata(
+            "!bob", "Bob", "BOB", None, position=GeoPosition(offset, offset)
+        )
+        charlie = NodeMetadata("!charlie", "Charlie", "CHR", None, position=south_of_local(3))
+        slots = assign_grid_slots([you, alice, bob, charlie], max_radius=3)
+        by_id = {item.node.node_id: item for item in slots}
+
+        self.assertEqual((by_id["!you"].x, by_id["!you"].y), (0, 0))
+        self.assertEqual(by_id["!you"].region, "LOCAL")
+        for node_id in ("!alice", "!bob", "!charlie"):
+            self.assertEqual(by_id[node_id].region, "GPS_RELATIVE")
+
+        self.assertLess(by_id["!alice"].x, by_id["!bob"].x)  # ALICE west of BOB
+        self.assertLess(by_id["!alice"].y, by_id["!charlie"].y)  # ALICE north of CHARLIE
+        self.assertLess(by_id["!bob"].y, by_id["!charlie"].y)  # BOB north of CHARLIE
+        self.assertEqual(by_id["!alice"].y, by_id["!bob"].y)  # symmetric fixture
+        for item in slots:
+            self.assertLessEqual(abs(item.x), 3)
+            self.assertLessEqual(abs(item.y), 3)
+
+    def test_relative_cluster_is_stable_across_repeated_calls(self) -> None:
+        """Case B: identical GPS inputs over repeated calls -> identical
+
+        positions, no jitter.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        alice = NodeMetadata("!alice", "Alice", "ALC", None, position=GeoPosition(0.02, -0.03))
+        bob = NodeMetadata("!bob", "Bob", "BOB", None, position=GeoPosition(-0.01, 0.04))
+        first = assign_grid_slots([you, alice, bob], max_radius=3)
+        second = assign_grid_slots([you, alice, bob], max_radius=3)
+        self.assertEqual(first, second)
+
+    def test_single_gps_remote_uses_fallback_not_fabricated_bearing(self) -> None:
+        """Case F: with YOU GPS-less, one GPS remote alone has no relative
+
+        geometry to construct -- it must use the existing deterministic
+        fallback, never a fabricated bearing from YOU.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        alice = NodeMetadata("!alice", "Alice", "ALC", None, position=north_of_local(3))
+        slots = assign_grid_slots([you, alice], max_radius=3)
+        by_id = {item.node.node_id: item for item in slots}
+        self.assertEqual(by_id["!alice"].region, "UNKNOWN")
+
+    def test_two_gps_remotes_preserve_east_west_ordering(self) -> None:
+        """Case G: exactly two GPS remotes -- their relative ordering is
+
+        meaningful and must survive arrival-order reversal.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        alice = NodeMetadata("!alice", "Alice", "ALC", None, position=west_of_local(2))
+        bob = NodeMetadata("!bob", "Bob", "BOB", None, position=east_of_local(2))
+        slots = assign_grid_slots([you, alice, bob], max_radius=3)
+        by_id = {item.node.node_id: item for item in slots}
+        self.assertEqual(by_id["!alice"].region, "GPS_RELATIVE")
+        self.assertEqual(by_id["!bob"].region, "GPS_RELATIVE")
+        self.assertLess(by_id["!alice"].x, by_id["!bob"].x)
+
+        reversed_slots = assign_grid_slots([you, bob, alice], max_radius=3)
+        reversed_by_id = {item.node.node_id: item for item in reversed_slots}
+        self.assertLess(reversed_by_id["!alice"].x, reversed_by_id["!bob"].x)
+
+    def test_uniform_scale_preserves_aspect_ratio_not_independent_stretch(
+        self,
+    ) -> None:
+        """A cluster twice as wide (east-west) as it is tall (north-south)
+
+        must render twice as wide as it is tall -- a single uniform
+        scale factor on both axes, never independently stretched per
+        axis merely to fill more of the available grid.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        west_node = NodeMetadata("!w", "W", None, None, position=GeoPosition(0.0, -1.0))
+        east_node = NodeMetadata("!e", "E", None, None, position=GeoPosition(0.0, 1.0))
+        north_node = NodeMetadata("!n", "N", None, None, position=GeoPosition(0.5, 0.0))
+        south_node = NodeMetadata("!s", "S", None, None, position=GeoPosition(-0.5, 0.0))
+        slots = assign_grid_slots(
+            [you, west_node, east_node, north_node, south_node], max_radius=6
+        )
+        by_id = {item.node.node_id: item for item in slots}
+        ew_span = by_id["!e"].x - by_id["!w"].x
+        ns_span = by_id["!s"].y - by_id["!n"].y
+        # Real-world ratio is 2:1 (2.0 degrees longitude vs 1.0 degree
+        # latitude, at the equator where cos(0) == 1).
+        self.assertEqual(ew_span, 12)
+        self.assertEqual(ns_span, 6)
+
+    def test_longitude_convergence_is_corrected_away_from_equator(self) -> None:
+        """At a non-equatorial latitude, the same-sized longitude delta
+
+        covers noticeably less real ground than the same-sized latitude
+        delta -- the projection must reflect that via cos(reference
+        latitude), never treat one degree of longitude as equal to one
+        degree of latitude everywhere.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        west_node = NodeMetadata(
+            "!west1", "West1", None, None, position=GeoPosition(80.0, -100.5)
+        )
+        east_node = NodeMetadata(
+            "!east1", "East1", None, None, position=GeoPosition(80.0, -99.5)
+        )
+        north_node = NodeMetadata(
+            "!north1", "North1", None, None, position=GeoPosition(80.5, -100.0)
+        )
+        south_node = NodeMetadata(
+            "!south1", "South1", None, None, position=GeoPosition(79.5, -100.0)
+        )
+        slots = assign_grid_slots(
+            [you, west_node, east_node, north_node, south_node], max_radius=10
+        )
+        by_id = {item.node.node_id: item for item in slots}
+        ew_span = abs(by_id["!east1"].x - by_id["!west1"].x)
+        ns_span = abs(by_id["!south1"].y - by_id["!north1"].y)
+        # Identical 1.0-degree raw deltas on each axis -- without the
+        # cos(latitude) correction these spans would come out equal.
+        self.assertLess(ew_span, ns_span)
 
 
 class RouteConnectorTests(unittest.TestCase):
@@ -1238,6 +1375,15 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("!oldclient", remote_ids)
 
     async def test_unchanged_data_produces_unchanged_positions(self) -> None:
+        """A second refresh moments later, with no underlying data change,
+
+        must not reshuffle anything -- including which nodes are
+        currently ACTIVE (see _mesh_active_hop_counts): both refreshes
+        use realistic, closely-spaced wall-clock values rather than an
+        arbitrary distant `wall_now` that would itself flip activity
+        (and therefore relay-chain presence) independent of any real
+        data change.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
@@ -1246,7 +1392,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             first_positions = dict(view.base_positions)
-            app._refresh_mesh(wall_now=1_700_000_500.0)
+            app._refresh_mesh(wall_now=time.time())
             await pilot.pause()
             self.assertEqual(view.base_positions, first_positions)
 
@@ -1742,6 +1888,63 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!0e0e0e0e")
 
+    async def test_navigation_works_after_visiting_chat_first(self) -> None:
+        """Real-hardware regression: switching CHAT -> MESH (the ordinary
+
+        workflow -- connect, check CHAT, then open MESH) left CHAT's own
+        focused widget (e.g. #chat-log, ChatTranscript) untouched, since
+        show_tab()'s "mesh" branch never claimed/cleared focus for
+        itself the way "chat" and "connection" already do for their own
+        widgets. ChatTranscript.on_key unconditionally handles up/down/
+        left/right/end for chat message navigation -- it never checks
+        app.current_tab -- so once it kept focus across the tab switch,
+        every arrow press on the now-visible MESH board was silently
+        redirected into invisible CHAT message navigation instead of
+        ever reaching _move_mesh_focus. Reproduces the exact
+        key/event/focus path (pilot.press, real tab switches via the
+        "2"/"3" bindings and the same Escape that moves focus off
+        #chat-input in real use), not just the selection helper
+        directly.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!0f0f0f0f", "Northern", position=north_of_local(2)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!0f0f0f0f",
+                    sender_long_name="Northern",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            self.assertIsInstance(app.focused, Input)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "chat-log")
+
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertIsNone(app.focused)
+
+            view = app.query_one(MeshTopologyView)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!0f0f0f0f")
+
     async def test_navigation_survives_decimal_vs_hex_node_id_mismatch(self) -> None:
         """End-to-end version of the mesh_state-level regression test: even
 
@@ -1804,7 +2007,14 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         nodes = [NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)]
         for name, (node_id, position) in directions.items():
             nodes.append(
-                NodeMetadata(node_id, name.title(), name[:4].upper(), hops.get(name), position=position)
+                NodeMetadata(
+                    node_id,
+                    name.title(),
+                    name[:4].upper(),
+                    hops.get(name),
+                    last_heard=time.time() - 5,
+                    position=position,
+                )
             )
         app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
         for name, (node_id, _position) in directions.items():
@@ -1905,7 +2115,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             target_id = "!ta4be701"
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata(target_id, "Target Node", "TGT", 2, position=north_of_local(9)),
+                NodeMetadata(
+                    target_id, "Target Node", "TGT", 2,
+                    last_heard=time.time() - 5, position=north_of_local(9),
+                ),
             )
             app._accept_received_message(
                 SIMULATED_MESSAGES[0].__class__(
@@ -1966,7 +2179,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             target_id = "!re1a5001"
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata(target_id, "Relay Target", "RLT", 1, position=east_of_local(9)),
+                NodeMetadata(
+                    target_id, "Relay Target", "RLT", 1,
+                    last_heard=time.time() - 5, position=east_of_local(9),
+                ),
             )
             app._accept_received_message(
                 SIMULATED_MESSAGES[0].__class__(
@@ -2042,7 +2258,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             alice_id = "!a1ice001"
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata(alice_id, "Alice", "ALC", 1, position=north_of_local(9)),
+                NodeMetadata(
+                    alice_id, "Alice", "ALC", 1,
+                    last_heard=time.time() - 5, position=north_of_local(9),
+                ),
             )
             app._accept_received_message(
                 SIMULATED_MESSAGES[0].__class__(
@@ -2093,7 +2312,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             target_id = "!ca4d1da1"
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata(target_id, "Alice", "ALC", 3, position=west_of_local(9)),
+                NodeMetadata(
+                    target_id, "Alice", "ALC", 3,
+                    last_heard=time.time() - 5, position=west_of_local(9),
+                ),
             )
             app._accept_received_message(
                 SIMULATED_MESSAGES[0].__class__(
@@ -2132,8 +2354,14 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             alice_id, bob_id = "!a11cebbb", "!b0bbbbbb"
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
-                NodeMetadata(alice_id, "Alice", "ALC", 2, position=east_of_local(9)),
-                NodeMetadata(bob_id, "Bob", "BOB", 2, position=west_of_local(9)),
+                NodeMetadata(
+                    alice_id, "Alice", "ALC", 2,
+                    last_heard=time.time() - 5, position=east_of_local(9),
+                ),
+                NodeMetadata(
+                    bob_id, "Bob", "BOB", 2,
+                    last_heard=time.time() - 5, position=west_of_local(9),
+                ),
             )
             for node_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
                 app._accept_received_message(
@@ -2434,7 +2662,16 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("RADIO DISCONNECTED", text)
             self.assertNotIn("RECONNECTING", text)
 
-    async def test_mesh_connection_status_disappears_once_connected(self) -> None:
+    async def test_mesh_connection_status_becomes_last_update_once_connected(
+        self,
+    ) -> None:
+        """The CONNECTING/RECONNECTING status text disappears once ONLINE
+
+        -- replaced by the persistent "LAST UPDATE <age>" mesh-freshness
+        indicator (see item 3), never left blank, since the default
+        SimulatedRadioService fixture has real, known NodeDB last_heard
+        data as soon as it connects.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             for _ in range(5):
@@ -2446,8 +2683,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app._radio_state, RadioState.ONLINE)
 
             status_widget = app.query_one("#mesh-connection-status")
-            self.assertFalse(status_widget.display)
-            self.assertEqual(str(status_widget.render()), "")
+            self.assertTrue(status_widget.display)
+            text = str(status_widget.render())
+            self.assertIn("LAST UPDATE", text)
+            self.assertNotIn("STATUS", text)
 
     async def test_mesh_topology_not_rebuilt_by_connection_status_change(
         self,
@@ -3366,11 +3605,666 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
 
 
-class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
-    """The shared #mesh-connection-status widget's fallback priority:
+class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
+    """Active real-node topology vs. stale last-known node history:
 
-    connection status text first, then "LAST UPDATE <age>" once ONLINE
-    but stale, else nothing -- see app._update_mesh_status_line.
+    a real node with a trustworthy nonzero hop count only gets an
+    anonymous relay chain and a connector line back to YOU while it is
+    currently ACTIVE (is_node_active(last_heard, now) -- the same
+    predicate the board's BASE/DIM_BASE styling and [3] MESH (N) use).
+    A stale node keeps its last-known grid position (see
+    _mesh_hop_counts, used for placement regardless of activity) but no
+    connector/relay chain -- see _mesh_active_hop_counts and
+    MeshTopologyView.set_nodes.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    def _relay_source_ids(self, view: MeshTopologyView) -> set[str]:
+        return {stage.source_node_id for stage in view.relay_stages}
+
+    async def test_active_nodes_get_topology_stale_nodes_stay_dim_and_disconnected(
+        self,
+    ) -> None:
+        """The item-9 example: ALICE (active, 0 hops) and CHARLIE (active,
+
+        2 hops) participate in visible connector topology; BOB and DAVID
+        (stale) remain visible at their last-known position with no
+        relay chain and no connector. [3] MESH (2) -- exactly the two
+        active endpoints, never the four displayed real nodes.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            alice = NodeMetadata(
+                "!a1ice000", "Alice", "ALC", 0,
+                last_heard=now - 5, position=north_of_local(3),
+            )
+            bob = NodeMetadata(
+                "!b0b00000", "Bob", "BOB", 0,
+                last_heard=stale_last_heard, position=south_of_local(3),
+            )
+            charlie = NodeMetadata(
+                "!cha4lie0", "Charlie", "CHL", 2,
+                last_heard=now - 5, position=east_of_local(3),
+            )
+            david = NodeMetadata(
+                "!dav1d000", "David", "DAV", 1,
+                last_heard=stale_last_heard, position=west_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda: (local, alice, bob, charlie, david)
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertIn("MESH (2)", str(app.query_one("#tab-bar").render()))
+            view = app.query_one(MeshTopologyView)
+
+            source_ids = self._relay_source_ids(view)
+            self.assertNotIn("!b0b00000", source_ids)
+            self.assertNotIn("!dav1d000", source_ids)
+            self.assertNotIn("!a1ice000", source_ids)  # 0 hops -> no stages
+            self.assertIn("!cha4lie0", source_ids)
+            self.assertEqual(
+                sum(1 for s in view.relay_stages if s.source_node_id == "!cha4lie0"), 2
+            )
+
+            for stale_id in ("!b0b00000", "!dav1d000"):
+                self.assertIn(stale_id, {w.node_id for w in app.query(MeshNodeWidget)})
+
+    async def test_node_becoming_active_gains_connector_without_moving(self) -> None:
+        """Live INACTIVE -> ACTIVE transition (item 4/5): a normal refresh
+
+        brightens the node, generates its relay chain from its current
+        hops_away, and connects it back to YOU -- all without a tab
+        switch/reconnect/restart, and without moving the node to a new
+        grid position (placement is independent of activity).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            crosser = NodeMetadata(
+                "!cr055er0", "Crosser", "CRS", 2,
+                last_heard=stale_last_heard, position=north_of_local(5),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, crosser): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertNotIn("!cr055er0", self._relay_source_ids(view))
+            position_before = view.base_positions["!cr055er0"]
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+
+            fresh_crosser = NodeMetadata(
+                "!cr055er0", "Crosser", "CRS", 2,
+                last_heard=now - 5, position=north_of_local(5),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, fresh_crosser): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertEqual(view.base_positions["!cr055er0"], position_before)
+            self.assertEqual(
+                sum(1 for s in view.relay_stages if s.source_node_id == "!cr055er0"), 2
+            )
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!cr055er0")
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+
+    async def test_node_becoming_inactive_loses_connector_without_orphans(self) -> None:
+        """Live ACTIVE -> INACTIVE transition (item 4/6): a normal refresh
+
+        dims the node, removes its connector path, and removes its own
+        synthetic relay stages -- with no orphan relay widgets left
+        behind for anyone -- while the node itself stays mounted and
+        visible.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            active_node = NodeMetadata(
+                "!ag1ng000", "Ager", "AGR", 3,
+                last_heard=now - 5, position=south_of_local(5),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, active_node): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("!ag1ng000", self._relay_source_ids(view))
+            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 3)
+            position_before = view.base_positions["!ag1ng000"]
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+
+            stale_node = NodeMetadata(
+                "!ag1ng000", "Ager", "AGR", 3,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=south_of_local(5),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale_node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertEqual(view.relay_stages, ())
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
+            self.assertIn("!ag1ng000", {w.node_id for w in app.query(MeshNodeWidget)})
+            self.assertEqual(view.base_positions["!ag1ng000"], position_before)
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!ag1ng000")
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+    async def test_every_relay_widget_belongs_to_a_currently_active_endpoint(
+        self,
+    ) -> None:
+        """General invariant (item 6/7): after a refresh with a mix of
+
+        active and stale hopped real nodes, every mounted MeshRelayWidget
+        belongs (via source_node_id) to a real node that is BOTH in the
+        current working set AND currently active -- no orphan relay
+        widget ever exists for a stale or vanished node.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            nodes = (
+                local,
+                NodeMetadata(
+                    "!act1ve01", "Active1", "AC1", 1,
+                    last_heard=now - 5, position=north_of_local(4),
+                ),
+                NodeMetadata(
+                    "!act1ve02", "Active2", "AC2", 2,
+                    last_heard=now - 5, position=east_of_local(4),
+                ),
+                NodeMetadata(
+                    "!sta1e001", "Stale1", "ST1", 3,
+                    last_heard=stale_last_heard, position=south_of_local(4),
+                ),
+                NodeMetadata(
+                    "!sta1e002", "Stale2", "ST2", 1,
+                    last_heard=stale_last_heard, position=west_of_local(4),
+                ),
+            )
+            app.radio.get_known_nodes = lambda: nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            active_ids = {
+                state.node.node_id
+                for state in view.working_set
+                if not state.node.is_local
+                and is_node_active(state.node.last_heard, now)
+            }
+            self.assertEqual(active_ids, {"!act1ve01", "!act1ve02"})
+            for stage in view.relay_stages:
+                self.assertIn(stage.source_node_id, active_ids)
+            relay_widget_ids = {w.node_id for w in app.query(MeshRelayWidget)}
+            self.assertEqual(relay_widget_ids, {s.node_id for s in view.relay_stages})
+
+    async def test_stale_node_stays_selectable_via_arrow_navigation(self) -> None:
+        """Losing active connector topology never removes a node from the
+
+        navigation candidate set (see _move_mesh_focus, which filters
+        only relay-stage IDs, never by activity) -- a stale, dim,
+        disconnected real node is still a first-class, selectable board
+        member.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            stale = NodeMetadata(
+                "!qu1et000", "Quiet", "QUI", 1,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100,
+                position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.relay_stages, ())
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!qu1et000")
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("Quiet"))
+
+    async def test_no_orphan_relays_under_realistic_mixed_topology(self) -> None:
+        """Reproduction of the hardware-observed "phantom relay" report:
+
+        a board mixing several stale, unlabeled-looking real nodes with
+        several active ones of varying hop counts, spread across
+        distinct compass directions (so bucket-ordering can't merge
+        their chains). For every rendered relay stage, prove its owner
+        is a real node that is (a) currently ACTIVE, (b) present in the
+        working set, (c) actually mounted as a MeshNodeWidget, and (d)
+        rendered FILLED (see item 2) -- and that the owner's stage COUNT
+        exactly matches its hops_away, never more, never fewer. No
+        relay may ever exist without satisfying all four.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            active_last_heard = now - 5
+            miles = 3.0
+            offset = miles / _MILES_PER_DEGREE_AT_EQUATOR
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            # 4 stale (unknown/known hops, never active) + 4 active
+            # (varying hop counts, including a long chain), one per
+            # compass direction.
+            nodes = (
+                local,
+                NodeMetadata(
+                    "!qnzt0000", "QnzT", "QNZ", None,
+                    last_heard=stale_last_heard, position=GeoPosition(offset, -offset),
+                ),
+                NodeMetadata(
+                    "!b60c0000", "b60c", "B60", 2,
+                    last_heard=stale_last_heard, position=GeoPosition(-offset, offset),
+                ),
+                NodeMetadata(
+                    "!zrak0000", "Zrak", "ZRK", 1,
+                    last_heard=stale_last_heard, position=GeoPosition(-offset, -offset),
+                ),
+                NodeMetadata(
+                    "!n2dh0000", "N2DH", "N2D", None,
+                    last_heard=stale_last_heard, position=GeoPosition(offset, offset),
+                ),
+                NodeMetadata(
+                    "!skugh000", "Skugh", "SKU", 1,
+                    last_heard=active_last_heard, position=north_of_local(miles),
+                ),
+                NodeMetadata(
+                    "!nova0000", "Nova", "NOV", 0,
+                    last_heard=active_last_heard, position=west_of_local(miles),
+                ),
+                NodeMetadata(
+                    "!b8b80000", "b8b8", "B8B", 5,
+                    last_heard=active_last_heard, position=east_of_local(miles),
+                ),
+                NodeMetadata(
+                    "!d0ec0000", "d0ec", "D0E", 2,
+                    last_heard=active_last_heard, position=south_of_local(miles),
+                ),
+            )
+            app.radio.get_known_nodes = lambda: nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn("MESH (4)", tab_bar)
+
+            view = app.query_one(MeshTopologyView)
+            expected_hops = {"!skugh000": 1, "!b8b80000": 5, "!d0ec0000": 2}
+            active_ids = set(expected_hops) | {"!nova0000"}
+            stale_ids = {"!qnzt0000", "!b60c0000", "!zrak0000", "!n2dh0000"}
+
+            # (a)/(d): every active real node is mounted and FILLED;
+            # every stale one is mounted and STROKED.
+            palette = THEME_PALETTES[app._current_theme]
+            for node_id in active_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(str(widget.render()).strip(), CIRCLE_SOLID_LARGE)
+            for node_id in stale_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(str(widget.render()).strip(), CIRCLE_STROKED_LARGE)
+
+            # (b)/(c): every relay's owner is a currently-active,
+            # displayed working-set member -- never a stale one.
+            mounted_ids = {w.node_id for w in app.query(MeshNodeWidget)}
+            working_set_active_ids = {
+                state.node.node_id
+                for state in view.working_set
+                if not state.node.is_local
+                and is_node_active(state.node.last_heard, now)
+            }
+            self.assertEqual(working_set_active_ids, active_ids)
+            for stage in view.relay_stages:
+                self.assertIn(stage.source_node_id, active_ids)
+                self.assertIn(stage.source_node_id, mounted_ids)
+                self.assertNotIn(stage.source_node_id, stale_ids)
+
+            # Exact stage count per active owner, no partial chains --
+            # Nova (0 hops) gets none.
+            for node_id, hops in expected_hops.items():
+                owned = [s for s in view.relay_stages if s.source_node_id == node_id]
+                self.assertEqual(len(owned), hops)
+                self.assertEqual(
+                    sorted(s.index for s in owned), list(range(1, hops + 1))
+                )
+            self.assertEqual(
+                sum(1 for s in view.relay_stages if s.source_node_id == "!nova0000"), 0
+            )
+            self.assertEqual(len(view.relay_stages), sum(expected_hops.values()))
+
+            # Every mounted relay widget corresponds 1:1 to a computed
+            # stage -- no leftover/orphan widget beyond what the model
+            # itself says should exist.
+            relay_widget_ids = {w.node_id for w in app.query(MeshRelayWidget)}
+            self.assertEqual(relay_widget_ids, {s.node_id for s in view.relay_stages})
+
+
+class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
+    """App-level integration coverage for MODE A/MODE B geographic
+
+    placement transitions, coexistence with non-GPS fallback nodes, and
+    the invariant that neither activity nor selection ever triggers a
+    fresh geographic projection -- see mesh_topology.assign_grid_slots
+    and _project_remote_gps_cluster for the underlying pure logic
+    (covered independently by MeshRemoteRelativeGeographyTests).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_you_gaining_gps_switches_to_true_you_relative_mode(self) -> None:
+        """Case C: YOU gains GPS mid-session -- placement switches to real
+
+        YOU-relative geography and actual distance becomes available on
+        a normal refresh, with no fake YOU coordinate ever having
+        existed beforehand.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!al1cegps", "!b0bgps00"
+            no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                alice_id, "Alice", "ALC", None, last_heard=now - 5,
+                position=north_of_local(2),
+            )
+            bob = NodeMetadata(
+                bob_id, "Bob", "BOB", None, last_heard=now - 5, position=south_of_local(2)
+            )
+            app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                {s.node.node_id for s in view.working_set if not s.node.is_local},
+                {alice_id, bob_id},
+            )
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            self.assertTrue(str(app.query_one("#mesh-context-status").render()).endswith("? mi"))
+
+            gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertFalse(status.endswith("? mi"))
+
+    async def test_you_losing_gps_returns_to_remote_relative_mode(self) -> None:
+        """Case D: YOU loses GPS -- returns cleanly to remote-relative
+
+        placement on the next normal refresh.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!al1cegps", "!b0bgps00"
+            alice = NodeMetadata(
+                alice_id, "Alice", "ALC", None, last_heard=now - 5, position=west_of_local(2)
+            )
+            bob = NodeMetadata(
+                bob_id, "Bob", "BOB", None, last_heard=now - 5, position=east_of_local(2)
+            )
+            gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            self.assertFalse(
+                str(app.query_one("#mesh-context-status").render()).endswith("? mi")
+            )
+
+            no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
+            app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertLess(
+                view.base_positions[alice_id][1], view.base_positions[bob_id][1]
+            )
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            self.assertTrue(
+                str(app.query_one("#mesh-context-status").render()).endswith("? mi")
+            )
+
+    async def test_gps_cluster_coexists_with_fallback_nodes_without_collision(
+        self,
+    ) -> None:
+        """Case E: 3 GPS remotes + 2 no-GPS remotes, YOU with no GPS.
+
+        The GPS cluster keeps its relative geometry; the fallback nodes
+        get deterministic free positions that never collide with the
+        GPS cluster or distort it.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!al1ce001", "Alice", "ALC", None, last_heard=now - 5,
+                position=north_of_local(3),
+            )
+            bob = NodeMetadata(
+                "!b0b00001", "Bob", "BOB", None, last_heard=now - 5, position=west_of_local(3)
+            )
+            david = NodeMetadata(
+                "!dav1d001", "David", "DAV", None, last_heard=now - 5,
+                position=east_of_local(3),
+            )
+            charlie = NodeMetadata(
+                "!char1001", "Charlie", "CHR", None, last_heard=now - 5, position=None
+            )
+            erin = NodeMetadata(
+                "!er1n0001", "Erin", "ERN", None, last_heard=now - 5, position=None
+            )
+            nodes = (local, alice, bob, david, charlie, erin)
+            app.radio.get_known_nodes = lambda: nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            positions = view.base_positions
+            all_ids = ["!al1ce001", "!b0b00001", "!dav1d001", "!char1001", "!er1n0001"]
+            position_values = [positions[n] for n in all_ids] + [
+                positions[app.radio.info.node_id]
+            ]
+            self.assertEqual(len(position_values), len(set(position_values)))
+            # Bob (west) still strictly west of David (east) -- the
+            # fallback nodes did not distort the GPS cluster's geometry.
+            self.assertLess(positions["!b0b00001"][1], positions["!dav1d001"][1])
+
+    async def test_activity_change_alone_never_moves_a_gps_node(self) -> None:
+        """Case H: ACTIVE -> STALE for a MODE B GPS-relative node changes
+
+        only its styling/topology, never its position.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!ag1nggps", "Ager", "AGR", None, last_heard=now - 5, position=north_of_local(3)
+            )
+            bob = NodeMetadata(
+                "!b0bstblx", "Bob", "BOB", None, last_heard=now - 5, position=south_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            position_before = view.base_positions["!ag1nggps"]
+
+            stale_alice = NodeMetadata(
+                "!ag1nggps", "Ager", "AGR", None,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale_alice, bob): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(view.base_positions["!ag1nggps"], position_before)
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!ag1nggps")
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+    async def test_selection_change_never_reprojects_gps_cluster(self) -> None:
+        """Case I: selecting a different node must not trigger a fresh
+
+        geographic projection with different normalization -- the
+        underlying relative geometry is exactly preserved, only the
+        recentering translation changes (see _mesh_translated_positions).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!al1cesel", "Alice", "ALC", None, last_heard=now - 5,
+                position=north_of_local(3),
+            )
+            bob = NodeMetadata(
+                "!b0bselec", "Bob", "BOB", None, last_heard=now - 5, position=south_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            base_positions_before = dict(view.base_positions)
+
+            _mesh_select_node(app, "!al1cesel")
+            await pilot.pause()
+            self.assertEqual(view.base_positions, base_positions_before)
+
+    async def test_live_gps_update_reflows_placement_on_normal_refresh(self) -> None:
+        """Case J: a remote node gaining/changing valid GPS mid-session
+
+        updates the geographic placement on the next normal refresh --
+        no tab switch, reconnect, or restart required.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!al1velv1", "Alice", "ALC", None, last_heard=now - 5, position=None
+            )
+            bob = NodeMetadata(
+                "!b0blivea", "Bob", "BOB", None, last_heard=now - 5, position=west_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                {s.node.node_id for s in view.working_set if s.node.node_id == "!al1velv1"},
+                {"!al1velv1"},
+            )
+            # Only one GPS remote (Bob) so far -- fallback placement.
+            alice_before = view.base_positions["!al1velv1"]
+
+            gps_alice = NodeMetadata(
+                "!al1velv1", "Alice", "ALC", None, last_heard=now - 5,
+                position=east_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, gps_alice, bob): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            # Now two GPS remotes -- relative geography kicks in, and
+            # Alice (east) must land strictly east of Bob (west).
+            self.assertLess(
+                view.base_positions["!b0blivea"][1], view.base_positions["!al1velv1"][1]
+            )
+            self.assertNotEqual(view.base_positions["!al1velv1"], alice_before)
+
+
+class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
+    """The shared #mesh-connection-status widget's priority:
+
+    the shared connection-status text while not ONLINE, else a
+    PERSISTENT "LAST UPDATE <age>" mesh-freshness indicator -- always
+    shown while ONLINE, not only when stale -- see
+    app._update_mesh_status_line. The age is a pure function of (most
+    recent working-set remote last_heard, current wall time): it climbs
+    between refreshes with no new data and resets only when a genuinely
+    fresher NodeDB timestamp arrives, never merely because a refresh ran.
     """
 
     def setUp(self) -> None:
@@ -3409,7 +4303,12 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("LAST UPDATE", text)
             self.assertIn("8m", text)
 
-    async def test_fresh_board_hides_last_update_indicator(self) -> None:
+    async def test_fresh_board_still_shows_last_update_age(self) -> None:
+        """LAST UPDATE is a persistent freshness indicator, not a
+
+        stale-only warning: it shows even while a node is currently
+        active and the board looks fully current.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
@@ -3420,9 +4319,106 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             text = await self._mesh_status_text(app)
+            self.assertIn("LAST UPDATE", text)
+            self.assertIn("5s", text)
+            self.assertTrue(app.query_one("#mesh-connection-status").display)
+
+    async def test_last_update_ages_between_refreshes_with_no_new_data(self) -> None:
+        """Between two refreshes with the SAME underlying last_heard, the
+
+        displayed age must grow by exactly the elapsed wall-clock time --
+        proving it is computed from (data, now), not reset just because
+        a refresh happened.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata("!ag1ng001", "Ager", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 5s", await self._mesh_status_text(app))
+
+            app._refresh_mesh(wall_now=now + 30)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 35s", await self._mesh_status_text(app))
+
+    async def test_ui_refresh_alone_does_not_reset_last_update(self) -> None:
+        """Calling _refresh_mesh() again with unchanged data AND
+
+        unchanged wall-clock time must leave the displayed age exactly
+        as it was -- a bare repaint is not a new data event.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata("!st111111", "Steady", last_heard=now - 42)
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            first_text = await self._mesh_status_text(app)
+            self.assertIn("LAST UPDATE 42s", first_text)
+
+            for _ in range(3):
+                app._refresh_mesh(wall_now=now)
+                await pilot.pause()
+            self.assertEqual(await self._mesh_status_text(app), first_text)
+
+    async def test_meaningful_nodedb_update_resets_last_update_age(self) -> None:
+        """A genuinely fresher NodeDB last_heard resets the displayed age
+
+        -- never derived from CHAT history, purely from the passive
+        mesh-state timestamp itself.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            old_heard = NodeMetadata("!upd00001", "Updater", last_heard=now - 90)
+            app.radio.get_known_nodes = lambda nodes=(local, old_heard): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 1m", await self._mesh_status_text(app))
+
+            fresh_heard = NodeMetadata("!upd00001", "Updater", last_heard=now)
+            app.radio.get_known_nodes = lambda nodes=(local, fresh_heard): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 0s", await self._mesh_status_text(app))
+
+    async def test_returning_online_restores_last_update(self) -> None:
+        """CONNECTING replaces LAST UPDATE in the same widget location;
+
+        once ONLINE resumes, LAST UPDATE returns automatically -- no
+        second/duplicate status line is ever created.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata("!re1turn0", "Returner", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            text = await self._mesh_status_text(app)
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.CONNECTING]}", text)
             self.assertNotIn("LAST UPDATE", text)
-            self.assertEqual(text, "")
-            self.assertFalse(app.query_one("#mesh-connection-status").display)
+
+            app._show_connection(RadioState.ONLINE, app.radio.info)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertEqual(len(list(app.query("#mesh-connection-status"))), 1)
 
     async def test_connecting_status_overrides_stale_last_update(self) -> None:
         """While CONNECTING/RECONNECTING, the shared connection-status
