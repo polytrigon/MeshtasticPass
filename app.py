@@ -106,8 +106,8 @@ install_flag_pair_protection()
 # navigation/UI-only change, not a deletion; restoring PROFILE to the
 # nav later only requires re-adding it to this dict and to tab_for_key.
 TAB_NAMES = {
-    "chat": "CHAT",
     "connection": "CONNECTION/CONFIG",
+    "chat": "CHAT",
     "mesh": "MESH",
 }
 
@@ -2320,8 +2320,8 @@ class MeshtasticPassApp(App[None]):
         # is simply not mapped to anything, rather than falling through
         # to the now-hidden tab.
         tab_for_key = {
-            "1": "chat",
-            "2": "connection",
+            "1": "connection",
+            "2": "chat",
             "3": "mesh",
         }
         if event.key in tab_for_key:

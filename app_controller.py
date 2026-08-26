@@ -177,6 +177,29 @@ def stored_chat_entry(
             # back through this function while the process that owns it
             # is still running.
             state = DeliveryState.INTERRUPTED
+        elif state is DeliveryState.SENT:
+            # A SENT row's confirmation window (ChatEntry.confirmation_
+            # deadline, a monotonic() timestamp compared against by
+            # _advance_delivery_states()) is never persisted -- it only
+            # ever lives on the in-memory ChatEntry the sending process
+            # created, and a HEARD acknowledgement can only ever reach
+            # that same live process's radio callback. Once this row is
+            # loaded fresh (no live deadline, confirmation_deadline
+            # defaults to None below), nothing can ever move it out of
+            # SENT again: _advance_delivery_states() only advances a SENT
+            # entry once `now >= confirmation_deadline`, which is never
+            # true for None. Meanwhile ChatEntryWidget.refresh_delivery_
+            # state() deliberately renders SENT identically to SENDING
+            # (an intentional "still awaiting confirmation" display) --
+            # so an unreconciled restored SENT row displays "SENDING..."
+            # forever, with no way out: SENT is also not in
+            # MANUAL_RESEND_STATES, so it never even offers a resend
+            # action. UNCONFIRMED is the honest state for "sent in a
+            # past session, no confirmation was ever received, and none
+            # ever can be now" -- it renders distinctly from SENDING and
+            # is manually resendable, exactly like a SENT row that timed
+            # out normally within a single session.
+            state = DeliveryState.UNCONFIRMED
     return ChatEntry(
         author=(
             "YOU"
