@@ -76,12 +76,19 @@ class RelayStage:
 
     `node_id` is an internal-only synthetic identifier
     ("relay:<source_node_id>:<index>") used purely for rendering,
-    navigation, and selection bookkeeping; it must never be shown to the
-    user (the UI always displays exactly "RELAY" for a selected relay
-    stage). `is_local` is always False, present only so a RelayStage can
-    be duck-typed alongside NodeMetadata (both expose node_id/is_local)
-    by generic, node-kind-agnostic code such as the arrow-navigation
-    layout. `source_node_id` is the real client this stage belongs to;
+    topology, and connector bookkeeping; it must never be shown to the
+    user. Anonymous relay stages are visual topology only -- they
+    cannot be selected, focused, or navigated to (see
+    MeshTopologyView.select_node() and app.py's _move_mesh_focus, which
+    excludes every RelayStage ID from the navigation candidate set), so
+    this ID never appears as `selected_node_id` and never drives the
+    bottom-left context line; a genuinely identified real RELAY-only
+    node (should trustworthy evidence for one ever exist) would instead
+    use the standard remote-node context line with ROLE=RELAY. `is_local`
+    is always False, present only so a RelayStage can be duck-typed
+    alongside NodeMetadata (both expose node_id/is_local) by generic,
+    node-kind-agnostic rendering/connector code. `source_node_id` is the
+    real client this stage belongs to;
     `index` is this stage's 1-indexed position counting outward from
     YOU (1 = nearest YOU, N = nearest the client for an N-hop client).
     Together, source_node_id and index guarantee that two different

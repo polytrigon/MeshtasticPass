@@ -1936,9 +1936,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         """Anonymous relay stages are never focusable/selectable: no
 
         on_click, never ACCENT, never the enlarged composite, never the
-        bottom-left context, and attempting to select one directly falls
-        back exactly like any other invalid ID (spec update section
-        "UNKNOWN RELAYS ARE NOT SELECTABLE").
+        bottom-left context, and MeshTopologyView.select_node() rejects
+        a relay stage ID outright as a no-op rather than accepting it
+        and relying on a later set_nodes() call to repair it (spec
+        update section "UNKNOWN RELAYS ARE NOT SELECTABLE").
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1984,8 +1985,11 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             # Directly attempting to select a relay stage ID (there is no
             # UI path that does this anymore -- proving the model layer
-            # itself refuses, not just the removed click handler) falls
-            # back to YOU exactly like any other invalid ID.
+            # itself refuses, not just the removed click handler): YOU is
+            # already selected here, and MeshTopologyView.select_node()
+            # rejects the relay ID outright as a no-op (see
+            # test_select_node_accepts_only_real_working_set_nodes for
+            # the dedicated proof) -- selection simply never moves off YOU.
             _mesh_select_node(app, stage_id)
             await pilot.pause()
             self.assertEqual(view.selected_node_id, you_id)
@@ -1996,6 +2000,72 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(int(relay_widget.styles.width.value), 1)
             self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
+
+    async def test_select_node_accepts_only_real_working_set_nodes(self) -> None:
+        """MeshTopologyView.select_node() is authoritative: only a real
+
+        node currently in `working_set` may ever become
+        `selected_node_id`. An anonymous RelayStage ID or an arbitrary
+        unknown ID is rejected outright as a no-op right here, never
+        even momentarily accepted and relying on a later set_nodes()
+        call to repair it (spec update: tighten the selection boundary
+        at select_node() itself, not just at the removed click handler
+        or the navigation candidate filter). Requirement 5 (falling
+        back to YOU when the selected REAL node disappears on refresh)
+        is proven separately by
+        test_selection_falls_back_to_you_if_it_disappears -- that path
+        goes through set_nodes()'s own fallback, not select_node(),
+        and is unaffected by this change.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            alice_id = "!a1ice001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(alice_id, "Alice", "ALC", 1, position=north_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=alice_id,
+                    sender_long_name="Alice",
+                    sender_short_name="ALC",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 1)
+            relay_id = view.relay_stages[0].node_id
+
+            # 1. Real working-set node selection succeeds.
+            view.select_node(alice_id)
+            self.assertEqual(view.selected_node_id, alice_id)
+
+            # 2. Anonymous relay-stage ID selection is a no-op.
+            view.select_node(relay_id)
+            self.assertEqual(view.selected_node_id, alice_id)
+            self.assertNotEqual(view.selected_node_id, relay_id)
+
+            # 3. Arbitrary/unknown ID selection is a no-op.
+            view.select_node("!totally-unknown-id")
+            self.assertEqual(view.selected_node_id, alice_id)
+
+            # 4. selected_node_id never even momentarily becomes a relay ID.
+            for _ in range(3):
+                view.select_node(relay_id)
+                self.assertNotEqual(view.selected_node_id, relay_id)
+            self.assertEqual(view.selected_node_id, alice_id)
+
+            # Normal real-node selection behavior is otherwise unchanged.
+            view.select_node(you_id)
+            self.assertEqual(view.selected_node_id, you_id)
 
     async def test_navigation_candidate_set_excludes_relay_stage_ids(self) -> None:
         app = self._make_app()

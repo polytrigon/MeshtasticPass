@@ -1044,7 +1044,18 @@ class MeshTopologyView(Container):
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
     def select_node(self, node_id: str) -> None:
-        self._selected_node_id = node_id
+        """Select a real working-set node by ID; anything else is a no-op.
+
+        `_selected_node_id` may only ever hold a real node currently in
+        `working_set` -- an anonymous RelayStage's synthetic ID, or any
+        other stale/unknown ID, is rejected outright rather than
+        accepted here and relying on a later set_nodes() call to
+        sanitize it back out. Relay stages are internal rendering/
+        topology bookkeeping only (see mesh_topology.RelayStage) and can
+        never be selected, focused, navigated to, or recentered on.
+        """
+        if any(state.node.node_id == node_id for state in self._working_set):
+            self._selected_node_id = node_id
 
     def select_local(self) -> None:
         local_id = next(
