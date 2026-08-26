@@ -140,6 +140,18 @@ class ChatStore:
 
         Returns the number of `messages` rows rewritten (for logging
         and tests).
+
+        Assumes at most one ChatStore is ever open against a given
+        database file at a time -- true of how the app itself uses
+        this (main() opens exactly one, for the process's whole
+        lifetime). Opening a SECOND store against a database another
+        still-running process/store already owns would incorrectly
+        interrupt a send that store has legitimately in flight, since
+        this method cannot distinguish "abandoned by a dead process"
+        from "owned by a live one" other than by that single-open
+        assumption. A read-only inspection tool (see
+        inspect_chat_store.py) must never call open() on a database
+        that might still be live for exactly this reason.
         """
         with self._transaction() as connection:
             cursor = connection.execute(

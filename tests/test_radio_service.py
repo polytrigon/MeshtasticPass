@@ -139,6 +139,80 @@ class RadioServiceTests(unittest.TestCase):
         self.assertEqual(open_interface.call_count, 2)
         self.assertGreaterEqual(interface.close.call_count, 2)
 
+    def test_receive_callback_delivers_messages_across_a_reconnect(self) -> None:
+        """_subscribe_to_events() only subscribes once per RadioService
+
+        (self._pub guards against re-subscribing on every reconnect,
+        since the underlying pubsub dispatch is a process-wide
+        singleton independent of any one interface object) -- but
+        _on_text_received must still correctly route messages to
+        _message_handlers for a SECOND interface generation, not only
+        the first, and must still ignore a stray callback tagged with
+        an interface this service no longer owns.
+        """
+        service = RadioService()
+        first_interface = make_interface()
+        second_interface = make_interface()
+        stopped = Event()
+        received: list[str] = []
+        service.add_message_handler(lambda message: received.append(message.text))
+
+        def text_packet(text: str) -> dict:
+            return {
+                "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": text},
+                "from": 0x12345678,
+                "fromId": "!12345678",
+                "channel": 0,
+            }
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                side_effect=[first_interface, second_interface],
+            ),
+        ):
+            events = service.connection_events(
+                retry_delay=0,
+                stop_event=stopped,
+                poll_interval=0.001,
+            )
+
+            self.assertEqual(next(events).state, RadioState.CONNECTING)
+            self.assertEqual(next(events).state, RadioState.ONLINE)
+
+            service._on_text_received(
+                packet=text_packet("first generation"), interface=first_interface
+            )
+            self.assertEqual(received, ["first generation"])
+
+            service._on_connection_lost(first_interface)
+            self.assertEqual(next(events).state, RadioState.OFFLINE)
+            self.assertEqual(next(events).state, RadioState.CONNECTING)
+            self.assertEqual(next(events).state, RadioState.ONLINE)
+
+            # A callback still tagged with the now-superseded interface
+            # (e.g. a message the SDK was already dispatching at the
+            # moment of disconnect) must not be attributed as live.
+            service._on_text_received(
+                packet=text_packet("stale first-generation packet"),
+                interface=first_interface,
+            )
+            self.assertEqual(received, ["first generation"])
+
+            # The receive callback must still be live for the NEW
+            # interface generation -- this is the actual "does receive
+            # survive a reconnect" proof.
+            service._on_text_received(
+                packet=text_packet("second generation"), interface=second_interface
+            )
+            self.assertEqual(received, ["first generation", "second generation"])
+
+            stopped.set()
+            with self.assertRaises(StopIteration):
+                next(events)
+
     def test_retries_after_initial_connection_failure(self) -> None:
         service = RadioService()
         interface = make_interface()
