@@ -10,12 +10,40 @@ from mesh_state import (
     MeshNodeState,
     build_mesh_working_set,
     format_mesh_context_line,
+    normalize_mesh_node_id,
 )
 from radio_service import NodeMetadata
 
 
 NOW = 1_000_000.0
 YOU = NodeMetadata("!you", "Local", "ME", 0, NOW, True)
+
+
+class NormalizeMeshNodeIdTests(unittest.TestCase):
+    """The exact int/hex and case mismatches flagged as the navigation
+
+    regression's likely cause: two representations of the same physical
+    node must normalize to one identical string.
+    """
+
+    def test_already_canonical_form_is_unchanged(self) -> None:
+        self.assertEqual(normalize_mesh_node_id("!075bcd15"), "!075bcd15")
+
+    def test_uppercase_hex_normalizes_to_lowercase(self) -> None:
+        self.assertEqual(normalize_mesh_node_id("!075BCD15"), "!075bcd15")
+
+    def test_bare_decimal_node_number_normalizes_to_hex_form(self) -> None:
+        """123456789 decimal == 0x075bcd15 -- the exact pairing called out
+
+        as the suspected root cause.
+        """
+        self.assertEqual(normalize_mesh_node_id("123456789"), "!075bcd15")
+
+    def test_whitespace_is_stripped(self) -> None:
+        self.assertEqual(normalize_mesh_node_id("  !075bcd15  "), "!075bcd15")
+
+    def test_empty_string_stays_empty(self) -> None:
+        self.assertEqual(normalize_mesh_node_id(""), "")
 
 
 def client_state(
@@ -142,6 +170,45 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         )
         remote = next(state for state in result if not state.node.is_local)
         self.assertEqual(remote.node.long_name, "Alice")
+
+    def test_decimal_sender_id_still_joins_the_real_known_node(self) -> None:
+        """Regression: if the CHAT-activity source reports a sender under a
+
+        bare decimal node number ("123456789") while get_known_nodes()
+        reports the SAME physical node as "!075bcd15", the two must
+        resolve to one MeshNodeState carrying the real name/position --
+        not a nameless "ghost" node under the decimal ID that leaves the
+        real node entirely absent from the working set (which is what
+        broke arrow navigation: the rendered/positioned node and the one
+        navigation could find were different objects).
+        """
+        north_node = NodeMetadata("!075bcd15", "North Node", "NORTH", 1, NOW)
+        result = build_mesh_working_set(
+            [YOU, north_node], last_message_at={"123456789": NOW - 10}
+        )
+        self.assertEqual(len(result), 2)
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertEqual(remote.node.node_id, "!075bcd15")
+        self.assertEqual(remote.node.long_name, "North Node")
+
+    def test_split_representations_of_one_node_merge_keeping_latest_time(
+        self,
+    ) -> None:
+        """If a node's history was already split across both raw
+
+        representations (e.g. an older message logged under the decimal
+        form, a newer one under the hex form), the working set must
+        merge them into one node, keeping the more recent timestamp --
+        never silently dropping one representation's activity.
+        """
+        result = build_mesh_working_set(
+            [YOU],
+            last_message_at={"123456789": NOW - 500, "!075bcd15": NOW - 10},
+        )
+        self.assertEqual(len(result), 2)
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertEqual(remote.node.node_id, "!075bcd15")
+        self.assertEqual(remote.last_interaction_at, NOW - 10)
 
     def test_working_set_is_bounded_to_max_remote_nodes(self) -> None:
         last_message_at = {f"!n{i:04x}": NOW - i for i in range(20)}

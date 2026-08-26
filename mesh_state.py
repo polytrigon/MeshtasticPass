@@ -7,7 +7,7 @@ testable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
 from mesh_topology import compact_node_label
@@ -17,6 +17,34 @@ from relative_time import format_relative_age
 
 MESH_STALE_THRESHOLD_SECONDS = 24 * 60 * 60
 DEFAULT_MAX_REMOTE_NODES = 8
+
+
+def normalize_mesh_node_id(node_id: str) -> str:
+    """Canonical MESH node-ID form: lowercase, "!"-prefixed 8-hex-digit.
+
+    Two representations of the SAME physical node must compare equal
+    everywhere MESH keys anything by node ID -- the working set, grid
+    layout positions, rendered widgets, and directional navigation all
+    join on this string. If any two of those disagreed on case, or one
+    carried a bare decimal node number (e.g. "123456789") where another
+    carried the standard "!075bcd15" hex form, the affected node would
+    silently vanish from ONE join (typically navigation, which looks up
+    an exact key) while still rendering fine via another path that
+    happened to tolerate the mismatch -- exactly the failure mode this
+    closes. Applied once, at the working-set boundary (see
+    build_mesh_working_set), so every MeshNodeState this module ever
+    produces already carries the canonical form.
+    """
+    candidate = node_id.strip()
+    if not candidate:
+        return candidate
+    lowered = candidate.lower()
+    if lowered.isdigit():
+        try:
+            return f"!{int(lowered):08x}"
+        except (ValueError, OverflowError):
+            return lowered
+    return lowered
 
 
 @dataclass(frozen=True)
@@ -102,26 +130,46 @@ def build_mesh_working_set(
     being stale). Ties break on node_id for determinism.
 
     `nodes` supplies richer NodeMetadata (name, hops_away, position) when
-    available, matched case-insensitively against `last_message_at`'s
-    keys; a CLIENT node absent from `nodes` (e.g. its passive node-
-    database record has not synced yet) still appears, with only its
-    node ID known.
+    available, matched against `last_message_at`'s keys through
+    normalize_mesh_node_id() (case-insensitive, and tolerant of a bare
+    decimal node number where the standard "!hex" form is expected) so a
+    node can never split into two silently-different identities depending
+    on which source reported it; a CLIENT node absent from `nodes` (e.g.
+    its passive node-database record has not synced yet) still appears,
+    with only its node ID known. Every MeshNodeState this function
+    returns carries that same normalized ID.
     """
     last_message_at = last_message_at or {}
     local: NodeMetadata | None = None
     known_by_id: dict[str, NodeMetadata] = {}
     for node in nodes:
-        key = node.node_id.strip().lower()
+        key = normalize_mesh_node_id(node.node_id)
         if not key:
             continue
+        normalized_node = node if node.node_id == key else replace(node, node_id=key)
         if node.is_local:
             if local is None:
-                local = node
+                local = normalized_node
             continue
-        known_by_id.setdefault(key, node)
+        known_by_id.setdefault(key, normalized_node)
+
+    # Merge by normalized ID, keeping only the most recent timestamp per
+    # node -- if the bug this normalizes against already split one
+    # node's history across two raw representations, this recombines it
+    # rather than silently picking (and thereby truncating) just one.
+    normalized_interactions: dict[str, float] = {}
+    for raw_node_id, interaction_at in last_message_at.items():
+        node_id = normalize_mesh_node_id(raw_node_id)
+        if not node_id:
+            continue
+        if (
+            node_id not in normalized_interactions
+            or interaction_at > normalized_interactions[node_id]
+        ):
+            normalized_interactions[node_id] = interaction_at
 
     candidates: list[MeshNodeState] = []
-    for node_id, interaction_at in last_message_at.items():
+    for node_id, interaction_at in normalized_interactions.items():
         node = known_by_id.get(node_id) or NodeMetadata(node_id)
         candidates.append(
             MeshNodeState(

@@ -1230,6 +1230,199 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!zzzznode")
 
+    async def test_arrow_navigation_full_regression_with_realistic_node_ids(
+        self,
+    ) -> None:
+        """End-to-end regression for the reported "arrow keys do nothing"
+
+        bug: YOU plus real-looking "!xxxxxxxx" node IDs (the exact format
+        RadioService.get_known_nodes() returns) in every cardinal
+        direction, proving the full navigation contract holds against
+        live-shaped data, not just the clean synthetic IDs used
+        elsewhere in this file.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            north_id, south_id, east_id, west_id = (
+                "!0a0a0a0a",
+                "!0b0b0b0b",
+                "!0c0c0c0c",
+                "!0d0d0d0d",
+            )
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(north_id, "North Real", "NORT", 2, position=north_of_local(3)),
+                NodeMetadata(south_id, "South Real", "SOUT", 1, position=south_of_local(3)),
+                NodeMetadata(east_id, "East Real", "EAST", 1, position=east_of_local(3)),
+                NodeMetadata(west_id, "West Real", "WEST", 3, position=west_of_local(3)),
+            )
+            for index, node_id in enumerate((north_id, south_id, east_id, west_id)):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=f"Node{index}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=100 + index,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+
+            # Arrow event is claimed by MESH; YOU is selected by default.
+            self.assertEqual(view.selected_node_id, you_id)
+            original_relative_positions = {
+                node_id: (
+                    view.base_positions[node_id][0] - view.base_positions[you_id][0],
+                    view.base_positions[node_id][1] - view.base_positions[you_id][1],
+                )
+                for node_id in (you_id, north_id, south_id, east_id, west_id)
+            }
+            board_offset_before = view.board.styles.offset
+
+            for key, expected_id in (
+                ("up", north_id),
+                ("down", you_id),
+                ("down", south_id),
+                ("up", you_id),
+                ("right", east_id),
+                ("left", you_id),
+                ("left", west_id),
+                ("right", you_id),
+            ):
+                await pilot.press(key)
+                await pilot.pause()
+                with self.subTest(key=key, expected=expected_id):
+                    # Selected ID corresponds to an actual rendered node.
+                    self.assertEqual(view.selected_node_id, expected_id)
+                    self.assertIn(
+                        expected_id, {w.node_id for w in app.query(MeshNodeWidget)}
+                    )
+                    selected_widget = next(
+                        w for w in app.query(MeshNodeWidget) if w.node_id == expected_id
+                    )
+                    self.assertEqual(
+                        selected_widget.render().spans[0].style.foreground,
+                        Color.parse(THEME_PALETTES[app._current_theme].accent),
+                    )
+                    # Bottom-left context reflects the new selection.
+                    status = str(app.query_one("#mesh-context-status").render())
+                    if expected_id == you_id:
+                        self.assertEqual(status, "YOU")
+                    else:
+                        self.assertNotEqual(status, "YOU")
+                    # The mesh recentered: the selected node's own base
+                    # position is now the center anchor.
+                    positions = _mesh_translated_positions(
+                        view.base_positions, view.selected_node_id
+                    )
+                    self.assertEqual(
+                        positions[expected_id], (MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN)
+                    )
+                    # Relative geometry between every node is unchanged --
+                    # recentering is a pure translation, not a reshuffle.
+                    for node_id in (you_id, north_id, south_id, east_id, west_id):
+                        relative = (
+                            positions[node_id][0] - positions[expected_id][0],
+                            positions[node_id][1] - positions[expected_id][1],
+                        )
+                        expected_relative = (
+                            original_relative_positions[node_id][0]
+                            - original_relative_positions[expected_id][0],
+                            original_relative_positions[node_id][1]
+                            - original_relative_positions[expected_id][1],
+                        )
+                        self.assertEqual(relative, expected_relative)
+                    # No scrolling: the board container's own offset never
+                    # moves (only individual node widgets do).
+                    self.assertEqual(view.board.styles.offset, board_offset_before)
+                    self.assertFalse(view.show_vertical_scrollbar)
+                    self.assertFalse(view.show_horizontal_scrollbar)
+
+    async def test_navigation_works_even_when_focus_is_on_the_board_container(
+        self,
+    ) -> None:
+        """Arrow-key MESH navigation is gated on the current tab, not on
+
+        Textual focus residing on any particular node widget -- explicitly
+        move focus to the board container itself and confirm navigation
+        still works.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!0e0e0e0e", "Northern", position=north_of_local(2)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!0e0e0e0e",
+                    sender_long_name="Northern",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            view.focus()
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!0e0e0e0e")
+
+    async def test_navigation_survives_decimal_vs_hex_node_id_mismatch(self) -> None:
+        """End-to-end version of the mesh_state-level regression test: even
+
+        if CHAT activity reports a sender under a bare decimal node
+        number while get_known_nodes() reports the same physical node in
+        the standard "!hex" form, arrow navigation must still reach the
+        real, positioned, rendered node -- not silently fail or land on
+        a nameless duplicate.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!075bcd15", "North Node", "NORTH", 1, position=north_of_local(3)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="123456789",  # decimal for 0x075bcd15
+                    sender_long_name="North Node",
+                    sender_short_name="NORTH",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                {state.node.node_id for state in view.working_set},
+                {app.radio.info.node_id, "!075bcd15"},
+            )
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!075bcd15")
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("North Node"))
+
     async def test_no_scrollbars_on_mesh(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
