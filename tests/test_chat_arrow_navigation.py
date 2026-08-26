@@ -168,6 +168,7 @@ class ChatArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             app.show_tab("chat")
             await pilot.pause()
             chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
             chat_input.value = "meet at the ridge"
             chat_input.cursor_position = 5
 
@@ -217,6 +218,7 @@ class ChatArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 22)) as pilot:
             app.show_tab("chat")
             chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
             chat_input.value = "draft"
             await pilot.press("up")
             self.assertIs(app.focused, chat_input)

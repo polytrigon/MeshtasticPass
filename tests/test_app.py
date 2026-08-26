@@ -21,6 +21,7 @@ from textual.widgets import Input, Static
 from app import (
     ANIMATED_STATUS,
     TAB_NAMES,
+    ChannelSelector,
     ConnectionPage,
     ChatTranscript,
     ChatEntryWidget,
@@ -119,10 +120,21 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("2")
             self.assertEqual(app.current_tab, "chat")
             chat_input = app.query_one("#chat-input", Input)
-
+            # CHAT opens neutral -- not focused on the composer -- and
+            # "1"/"2"/"3" must still reach the tab-switch binding even
+            # while already on CHAT (never captured as a typed digit;
+            # see on_key's printable-character exclusion).
+            self.assertFalse(chat_input.has_focus)
+            await pilot.press("3")
+            self.assertEqual(app.current_tab, "mesh")
             await pilot.press("2")
             self.assertEqual(app.current_tab, "chat")
-            self.assertEqual(chat_input.value, "2")
+            self.assertFalse(chat_input.has_focus)
+
+            # Any OTHER printable character begins composing.
+            await pilot.press("h")
+            self.assertTrue(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "h")
 
             chat_input.value = "hello from test"
             await pilot.press("enter")
@@ -172,7 +184,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             tab_bar = str(app.query_one("#tab-bar", Static).render())
             self.assertIn("CONNECTION/CONFIG", tab_bar)
             self.assertIn("CHAT", tab_bar)
-            self.assertRegex(tab_bar, r"MESH \(\d+\)")
+            self.assertRegex(tab_bar, r"MESH\(\d+\)")
             self.assertNotIn("CONNECTION/CONFIG(", tab_bar)
             self.assertNotIn("ACTIVE", tab_bar)
             # CONNECTION appears strictly before CHAT, which appears
@@ -2767,6 +2779,146 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 [e.text for e in app.chat_history],
             )
 
+    # ---- CHAT opens neutral: composer is not auto-focused ---------------
+
+    async def test_entering_chat_does_not_focus_the_composer(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertFalse(chat_input.has_focus)
+            self.assertIs(app.focused, app.query_one(ChatTranscript))
+
+    async def test_existing_draft_survives_entering_chat_unfocused(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "unsent draft"
+
+            await pilot.press("escape", "1")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+            self.assertEqual(chat_input.value, "unsent draft")
+
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            self.assertFalse(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "unsent draft")
+
+    async def test_printable_key_focuses_composer_and_inserts_character(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "hel"
+            self.assertFalse(chat_input.has_focus)
+
+            await pilot.press("l")
+            self.assertTrue(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "hell")
+            await pilot.press("o")
+            self.assertEqual(chat_input.value, "hello")
+
+    async def test_down_focuses_composer_on_an_empty_chat(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(len(app._chat_navigation_targets()), 0)
+
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+
+    async def test_disabled_composer_ignores_printable_and_down_while_reconnecting(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "kept"
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            self.assertTrue(chat_input.disabled)
+            transcript = app.query_one(ChatTranscript)
+            self.assertIs(app.focused, transcript)
+
+            await pilot.press("x")
+            self.assertIs(app.focused, transcript)
+            self.assertEqual(chat_input.value, "kept")
+
+            await pilot.press("down")
+            self.assertIs(app.focused, transcript)
+            self.assertEqual(chat_input.value, "kept")
+
+    async def test_open_channel_selector_menu_blocks_composer_activation(self) -> None:
+        """The channel-selector shortcut ("c") still opens its dropdown
+
+        menu rather than being captured as a printable "begin composing"
+        keystroke, and once open, further printable keys/DOWN drive the
+        dropdown's own menu instead of leaking into the composer.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+
+            await pilot.press("c")
+            await pilot.pause()
+            selector = app.query_one(ChannelSelector)
+            self.assertTrue(selector.is_open)
+            self.assertFalse(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "")
+
+            await pilot.press("down")
+            self.assertTrue(selector.is_open)
+            self.assertFalse(chat_input.has_focus)
+
+    async def test_open_user_menu_blocks_composer_activation(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+            widget = list(app.query(ChatEntryWidget))[-1]
+            widget.focus()
+            chat_input = app.query_one("#chat-input", Input)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+
+            await pilot.press("x")
+            self.assertIsNotNone(app._user_menu)
+            self.assertFalse(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "")
+
+            await pilot.press("down")
+            self.assertIsNotNone(app._user_menu)
+            self.assertFalse(chat_input.has_focus)
+
     # ---- Connection-status consistency (CHAT top heading) --------------
 
     async def test_reconnecting_disables_chat_input_and_shows_status(self) -> None:
@@ -2996,6 +3148,85 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chat_heading, mesh_heading)
             self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", mesh_heading)
 
+    # ---- Connection-status color reuses CONNECTION/CONFIG's own ---------
+
+    async def test_connecting_status_uses_accent_color_on_chat_and_mesh(self) -> None:
+        """CONNECTING uses ACCENT -- the same semantic color
+
+        CONNECTION/CONFIG's own status row uses (see
+        _render_connection_details/_connection_status_color) -- on both
+        CHAT's heading and MESH's status line, never a hardcoded literal
+        color duplicated in either place.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            palette = THEME_PALETTES[app._current_theme]
+
+            chat_title = app.query_one("#chat-title", Static)
+            self.assertEqual(chat_title.render().spans[0].style, palette.accent)
+
+            await pilot.press("3")
+            await pilot.pause()
+            mesh_status = app.query_one("#mesh-connection-status", Static)
+            self.assertEqual(mesh_status.render().spans[0].style, palette.accent)
+
+    async def test_error_status_uses_error_color_not_accent(self) -> None:
+        """RadioState.ERROR mirrors CONNECTION/CONFIG's own ERROR
+
+        semantic color -- distinct from ACCENT, never forced to ACCENT
+        just because it's also a "temporary status" state.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.ERROR, message="boom")
+            await pilot.pause()
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertNotEqual(palette.error, palette.accent)
+
+            chat_title = app.query_one("#chat-title", Static)
+            self.assertEqual(chat_title.render().spans[0].style, palette.error)
+
+            await pilot.press("3")
+            await pilot.pause()
+            mesh_status = app.query_one("#mesh-connection-status", Static)
+            self.assertEqual(mesh_status.render().spans[0].style, palette.error)
+
+    async def test_offline_status_uses_accent_color(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            palette = THEME_PALETTES[app._current_theme]
+            chat_title = app.query_one("#chat-title", Static)
+            self.assertEqual(chat_title.render().spans[0].style, palette.accent)
+
+    async def test_connection_status_color_tracks_theme_switches(self) -> None:
+        """Switching WHITE/GREEN/ORANGE while a temporary status is showing
+
+        must immediately remap to that theme's own ACCENT -- never leave
+        a previous theme's color stuck on CHAT or MESH's status line.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            for theme in ("white", "green", "orange"):
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                palette = THEME_PALETTES[theme]
+                chat_title = app.query_one("#chat-title", Static)
+                self.assertEqual(chat_title.render().spans[0].style, palette.accent)
+
     # ---- Empty-message error lifecycle ---------------------------------
 
     async def test_empty_and_whitespace_input_rejected_with_no_send(self) -> None:
@@ -3006,6 +3237,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("2")
             await pilot.pause()
             chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
             before = len(app.chat_history)
 
             chat_input.value = ""
@@ -3029,6 +3261,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("2")
             await pilot.pause()
+            app.query_one("#chat-input", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
             self.assertTrue(app._send_error_message)
@@ -3048,6 +3281,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("2")
             await pilot.pause()
+            app.query_one("#chat-input", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
             self.assertTrue(app._send_error_message)
@@ -3063,6 +3297,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("2")
             await pilot.pause()
+            app.query_one("#chat-input", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
             self.assertTrue(app._send_error_message)
@@ -3090,6 +3325,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("2")
             await pilot.pause()
+            app.query_one("#chat-input", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
             self.assertTrue(app._send_error_message)
@@ -3107,6 +3343,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("2")
             await pilot.pause()
+            app.query_one("#chat-input", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
             first_timer = app._send_error_dismiss_timer
