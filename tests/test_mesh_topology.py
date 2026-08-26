@@ -1,4 +1,12 @@
-"""Pure and headless tests for the bounded, YOU-centered MESH board."""
+"""Pure and headless tests for MESH: pure grid geometry, the real passive
+
+working-set/role/staleness model (mesh_state.py), and the fixed-grid
+board that renders it. See app.py's module comment above MESH_GRID_ROWS
+and mesh_state.py's module docstring for what remains deliberately out
+of scope (Favorites, dynamic node-count growth beyond the bounded
+working set, scrolling, and RELAY inference from anything but
+trustworthy per-packet relay evidence, which this app does not have).
+"""
 
 from __future__ import annotations
 
@@ -8,48 +16,77 @@ import unittest
 
 from rich.cells import cell_len
 from textual.color import Color
-from textual.events import MouseScrollDown
+from textual.containers import ScrollableContainer
 
 from app import (
-    CHAT_SCROLLBAR_THUMB_GLYPH,
     CIRCLE_SOLID_LARGE,
     CIRCLE_STROKED_LARGE,
-    CIRCLE_STROKED_SMALL,
     DOT_GRID_GLYPH,
     DOT_GRID_SPACING_X,
     DOT_GRID_SPACING_Y,
-    ChatEntryWidget,
+    MESH_GRID_CENTER_COLUMN,
+    MESH_GRID_CENTER_ROW,
+    MESH_BOARD_LABEL_MAX_CELLS,
+    MESH_GRID_COLUMNS,
+    MESH_GRID_ROWS,
+    MESH_SELECTED_GLYPH_WIDTH,
     MeshCanvas,
+    MeshNodeLabelWidget,
     MeshNodeWidget,
+    MeshRelayWidget,
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
+    _mesh_directional_target,
+    _mesh_grid_pixel,
+    _mesh_hop_counts,
+    _mesh_node_color,
+    _mesh_relay_color,
+    _mesh_select_node,
+    _mesh_translated_positions,
     _render_mesh_canvas,
 )
 from app_settings import AppSettings
 from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
-from geo import GeoPosition
-from mesh_state import DEFAULT_MAX_REMOTE_NODES
+from geo import GeoPosition, distance_between
+from mesh_state import (
+    DEFAULT_MAX_REMOTE_NODES,
+    MESH_STALE_THRESHOLD_SECONDS,
+    MeshNodeState,
+    build_mesh_working_set,
+    format_mesh_context_line,
+)
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
     HORIZONTAL_GAP,
     NODE_HEIGHT,
     NODE_WIDTH,
-    VERTICAL_GAP,
+    RelayStage,
+    assign_grid_slots,
+    build_relay_stages,
     build_topology,
     compact_node_label,
     directional_target,
+    place_within_bounds,
+    route_chain,
     route_connector,
 )
 import mesh_topology as mesh_topology_module
-from radio_service import NodeMetadata, RadioState
-from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
+from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
+from radio_service import NodeMetadata
+from simulated_radio_service import (
+    SIMULATED_LOCAL_POSITION,
+    SIMULATED_MESSAGES,
+    SIMULATED_NODES,
+    SimulatedRadioService,
+)
 from theme_palette import THEME_PALETTES
-from viewport_menu import ViewportMenu
 
 
 LOCAL_GEO = GeoPosition(0.0, 0.0)
 _MILES_PER_DEGREE_AT_EQUATOR = 69.0
+
+YOU = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=LOCAL_GEO)
 
 
 def west_of_local(miles: float) -> GeoPosition:
@@ -82,6 +119,33 @@ def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
             )
         )
     return tuple(nodes)
+
+
+def offset_xy(widget) -> tuple[int, int]:
+    offset = widget.styles.offset
+    return (int(offset.x.value), int(offset.y.value))
+
+
+def glyph_screen_position(widget) -> tuple[int, int]:
+    """The glyph's own anchor (x, y): the center column of its box.
+
+    Unselected, MeshNodeWidget is a 1-cell-wide box, so its offset IS the
+    anchor. Selected, it widens to a 3-cell composite (small dot / role
+    glyph / small dot) for the "larger" treatment -- the anchor is still
+    the box's center column, never its left edge, so this must account
+    for width rather than assume width == 1.
+    """
+    offset_x, offset_y = offset_xy(widget)
+    width = int(widget.styles.width.value)
+    return (offset_x + width // 2, offset_y)
+
+
+def client_state(
+    node: NodeMetadata, *, last_interaction_at: float | None, is_relay: bool = False
+) -> MeshNodeState:
+    return MeshNodeState(
+        node=node, is_client=True, is_relay=is_relay, last_interaction_at=last_interaction_at
+    )
 
 
 class MeshTopologyModelTests(unittest.TestCase):
@@ -467,27 +531,563 @@ class MeshCanvasRenderTests(unittest.TestCase):
         self.assertFalse(MeshCanvas.can_focus)
 
 
-class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
+class MeshGridPlacementTests(unittest.TestCase):
+    """Pure tests for assign_grid_slots()/place_within_bounds(): the shared
+
+    geometry MESH now uses to place a real, bounded working set on its
+    fixed grid.
+    """
+
+    def test_assign_grid_slots_places_local_at_origin(self) -> None:
+        slots = assign_grid_slots([YOU])
+        self.assertEqual(len(slots), 1)
+        self.assertEqual((slots[0].x, slots[0].y), (0, 0))
+        self.assertEqual(slots[0].region, "LOCAL")
+
+    def test_place_within_bounds_centers_local_at_the_given_center(self) -> None:
+        slots = assign_grid_slots([YOU])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        self.assertEqual(positions["!you"], (5, 11))
+
+    def test_place_within_bounds_keeps_a_far_node_inside_the_grid(self) -> None:
+        far_east = NodeMetadata("!far", "Far", position=east_of_local(500))
+        slots = assign_grid_slots([YOU, far_east], max_radius=DEFAULT_MAX_GRID_RADIUS)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        row, column = positions["!far"]
+        self.assertTrue(1 <= row <= 8)
+        self.assertTrue(1 <= column <= 21)
+
+    def test_place_within_bounds_never_overlaps_under_collision_pressure(self) -> None:
+        """Cram many nodes into the same compass direction so the shared,
+
+        unbounded collision-avoidance (_reserve_slot) would want to push
+        several of them past this fixed board's edge -- place_within_bounds
+        must still land every one in-bounds and collision-free.
+        """
+        nodes = [YOU] + [
+            NodeMetadata(f"!s{index:02x}", f"South{index}", position=south_of_local(index + 1))
+            for index in range(10)
+        ]
+        slots = assign_grid_slots(nodes, max_radius=3)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        self.assertEqual(len(positions), len(nodes))
+        self.assertEqual(len(positions), len(set(positions.values())))
+        for row, column in positions.values():
+            self.assertTrue(1 <= row <= 8)
+            self.assertTrue(1 <= column <= 21)
+
+    def test_place_within_bounds_is_deterministic_and_order_independent(self) -> None:
+        nodes = [
+            YOU,
+            NodeMetadata("!a", "A", position=north_of_local(2)),
+            NodeMetadata("!b", "B", position=north_of_local(5)),
+            NodeMetadata("!c", "C"),
+        ]
+        forward = place_within_bounds(
+            assign_grid_slots(nodes),
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+        )
+        backward = place_within_bounds(
+            assign_grid_slots(list(reversed(nodes))),
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(forward, backward)
+
+    # ---- Grid-spread: use more of the available fixed-grid room --------
+
+    def test_lone_direction_node_stretches_to_use_available_room(self) -> None:
+        """A lone north node has 1 raw logical step but 3 rows of
+
+        headroom above center on this 8-row grid (row_count=8,
+        center_row=5, default margin=1: 5-1-1=3) -- it must stretch to
+        use that room instead of clustering one row from center.
+        """
+        node = NodeMetadata("!n", "N", position=north_of_local(3))
+        slots = assign_grid_slots([YOU, node])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        row, _column = positions["!n"]
+        self.assertEqual(row, 2)  # center_row(5) - full up_room(3)
+
+    def test_spread_does_not_shrink_when_room_is_already_fully_used(self) -> None:
+        """Three same-direction nodes already spanning the full 3-row
+
+        headroom must land at exactly their original ranks (4, 3, 2) --
+        spreading only ever stretches outward when there is slack, never
+        compresses when the available room is already fully used.
+        """
+        nodes = [YOU] + [
+            NodeMetadata(f"!n{i}", f"N{i}", position=north_of_local(i + 1)) for i in range(3)
+        ]
+        slots = assign_grid_slots(nodes, max_radius=3)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        rows = sorted(positions[f"!n{i}"][0] for i in range(3))
+        self.assertEqual(rows, [2, 3, 4])
+
+    def test_spread_respects_asymmetric_room_between_axes(self) -> None:
+        """The 21-column grid has far more horizontal headroom (9) than
+
+        this 8-row grid has vertical headroom (3 up / 2 down) around
+        center (11, 5) -- a lone east node and a lone north node, each
+        one raw logical step out, must stretch by different amounts
+        that reflect their own axis's actual available room.
+        """
+        east_node = NodeMetadata("!e", "E", position=east_of_local(3))
+        north_node = NodeMetadata("!n", "N", position=north_of_local(3))
+        slots = assign_grid_slots([YOU, east_node, north_node])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        east_distance = positions["!e"][1] - 11
+        north_distance = 5 - positions["!n"][0]
+        self.assertGreater(east_distance, north_distance)
+
+    def test_spread_preserves_relative_ordering_within_a_direction(self) -> None:
+        near = NodeMetadata("!near", "Near", position=north_of_local(1))
+        far = NodeMetadata("!far", "Far", position=north_of_local(50))
+        slots = assign_grid_slots([YOU, near, far], max_radius=3)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        # Farther logical rank must still render strictly farther from
+        # center after spreading, never reordered by the stretch.
+        self.assertLess(positions["!far"][0], positions["!near"][0])
+
+    def test_spread_stays_collision_free_and_deterministic_for_a_mixed_fixture(
+        self,
+    ) -> None:
+        """A representative multi-direction, multi-node fixture: spread
+
+        must never collide and must never depend on input order, exactly
+        like the unspread algorithm already guaranteed.
+        """
+        nodes = [YOU] + [
+            NodeMetadata("!n1", "N1", position=north_of_local(2)),
+            NodeMetadata("!s1", "S1", position=south_of_local(3)),
+            NodeMetadata("!e1", "E1", position=east_of_local(4)),
+            NodeMetadata("!e2", "E2", position=east_of_local(20)),
+            NodeMetadata("!w1", "W1", position=west_of_local(5)),
+        ]
+        forward = place_within_bounds(
+            assign_grid_slots(nodes), center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        backward = place_within_bounds(
+            assign_grid_slots(list(reversed(nodes))),
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(forward, backward)
+        self.assertEqual(len(forward), len(set(forward.values())))
+        for row, column in forward.values():
+            self.assertTrue(1 <= row <= 8)
+            self.assertTrue(1 <= column <= 21)
+
+    def test_spread_never_places_a_node_at_the_true_outer_edge_by_default(
+        self,
+    ) -> None:
+        """The default margin=1 keeps at least one row/column of breathing
+
+        room at the true edge even when a lone node stretches to fill
+        all available headroom (spec: "Do not push everything against
+        the outer edge either; preserve reasonable margins").
+        """
+        node = NodeMetadata("!n", "N", position=north_of_local(3))
+        slots = assign_grid_slots([YOU, node])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        self.assertGreater(positions["!n"][0], 1)
+
+
+class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
+    """Pure tests for app.py's generic (not fixture-specific) whole-mesh
+
+    translation and arrow-navigation helpers, now parametrized by
+    whatever working set/base positions the live model produces.
+    """
+
+    def test_translate_shifts_every_node_by_the_identical_delta(self) -> None:
+        base = {"!you": (5, 11), "!a": (4, 10), "!b": (6, 9)}
+        translated = _mesh_translated_positions(base, "!a")
+        self.assertEqual(translated["!a"], (5, 11))
+        row_delta, column_delta = 5 - 4, 11 - 10
+        self.assertEqual(translated["!you"], (5 + row_delta, 11 + column_delta))
+        self.assertEqual(translated["!b"], (6 + row_delta, 9 + column_delta))
+
+    def test_translate_with_unresolvable_selection_is_a_no_op(self) -> None:
+        base = {"!you": (5, 11)}
+        self.assertEqual(_mesh_translated_positions(base, "!missing"), base)
+
+    def test_directional_target_picks_the_nearest_candidate(self) -> None:
+        """No hardcoded node IDs: the same general nearest-candidate rule
+
+        used by mesh_topology.directional_target, just fed the current
+        rendered layout's own positions -- real nodes and anonymous
+        relay stages alike, since both are just entries in this dict.
+        """
+        base_positions = {"!you": (5, 11), "!near": (4, 10), "!far": (1, 8)}
+        self.assertEqual(
+            _mesh_directional_target(base_positions, "!you", "left"), "!near"
+        )
+
+    def test_directional_target_with_no_candidate_is_none(self) -> None:
+        target = _mesh_directional_target({"!you": (5, 11)}, "!you", "left")
+        self.assertIsNone(target)
+
+
+class RelayStageGeometryTests(unittest.TestCase):
+    """Pure tests for mesh_topology's anonymous-relay-stage placement:
+
+    exact stage counts per hop depth, independence between clients, and
+    collision-free placement -- no app, no widgets.
+    """
+
+    def _positions(self, *, target_hops: int) -> tuple[dict, dict]:
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        target = NodeMetadata(
+            "!target", "Target", "TGT", target_hops, position=GeoPosition(9 / 69.0, 0.0)
+        )
+        min_radius = {"!target": target_hops + 1} if target_hops > 0 else {}
+        slots = assign_grid_slots(
+            (you, target), max_radius=DEFAULT_MAX_GRID_RADIUS, min_radius_by_id=min_radius
+        )
+        base = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        return base, {"!target": target_hops} if target_hops > 0 else {}
+
+    def test_zero_hops_generates_no_relay_stages(self) -> None:
+        base, hop_counts = self._positions(target_hops=0)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(stages, ())
+        self.assertEqual(positions, {})
+
+    def test_one_hop_generates_exactly_one_relay_stage(self) -> None:
+        base, hop_counts = self._positions(target_hops=1)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(len(positions), 1)
+
+    def test_two_hops_generates_exactly_two_relay_stages(self) -> None:
+        base, hop_counts = self._positions(target_hops=2)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(len(stages), 2)
+        self.assertEqual({s.index for s in stages}, {1, 2})
+
+    def test_three_hops_generates_exactly_three_relay_stages(self) -> None:
+        base, hop_counts = self._positions(target_hops=3)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        self.assertEqual(len(stages), 3)
+        self.assertEqual({s.index for s in stages}, {1, 2, 3})
+        self.assertEqual(len(positions.values()), len(set(positions.values())))
+
+    def test_unknown_hops_client_absent_from_hop_counts_gets_no_stages(self) -> None:
+        """A `? HOPS` client is never passed into hop_counts at all (see
+
+        app._mesh_hop_counts) -- proving build_relay_stages never
+        fabricates stages for a client it isn't told about.
+        """
+        base, _ = self._positions(target_hops=0)
+        stages, positions = build_relay_stages(
+            base, you_id="!you", hop_counts={}, row_count=8, column_count=21
+        )
+        self.assertEqual(stages, ())
+        self.assertEqual(positions, {})
+
+    def test_no_you_position_produces_no_stages(self) -> None:
+        stages, positions = build_relay_stages(
+            {"!target": (4, 11)},
+            you_id="!you",
+            hop_counts={"!target": 2},
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(stages, ())
+        self.assertEqual(positions, {})
+
+    def test_relay_stage_ids_are_never_shared_between_clients_with_equal_hops(
+        self,
+    ) -> None:
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        alice = NodeMetadata(
+            "!alice", "Alice", position=GeoPosition(0.0, 9 / 69.0)
+        )  # east
+        bob = NodeMetadata(
+            "!bob", "Bob", position=GeoPosition(0.0, -9 / 69.0)
+        )  # west
+        slots = assign_grid_slots(
+            (you, alice, bob),
+            max_radius=DEFAULT_MAX_GRID_RADIUS,
+            min_radius_by_id={"!alice": 3, "!bob": 3},
+        )
+        base = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        stages, positions = build_relay_stages(
+            base,
+            you_id="!you",
+            hop_counts={"!alice": 2, "!bob": 2},
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(len(stages), 4)
+        alice_ids = {s.node_id for s in stages if s.source_node_id == "!alice"}
+        bob_ids = {s.node_id for s in stages if s.source_node_id == "!bob"}
+        self.assertEqual(len(alice_ids), 2)
+        self.assertEqual(len(bob_ids), 2)
+        self.assertEqual(alice_ids & bob_ids, set())
+        # No fabricated real-node shape leaks onto a placeholder.
+        for stage in stages:
+            self.assertFalse(stage.is_local)
+            self.assertTrue(stage.node_id.startswith("relay:"))
+        self.assertEqual(len(positions.values()), len(set(positions.values())))
+
+    def test_relay_stage_node_id_encodes_source_and_index_internally_only(
+        self,
+    ) -> None:
+        """The synthetic ID format is internal bookkeeping -- proven here
+
+        directly -- and never surfaces in any user-facing string (the
+        app-level tests prove the UI always shows exactly "RELAY").
+        """
+        base, hop_counts = self._positions(target_hops=2)
+        stages, _ = build_relay_stages(
+            base, you_id="!you", hop_counts=hop_counts, row_count=8, column_count=21
+        )
+        ids = {s.node_id for s in stages}
+        self.assertEqual(ids, {"relay:!target:1", "relay:!target:2"})
+
+    def test_min_radius_by_id_does_not_affect_unlisted_nodes(self) -> None:
+        """assign_grid_slots' new optional parameter is fully backward
+
+        compatible: omitting it (as every non-MESH-hop caller does)
+        reproduces the exact prior placement.
+        """
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        node = NodeMetadata("!n", "N", position=GeoPosition(9 / 69.0, 0.0))
+        without = assign_grid_slots((you, node), max_radius=DEFAULT_MAX_GRID_RADIUS)
+        with_empty = assign_grid_slots(
+            (you, node), max_radius=DEFAULT_MAX_GRID_RADIUS, min_radius_by_id={}
+        )
+        self.assertEqual(without, with_empty)
+
+    def test_min_radius_by_id_boosts_only_the_named_node(self) -> None:
+        you = NodeMetadata("!you", is_local=True, position=GeoPosition(0.0, 0.0))
+        node = NodeMetadata("!n", "N", position=GeoPosition(9 / 69.0, 0.0))
+        boosted = assign_grid_slots(
+            (you, node), max_radius=DEFAULT_MAX_GRID_RADIUS, min_radius_by_id={"!n": 3}
+        )
+        entry = next(item for item in boosted if item.node.node_id == "!n")
+        self.assertEqual((entry.x, entry.y), (0, -3))
+
+
+class RouteChainTests(unittest.TestCase):
+    """Pure tests for the multi-segment connector-chain helper."""
+
+    def test_two_point_chain_matches_plain_route_connector(self) -> None:
+        self.assertEqual(
+            route_chain(((0, 0), (4, 3))), route_connector(0, 0, 4, 3)
+        )
+
+    def test_chain_concatenates_each_segment_in_order(self) -> None:
+        chain = route_chain(((0, 0), (0, 3), (4, 3)))
+        expected = route_connector(0, 0, 0, 3) + route_connector(0, 3, 4, 3)
+        self.assertEqual(chain, expected)
+
+    def test_single_point_chain_is_empty(self) -> None:
+        self.assertEqual(route_chain(((2, 2),)), ())
+
+
+class BoardLabelFiveCellLimitTests(unittest.TestCase):
+    """Pure tests for the new 5-display-cell BOARD label limit.
+
+    This is a DISPLAY-CELL limit (cell_len()), never Python len() --
+    grapheme-safe truncation, emoji/ZWJ/CJK safety, and the underlying
+    compact_node_label() truncation convention are all unchanged; only
+    the max_cells value app.py passes for the label physically above a
+    node's glyph is new. The rich bottom-left context (mesh_state.
+    format_mesh_context_line) is untouched and always uses the full,
+    uncapped Long Name/Short Name -- proven separately in test_mesh_state.py.
+    """
+
+    def test_short_ascii_name_passes_through_unchanged(self) -> None:
+        node = NodeMetadata("!12345678", "ALICE", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertEqual(label, "ALICE")
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+    def test_long_ascii_name_truncates_to_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "CHARLIE THE LONG NAMED NODE", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertTrue(label.endswith("…"))
+
+    def test_emoji_name_stays_within_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "🐔pizza party extra long name", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+    def test_zwj_emoji_never_severed_at_five_cells(self) -> None:
+        node = NodeMetadata(
+            "!12345678", "👨‍👩‍👧‍👦 family extra long descriptive name", None
+        )
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+        if label.endswith("…"):
+            last_kept = label[:-1][-1:]
+            self.assertNotEqual(last_kept, mesh_topology_module._ZERO_WIDTH_JOINER)
+            self.assertNotIn(last_kept, mesh_topology_module._VARIATION_SELECTORS)
+
+    def test_cjk_wide_characters_stay_within_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "CJK漢字測試名稱超長節點標籤", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+    def test_short_name_fallback_also_respects_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "A Very Long Descriptive Long Name", "SHORT")
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertEqual(label, "SHORT")
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+
+class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
+    """Headless app tests proving MESH is now driven by real passive data:
+
+    CLIENT derivation, RELAY truthfulness, the bounded working set,
+    geographic placement, context text, selection/navigation, the
+    preserved visual contract, and zero new radio traffic.
+    """
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        root = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name)
         self.settings = AppSettings.load(
-            config_path=root / "config.json",
-            profile_path=root / "terminal.conf",
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
         )
 
-    async def test_message_older_than_mounted_chat_window_still_influences_mesh(
-        self,
-    ) -> None:
-        """A node's true last-message time must count even when CHAT's
+    def _make_app(
+        self, *, chat_store: ChatStore | None = None, scripted_messages=()
+    ) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=scripted_messages
+        )
+        return MeshtasticPassApp(radio, self.settings, chat_store=chat_store)
 
-        bounded history window never loaded that old message into memory.
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("4")
+        await pilot.pause()
+        await pilot.pause()
+
+    # ---- CLIENT derivation (spec section 21) -------------------------
+
+    async def test_incoming_message_makes_the_sender_a_client(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice = next(
+                state
+                for state in view.working_set
+                if state.node.node_id == SIMULATED_MESSAGES[0].sender_node_id
+            )
+            self.assertTrue(alice.is_client)
+
+    async def test_outgoing_message_does_not_make_a_remote_node_client(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accepted_send("hello from me")
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertEqual(remote_ids, set())
+
+    async def test_persisted_incoming_history_survives_a_fresh_app_instance(self) -> None:
+        """Simulates a process restart: a new ChatStore/App reading the same
+
+        database file must still see Alice as CLIENT from "before".
         """
-        root = Path(self.temporary_directory.name)
-        db_path = root / "chat.db"
+        db_path = self.root / "chat.db"
         now = 1_700_000_000.0
-        old_timestamp = now - 30 * 24 * 60 * 60  # a month ago
+        old_timestamp = now - 10 * 24 * 60 * 60
+
+        first_process_store = ChatStore.open(db_path)
+        first_process_store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="before restart",
+            radio_rx_at=old_timestamp,
+            received_at=old_timestamp,
+        )
+        first_process_store.close()
+
+        second_process_store = ChatStore.open(db_path)
+        self.addCleanup(second_process_store.close)
+        app = self._make_app(chat_store=second_process_store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice = next(
+                state for state in view.working_set if state.node.node_id == "!a11ce001"
+            )
+            self.assertTrue(alice.is_client)
+            self.assertEqual(alice.last_interaction_at, old_timestamp)
+
+    async def test_most_recent_incoming_message_determines_last_interaction(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            # SIMULATED_MESSAGES[0] and [3] both come from the "!cafe0003"-
+            # or "!a11ce001"-style senders at different ages; use the two
+            # channel-0 Cafe Relay messages (index 2 is channel 1, index 3
+            # is channel 0 and older than index 0's sender is irrelevant --
+            # pick two messages from the SAME sender at different ages).
+            older = SIMULATED_MESSAGES[3]
+            newer = older.__class__(**{**older.__dict__, "radio_rx_at": older.radio_rx_at + 500})
+            app._accept_received_message(older)
+            app._accept_received_message(newer)
+            activity = app._mesh_last_message_activity()
+            self.assertEqual(activity[older.sender_node_id.lower()], newer.radio_rx_at)
+
+    async def test_message_older_than_mounted_chat_window_still_makes_client(self) -> None:
+        db_path = self.root / "bounded_chat.db"
+        now = 1_700_000_000.0
+        old_timestamp = now - 30 * 24 * 60 * 60
 
         store = ChatStore.open(db_path)
         store.add_incoming(
@@ -515,695 +1115,1586 @@ class MeshTopologyAppTests(unittest.IsolatedAsyncioTestCase):
 
         store = ChatStore.open(db_path)
         self.addCleanup(store.close)
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        app = self._make_app(chat_store=store)
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            # Confirm the old message genuinely fell outside CHAT's mounted
-            # window -- otherwise this test would not be exercising anything.
-            mounted_ids = {
-                entry.node_id for entry in app.chat_history if entry.node_id
-            }
+            mounted_ids = {entry.node_id for entry in app.chat_history if entry.node_id}
             self.assertNotIn("!a11ce001", mounted_ids)
-
-            activity = app._mesh_last_message_activity()
-            self.assertEqual(activity["!a11ce001"], old_timestamp)
-
             await pilot.press("4")
             await pilot.pause()
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
+            view = app.query_one(MeshTopologyView)
             alice = next(
-                widget
-                for widget in app.query(MeshNodeWidget)
-                if widget.node.node_id == "!a11ce001"
+                state for state in view.working_set if state.node.node_id == "!a11ce001"
             )
-            self.assertEqual(alice.display_node.last_message_at, old_timestamp)
-            self.assertEqual(alice.display_node.recency_bucket, "very_stale")
+            self.assertTrue(alice.is_client)
+            self.assertTrue(alice.is_stale(now=now))
 
-    async def test_message_activity_survives_a_fresh_app_instance(self) -> None:
-        """Simulates a process restart: a new ChatStore/App reading the same
+    # ---- RELAY truthfulness (spec section 22) ------------------------
 
-        database file must still see message activity from "before".
+    async def test_no_node_is_ever_relay_from_current_real_data(self) -> None:
+        """No data source available to this app identifies a specific relay
+
+        node (see mesh_state.MeshNodeState's docstring) -- RELAY must
+        never be fabricated from hop count or a configured role, so
+        every real-data node produced by the live app is_relay=False,
+        even a node with a high hop count.
         """
-        root = Path(self.temporary_directory.name)
-        db_path = root / "restart_chat.db"
-        now = 1_700_000_000.0
-        old_timestamp = now - 10 * 24 * 60 * 60
-
-        first_process_store = ChatStore.open(db_path)
-        first_process_store.add_incoming(
-            packet_id=1,
-            node_id="!a11ce001",
-            sender_name="Alice Trail",
-            sender_short_name="ALCE",
-            channel_index=0,
-            text="before restart",
-            radio_rx_at=old_timestamp,
-            received_at=old_timestamp,
-        )
-        first_process_store.close()
-
-        second_process_store = ChatStore.open(db_path)
-        self.addCleanup(second_process_store.close)
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        app = MeshtasticPassApp(radio, self.settings, chat_store=second_process_store)
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            activity = app._mesh_last_message_activity()
-            self.assertEqual(activity["!a11ce001"], old_timestamp)
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertTrue(view.working_set)
+            self.assertTrue(all(not state.is_relay for state in view.working_set))
 
-    async def test_mesh_query_does_not_mass_load_chat_history(self) -> None:
-        root = Path(self.temporary_directory.name)
-        db_path = root / "bounded_chat.db"
-        store = ChatStore.open(db_path)
-        for index in range(300):
-            store.add_incoming(
-                packet_id=index,
-                node_id=f"!n{index % 10:07x}",
-                sender_name="X",
-                sender_short_name="X",
-                channel_index=0,
-                text="m",
-                radio_rx_at=float(index),
-                received_at=float(index),
+    async def test_high_hop_count_does_not_produce_relay_state(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            far_hop_message = SIMULATED_MESSAGES[0].__class__(
+                **{**SIMULATED_MESSAGES[0].__dict__}
             )
-        self.addCleanup(store.close)
-        calls = {"recent": 0, "older": 0}
-        original_recent = store.load_recent_page
-        original_older = store.load_older_page
+            app._accept_received_message(far_hop_message)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(far_hop_message.sender_node_id, hops_away=9),
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            remote = next(
+                state
+                for state in view.working_set
+                if state.node.node_id == far_hop_message.sender_node_id.lower()
+                or state.node.node_id == far_hop_message.sender_node_id
+            )
+            self.assertFalse(remote.is_relay)
 
-        def spy_recent(*args, **kwargs):
-            calls["recent"] += 1
-            return original_recent(*args, **kwargs)
+    # ---- Working set (spec section 23) -------------------------------
 
-        def spy_older(*args, **kwargs):
-            calls["older"] += 1
-            return original_older(*args, **kwargs)
-
-        store.load_recent_page = spy_recent
-        store.load_older_page = spy_older
-
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+    async def test_working_set_is_bounded(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            calls_before_query = dict(calls)
-            activity = app._mesh_last_message_activity()
-            # The aggregated per-node query must not trigger any additional
-            # bulk page load beyond whatever CHAT itself already did on mount.
-            self.assertEqual(calls, calls_before_query)
-            self.assertEqual(len(activity), 10)
+            for index in range(20):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=f"!n{index:07x}",
+                        sender_long_name=f"Node{index}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_000_000 + index,
+                        radio_rx_at=1_700_000_000.0 - index,
+                    )
+                )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            remote_count = sum(1 for state in view.working_set if not state.node.is_local)
+            self.assertEqual(remote_count, DEFAULT_MAX_REMOTE_NODES)
 
-    async def test_outgoing_messages_never_count_as_mesh_activity(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+    async def test_stale_fallback_appears_when_nothing_is_recent(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            app._accepted_send("hello from me")
-            await pilot.pause()
-            activity = app._mesh_last_message_activity()
-            self.assertEqual(activity, {})
-
-    async def test_tab_renders_bounded_working_set_and_shared_local_menu(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
+            very_old = 1_700_000_000.0 - MESH_STALE_THRESHOLD_SECONDS * 10
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!oldclient",
+                    sender_long_name="OldClient",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="ancient",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=very_old,
+                )
+            )
             await pilot.press("4")
             await pilot.pause()
-            self.assertEqual(app.current_tab, "mesh")
-            self.assertIn("[4] MESH", str(app.query_one("#tab-bar").render()))
-            nodes = list(app.query(MeshNodeWidget))
-            self.assertEqual(len(nodes), 8)
-            self.assertTrue(isinstance(app.focused, MeshNodeWidget))
-            self.assertTrue(app.focused.node.is_local)
-            self.assertEqual(radio.sent_messages, ())
-
-            await pilot.press("enter")
+            app._refresh_mesh(wall_now=1_700_000_000.0)
             await pilot.pause()
-            menu = app.query_one("#node-context-menu", ViewportMenu)
-            labels = [item.label for item in menu.items]
-            self.assertIn("Simulated Node", labels)
-            self.assertNotIn("FAVORITE", labels)
-            self.assertNotIn("UNFAVORITE", labels)
-            await pilot.press("escape")
+            view = app.query_one(MeshTopologyView)
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertIn("!oldclient", remote_ids)
 
-            radio.get_known_nodes = lambda: (
+    async def test_unchanged_data_produces_unchanged_positions(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            first_positions = dict(view.base_positions)
+            app._refresh_mesh(wall_now=1_700_000_500.0)
+            await pilot.pause()
+            self.assertEqual(view.base_positions, first_positions)
+
+    async def test_working_set_nodes_never_overlap(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            positions = list(view.base_positions.values())
+            self.assertEqual(len(positions), len(set(positions)))
+
+    async def test_you_is_always_in_the_working_set_when_local_node_known(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertTrue(any(state.node.is_local for state in view.working_set))
+
+    # ---- Geography (spec section 24) ---------------------------------
+
+    async def test_north_node_appears_above_you_south_below(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
                 NodeMetadata(
-                    radio.info.node_id,
-                    radio.info.long_name,
-                    radio.info.short_name,
-                    0,
-                    1_000.0,
-                    True,
+                    app.radio.info.node_id, is_local=True, position=LOCAL_GEO
                 ),
+                NodeMetadata("!north1", "North1", position=north_of_local(5)),
+                NodeMetadata("!south1", "South1", position=south_of_local(5)),
             )
-            app._refresh_mesh(wall_now=1_000.0)
-            await pilot.pause()
-            only_node = list(app.query(MeshNodeWidget))
-            self.assertEqual(len(only_node), 1)
-            self.assertTrue(only_node[0].node.is_local)
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!north1",
+                    sender_long_name="North1",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!south1",
+                    sender_long_name="South1",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=2,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            you_row, _you_col = view.base_positions[app.radio.info.node_id]
+            north_row, _ = view.base_positions["!north1"]
+            south_row, _ = view.base_positions["!south1"]
+            self.assertLess(north_row, you_row)
+            self.assertGreater(south_row, you_row)
 
-    async def test_working_set_is_bounded_and_never_shows_all_historical_nodes(
-        self,
-    ) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+    async def test_east_node_appears_right_of_you_west_left(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            many = [
+            app.radio.get_known_nodes = lambda: (
                 NodeMetadata(
-                    radio.info.node_id,
-                    radio.info.long_name,
-                    radio.info.short_name,
-                    0,
-                    1_000.0,
-                    True,
-                )
-            ]
-            for index in range(25):
-                many.append(
-                    NodeMetadata(
-                        f"!n{index:04x}", f"Node{index}", None, None, 1_000.0 - index
+                    app.radio.info.node_id, is_local=True, position=LOCAL_GEO
+                ),
+                NodeMetadata("!east1", "East1", position=east_of_local(5)),
+                NodeMetadata("!west1", "West1", position=west_of_local(5)),
+            )
+            for node_id in ("!east1", "!west1"):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=node_id,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
                     )
                 )
-            radio.get_known_nodes = lambda: tuple(many)
-            await pilot.press("4")
-            await pilot.pause()
-            await pilot.pause()
-            widgets = list(app.query(MeshNodeWidget))
-            self.assertEqual(len(widgets), DEFAULT_MAX_REMOTE_NODES + 1)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            _you_row, you_column = view.base_positions[app.radio.info.node_id]
+            _er, east_column = view.base_positions["!east1"]
+            _wr, west_column = view.base_positions["!west1"]
+            self.assertGreater(east_column, you_column)
+            self.assertLess(west_column, you_column)
 
-    async def test_favorite_is_preserved_in_working_set_despite_being_oldest(
-        self,
-    ) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+    async def test_farther_node_is_at_least_as_many_grid_steps_away(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            many = [
+            app.radio.get_known_nodes = lambda: (
                 NodeMetadata(
-                    radio.info.node_id,
-                    radio.info.long_name,
-                    radio.info.short_name,
-                    0,
-                    1_000.0,
-                    True,
-                )
-            ]
-            for index in range(12):
-                many.append(
-                    NodeMetadata(
-                        f"!n{index:04x}",
-                        f"Node{index}",
-                        None,
-                        None,
-                        1_000.0 - (index + 1) * 100_000,
+                    app.radio.info.node_id, is_local=True, position=LOCAL_GEO
+                ),
+                NodeMetadata("!near1", "Near1", position=north_of_local(1)),
+                NodeMetadata("!far1", "Far1", position=north_of_local(500)),
+            )
+            for node_id in ("!near1", "!far1"):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=node_id,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
                     )
                 )
-            oldest_id = "!n000b"
-            self.settings.set_favorite(oldest_id, True)
-            radio.get_known_nodes = lambda: tuple(many)
-            await pilot.press("4")
-            await pilot.pause()
-            await pilot.pause()
-            ids = {widget.node.node_id for widget in app.query(MeshNodeWidget)}
-            self.assertIn(oldest_id, ids)
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            you_row, _ = view.base_positions[app.radio.info.node_id]
+            near_row, _ = view.base_positions["!near1"]
+            far_row, _ = view.base_positions["!far1"]
+            self.assertGreaterEqual(you_row - far_row, you_row - near_row)
 
-    async def test_arrow_selection_context_favorite_and_disconnected_state(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+    async def test_missing_gps_fallback_is_deterministic_and_collision_free(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            local = app.focused
-            self.assertIsInstance(local, MeshNodeWidget)
-            assert isinstance(local, MeshNodeWidget)
-            await pilot.press("up")
-            self.assertIsInstance(app.focused, MeshNodeWidget)
-            self.assertIsNot(app.focused, local)
-            remote = app.focused
-            assert isinstance(remote, MeshNodeWidget)
-            self.assertTrue(await pilot.click(local))
-            self.assertIs(app.focused, local)
-            await pilot.press("up")
-            remote = app.focused
-            assert isinstance(remote, MeshNodeWidget)
-
-            await pilot.press("enter")
-            await pilot.pause()
-            menu = app.query_one("#node-context-menu", ViewportMenu)
-            labels = [item.label for item in menu.items]
-            self.assertIn("FAVORITE", labels)
-            self.assertTrue(any("HOP" in label for label in labels))
-            await pilot.press("enter")
-            await pilot.pause()
-            self.assertTrue(self.settings.is_favorite(remote.node.node_id))
-
-            app._show_connection(RadioState.OFFLINE)
-            await pilot.pause()
-            self.assertEqual(len(app.query(MeshNodeWidget)), 0)
+            no_gps_nodes = tuple(
+                NodeMetadata(f"!ng{index:02x}", f"NoGps{index}") for index in range(4)
+            )
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                *no_gps_nodes,
+            )
+            for node in no_gps_nodes:
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node.node_id,
+                        sender_long_name=node.long_name,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node.node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            first_positions = dict(view.base_positions)
             self.assertEqual(
-                str(app.query_one("#mesh-status").render()),
-                "NO MESH DATA — RADIO DISCONNECTED",
+                len(first_positions.values()), len(set(first_positions.values()))
             )
 
-    async def test_you_solid_base_and_accent_when_selected(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
+            self.assertEqual(view.base_positions, first_positions)
+
+    # ---- Context (spec section 25) -----------------------------------
+
+    async def test_context_line_for_you(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(status, "YOU")
+
+    async def test_context_line_for_client(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            app._accept_received_message(SIMULATED_MESSAGES[1])  # Bob, hops_away=1
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            bob_id = SIMULATED_MESSAGES[1].sender_node_id
+            view.select_node(bob_id)
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
+            )
+            app._update_mesh_context_status()
             await pilot.pause()
-            you = app.focused
-            assert isinstance(you, MeshNodeWidget)
-            self.assertTrue(you.node.is_local)
-            palette = THEME_PALETTES["white"]
-            rendered = you.render()
-            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent))
-            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertIn("CLIENT", status)
+            self.assertIn("1 HOPS", status)
+            self.assertNotIn("CLIENT+RELAY", status)
 
-            # Move away, then back, to see YOU in its unselected state.
-            await pilot.press("up")
+    async def test_context_line_unknown_hops_shows_question_mark(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            you.refresh_visual(selected=False, theme="white")
-            rendered = you.render()
-            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.base))
-            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_SOLID_LARGE)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata("!unknownhop", "UnknownHop", hops_away=None),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!unknownhop",
+                    sender_long_name="UnknownHop",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            view.select_node("!unknownhop")
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            app._update_mesh_context_status()
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertIn("? HOPS", status)
+            self.assertNotIn("0 HOPS", status)
 
-    async def test_recency_and_favorite_styling_states(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
+    def test_context_line_supports_client_and_relay_and_relay_only_format(self) -> None:
+        """Formatting-level proof (see mesh_state tests): the live app's
+
+        role-to-glyph and context-line logic supports CLIENT+RELAY and
+        RELAY-only correctly even though no current real-data path can
+        produce them (see MeshNodeState's docstring on why is_relay is
+        always False today) -- so the code is truthfully ready without
+        the live app ever fabricating either state.
+        """
+        client_and_relay = MeshNodeState(
+            node=NodeMetadata("!cr", "ClientRelay", 0),
+            is_client=True,
+            is_relay=True,
+            last_interaction_at=1_700_000_000.0,
         )
-        app = MeshtasticPassApp(radio, self.settings)
+        relay_only = MeshNodeState(
+            node=NodeMetadata("!ro", "RelayOnly", 2),
+            is_client=False,
+            is_relay=True,
+            last_interaction_at=1_700_000_000.0,
+        )
+        self.assertIn(
+            "CLIENT+RELAY", format_mesh_context_line(client_and_relay, now=1_700_000_100.0)
+        )
+        self.assertIn("RELAY", format_mesh_context_line(relay_only, now=1_700_000_100.0))
+        self.assertNotIn("CLIENT", format_mesh_context_line(relay_only, now=1_700_000_100.0))
+
+    # ---- Selection preservation / navigation (spec section 18/19) ----
+
+    async def test_selection_preserved_across_refresh_if_still_present(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             app._accept_received_message(SIMULATED_MESSAGES[0])
-            await pilot.press("4")
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice_id = SIMULATED_MESSAGES[0].sender_node_id
+            view.select_node(alice_id)
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
+            )
             await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_100.0)
             await pilot.pause()
-            alice = next(
-                widget
-                for widget in app.query(MeshNodeWidget)
-                if widget.node.node_id == "!a11ce001"
-            )
-            self.assertEqual(alice.display_node.recency_bucket, "recent")
-            palette = THEME_PALETTES["white"]
+            self.assertEqual(view.selected_node_id.lower(), alice_id.lower())
 
-            # Recent, not favorited: BASE, large stroked circle.
-            rendered = alice.render()
-            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.base))
-            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_STROKED_LARGE)
-
-            # Recent and favorited: FAVORITE_ACCENT, distinct from selection ACCENT.
-            self.settings.set_favorite(alice.node.node_id, True)
-            app._refresh_mesh()
-            await pilot.pause()
-            alice = next(
-                widget
-                for widget in app.query(MeshNodeWidget)
-                if widget.node.node_id == "!a11ce001"
-            )
-            rendered = alice.render()
-            self.assertEqual(
-                rendered.spans[0].style.foreground, Color.parse(palette.favorite_accent)
-            )
-            self.assertNotEqual(palette.favorite_accent, palette.accent)
-
-            # Force a >48h very-stale reading: name only, no circle line.
-            far_future = SIMULATED_MESSAGES[0].radio_rx_at + 3 * 24 * 60 * 60
-            alice.refresh_visual(selected=False, theme="white")
-            from mesh_state import MeshDisplayNode
-
-            very_stale = MeshDisplayNode(
-                node=alice.node,
-                last_message_at=SIMULATED_MESSAGES[0].radio_rx_at,
-                reference_activity=SIMULATED_MESSAGES[0].radio_rx_at,
-                favorite=True,
-                relationship_kind="direct",
-                recency_bucket="very_stale",
-            )
-            alice.display_node = very_stale
-            alice.refresh_visual(selected=False, theme="white")
-            rendered = alice.render()
-            # Label plus a lone trailing newline: no second-line glyph at all.
-            self.assertEqual(rendered.plain, "Alice Trail\n")
-            self.assertEqual(
-                rendered.spans[0].style.foreground, Color.parse(palette.dim_base)
-            )
-
-            # Selection always overrides Favorite/staleness, and always shows
-            # a circle even for an otherwise glyph-less very-stale node.
-            alice.refresh_visual(selected=True, theme="white")
-            rendered = alice.render()
-            self.assertEqual(
-                rendered.spans[0].style.foreground, Color.parse(palette.accent)
-            )
-            self.assertEqual(str(rendered).splitlines()[-1].strip(), CIRCLE_STROKED_LARGE)
-
-    async def test_refresh_preserves_selected_remote_node_metadata_change(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+    async def test_selection_falls_back_to_you_if_it_disappears(self) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice_id = SIMULATED_MESSAGES[0].sender_node_id
+            view.select_node(alice_id)
+            view.set_nodes(
+                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
+            )
+            await pilot.pause()
+
+            # Alice no longer has any recorded interaction at all -- she
+            # can no longer exist in a CLIENT-only working set.
+            app._channel_states.clear()
+            app.chat_store = None
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
+            self.assertTrue(view.selected_node_id)
+            selected_state = next(
+                state
+                for state in view.working_set
+                if state.node.node_id == view.selected_node_id
+            )
+            self.assertTrue(selected_state.node.is_local)
+
+    async def test_navigation_is_general_not_hardcoded_by_node_id(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!zzzznode", "ZzzzNode", position=north_of_local(2)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!zzzznode",
+                    sender_long_name="ZzzzNode",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, app.radio.info.node_id)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!zzzznode")
+
+    async def test_arrow_navigation_full_regression_with_realistic_node_ids(
+        self,
+    ) -> None:
+        """End-to-end regression for the reported "arrow keys do nothing"
+
+        bug: YOU plus real-looking "!xxxxxxxx" node IDs (the exact format
+        RadioService.get_known_nodes() returns) in every cardinal
+        direction, proving the full navigation contract holds against
+        live-shaped data, not just the clean synthetic IDs used
+        elsewhere in this file. Hop count is 0 for all four so no
+        anonymous relay stage is generated -- this test is specifically
+        about ID handling in the real-node navigation path, not the
+        separate relay-stage-traversal contract proven by
+        test_navigation_walks_through_relay_stages_and_back.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            north_id, south_id, east_id, west_id = (
+                "!0a0a0a0a",
+                "!0b0b0b0b",
+                "!0c0c0c0c",
+                "!0d0d0d0d",
+            )
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(north_id, "North Real", "NORT", 0, position=north_of_local(3)),
+                NodeMetadata(south_id, "South Real", "SOUT", 0, position=south_of_local(3)),
+                NodeMetadata(east_id, "East Real", "EAST", 0, position=east_of_local(3)),
+                NodeMetadata(west_id, "West Real", "WEST", 0, position=west_of_local(3)),
+            )
+            for index, node_id in enumerate((north_id, south_id, east_id, west_id)):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=f"Node{index}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=100 + index,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+
+            # Arrow event is claimed by MESH; YOU is selected by default.
+            self.assertEqual(view.selected_node_id, you_id)
+            original_relative_positions = {
+                node_id: (
+                    view.base_positions[node_id][0] - view.base_positions[you_id][0],
+                    view.base_positions[node_id][1] - view.base_positions[you_id][1],
+                )
+                for node_id in (you_id, north_id, south_id, east_id, west_id)
+            }
+            board_offset_before = view.board.styles.offset
+
+            for key, expected_id in (
+                ("up", north_id),
+                ("down", you_id),
+                ("down", south_id),
+                ("up", you_id),
+                ("right", east_id),
+                ("left", you_id),
+                ("left", west_id),
+                ("right", you_id),
+            ):
+                await pilot.press(key)
+                await pilot.pause()
+                with self.subTest(key=key, expected=expected_id):
+                    # Selected ID corresponds to an actual rendered node.
+                    self.assertEqual(view.selected_node_id, expected_id)
+                    self.assertIn(
+                        expected_id, {w.node_id for w in app.query(MeshNodeWidget)}
+                    )
+                    selected_widget = next(
+                        w for w in app.query(MeshNodeWidget) if w.node_id == expected_id
+                    )
+                    self.assertEqual(
+                        selected_widget.render().spans[0].style.foreground,
+                        Color.parse(THEME_PALETTES[app._current_theme].accent),
+                    )
+                    # Bottom-left context reflects the new selection.
+                    status = str(app.query_one("#mesh-context-status").render())
+                    if expected_id == you_id:
+                        self.assertEqual(status, "YOU")
+                    else:
+                        self.assertNotEqual(status, "YOU")
+                    # The mesh recentered: the selected node's own base
+                    # position is now the center anchor.
+                    positions = _mesh_translated_positions(
+                        view.base_positions, view.selected_node_id
+                    )
+                    self.assertEqual(
+                        positions[expected_id], (MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN)
+                    )
+                    # Relative geometry between every node is unchanged --
+                    # recentering is a pure translation, not a reshuffle.
+                    for node_id in (you_id, north_id, south_id, east_id, west_id):
+                        relative = (
+                            positions[node_id][0] - positions[expected_id][0],
+                            positions[node_id][1] - positions[expected_id][1],
+                        )
+                        expected_relative = (
+                            original_relative_positions[node_id][0]
+                            - original_relative_positions[expected_id][0],
+                            original_relative_positions[node_id][1]
+                            - original_relative_positions[expected_id][1],
+                        )
+                        self.assertEqual(relative, expected_relative)
+                    # No scrolling: the board container's own offset never
+                    # moves (only individual node widgets do).
+                    self.assertEqual(view.board.styles.offset, board_offset_before)
+                    self.assertFalse(view.show_vertical_scrollbar)
+                    self.assertFalse(view.show_horizontal_scrollbar)
+
+    async def test_navigation_works_even_when_focus_is_on_the_board_container(
+        self,
+    ) -> None:
+        """Arrow-key MESH navigation is gated on the current tab, not on
+
+        Textual focus residing on any particular node widget -- explicitly
+        move focus to the board container itself and confirm navigation
+        still works.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!0e0e0e0e", "Northern", position=north_of_local(2)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!0e0e0e0e",
+                    sender_long_name="Northern",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            view.focus()
             await pilot.pause()
             await pilot.press("up")
             await pilot.pause()
-            selected = app.focused
-            self.assertIsInstance(selected, MeshNodeWidget)
-            assert isinstance(selected, MeshNodeWidget)
-            selected_id = selected.node.node_id
-            self.assertFalse(selected.node.is_local)
+            self.assertEqual(view.selected_node_id, "!0e0e0e0e")
 
-            base_nodes = radio.get_known_nodes()
-            changed_nodes = tuple(
-                NodeMetadata(
-                    node.node_id,
-                    "Renamed Node" if node.node_id == selected_id else node.long_name,
-                    node.short_name,
-                    node.hops_away,
-                    node.last_heard,
-                    node.is_local,
-                )
-                for node in base_nodes
-            )
-            radio.get_known_nodes = lambda: changed_nodes
-            app._refresh_mesh(wall_now=1_000.0)
+    async def test_navigation_survives_decimal_vs_hex_node_id_mismatch(self) -> None:
+        """End-to-end version of the mesh_state-level regression test: even
+
+        if CHAT activity reports a sender under a bare decimal node
+        number while get_known_nodes() reports the same physical node in
+        the standard "!hex" form, arrow navigation must still reach the
+        real, positioned, rendered node -- not silently fail or land on
+        a nameless duplicate. Hop count is 0 so no relay stage sits
+        between YOU and it, keeping this test focused on ID handling.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata("!075bcd15", "North Node", "NORTH", 0, position=north_of_local(3)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="123456789",  # decimal for 0x075bcd15
+                    sender_long_name="North Node",
+                    sender_short_name="NORTH",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                {state.node.node_id for state in view.working_set},
+                {app.radio.info.node_id, "!075bcd15"},
+            )
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!075bcd15")
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("North Node"))
 
-            self.assertIsInstance(app.focused, MeshNodeWidget)
-            assert isinstance(app.focused, MeshNodeWidget)
-            self.assertEqual(app.focused.node.node_id, selected_id)
-            self.assertEqual(app.focused.node.long_name, "Renamed Node")
+    # ---- Anonymous relay-stage topology (hop-count based) --------------
 
-    async def test_repeated_refresh_with_unchanged_data_keeps_same_positions(
+    async def _open_mesh_with_directional_clients(
+        self, pilot, *, hops: dict
+    ) -> "MeshtasticPassApp":
+        """Wire up to four clients, one per cardinal direction, each with
+
+        the given hops_away -- avoiding same-bucket contention so each
+        client's own relay chain has genuinely interior grid cells.
+        """
+        app = pilot.app
+        directions = {
+            "north": ("!d0000001", north_of_local(3)),
+            "south": ("!d0000002", south_of_local(3)),
+            "east": ("!d0000003", east_of_local(3)),
+            "west": ("!d0000004", west_of_local(3)),
+        }
+        nodes = [NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)]
+        for name, (node_id, position) in directions.items():
+            nodes.append(
+                NodeMetadata(node_id, name.title(), name[:4].upper(), hops.get(name), position=position)
+            )
+        app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+        for name, (node_id, _position) in directions.items():
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name=name.title(),
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=hash(node_id) & 0xFFFF,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+        await self._open_mesh(pilot)
+        return directions
+
+    async def test_hop_count_topology_generates_correct_relay_stage_counts(
         self,
     ) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+        """0/1/2/3 HOPS -> exactly that many anonymous relay stages each
+
+        (spec section 2/32), never fewer, never more, one client per
+        compass direction so counts can't be confused across clients.
+        """
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            directions = await self._open_mesh_with_directional_clients(
+                pilot, hops={"north": 0, "south": 1, "east": 2, "west": 3}
+            )
             view = app.query_one(MeshTopologyView)
-            original_positions = {
-                item.node.node_id: (item.x, item.y) for item in view.layout_model.nodes
-            }
-            app._refresh_mesh(wall_now=2_000.0)
-            await pilot.pause()
-            new_positions = {
-                item.node.node_id: (item.x, item.y) for item in view.layout_model.nodes
-            }
-            self.assertEqual(original_positions, new_positions)
+            for name, expected_count in (
+                ("north", 0),
+                ("south", 1),
+                ("east", 2),
+                ("west", 3),
+            ):
+                node_id = directions[name][0]
+                with self.subTest(direction=name):
+                    stage_count = sum(
+                        1 for stage in view.relay_stages if stage.source_node_id == node_id
+                    )
+                    self.assertEqual(stage_count, expected_count)
+            self.assertEqual(len(view.relay_stages), 0 + 1 + 2 + 3)
+            self.assertEqual(
+                {w.node_id for w in app.query(MeshRelayWidget)},
+                {stage.node_id for stage in view.relay_stages},
+            )
 
-    async def test_directional_arrows_navigate_and_no_candidate_is_noop(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+    async def test_unknown_hops_client_has_no_relay_stages_but_stays_visible(
+        self,
+    ) -> None:
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
+            directions = await self._open_mesh_with_directional_clients(
+                pilot, hops={"north": None, "south": None, "east": None, "west": None}
+            )
             view = app.query_one(MeshTopologyView)
-            local = app.focused
-            assert isinstance(local, MeshNodeWidget)
-            local_x, local_y = local.positioned.x, local.positioned.y
+            self.assertEqual(view.relay_stages, ())
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
+            north_id = directions["north"][0]
+            self.assertIn(north_id, {w.node_id for w in app.query(MeshNodeWidget)})
 
-            await pilot.press("right")
+    async def test_relay_stages_never_count_toward_active_or_working_set_bound(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            self.assertIsInstance(app.focused, MeshNodeWidget)
-            assert isinstance(app.focused, MeshNodeWidget)
-            self.assertGreater(app.focused.positioned.x, local_x)
+            await self._open_mesh_with_directional_clients(
+                pilot, hops={"north": 3, "south": 3, "east": 3, "west": 3}
+            )
+            view = app.query_one(MeshTopologyView)
+            remote_count = sum(1 for state in view.working_set if not state.node.is_local)
+            self.assertEqual(remote_count, 4)
+            self.assertGreater(len(view.relay_stages), 0)
 
-            await pilot.press("left")
+    async def test_navigation_skips_over_relay_stages_directly_to_real_node(
+        self,
+    ) -> None:
+        """Anonymous relay stages are visual topology only -- NOT
+
+        navigable (spec update: "UNKNOWN RELAYS ARE NOT SELECTABLE"). A
+        single 2-hop client sits with two relay stages geometrically
+        between it and YOU; a single "up" press from YOU must land
+        directly on the real node in one press, never stopping on
+        either relay stage, and a single "down" press from the real
+        node returns directly to YOU. No wrapping, no scrolling.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            self.assertIs(app.focused, local)
+            you_id = app.radio.info.node_id
+            target_id = "!ta4be701"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Target Node", "TGT", 2, position=north_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Target Node",
+                    sender_short_name="TGT",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertEqual(len(view.relay_stages), 2)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+            board_offset_before = view.board.styles.offset
+
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
+            self.assertNotIn(view.selected_node_id, relay_ids)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("Target Node"))
+
+            # No wrapping: one more "up" from the real node changes nothing.
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
 
             await pilot.press("down")
             await pilot.pause()
-            self.assertIsInstance(app.focused, MeshNodeWidget)
-            assert isinstance(app.focused, MeshNodeWidget)
-            self.assertGreater(app.focused.positioned.y, local_y)
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
 
-            # Move to the topmost node, where "up" has no candidate.
-            top = min(view.layout_model.nodes, key=lambda item: item.y)
-            view.select_node(top.node.node_id)
-            await pilot.pause()
-            focused_before = app.focused
-            await pilot.press("up")
-            await pilot.pause()
-            self.assertIs(app.focused, focused_before)
+            self.assertEqual(view.board.styles.offset, board_offset_before)
+            self.assertFalse(view.show_vertical_scrollbar)
+            self.assertFalse(view.show_horizontal_scrollbar)
 
-    async def test_mouse_wheel_does_not_pan_mesh(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+    async def test_relay_stage_cannot_be_selected_and_always_renders_dim(
+        self,
+    ) -> None:
+        """Anonymous relay stages are never focusable/selectable: no
+
+        on_click, never ACCENT, never the enlarged composite, never the
+        bottom-left context, and MeshTopologyView.select_node() rejects
+        a relay stage ID outright as a no-op rather than accepting it
+        and relying on a later set_nodes() call to repair it (spec
+        update section "UNKNOWN RELAYS ARE NOT SELECTABLE").
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            you_id = app.radio.info.node_id
+            target_id = "!re1a5001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Relay Target", "RLT", 1, position=east_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Relay Target",
+                    sender_short_name="RLT",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 1)
+            stage_id = view.relay_stages[0].node_id
+            palette = THEME_PALETTES[app._current_theme]
+
+            self.assertFalse(hasattr(MeshRelayWidget, "on_click"))
+            self.assertFalse(MeshRelayWidget.can_focus)
+
+            relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
+            self.assertEqual(
+                relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertEqual(int(relay_widget.styles.width.value), 1)
+            self.assertEqual(str(relay_widget.render()), CIRCLE_STROKED_LARGE)
+            self.assertEqual(
+                next((w for w in app.query(MeshNodeLabelWidget) if w.node_id == stage_id), None),
+                None,
+            )
+
+            # Directly attempting to select a relay stage ID (there is no
+            # UI path that does this anymore -- proving the model layer
+            # itself refuses, not just the removed click handler): YOU is
+            # already selected here, and MeshTopologyView.select_node()
+            # rejects the relay ID outright as a no-op (see
+            # test_select_node_accepts_only_real_working_set_nodes for
+            # the dedicated proof) -- selection simply never moves off YOU.
+            _mesh_select_node(app, stage_id)
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertNotEqual(view.selected_node_id, stage_id)
+            relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
+            self.assertEqual(
+                relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertEqual(int(relay_widget.styles.width.value), 1)
+            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
+
+    async def test_select_node_accepts_only_real_working_set_nodes(self) -> None:
+        """MeshTopologyView.select_node() is authoritative: only a real
+
+        node currently in `working_set` may ever become
+        `selected_node_id`. An anonymous RelayStage ID or an arbitrary
+        unknown ID is rejected outright as a no-op right here, never
+        even momentarily accepted and relying on a later set_nodes()
+        call to repair it (spec update: tighten the selection boundary
+        at select_node() itself, not just at the removed click handler
+        or the navigation candidate filter). Requirement 5 (falling
+        back to YOU when the selected REAL node disappears on refresh)
+        is proven separately by
+        test_selection_falls_back_to_you_if_it_disappears -- that path
+        goes through set_nodes()'s own fallback, not select_node(),
+        and is unaffected by this change.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            alice_id = "!a1ice001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(alice_id, "Alice", "ALC", 1, position=north_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=alice_id,
+                    sender_long_name="Alice",
+                    sender_short_name="ALC",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 1)
+            relay_id = view.relay_stages[0].node_id
+
+            # 1. Real working-set node selection succeeds.
+            view.select_node(alice_id)
+            self.assertEqual(view.selected_node_id, alice_id)
+
+            # 2. Anonymous relay-stage ID selection is a no-op.
+            view.select_node(relay_id)
+            self.assertEqual(view.selected_node_id, alice_id)
+            self.assertNotEqual(view.selected_node_id, relay_id)
+
+            # 3. Arbitrary/unknown ID selection is a no-op.
+            view.select_node("!totally-unknown-id")
+            self.assertEqual(view.selected_node_id, alice_id)
+
+            # 4. selected_node_id never even momentarily becomes a relay ID.
+            for _ in range(3):
+                view.select_node(relay_id)
+                self.assertNotEqual(view.selected_node_id, relay_id)
+            self.assertEqual(view.selected_node_id, alice_id)
+
+            # Normal real-node selection behavior is otherwise unchanged.
+            view.select_node(you_id)
+            self.assertEqual(view.selected_node_id, you_id)
+
+    async def test_navigation_candidate_set_excludes_relay_stage_ids(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!ca4d1da1"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Alice", "ALC", 3, position=west_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Alice",
+                    sender_short_name="ALC",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 3)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
+            self.assertEqual(relay_ids & {view.selected_node_id}, set())
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, you_id)
+
+    async def test_multiple_clients_same_hop_count_get_independent_relay_stages(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!a11cebbb", "!b0bbbbbb"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(alice_id, "Alice", "ALC", 2, position=east_of_local(9)),
+                NodeMetadata(bob_id, "Bob", "BOB", 2, position=west_of_local(9)),
+            )
+            for node_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=name,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 4)
+            alice_stage_ids = {
+                s.node_id for s in view.relay_stages if s.source_node_id == alice_id
+            }
+            bob_stage_ids = {s.node_id for s in view.relay_stages if s.source_node_id == bob_id}
+            self.assertEqual(len(alice_stage_ids), 2)
+            self.assertEqual(len(bob_stage_ids), 2)
+            self.assertEqual(alice_stage_ids & bob_stage_ids, set())
+            positions = list(view.base_positions.values())
+            self.assertEqual(len(positions), len(set(positions)))
+
+    # ---- ACTIVE / brightness predicate unification (spec section 17-20) --
+
+    async def test_active_count_and_node_brightness_use_same_predicate(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            client_ids = [f"!ac00000{i}" for i in range(8)]
+            active_ids = set(client_ids[:4])
+            nodes = [NodeMetadata(app.radio.info.node_id, is_local=True)]
+            for index, node_id in enumerate(client_ids):
+                last_heard = (
+                    now - 10
+                    if node_id in active_ids
+                    else now - ACTIVE_WINDOW_SECONDS - 100
+                )
+                nodes.append(NodeMetadata(node_id, f"Node{index}", last_heard=last_heard))
+            app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+            for index, node_id in enumerate(client_ids):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=f"Node{index}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_500_000 + index,
+                        radio_rx_at=now - index,
+                    )
+                )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            title = str(app.query_one("#mesh-title").render())
+            self.assertEqual(title, "> MESH · ACTIVE 4")
+
+            view = app.query_one(MeshTopologyView)
+            self.assertNotIn(view.selected_node_id, client_ids)
+            palette = THEME_PALETTES[app._current_theme]
+            for node_id in client_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                color = widget.render().spans[0].style.foreground
+                with self.subTest(node_id=node_id, active=node_id in active_ids):
+                    if node_id in active_ids:
+                        self.assertEqual(color, Color.parse(palette.base))
+                    else:
+                        self.assertEqual(color, Color.parse(palette.dim_base))
+
+    async def test_relay_stage_brightness_ignores_activity_and_is_never_counted(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!d1d0007f"
+            now = 1_700_000_000.0
+            # A recently-heard (ACTIVE) client, but its relay stage must
+            # still always render DIM_BASE unless selected -- it has no
+            # identity of its own to be "heard" from.
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    target_id, "DimTarget", "DIM", 1, last_heard=now - 5, position=north_of_local(9)
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="DimTarget",
+                    sender_short_name="DIM",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
-            board_offset_before = view.board.styles.offset
-            # A plain Container has no functional scroll/overflow behavior,
-            # so a wheel event is simply a no-op -- the board never moves.
-            view._on_mouse_scroll_down(
-                MouseScrollDown(view, 1, 1, 0, 1, 0, False, False, False)
+            self.assertEqual(len(view.relay_stages), 1)
+            palette = THEME_PALETTES[app._current_theme]
+            stage_widget = next(iter(app.query(MeshRelayWidget)))
+            self.assertEqual(
+                stage_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
-            await pilot.pause()
-            self.assertEqual(view.board.styles.offset, board_offset_before)
+            title = str(app.query_one("#mesh-title").render())
+            self.assertEqual(title, "> MESH · ACTIVE 1")
 
-    async def test_no_scrollbars_are_present_on_mesh(self) -> None:
-        from textual.containers import ScrollableContainer
+    async def test_active_header_excludes_known_nodes_outside_displayed_working_set(
+        self,
+    ) -> None:
+        """Regression for the exact observed uConsole bug: MESH showed 9
 
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(42, 15)) as pilot:
+        real nodes all DIM_BASE while the header said ACTIVE 2. Root
+        cause was a population mismatch -- ACTIVE previously counted
+        activity across the FULL known-node population (get_known_nodes()),
+        independent of the bounded CLIENT-derived working set actually
+        rendered, so a passively-active node with no CHAT history could
+        inflate the header without ever appearing on the board at all.
+
+        Fixture: YOU + 8 real remote CLIENTs (all displayed, exactly 2
+        satisfying is_node_active()) + 2 additional known nodes that are
+        ALSO passively active but have never sent a CHAT message, so
+        they are excluded from the working set entirely. ACTIVE must
+        read exactly 2 -- the hidden active nodes must not count -- and
+        exactly those same 2 displayed nodes must render BASE.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await pilot.press("4")
+            now = 1_700_000_000.0
+            displayed_ids = [f"!disp000{i}" for i in range(8)]
+            active_displayed_ids = set(displayed_ids[:2])
+            hidden_active_ids = ["!hidn0001", "!hidn0002"]
+
+            nodes = [NodeMetadata(app.radio.info.node_id, is_local=True)]
+            for node_id in displayed_ids:
+                last_heard = (
+                    now - 10 if node_id in active_displayed_ids
+                    else now - ACTIVE_WINDOW_SECONDS - 100
+                )
+                nodes.append(NodeMetadata(node_id, node_id, last_heard=last_heard))
+            for node_id in hidden_active_ids:
+                # Passively active (recent last_heard) but never a
+                # CLIENT -- no _accept_received_message call for these.
+                nodes.append(NodeMetadata(node_id, node_id, last_heard=now - 10))
+            app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+
+            for index, node_id in enumerate(displayed_ids):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=node_id,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_700_000 + index,
+                        radio_rx_at=now - index,
+                    )
+                )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
             await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            displayed_remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertEqual(displayed_remote_ids, set(displayed_ids))
+            for hidden_id in hidden_active_ids:
+                self.assertNotIn(hidden_id, displayed_remote_ids)
+                self.assertNotIn(
+                    hidden_id, {w.node_id for w in app.query(MeshNodeWidget)}
+                )
+
+            title = str(app.query_one("#mesh-title").render())
+            self.assertEqual(title, "> MESH · ACTIVE 2")
+
+            palette = THEME_PALETTES[app._current_theme]
+            bright_ids = set()
+            for node_id in displayed_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                color = widget.render().spans[0].style.foreground
+                if color == Color.parse(palette.base):
+                    bright_ids.add(node_id)
+                else:
+                    self.assertEqual(color, Color.parse(palette.dim_base))
+            self.assertEqual(bright_ids, active_displayed_ids)
+
+            # Selecting an inactive node shows ACCENT; deselecting it
+            # restores DIM_BASE. Selecting an active node shows ACCENT;
+            # deselecting it restores BASE. Rendered directly at the
+            # FIXED simulated `now` (not via _mesh_select_node, which
+            # always uses real wall-clock time()) so is_node_active()
+            # evaluates against the same timestamp as the setup above.
+            inactive_id = next(iter(set(displayed_ids) - active_displayed_ids))
+            active_id = next(iter(active_displayed_ids))
+            for node_id, restored in ((inactive_id, palette.dim_base), (active_id, palette.base)):
+                view.select_node(node_id)
+                view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=now)
+                await pilot.pause()
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(
+                    widget.render().spans[0].style.foreground, Color.parse(palette.accent)
+                )
+                view.select_node(app.radio.info.node_id)
+                view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=now)
+                await pilot.pause()
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(restored))
+
+    async def test_activity_styling_refreshes_without_leaving_mesh_tab(self) -> None:
+        """The user should not have to leave/re-enter MESH for active
+
+        styling (or ACTIVE N) to become correct as time passes -- the
+        existing 1s _refresh_chat_timestamps timer already calls
+        _refresh_mesh() while the MESH tab is current; this proves the
+        resulting recompute actually updates both the header and the
+        node's own color, entirely via repeated _refresh_mesh() calls
+        with no additional tab switch and no new radio traffic.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            node_id = "!c0055ing1"
+            heard_at = 1_700_000_000.0
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(node_id, "Crosser", last_heard=heard_at),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Crosser",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=heard_at,
+                )
+            )
+            await self._open_mesh(pilot)
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._refresh_mesh(wall_now=heard_at + 10)
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertEqual(str(app.query_one("#mesh-title").render()), "> MESH · ACTIVE 1")
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(palette.base))
+
+            # Same session, same tab -- only wall-clock time advanced past
+            # the active window, exactly as the 1s timer would apply it.
+            app._refresh_mesh(wall_now=heard_at + ACTIVE_WINDOW_SECONDS + 50)
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertEqual(str(app.query_one("#mesh-title").render()), "> MESH · ACTIVE 0")
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertEqual(app.radio.sent_messages, ())
+
+    # ---- Expanded selected-node context (spec section 21-27) -----------
+
+    async def test_selected_context_full_format_with_distance(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee01"
+            target_position = north_of_local(4.2)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    target_id, "Bob Basecamp", "BOB", 1, position=target_position
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Bob Basecamp",
+                    sender_short_name="BOB",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_699_999_970.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            # _update_mesh_context_status() formats AGE against real
+            # wall-clock time() (see app.py), so -- like the pre-existing
+            # test_context_line_for_client -- this cannot pin an exact
+            # AGE string; only the name/short-name/role/hops/distance
+            # segments, which are wall-clock-independent, are asserted
+            # exactly (spec section 37: no test may depend on
+            # uncontrolled wall-clock timing).
+            segments = status.split(" / ")
+            self.assertEqual(len(segments), 6)
+            expected_distance = distance_between(LOCAL_GEO, target_position)
+            self.assertEqual(
+                [segments[0], segments[1], segments[2], segments[3], segments[5]],
+                ["Bob Basecamp", "BOB", "CLIENT", "1 HOPS", f"{expected_distance:.1f} mi"],
+            )
+            self.assertNotEqual(segments[4], "?")
+
+    async def test_selected_context_missing_short_name_and_distance(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee02"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True),  # no position -> "? mi"
+                NodeMetadata(target_id, "No Short Name", None, 1),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="No Short Name",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(len(status.split(" / ")), 5)  # no Short Name segment
+            self.assertTrue(status.endswith("? mi"))
+            self.assertTrue(status.startswith("No Short Name / CLIENT"))
+
+    async def test_distance_unchanged_by_recentering(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!a1a1a1a1", "!b2b2b2b2"
+            alice_position = north_of_local(3.7)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(alice_id, "Alice", "ALC", 1, position=alice_position),
+                NodeMetadata(bob_id, "Bob", "BOB", 1, position=south_of_local(5)),
+            )
+            for node_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=name,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=hash(node_id) & 0xFFFF,
+                        radio_rx_at=1_700_000_000.0,
+                    )
+                )
+            await self._open_mesh(pilot)
+
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            first_status = str(app.query_one("#mesh-context-status").render())
+            first_distance = first_status.rsplit(" / ", 1)[-1]
+
+            # Selecting Bob recenters the whole board on him.
+            _mesh_select_node(app, bob_id)
+            await pilot.pause()
+            self.assertNotEqual(
+                str(app.query_one("#mesh-context-status").render()), first_status
+            )
+
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            second_status = str(app.query_one("#mesh-context-status").render())
+            self.assertEqual(second_status, first_status)
+            self.assertEqual(second_status.rsplit(" / ", 1)[-1], first_distance)
+
+    async def test_no_scrollbars_on_mesh(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             self.assertNotIsInstance(view, ScrollableContainer)
             self.assertFalse(view.show_vertical_scrollbar)
             self.assertFalse(view.show_horizontal_scrollbar)
-            self.assertEqual(view.styles.overflow_x, "hidden")
-            self.assertEqual(view.styles.overflow_y, "hidden")
 
-    async def test_board_size_is_bounded_regardless_of_working_set(self) -> None:
-        """The grid radius is fixed, so board size never grows past a fixed
+    # ---- Board label 5-cell limit (app-level) --------------------------
 
-        bound even with the maximum working set and no scrolling exists to
-        reach anything beyond it -- see MeshTopologyView's docstring for why
-        radius is fixed rather than adapted from live viewport size.
-        """
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            cell_width = NODE_WIDTH + HORIZONTAL_GAP
-            cell_height = NODE_HEIGHT + VERTICAL_GAP
-            max_span = 2 * DEFAULT_MAX_GRID_RADIUS + 3  # radius + collision slack
-            self.assertLessEqual(view.layout_model.width, cell_width * max_span)
-            self.assertLessEqual(view.layout_model.height, cell_height * max_span)
-
-    async def test_you_to_node_connectors_are_you_origin_only(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            await pilot.pause()
-            view = app.query_one(MeshTopologyView)
-            local_item = next(
-                item for item in view.layout_model.nodes if item.node.is_local
-            )
-            local_center = (
-                local_item.x + NODE_WIDTH // 2,
-                local_item.y + NODE_HEIGHT // 2,
-            )
-            canvas = app.query_one(MeshCanvas)
-            signature = canvas._signature
-            assert signature is not None
-            connectors = signature[2]
-            self.assertTrue(connectors)
-            # Every connector must trace back to a straight/elbow path that
-            # actually originates or ends at YOU's center -- never a
-            # fabricated node-to-node edge.
-            for item in view.layout_model.nodes:
-                if item.node.is_local:
-                    continue
-                node_center = (item.x + NODE_WIDTH // 2, item.y + NODE_HEIGHT // 2)
-                expected = route_connector(*local_center, *node_center)
-                if not expected:
-                    continue
-                for x, y, glyph in expected:
-                    self.assertTrue(
-                        any(cx == x and cy == y and cg == glyph for cx, cy, cg, _c in connectors)
-                    )
-
-    async def test_selected_connector_uses_accent_others_use_dim_base(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            await pilot.press("4")
-            await pilot.pause()
-            await pilot.press("right")
-            await pilot.pause()
-            await pilot.pause()
-            canvas = app.query_one(MeshCanvas)
-            signature = canvas._signature
-            assert signature is not None
-            connectors = signature[2]
-            palette = THEME_PALETTES["white"]
-            colors = {color for _x, _y, _glyph, color in connectors}
-            self.assertIn(palette.accent, colors)
-            self.assertTrue(colors - {palette.accent} <= {palette.dim_base})
-
-    async def test_context_status_line_you_and_remote(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            app._accept_received_message(SIMULATED_MESSAGES[0])
-            await pilot.press("4")
-            await pilot.pause()
-            await pilot.pause()
-            you_status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(you_status.startswith("YOU · CONNECTED TO "))
-            self.assertNotIn("--", you_status)
-
-            alice = next(
-                widget
-                for widget in app.query(MeshNodeWidget)
-                if widget.node.node_id == "!a11ce001"
-            )
-            view = app.query_one(MeshTopologyView)
-            view.select_node(alice.node.node_id)
-            await pilot.pause()
-            await pilot.pause()
-            remote_status = str(app.query_one("#mesh-context-status").render())
-            self.assertIn("Alice Trail", remote_status)
-            self.assertIn(" · ", remote_status)
-            self.assertNotIn(" - ", remote_status)
-            self.assertIn("HOP", remote_status)
-            self.assertIn("LAST MESSAGE", remote_status)
-
-    async def test_emoji_node_labels_render_without_corrupting_board_geometry(
+    async def test_board_label_five_cells_stays_centered_and_glyph_unmoved(
         self,
     ) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
-        )
-        app = MeshtasticPassApp(radio, self.settings)
+        """A long name truncates to <= 5 display cells on the board label,
+
+        the label stays centered over the glyph's fixed grid anchor, and
+        the glyph's own coordinate is completely unaffected by label
+        length (spec: "label width never moves the glyph").
+        """
+        app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            base_nodes = radio.get_known_nodes()
-            emoji_labels = (
-                "🐔chicken_node_long",
-                "🍕pizza_node_long_name",
-                "👨‍👩‍👧‍👦family_node",
-                "🇺🇸🇬🇧flags_node",
-            )
-            emoji_nodes = tuple(
+            you_id = app.radio.info.node_id
+            long_id = "!10ngname"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
                 NodeMetadata(
-                    node.node_id,
-                    emoji_labels[index % len(emoji_labels)]
-                    if not node.is_local
-                    else node.long_name,
-                    node.short_name,
-                    node.hops_away,
-                    node.last_heard,
-                    node.is_local,
-                )
-                for index, node in enumerate(base_nodes)
+                    long_id,
+                    "A Very Long Descriptive Node Name",
+                    None,
+                    position=north_of_local(3),
+                ),
             )
-            radio.get_known_nodes = lambda: emoji_nodes
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=long_id,
+                    sender_long_name="A Very Long Descriptive Node Name",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            glyph = next(w for w in app.query(MeshNodeWidget) if w.node_id == long_id)
+            label = next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == long_id)
+
+            label_text = str(label.render())
+            self.assertLessEqual(cell_len(label_text), MESH_BOARD_LABEL_MAX_CELLS)
+            # The label sits exactly one row above the glyph, horizontally
+            # centered on the SAME column anchor -- never the glyph's own
+            # coordinate (see MeshNodeLabelWidget/set_nodes).
+            glyph_x, glyph_y = glyph_screen_position(glyph)
+            label_x, label_y = glyph_screen_position(label)
+            self.assertEqual(label_x, glyph_x)
+            self.assertEqual(label_y, glyph_y - 1)
+
+            # Selecting a neighbor recenters the whole board (glyph moves
+            # with the translation) but the label stays centered on it.
+            _mesh_select_node(app, you_id)
+            await pilot.pause()
+            glyph = next(w for w in app.query(MeshNodeWidget) if w.node_id == long_id)
+            label = next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == long_id)
+            glyph_x, glyph_y = glyph_screen_position(glyph)
+            label_x, label_y = glyph_screen_position(label)
+            self.assertEqual(label_x, glyph_x)
+            self.assertEqual(label_y, glyph_y - 1)
+
+    # ---- Preserved visual contract -----------------------------------
+
+    async def test_selected_node_uses_accent_and_wider_composite(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            palette = THEME_PALETTES[app._current_theme]
+            you_widget = next(
+                widget
+                for widget in app.query(MeshNodeWidget)
+                if widget.node_id == view.selected_node_id
+            )
+            rendered = you_widget.render()
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent))
+            self.assertEqual(int(you_widget.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
+
+    async def test_stale_unselected_node_uses_dim_base(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            very_old = 1_700_000_000.0 - MESH_STALE_THRESHOLD_SECONDS * 5
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id="!stale001",
+                    sender_long_name="StaleOne",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="ancient",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=very_old,
+                )
+            )
             await pilot.press("4")
             await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_000.0)
+            await pilot.pause()
+            palette = THEME_PALETTES[app._current_theme]
+            stale_widget = next(
+                widget for widget in app.query(MeshNodeWidget) if widget.node_id == "!stale001"
+            )
+            rendered = stale_widget.render()
+            self.assertEqual(
+                rendered.spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
 
-            widgets = list(app.query(MeshNodeWidget))
-            self.assertEqual(len(widgets), len(emoji_nodes))
-            for widget in widgets:
-                label_line = str(widget.render()).splitlines()[0]
-                self.assertLessEqual(cell_len(label_line), NODE_WIDTH)
+    async def test_no_selection_background_rectangle(self) -> None:
+        self.assertNotIn(".mesh-node:focus", MeshtasticPassApp.CSS)
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            for widget in app.query(MeshNodeWidget):
+                self.assertEqual(widget.styles.background.a, 0)
+
+    # ---- Zero new radio traffic (spec section 26) ---------------------
+
+    async def test_mesh_refresh_navigation_generate_no_radio_traffic(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            for key in ("up", "down", "left", "right", "up", "down"):
+                await pilot.press(key)
+                await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
+            self.assertEqual(app.radio.sent_messages, ())
+
+    async def test_mesh_never_calls_send_text_or_traceroute_paths(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for method_name in ("send_text", "sendData", "sendText", "sendPosition"):
+                if hasattr(app.radio, method_name):
+                    setattr(
+                        app.radio,
+                        method_name,
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            AssertionError(f"MESH must never call {method_name}")
+                        ),
+                    )
+            for message in SIMULATED_MESSAGES:
+                app._accept_received_message(message)
+            await self._open_mesh(pilot)
+            for key in ("up", "down", "left", "right"):
+                await pilot.press(key)
+                await pilot.pause()
+            app._refresh_mesh(wall_now=1_700_000_100.0)
+            await pilot.pause()
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):
     def test_vertical_thin_render_uses_the_thin_glyph(self) -> None:
         from rich.color import Color as RichColor
+
+        from app import CHAT_SCROLLBAR_THUMB_GLYPH
 
         rendered = ThinScrollBarRender.render_bar(
             size=10,

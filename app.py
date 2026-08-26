@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from time import monotonic, time
 
@@ -22,7 +22,7 @@ from textual.containers import (
     Vertical,
     VerticalScroll,
 )
-from textual.events import Blur, Click, Focus, Key
+from textual.events import Click, Focus, Key
 from textual.message import Message
 from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
@@ -46,19 +46,18 @@ from chat_store import (
 )
 from geo import format_distance_miles
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
-from mesh_state import MeshDisplayNode, build_display_nodes
+from mesh_state import MeshNodeState, build_mesh_working_set, format_mesh_context_line
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
-    HORIZONTAL_GAP,
-    NODE_HEIGHT,
-    NODE_WIDTH,
-    VERTICAL_GAP,
     PositionedNode,
+    RelayStage,
     TopologyLayout,
-    build_topology,
+    assign_grid_slots,
+    build_relay_stages,
     compact_node_label,
     directional_target,
-    route_connector,
+    place_within_bounds,
+    route_chain,
 )
 from node_activity import is_node_active
 from radio_service import (
@@ -389,89 +388,291 @@ class ConnectionPage(VerticalScroll):
 
 CIRCLE_SOLID_LARGE = "●"
 CIRCLE_STROKED_LARGE = "○"
-CIRCLE_STROKED_SMALL = "◦"
-_CIRCLE_GLYPHS = {
-    "solid": CIRCLE_SOLID_LARGE,
-    "large": CIRCLE_STROKED_LARGE,
-    "small": CIRCLE_STROKED_SMALL,
-}
+
+# --- MESH: real passive-data visualization on a fixed grid -----------------
+#
+# A fixed 21-column x 8-row board driven entirely by real, passively
+# observed Meshtastic data -- no LoRa traffic is ever generated to
+# populate or refresh it (see _refresh_mesh). Real nodes are placed by
+# coarse compass direction/distance ranking when GPS is available
+# (never exact, proportional geography), spread to use more of the
+# fixed grid's available room, and a real CLIENT's truthful nonzero hop
+# count renders as that many anonymous relay-stage placeholders along
+# its path to YOU (see mesh_topology.RelayStage) -- visual/topology
+# decoration only, never selectable, focusable, or a navigation
+# candidate. Intentionally out of scope: Favorites, dynamic node-count
+# growth beyond the bounded working set, and scrolling (the working set
+# is bounded precisely so the whole board always fits one viewport).
+# See mesh_state.py for the working-set/role/staleness/distance model
+# and mesh_topology.py for the pure grid geometry (assign_grid_slots(),
+# place_within_bounds(), directional_target(), build_relay_stages(),
+# route_chain()) reused here.
+MESH_GRID_ROWS = 8
+MESH_GRID_COLUMNS = 21
+MESH_GRID_CENTER_ROW = 5
+MESH_GRID_CENTER_COLUMN = 11
+# Selected-node "visually larger" treatment: a 3-cell-wide composite
+# (small dot + role glyph + small dot) replacing the ordinary 1-cell
+# glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
+# enough and why this stays a reliable-width text composite rather than
+# an ambiguous-width "big circle" Unicode glyph.
+MESH_SELECTED_GLYPH_WIDTH = 3
+MESH_SELECTED_HALO_GLYPH = "·"
+# The label physically above a node's glyph is a compact hint, not the
+# full identity -- that lives in the rich bottom-left context (see
+# mesh_state.format_mesh_context_line, which always has the full Long
+# Name/Short Name, uncapped). Capped in DISPLAY CELLS (cell_len()), not
+# Python len(), so wide/CJK/emoji glyphs are counted by their actual
+# terminal width -- see mesh_topology.compact_node_label/_truncate for
+# the grapheme-safe truncation this limit is applied through.
+MESH_BOARD_LABEL_MAX_CELLS = 5
+
+
+def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
+    """Selection (ACCENT) always overrides active/inactive styling.
+
+    A real remote node's brightness uses the EXACT SAME predicate as the
+    MESH header's "ACTIVE N" count -- node_activity.is_node_active,
+    keyed on RadioService's passive last_heard -- so the two always
+    visually agree: if the header says ACTIVE 4, exactly the working
+    set's real remote nodes satisfying this same predicate render BASE.
+    This is deliberately a different concept from MeshNodeState.
+    is_stale() (>24h since the last CHAT interaction), which decides
+    which nodes are worth ranking into the working set at all (see
+    mesh_state.build_mesh_working_set) -- not how bright an already-
+    displayed node looks. A node can therefore show a merely-old
+    interaction time ("2h") while still rendering dim, and that is
+    expected. YOU has no activity concept and always uses ordinary
+    ACCENT/BASE.
+    """
+    palette = THEME_PALETTES[theme]
+    if selected:
+        return palette.accent
+    if not state.node.is_local and not is_node_active(state.node.last_heard, now):
+        return palette.dim_base
+    return palette.base
+
+
+def _mesh_relay_color(theme: str) -> str:
+    """An anonymous relay-stage placeholder is visual topology only: it
+
+    has no identity to be "heard" from, is never active/inactive, and
+    (unlike a real node) is never selectable, so it is always DIM_BASE
+    -- never ACCENT, regardless of theme, activity, or selection state
+    anywhere else on the board.
+    """
+    return THEME_PALETTES[theme].dim_base
+
+
+def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
+    """Convert a 1-indexed logical grid position to a pixel coordinate,
+
+    aligned exactly to a dot-grid intersection (DOT_GRID_SPACING_X/Y below).
+    """
+    return (column - 1) * DOT_GRID_SPACING_X, (row - 1) * DOT_GRID_SPACING_Y
+
+
+def _mesh_translated_positions(
+    base_positions: Mapping[str, tuple[int, int]], selected_node_id: str
+) -> dict[str, tuple[int, int]]:
+    """Translate the whole current layout so the selected node sits at the
+
+    center grid position. This is a pure whole-mesh translation: every
+    node shifts by the same row/column delta, so relative geometry
+    between nodes never changes -- it is never an independent per-node
+    recomputation, and it never touches `base_positions` (the working
+    set's fixed geographic/fallback layout) itself.
+    """
+    selected = base_positions.get(selected_node_id)
+    if selected is None:
+        return dict(base_positions)
+    row_delta = MESH_GRID_CENTER_ROW - selected[0]
+    column_delta = MESH_GRID_CENTER_COLUMN - selected[1]
+    return {
+        node_id: (row + row_delta, column + column_delta)
+        for node_id, (row, column) in base_positions.items()
+    }
+
+
+def _mesh_directional_target(
+    base_positions: Mapping[str, tuple[int, int]],
+    current_node_id: str,
+    direction: str,
+) -> str | None:
+    """Pick the ID reached by an arrow press, reusing the shared
+
+    spatial-navigation rule (mesh_topology.directional_target) against
+    the CURRENT fixed, untranslated LOGICAL (row, column) positions --
+    not rendered pixel positions. DOT_GRID_SPACING_X/Y (4x2) make one
+    logical row-step visually shorter than one column-step on screen, a
+    purely cosmetic choice; ranking by pixel distance would let that
+    asymmetry distort "sensible direction". Direction is a property of
+    the mesh's logical geometry, not of wherever the selection happens
+    to be recentered on screen.
+
+    Candidates come directly from whatever `base_positions` the caller
+    passes -- e.g. _move_mesh_focus deliberately excludes anonymous
+    relay-stage IDs before calling this, since a relay stage is visual
+    topology only and must never become a navigation target -- rather
+    than from any node-role data baked into this function itself. No
+    node IDs are hardcoded: this is the same general nearest-candidate
+    rule for whatever position set the caller provides.
+    """
+    layout = TopologyLayout(
+        tuple(
+            PositionedNode(node=NodeMetadata(node_id), x=column, y=row, region="UNKNOWN")
+            for node_id, (row, column) in base_positions.items()
+        ),
+        width=MESH_GRID_COLUMNS,
+        height=MESH_GRID_ROWS,
+    )
+    target = directional_target(current_node_id, layout, direction)  # type: ignore[arg-type]
+    return target.node.node_id if target is not None else None
+
+
+def _mesh_hop_counts(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
+    """Real remote CLIENTs with a trustworthy, nonzero hop count -- the
+
+    number of anonymous relay-stage placeholders each needs (see
+    mesh_topology.RelayStage). A `? HOPS` client (hops_away is None) is
+    deliberately absent: an unknown hop count must never be treated as
+    zero or imply any specific path depth.
+    """
+    return {
+        state.node.node_id: state.node.hops_away
+        for state in working_set
+        if not state.node.is_local
+        and state.node.hops_away is not None
+        and state.node.hops_away > 0
+    }
 
 
 class MeshNodeWidget(Static):
-    """One keyboard- and mouse-selectable node on the bounded MESH board."""
+    """The node's glyph: a single cell, anchored exactly on its grid
 
-    can_focus = True
+    coordinate. The glyph's own screen position must never depend on its
+    label's width -- see MeshNodeLabelWidget for the label, a separately
+    positioned overlay above this glyph, never the other way around.
 
-    class MenuRequested(Message):
-        def __init__(self, widget: "MeshNodeWidget") -> None:
-            super().__init__()
-            self.widget = widget
+    (A single two-line Text with justify="center" was tried here first,
+    relying on Rich's own per-line centering to align the 1-cell glyph
+    line under the wider label line. That does not hold once Textual
+    composites the Static's content into the screen buffer -- the short
+    line renders flush against the box's left edge instead of centered,
+    silently shifting the glyph off its grid coordinate. Two independently
+    positioned single-line widgets sidesteps that entirely: neither box is
+    ever wider than its own content, so there is no centering decision left
+    for Textual's renderer to get wrong.)
 
-    def __init__(self, positioned: PositionedNode, display_node: MeshDisplayNode) -> None:
-        self.positioned = positioned
-        self.display_node = display_node
-        self.node = display_node.node
+    Selection state lives on MeshTopologyView, not Textual's focus system:
+    rendering always reflects the current selection synchronously, so there
+    is no second, focus-driven source of visual selection state to keep in
+    sync. Textual focus is not used here at all -- mouse clicks are routed
+    by position, not focus, and keyboard arrow routing is handled entirely
+    at the App level against MeshTopologyView.selected_node_id.
+    """
+
+    def __init__(self, state: MeshNodeState) -> None:
+        self.state = state
+        self.node_id = state.node.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str) -> None:
-        palette = THEME_PALETTES[theme]
-        display = self.display_node
-        node = display.node
-
+    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+        color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
+        # The role glyph itself is never altered by selection -- CLIENT
+        # (solid) vs RELAY-only (stroked) stays the authoritative node
+        # semantic regardless of visual selection state. YOU has no
+        # observed role and is always solid.
+        glyph = (
+            CIRCLE_SOLID_LARGE
+            if self.state.node.is_local or self.state.glyph_is_solid()
+            else CIRCLE_STROKED_LARGE
+        )
+        style = Style(color=color, bold=selected)
         if selected:
-            color = palette.accent
-            bold = True
-            circle = "solid" if node.is_local else "large"
-        elif node.is_local:
-            color = palette.base
-            bold = True
-            circle = "solid"
-        elif display.recency_bucket == "very_stale":
-            color = palette.dim_base
-            bold = False
-            circle = None
+            # Bold alone reads as barely-different on many terminals, so
+            # the anchor cell's role glyph is flanked by a small dot in
+            # each immediately neighboring cell on the same row -- a real,
+            # ~3x wider visual footprint, not a font-weight trick. The
+            # widget's own width/offset (set in MeshTopologyView.set_nodes) keep the
+            # center *column* of this 3-cell composite exactly on the
+            # glyph's (grid_x, grid_y) anchor, so growing it can never
+            # move that coordinate.
+            content = Text(justify="center")
+            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+            content.append(glyph, style=style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
         else:
-            stale = display.recency_bucket in ("stale", "unknown")
-            if display.favorite and not stale:
-                color = palette.favorite_accent
-            elif stale:
-                color = palette.dim_base
-            else:
-                color = palette.base
-            bold = not stale
-            circle = "small" if display.relationship_kind == "relay" else "large"
-
-        content = Text(justify="center")
-        content.append(compact_node_label(node), style=Style(color=color, bold=bold))
-        content.append("\n")
-        if circle is not None:
-            content.append(_CIRCLE_GLYPHS[circle], style=Style(color=color))
+            content = Text(glyph, style=style)
         self.update(content)
 
     def on_click(self, _event: Click) -> None:
-        self.focus(scroll_visible=False)
+        _mesh_select_node(self.app, self.node_id)
 
-    def on_focus(self, _event: Focus) -> None:
-        self._refresh_mesh_selection()
 
-    def on_blur(self, _event: Blur) -> None:
-        self._refresh_mesh_selection()
+class MeshNodeLabelWidget(Static):
+    """The node's label: a separately positioned overlay above its glyph.
 
-    def _refresh_mesh_selection(self) -> None:
-        # Widget.focus() defers the actual focus assignment (App.call_later),
-        # so styling/connectors/status must be refreshed after it lands, via
-        # this Focus/Blur hook, not synchronously from whatever changed focus.
-        self.app.call_after_refresh(self.app._refresh_mesh_selection)
+    Always exactly cell_len(label) cells wide -- its own box is never wider
+    than its content, so it needs no internal centering, only a computed
+    offset (see MeshTopologyView.set_nodes). Never influences the
+    glyph's own coordinate; see MeshNodeWidget.
+    """
 
-    def on_key(self, event: Key) -> None:
-        if event.key == "enter" and getattr(self.app, "_user_menu", None) is None:
-            self.post_message(self.MenuRequested(self))
-            event.stop()
+    def __init__(self, state: MeshNodeState) -> None:
+        self.state = state
+        self.node_id = state.node.node_id
+        super().__init__(classes="mesh-node", markup=False)
+
+    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+        color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
+        label = compact_node_label(self.state.node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.update(Text(label, style=Style(color=color)))
+
+    def on_click(self, _event: Click) -> None:
+        _mesh_select_node(self.app, self.node_id)
+
+
+class MeshRelayWidget(Static):
+    """An anonymous relay-stage placeholder glyph: visual topology only.
+
+    Always a stroked, DIM_BASE, unlabeled 1-cell glyph -- see
+    mesh_topology.RelayStage. Deliberately NOT interactive: no on_click
+    (a click here does nothing), can_focus is False, and it is excluded
+    from the arrow-navigation candidate set entirely (see
+    MeshtasticPassApp._move_mesh_focus) -- it can never become
+    selected_node_id, never shows ACCENT or the enlarged selected
+    composite, and never appears in the bottom-left context. A hollow
+    dot here means only "an unidentified relay stage exists between two
+    real, inspectable nodes" -- never a thing to inspect itself.
+    """
+
+    can_focus = False
+
+    def __init__(self, stage: RelayStage) -> None:
+        self.stage = stage
+        self.node_id = stage.node_id
+        super().__init__(classes="mesh-node", markup=False)
+
+    def refresh_visual(self, *, theme: str) -> None:
+        self.update(Text(CIRCLE_STROKED_LARGE, style=Style(color=_mesh_relay_color(theme))))
+
+
+def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
+    view = app.query_one(MeshTopologyView)
+    view.select_node(node_id)
+    view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
+    app._update_mesh_context_status()
 
 
 DOT_GRID_GLYPH = "·"
-DOT_GRID_SPACING_X = 6
-DOT_GRID_SPACING_Y = 3
+# The fixed MESH grid must fit entirely inside the MESH viewport on the
+# supported uConsole/test terminal size (~90 columns) with no scrolling.
+# 4x2 keeps a 2:1 x:y ratio (so the grid reads as roughly square against
+# typical terminal cell proportions); at the current 9x21 grid that renders
+# an 84x18 board, with margin inside that viewport.
+DOT_GRID_SPACING_X = 4
+DOT_GRID_SPACING_Y = 2
 
 
 def _render_mesh_canvas(
@@ -545,30 +746,15 @@ class MeshCanvas(Static):
         )
 
 
-def _connector_eligible(display: MeshDisplayNode, *, selected: bool) -> bool:
-    """A line means "currently part of the relevant local mesh context" --
-
-    not proven RF adjacency or a routing edge. Very-stale (>48h) nodes are
-    "ghost/history context" and get no connector, unless selected (selection
-    must remain unambiguous even for an otherwise glyph-less node).
-    """
-    if display.node.is_local:
-        return False
-    return selected or display.recency_bucket != "very_stale"
-
-
 class MeshTopologyView(Container):
-    """A bounded, non-scrolling YOU-centered MESH board.
+    """A fixed 8x21 grid MESH board driven by a real, bounded MESH working set.
 
-    The working set is deliberately small (see mesh_state.py) and the grid
-    radius is fixed (DEFAULT_MAX_GRID_RADIUS), so the whole board is
-    designed to fit within one viewport -- MESH never pans or scrolls, and
-    there are no scrollbars. The radius is intentionally NOT derived from
-    the live viewport size: that was tried and reverted because a widget's
-    reported `size` can vary slightly across refresh cycles for the same
-    data (e.g. before/after layout fully settles), which produced visible
-    reshuffling for unchanged input -- a direct violation of "same data
-    produces same positions". A fixed radius keeps layout deterministic.
+    No scrolling, no scrollbars -- the working set is bounded precisely
+    so the whole board always fits this one fixed viewport (see
+    mesh_state.build_mesh_working_set). Node identity, positions
+    (base_positions, from mesh_topology.assign_grid_slots() +
+    place_within_bounds()), and roles all come from the current working
+    set passed to set_nodes(); this view only lays out and renders them.
     """
 
     can_focus = True
@@ -578,131 +764,319 @@ class MeshTopologyView(Container):
             Container(MeshCanvas(), id="mesh-board"),
             id="mesh-view",
         )
-        self.layout_model = TopologyLayout((), 1, 1)
-        self._layout_signature: tuple[object, ...] = ()
+        self._selected_node_id = ""
+        self._working_set: tuple[MeshNodeState, ...] = ()
+        self._base_positions: dict[str, tuple[int, int]] = {}
+        self._relay_stages: tuple[RelayStage, ...] = ()
 
     @property
     def board(self) -> Container:
         return self.query_one("#mesh-board", Container)
 
+    @property
+    def selected_node_id(self) -> str:
+        return self._selected_node_id
+
+    @property
+    def working_set(self) -> tuple[MeshNodeState, ...]:
+        return self._working_set
+
+    @property
+    def base_positions(self) -> dict[str, tuple[int, int]]:
+        """Real-node AND anonymous-relay-stage logical (row, column)
+
+        positions, merged -- rendering and connector routing need both
+        kinds of coordinate together. This is NOT the arrow-navigation
+        candidate set: a RelayStage's ID is included here (its glyph
+        must be positioned and translated exactly like a real node's)
+        but is never itself navigable -- see
+        MeshtasticPassApp._move_mesh_focus, which explicitly filters
+        every RelayStage ID out of this dict before calling
+        _mesh_directional_target, so only real working-set nodes are
+        ever navigation candidates.
+        """
+        return self._base_positions
+
+    @property
+    def relay_stages(self) -> tuple[RelayStage, ...]:
+        return self._relay_stages
+
     def set_nodes(
         self,
-        display_nodes: tuple[MeshDisplayNode, ...],
+        working_set: tuple[MeshNodeState, ...],
+        base_positions: Mapping[str, tuple[int, int]],
         *,
         theme: str,
+        now: float,
     ) -> None:
-        metadata = tuple(display.node for display in display_nodes)
-        layout = build_topology(metadata, max_radius=DEFAULT_MAX_GRID_RADIUS)
-        by_display = {display.node.node_id: display for display in display_nodes}
-        signature = tuple((item.node.node_id, item.x, item.y) for item in layout.nodes)
-        self.layout_model = layout
-        board = self.board
-        board.styles.width = layout.width
-        board.styles.height = layout.height
+        """Render the current working set, recentered on the selection.
 
-        selected_id = (
-            self.app.focused.node.node_id
-            if isinstance(self.app.focused, MeshNodeWidget)
-            else None
-        )
-        if signature != self._layout_signature:
-            board.remove_children(MeshNodeWidget)
-            widgets: list[MeshNodeWidget] = []
-            for item in layout.nodes:
-                display = by_display.get(item.node.node_id)
-                if display is None:
-                    continue
-                widget = MeshNodeWidget(item, display)
-                widget.styles.offset = (item.x, item.y)
-                widgets.append(widget)
-            if widgets:
-                board.mount_all(widgets)
-            self._layout_signature = signature
-            if selected_id:
-                self.app.call_after_refresh(self.select_node, selected_id)
-        else:
-            item_by_id = {item.node.node_id: item for item in layout.nodes}
-            for widget in self.query(MeshNodeWidget):
-                item = item_by_id.get(widget.node.node_id)
-                display = by_display.get(widget.node.node_id)
-                if item is not None and display is not None:
-                    widget.positioned = item
-                    widget.display_node = display
-                    widget.node = display.node
-
-        self.refresh_selection_visuals(theme=theme)
-
-    def refresh_selection_visuals(self, *, theme: str) -> None:
-        """Recompute connectors and per-node selected/color styling only.
-
-        Cheap and safe to call on every focus change (see MeshNodeWidget's
-        on_focus/on_blur): it never touches layout or rebuilds widgets, so
-        selecting a node with arrows/mouse updates its ACCENT styling and
-        connector immediately rather than waiting for the next periodic
-        _refresh_mesh() tick.
+        Preserves the current selection if it is still in the working
+        set; otherwise falls back to YOU (or the first node, if somehow
+        there is no local node). Widgets are added/removed only for
+        nodes that actually entered/left the working set -- unchanged
+        nodes keep their existing widget, so unchanged data never
+        reshuffles or remounts anything.
         """
-        layout = self.layout_model
-        node_widgets = list(self.query(MeshNodeWidget))
-        by_display = {widget.node.node_id: widget.display_node for widget in node_widgets}
-        selected_id = (
-            self.app.focused.node.node_id
-            if isinstance(self.app.focused, MeshNodeWidget)
-            else None
-        )
+        board = self.board
+        board_width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
+        board_height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        board.styles.width = board_width
+        board.styles.height = board_height
+        # Horizontally center the whole board as one rigid block inside the
+        # available MESH region -- a board-level offset, not a per-node one,
+        # so it can never desync node-to-grid coordinates. On the very first
+        # render (before this view has ever been laid out), self.size is
+        # not resolved yet (0x0); re-run once after the next refresh, when
+        # it is, rather than leaving the board visibly left-anchored.
+        view_width = self.size.width
+        if view_width:
+            board.styles.offset = (max(0, (view_width - board_width) // 2), 0)
+        else:
+            self.app.call_after_refresh(
+                lambda: self.set_nodes(working_set, base_positions, theme=theme, now=now)
+            )
 
+        self._working_set = working_set
+        current_ids = {state.node.node_id for state in working_set}
+        you_id = next(
+            (state.node.node_id for state in working_set if state.node.is_local),
+            None,
+        )
+        # `base_positions` is expected to carry only real-node positions
+        # (exactly what place_within_bounds() produces), but is filtered
+        # against `current_ids` regardless -- so passing back a previous
+        # call's already-merged view.base_positions (which also contains
+        # relay-stage entries) is harmless: those extra keys are simply
+        # ignored here and relay stages are recomputed fresh below, never
+        # accumulated across calls.
+        real_positions = {
+            node_id: position
+            for node_id, position in base_positions.items()
+            if node_id in current_ids
+        }
+        hop_counts = _mesh_hop_counts(working_set)
+        relay_stages, relay_positions = build_relay_stages(
+            real_positions,
+            you_id=you_id or "",
+            hop_counts=hop_counts,
+            row_count=MESH_GRID_ROWS,
+            column_count=MESH_GRID_COLUMNS,
+        )
+        self._relay_stages = relay_stages
+        self._base_positions = {**real_positions, **relay_positions}
+        relay_ids = {stage.node_id for stage in relay_stages}
+        # Anonymous relay stages are visual topology only -- an anonymous
+        # relay ID is never a valid selection, so it falls back to YOU
+        # exactly like any other ID that isn't a real working-set member.
+        if self._selected_node_id not in current_ids:
+            local_id = you_id
+            self._selected_node_id = local_id or (
+                working_set[0].node.node_id if working_set else ""
+            )
+
+        states_by_id = {state.node.node_id: state for state in working_set}
+        stages_by_id = {stage.node_id: stage for stage in relay_stages}
+        # Widget.remove() only schedules removal -- it does not take effect
+        # before the next refresh -- so every query below must keep
+        # filtering by `current_ids` itself rather than assume a removed
+        # widget is already gone from self.query().
+        for widget in list(self.query(MeshNodeWidget)):
+            if widget.node_id not in current_ids:
+                widget.remove()
+        for widget in list(self.query(MeshNodeLabelWidget)):
+            if widget.node_id not in current_ids:
+                widget.remove()
+        for widget in list(self.query(MeshRelayWidget)):
+            if widget.node_id not in relay_ids:
+                widget.remove()
+        existing_glyph_ids = {
+            widget.node_id
+            for widget in self.query(MeshNodeWidget)
+            if widget.node_id in current_ids
+        }
+        existing_label_ids = {
+            widget.node_id
+            for widget in self.query(MeshNodeLabelWidget)
+            if widget.node_id in current_ids
+        }
+        existing_relay_ids = {
+            widget.node_id
+            for widget in self.query(MeshRelayWidget)
+            if widget.node_id in relay_ids
+        }
+        new_glyphs = [
+            MeshNodeWidget(states_by_id[node_id])
+            for node_id in states_by_id
+            if node_id not in existing_glyph_ids
+        ]
+        new_labels = [
+            MeshNodeLabelWidget(states_by_id[node_id])
+            for node_id in states_by_id
+            if node_id not in existing_label_ids
+        ]
+        # Anonymous relay-stage placeholders are never labeled -- no
+        # MeshRelayLabelWidget counterpart exists (see RelayStage).
+        new_relays = [
+            MeshRelayWidget(stages_by_id[node_id])
+            for node_id in stages_by_id
+            if node_id not in existing_relay_ids
+        ]
+        if new_glyphs:
+            board.mount_all(new_glyphs)
+        if new_labels:
+            board.mount_all(new_labels)
+        if new_relays:
+            board.mount_all(new_relays)
+        glyph_widgets = [
+            widget for widget in self.query(MeshNodeWidget) if widget.node_id in current_ids
+        ]
+        label_widgets = [
+            widget
+            for widget in self.query(MeshNodeLabelWidget)
+            if widget.node_id in current_ids
+        ]
+        relay_widgets = [
+            widget for widget in self.query(MeshRelayWidget) if widget.node_id in relay_ids
+        ]
+        for widget in glyph_widgets:
+            widget.state = states_by_id[widget.node_id]
+        for widget in label_widgets:
+            widget.state = states_by_id[widget.node_id]
+        for widget in relay_widgets:
+            widget.stage = stages_by_id[widget.node_id]
+
+        positions = _mesh_translated_positions(
+            self._base_positions, self._selected_node_id
+        )
+        centers: dict[str, tuple[int, int]] = {}
+        # The glyph is the sole coordinate authority: it is always a 1x1
+        # (or, selected, 3x1) widget centered exactly on (grid_x, grid_y),
+        # so label width can never influence it. Positioned first so
+        # `centers` (used for connector endpoints below) only ever
+        # reflects glyph coordinates.
+        for widget in glyph_widgets:
+            row, column = positions[widget.node_id]
+            grid_x, grid_y = _mesh_grid_pixel(row, column)
+            selected = widget.node_id == self._selected_node_id
+            # Selected nodes render a 3-cell-wide composite (see
+            # MeshNodeWidget.refresh_visual); centering that wider box on
+            # grid_x -- the same formula used for the label -- keeps its
+            # middle column, not just its left edge, on the anchor.
+            width = MESH_SELECTED_GLYPH_WIDTH if selected else 1
+            widget.styles.width = width
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x - width // 2, grid_y)
+            centers[widget.node_id] = (grid_x, grid_y)
+            widget.refresh_visual(selected=selected, theme=theme, now=now)
+
+        # Relay-stage placeholders share the same glyph anchor formula as
+        # a real node's glyph (see MeshNodeWidget above) but never the
+        # enlarged selected composite -- a relay stage is never selected
+        # (see MeshRelayWidget), so it is always exactly 1 cell wide.
+        for widget in relay_widgets:
+            row, column = positions[widget.node_id]
+            grid_x, grid_y = _mesh_grid_pixel(row, column)
+            widget.styles.width = 1
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x, grid_y)
+            centers[widget.node_id] = (grid_x, grid_y)
+            widget.refresh_visual(theme=theme)
+
+        # The label is a separate, independently positioned overlay: its
+        # own box is exactly cell_len(label) wide (never wider), centered
+        # over the glyph's fixed (grid_x, grid_y) by offsetting the whole
+        # label widget -- never by resizing or repositioning the glyph.
+        for widget in label_widgets:
+            grid_x, grid_y = centers[widget.node_id]
+            label_width = max(
+                1, cell_len(compact_node_label(widget.state.node, MESH_BOARD_LABEL_MAX_CELLS))
+            )
+            widget.styles.width = label_width
+            widget.styles.height = 1
+            widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
+            selected = widget.node_id == self._selected_node_id
+            widget.refresh_visual(selected=selected, theme=theme, now=now)
+
+        # Connector semantics: a YOU-to-node path means "we have observed
+        # communication with this node" (it is CLIENT), never proven RF
+        # adjacency. It is drawn through exactly that client's own
+        # anonymous relay stages (hops_away of them, in order -- see
+        # RelayStage/build_relay_stages), representing observed path
+        # DEPTH, never discovered relay identity: "Alice is 3 relay
+        # stages away", never "these are three identified radios". A
+        # `? HOPS` client gets no path at all -- any line, direct or
+        # through relay stages, would imply a specific, unverified hop
+        # depth, which is never fabricated (see the MESH spec's
+        # "UNKNOWN HOPS" / "? HOPS CONNECTORS" sections).
         palette = THEME_PALETTES[theme]
-        local_item = next((item for item in layout.nodes if item.node.is_local), None)
-        connectors: list[tuple[int, int, str, str]] = []
-        if local_item is not None:
-            local_center = (
-                local_item.x + NODE_WIDTH // 2,
-                local_item.y + NODE_HEIGHT // 2,
-            )
-            for item in layout.nodes:
-                if item is local_item:
-                    continue
-                display = by_display.get(item.node.node_id)
-                if display is None:
-                    continue
-                selected = item.node.node_id == selected_id
-                if not _connector_eligible(display, selected=selected):
-                    continue
-                node_center = (item.x + NODE_WIDTH // 2, item.y + NODE_HEIGHT // 2)
-                color = palette.accent if selected else palette.dim_base
-                connectors.extend(
-                    (x, y, glyph, color)
-                    for x, y, glyph in route_connector(*local_center, *node_center)
-                )
+        stages_by_client: dict[str, list[RelayStage]] = {}
+        for stage in relay_stages:
+            stages_by_client.setdefault(stage.source_node_id, []).append(stage)
+        for stages in stages_by_client.values():
+            stages.sort(key=lambda stage: stage.index)
 
+        connector_cells: list[tuple[int, int, str, str]] = []
+        if you_id is not None and you_id in centers:
+            for state in working_set:
+                remote_id = state.node.node_id
+                hops = state.node.hops_away
+                if state.node.is_local or remote_id not in centers or hops is None:
+                    continue
+                chain_stages = stages_by_client.get(remote_id, ())
+                chain_ids = {remote_id, *(stage.node_id for stage in chain_stages)}
+                chain_points = (
+                    centers[you_id],
+                    *(
+                        centers[stage.node_id]
+                        for stage in chain_stages
+                        if stage.node_id in centers
+                    ),
+                    centers[remote_id],
+                )
+                color = (
+                    palette.accent
+                    if self._selected_node_id in chain_ids
+                    else palette.dim_base
+                )
+                connector_cells.extend(
+                    (x, y, glyph, color) for x, y, glyph in route_chain(chain_points)
+                )
         self.board.query_one(MeshCanvas).render_scene(
-            layout.width, layout.height, tuple(connectors), theme
+            board_width, board_height, tuple(connector_cells), theme
         )
-        for widget in node_widgets:
-            widget.refresh_visual(
-                selected=widget.node.node_id == selected_id, theme=theme
-            )
 
     def clear_nodes(self) -> None:
-        self.layout_model = TopologyLayout((), 1, 1)
-        self._layout_signature = ()
         self.board.remove_children(MeshNodeWidget)
+        self.board.remove_children(MeshNodeLabelWidget)
+        self.board.remove_children(MeshRelayWidget)
+        self._working_set = ()
+        self._base_positions = {}
+        self._relay_stages = ()
+        self._selected_node_id = ""
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
     def select_node(self, node_id: str) -> None:
-        for widget in self.query(MeshNodeWidget):
-            if widget.node.node_id == node_id:
-                widget.focus(scroll_visible=False)
-                return
+        """Select a real working-set node by ID; anything else is a no-op.
+
+        `_selected_node_id` may only ever hold a real node currently in
+        `working_set` -- an anonymous RelayStage's synthetic ID, or any
+        other stale/unknown ID, is rejected outright rather than
+        accepted here and relying on a later set_nodes() call to
+        sanitize it back out. Relay stages are internal rendering/
+        topology bookkeeping only (see mesh_topology.RelayStage) and can
+        never be selected, focused, navigated to, or recentered on.
+        """
+        if any(state.node.node_id == node_id for state in self._working_set):
+            self._selected_node_id = node_id
 
     def select_local(self) -> None:
-        """Select YOU (or the first known node) -- the whole board is always visible."""
-        local = next(
-            (item for item in self.layout_model.nodes if item.node.is_local),
+        local_id = next(
+            (state.node.node_id for state in self._working_set if state.node.is_local),
             None,
         )
-        target = local or next(iter(self.layout_model.nodes), None)
-        if target is not None:
-            self.select_node(target.node.node_id)
+        if local_id is not None:
+            self.select_node(local_id)
 
 
 class IdentityNameControl(Horizontal):
@@ -1286,7 +1660,11 @@ class MeshtasticPassApp(App[None]):
 
     #mesh-view {
         height: 1fr;
-        align: center middle;
+        /* Horizontal centering is applied explicitly in code as a
+           board-level offset (see MeshTopologyView.set_nodes), not
+           via CSS align, so it stays exact regardless of board width
+           parity; vertical centering is still fine left to CSS. */
+        align: left middle;
     }
 
     #mesh-board {
@@ -1305,13 +1683,7 @@ class MeshtasticPassApp(App[None]):
     .mesh-node {
         layer: nodes;
         position: absolute;
-        width: 18;
-        height: 3;
         content-align: center middle;
-    }
-
-    .mesh-node:focus {
-        background: $selection_background;
     }
 
     Screen.theme-green .identity-name-unavailable {
@@ -2478,8 +2850,8 @@ class MeshtasticPassApp(App[None]):
         """Most recent trustworthy incoming-message timestamp per node.
 
         Distinct from RadioService's `lastHeard` (passive node-database
-        sync): this is specifically CHAT receive activity, used for MESH's
-        24h/48h freshness classification and working-set ranking.
+        sync): this is specifically CHAT receive activity, the source of
+        truth for MESH's CLIENT role and last-interaction time.
 
         Persisted CHAT history is authoritative, not whatever bounded page
         happens to be mounted in memory: a node's last message may be far
@@ -2540,68 +2912,80 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = time() if wall_now is None else wall_now
-        # ACTIVE keeps CHAT's five-minute freshness semantics and counts the
-        # full known-node population, independent of MESH's separate 24h/48h
-        # display-freshness styling and its bounded working set below.
+        working_set = build_mesh_working_set(
+            nodes, last_message_at=self._mesh_last_message_activity()
+        )
+        # ACTIVE describes the real remote nodes CURRENTLY DISPLAYED on
+        # this MESH view -- the same bounded working set rendered below,
+        # not the full known-node population (which may include nodes
+        # this view never shows at all, e.g. passively heard but never a
+        # CLIENT). Uses the EXACT SAME predicate (is_node_active) that
+        # _mesh_node_color() uses for each node's own BASE/DIM_BASE
+        # styling, so the header and the board can never disagree about
+        # which/how many displayed nodes are active. Anonymous relay
+        # stages are never part of `working_set` and so never affect
+        # this count either way (see mesh_topology.RelayStage).
         active = sum(
             1
-            for node in nodes
-            if not node.is_local and is_node_active(node.last_heard, current_time)
+            for state in working_set
+            if not state.node.is_local and is_node_active(state.node.last_heard, current_time)
         )
         title.update(f"> MESH · ACTIVE {active}")
-        if nodes:
-            status.update("")
-            display_nodes = build_display_nodes(
-                nodes,
-                now=current_time,
-                is_favorite=self.settings.is_favorite,
-                last_message_at=self._mesh_last_message_activity(),
-            )
-            view.set_nodes(display_nodes, theme=self._current_theme)
-            # Rebuilding node widgets can transiently clear focus (the old
-            # widget was just removed) before set_nodes()'s own restoration
-            # callback runs. Check again only after that callback has had its
-            # turn, so a restored selection is never clobbered.
-            self.call_after_refresh(self._ensure_mesh_node_focus)
-        else:
+        if not working_set:
             view.clear_nodes()
-            status.update("NO SYNCED NODE DATA")
+            status.update("NO MESH DATA")
+            self._update_mesh_context_status()
+            return
+        status.update("")
+        # A real CLIENT with a truthful nonzero hop count is placed at
+        # least hops_away+1 grid steps out -- never closer -- so its own
+        # anonymous relay-stage placeholders have genuinely interior
+        # cells to occupy along the YOU-to-client line (see RelayStage/
+        # build_relay_stages); geography alone would otherwise often
+        # place it immediately adjacent to YOU, leaving no room at all.
+        min_radius_by_id = {
+            node_id: hops + 1 for node_id, hops in _mesh_hop_counts(working_set).items()
+        }
+        slots = assign_grid_slots(
+            tuple(state.node for state in working_set),
+            max_radius=DEFAULT_MAX_GRID_RADIUS,
+            min_radius_by_id=min_radius_by_id,
+        )
+        base_positions = place_within_bounds(
+            slots,
+            center_row=MESH_GRID_CENTER_ROW,
+            center_column=MESH_GRID_CENTER_COLUMN,
+            row_count=MESH_GRID_ROWS,
+            column_count=MESH_GRID_COLUMNS,
+        )
+        view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
         self._update_mesh_context_status()
-
-    def _ensure_mesh_node_focus(self) -> None:
-        # MeshNodeWidget.on_focus refreshes styling/connectors/status once
-        # the deferred focus assignment actually lands (see its docstring).
-        if self.current_tab == "mesh" and not isinstance(self.focused, MeshNodeWidget):
-            self.query_one(MeshTopologyView).select_local()
 
     def _move_mesh_focus(self, direction: str) -> None:
-        focused = self.focused
         view = self.query_one(MeshTopologyView)
-        if not isinstance(focused, MeshNodeWidget):
-            view.select_local()
-        else:
-            target = directional_target(
-                focused.node.node_id,
-                view.layout_model,
-                direction,  # type: ignore[arg-type]
+        # Anonymous relay-stage placeholders are visual topology only --
+        # excluded from the navigation candidate set entirely, so an
+        # arrow press always lands on the nearest sensible REAL node
+        # (YOU, or a real CLIENT/CLIENT+RELAY/RELAY), skipping over any
+        # relay stage that happens to sit geometrically between them.
+        relay_ids = {stage.node_id for stage in view.relay_stages}
+        navigable_positions = {
+            node_id: position
+            for node_id, position in view.base_positions.items()
+            if node_id not in relay_ids
+        }
+        target_id = _mesh_directional_target(
+            navigable_positions, view.selected_node_id, direction
+        )
+        if target_id is not None:
+            view.select_node(target_id)
+            view.set_nodes(
+                view.working_set,
+                view.base_positions,
+                theme=self._current_theme,
+                now=time(),
             )
-            if target is not None:
-                view.select_node(target.node.node_id)
-
-    def _refresh_mesh_selection(self) -> None:
-        """Re-render MESH selection styling/connectors/status for the current focus.
-
-        Called after Widget.focus()'s deferred assignment actually lands
-        (see MeshNodeWidget.on_focus/on_blur), so arrow/mouse selection
-        updates immediately instead of waiting for the next periodic
-        _refresh_mesh() tick.
-        """
-        if self.current_tab != "mesh":
-            return
-        views = list(self.query(MeshTopologyView))
-        if views:
-            views[0].refresh_selection_visuals(theme=self._current_theme)
-        self._update_mesh_context_status()
+            self._update_mesh_context_status()
 
     def _update_mesh_context_status(self) -> None:
         """Minimal truthful summary line for the currently selected MESH node."""
@@ -2609,31 +2993,30 @@ class MeshtasticPassApp(App[None]):
         if not widgets:
             return
         status_widget = widgets[0]
-        focused = self.focused
-        if not isinstance(focused, MeshNodeWidget):
+        if self.current_tab != "mesh" or self._radio_state is not RadioState.ONLINE:
             status_widget.update("")
             return
-        display = focused.display_node
-        node = display.node
-        if node.is_local:
-            remote_count = sum(
-                1 for widget in self.query(MeshNodeWidget) if not widget.node.is_local
-            )
-            status_widget.update(f"YOU · CONNECTED TO {remote_count}")
+        views = list(self.query(MeshTopologyView))
+        if not views:
+            status_widget.update("")
             return
-        parts = [compact_node_label(node)]
-        if node.hops_away is not None:
-            unit = "HOP" if node.hops_away == 1 else "HOPS"
-            parts.append(f"{node.hops_away} {unit} AWAY")
-        current_time = time()
-        if display.last_message_at is not None and display.last_message_at <= current_time:
-            parts.append(f"LAST MESSAGE {format_relative_age(current_time - display.last_message_at)}")
-        elif (
-            display.reference_activity is not None
-            and display.reference_activity <= current_time
-        ):
-            parts.append(f"RX {format_relative_age(current_time - display.reference_activity)}")
-        status_widget.update(" · ".join(parts))
+        view = views[0]
+        state = next(
+            (
+                candidate
+                for candidate in view.working_set
+                if candidate.node.node_id == view.selected_node_id
+            ),
+            None,
+        )
+        # An anonymous relay-stage placeholder can never be selected (see
+        # MeshRelayWidget/_move_mesh_focus), so `state` is None here only
+        # for a genuinely stale/invalid ID, never a relay stage -- the
+        # bottom-left context is always either YOU or a real node's full
+        # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
+        status_widget.update(
+            format_mesh_context_line(state, now=time()) if state is not None else ""
+        )
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
@@ -2848,16 +3231,6 @@ class MeshtasticPassApp(App[None]):
             metadata,
             event.widget,
             self.query_one(ChatTranscript),
-        )
-
-    @on(MeshNodeWidget.MenuRequested)
-    def open_mesh_node_menu(self, event: MeshNodeWidget.MenuRequested) -> None:
-        # MESH no longer scrolls, so there is no scroll position to restore.
-        self._open_node_menu(
-            event.widget.node,
-            event.widget,
-            None,
-            include_rx_age=True,
         )
 
     def _open_node_menu(
@@ -3296,7 +3669,7 @@ class MeshtasticPassApp(App[None]):
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
             text = (
-                "↑↓←→ select    ENTER details    1-4 tabs    F4 quit"
+                "↑↓←→ select    1-4 tabs    F4 quit"
                 if self.current_tab == "mesh"
                 else "1-4 switch tabs    F4 quit"
             )
