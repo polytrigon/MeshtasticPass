@@ -2527,7 +2527,16 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("RADIO DISCONNECTED", text)
             self.assertNotIn("RECONNECTING", text)
 
-    async def test_mesh_connection_status_disappears_once_connected(self) -> None:
+    async def test_mesh_connection_status_becomes_last_update_once_connected(
+        self,
+    ) -> None:
+        """The CONNECTING/RECONNECTING status text disappears once ONLINE
+
+        -- replaced by the persistent "LAST UPDATE <age>" mesh-freshness
+        indicator (see item 3), never left blank, since the default
+        SimulatedRadioService fixture has real, known NodeDB last_heard
+        data as soon as it connects.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             for _ in range(5):
@@ -2539,8 +2548,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app._radio_state, RadioState.ONLINE)
 
             status_widget = app.query_one("#mesh-connection-status")
-            self.assertFalse(status_widget.display)
-            self.assertEqual(str(status_widget.render()), "")
+            self.assertTrue(status_widget.display)
+            text = str(status_widget.render())
+            self.assertIn("LAST UPDATE", text)
+            self.assertNotIn("STATUS", text)
 
     async def test_mesh_topology_not_rebuilt_by_connection_status_change(
         self,
@@ -3722,12 +3733,133 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             status = str(app.query_one("#mesh-context-status").render())
             self.assertTrue(status.startswith("Quiet"))
 
+    async def test_no_orphan_relays_under_realistic_mixed_topology(self) -> None:
+        """Reproduction of the hardware-observed "phantom relay" report:
+
+        a board mixing several stale, unlabeled-looking real nodes with
+        several active ones of varying hop counts, spread across
+        distinct compass directions (so bucket-ordering can't merge
+        their chains). For every rendered relay stage, prove its owner
+        is a real node that is (a) currently ACTIVE, (b) present in the
+        working set, (c) actually mounted as a MeshNodeWidget, and (d)
+        rendered FILLED (see item 2) -- and that the owner's stage COUNT
+        exactly matches its hops_away, never more, never fewer. No
+        relay may ever exist without satisfying all four.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            active_last_heard = now - 5
+            miles = 3.0
+            offset = miles / _MILES_PER_DEGREE_AT_EQUATOR
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            # 4 stale (unknown/known hops, never active) + 4 active
+            # (varying hop counts, including a long chain), one per
+            # compass direction.
+            nodes = (
+                local,
+                NodeMetadata(
+                    "!qnzt0000", "QnzT", "QNZ", None,
+                    last_heard=stale_last_heard, position=GeoPosition(offset, -offset),
+                ),
+                NodeMetadata(
+                    "!b60c0000", "b60c", "B60", 2,
+                    last_heard=stale_last_heard, position=GeoPosition(-offset, offset),
+                ),
+                NodeMetadata(
+                    "!zrak0000", "Zrak", "ZRK", 1,
+                    last_heard=stale_last_heard, position=GeoPosition(-offset, -offset),
+                ),
+                NodeMetadata(
+                    "!n2dh0000", "N2DH", "N2D", None,
+                    last_heard=stale_last_heard, position=GeoPosition(offset, offset),
+                ),
+                NodeMetadata(
+                    "!skugh000", "Skugh", "SKU", 1,
+                    last_heard=active_last_heard, position=north_of_local(miles),
+                ),
+                NodeMetadata(
+                    "!nova0000", "Nova", "NOV", 0,
+                    last_heard=active_last_heard, position=west_of_local(miles),
+                ),
+                NodeMetadata(
+                    "!b8b80000", "b8b8", "B8B", 5,
+                    last_heard=active_last_heard, position=east_of_local(miles),
+                ),
+                NodeMetadata(
+                    "!d0ec0000", "d0ec", "D0E", 2,
+                    last_heard=active_last_heard, position=south_of_local(miles),
+                ),
+            )
+            app.radio.get_known_nodes = lambda: nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn("MESH (4)", tab_bar)
+
+            view = app.query_one(MeshTopologyView)
+            expected_hops = {"!skugh000": 1, "!b8b80000": 5, "!d0ec0000": 2}
+            active_ids = set(expected_hops) | {"!nova0000"}
+            stale_ids = {"!qnzt0000", "!b60c0000", "!zrak0000", "!n2dh0000"}
+
+            # (a)/(d): every active real node is mounted and FILLED;
+            # every stale one is mounted and STROKED.
+            palette = THEME_PALETTES[app._current_theme]
+            for node_id in active_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(str(widget.render()).strip(), CIRCLE_SOLID_LARGE)
+            for node_id in stale_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(str(widget.render()).strip(), CIRCLE_STROKED_LARGE)
+
+            # (b)/(c): every relay's owner is a currently-active,
+            # displayed working-set member -- never a stale one.
+            mounted_ids = {w.node_id for w in app.query(MeshNodeWidget)}
+            working_set_active_ids = {
+                state.node.node_id
+                for state in view.working_set
+                if not state.node.is_local
+                and is_node_active(state.node.last_heard, now)
+            }
+            self.assertEqual(working_set_active_ids, active_ids)
+            for stage in view.relay_stages:
+                self.assertIn(stage.source_node_id, active_ids)
+                self.assertIn(stage.source_node_id, mounted_ids)
+                self.assertNotIn(stage.source_node_id, stale_ids)
+
+            # Exact stage count per active owner, no partial chains --
+            # Nova (0 hops) gets none.
+            for node_id, hops in expected_hops.items():
+                owned = [s for s in view.relay_stages if s.source_node_id == node_id]
+                self.assertEqual(len(owned), hops)
+                self.assertEqual(
+                    sorted(s.index for s in owned), list(range(1, hops + 1))
+                )
+            self.assertEqual(
+                sum(1 for s in view.relay_stages if s.source_node_id == "!nova0000"), 0
+            )
+            self.assertEqual(len(view.relay_stages), sum(expected_hops.values()))
+
+            # Every mounted relay widget corresponds 1:1 to a computed
+            # stage -- no leftover/orphan widget beyond what the model
+            # itself says should exist.
+            relay_widget_ids = {w.node_id for w in app.query(MeshRelayWidget)}
+            self.assertEqual(relay_widget_ids, {s.node_id for s in view.relay_stages})
+
 
 class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
-    """The shared #mesh-connection-status widget's fallback priority:
+    """The shared #mesh-connection-status widget's priority:
 
-    connection status text first, then "LAST UPDATE <age>" once ONLINE
-    but stale, else nothing -- see app._update_mesh_status_line.
+    the shared connection-status text while not ONLINE, else a
+    PERSISTENT "LAST UPDATE <age>" mesh-freshness indicator -- always
+    shown while ONLINE, not only when stale -- see
+    app._update_mesh_status_line. The age is a pure function of (most
+    recent working-set remote last_heard, current wall time): it climbs
+    between refreshes with no new data and resets only when a genuinely
+    fresher NodeDB timestamp arrives, never merely because a refresh ran.
     """
 
     def setUp(self) -> None:
@@ -3766,7 +3898,12 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("LAST UPDATE", text)
             self.assertIn("8m", text)
 
-    async def test_fresh_board_hides_last_update_indicator(self) -> None:
+    async def test_fresh_board_still_shows_last_update_age(self) -> None:
+        """LAST UPDATE is a persistent freshness indicator, not a
+
+        stale-only warning: it shows even while a node is currently
+        active and the board looks fully current.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
@@ -3777,9 +3914,106 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             text = await self._mesh_status_text(app)
+            self.assertIn("LAST UPDATE", text)
+            self.assertIn("5s", text)
+            self.assertTrue(app.query_one("#mesh-connection-status").display)
+
+    async def test_last_update_ages_between_refreshes_with_no_new_data(self) -> None:
+        """Between two refreshes with the SAME underlying last_heard, the
+
+        displayed age must grow by exactly the elapsed wall-clock time --
+        proving it is computed from (data, now), not reset just because
+        a refresh happened.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata("!ag1ng001", "Ager", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 5s", await self._mesh_status_text(app))
+
+            app._refresh_mesh(wall_now=now + 30)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 35s", await self._mesh_status_text(app))
+
+    async def test_ui_refresh_alone_does_not_reset_last_update(self) -> None:
+        """Calling _refresh_mesh() again with unchanged data AND
+
+        unchanged wall-clock time must leave the displayed age exactly
+        as it was -- a bare repaint is not a new data event.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata("!st111111", "Steady", last_heard=now - 42)
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            first_text = await self._mesh_status_text(app)
+            self.assertIn("LAST UPDATE 42s", first_text)
+
+            for _ in range(3):
+                app._refresh_mesh(wall_now=now)
+                await pilot.pause()
+            self.assertEqual(await self._mesh_status_text(app), first_text)
+
+    async def test_meaningful_nodedb_update_resets_last_update_age(self) -> None:
+        """A genuinely fresher NodeDB last_heard resets the displayed age
+
+        -- never derived from CHAT history, purely from the passive
+        mesh-state timestamp itself.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            old_heard = NodeMetadata("!upd00001", "Updater", last_heard=now - 90)
+            app.radio.get_known_nodes = lambda nodes=(local, old_heard): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 1m", await self._mesh_status_text(app))
+
+            fresh_heard = NodeMetadata("!upd00001", "Updater", last_heard=now)
+            app.radio.get_known_nodes = lambda nodes=(local, fresh_heard): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE 0s", await self._mesh_status_text(app))
+
+    async def test_returning_online_restores_last_update(self) -> None:
+        """CONNECTING replaces LAST UPDATE in the same widget location;
+
+        once ONLINE resumes, LAST UPDATE returns automatically -- no
+        second/duplicate status line is ever created.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata("!re1turn0", "Returner", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            text = await self._mesh_status_text(app)
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.CONNECTING]}", text)
             self.assertNotIn("LAST UPDATE", text)
-            self.assertEqual(text, "")
-            self.assertFalse(app.query_one("#mesh-connection-status").display)
+
+            app._show_connection(RadioState.ONLINE, app.radio.info)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertEqual(len(list(app.query("#mesh-connection-status"))), 1)
 
     async def test_connecting_status_overrides_stale_last_update(self) -> None:
         """While CONNECTING/RECONNECTING, the shared connection-status

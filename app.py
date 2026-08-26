@@ -670,13 +670,20 @@ class MeshNodeWidget(Static):
 
     def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
-        # The role glyph itself is never altered by selection -- CLIENT
-        # (solid) vs RELAY-only (stroked) stays the authoritative node
-        # semantic regardless of visual selection state. YOU has no
-        # observed role and is always solid.
+        # The glyph shape itself is never altered by selection -- ACTIVE
+        # (solid) vs stale (stroked) stays the authoritative visual state
+        # regardless of selection. This is the EXACT SAME predicate as
+        # _mesh_node_color's BASE/DIM_BASE split and [3] MESH (N)'s count
+        # (is_node_active), not CLIENT/is_client -- a real node admitted
+        # purely from passive NodeDB data (never having sent a CHAT
+        # message) is otherwise indistinguishable in shape from an
+        # anonymous relay stage while active, which is exactly what made
+        # a genuinely active endpoint look like a relay chain dead-end
+        # (see MeshRelayWidget, always stroked/unlabeled). YOU has no
+        # activity concept and is always solid.
         glyph = (
             CIRCLE_SOLID_LARGE
-            if self.state.node.is_local or self.state.glyph_is_solid()
+            if self.state.node.is_local or is_node_active(self.state.node.last_heard, now)
             else CIRCLE_STROKED_LARGE
         )
         style = Style(color=color, bold=selected)
@@ -4114,23 +4121,32 @@ class MeshtasticPassApp(App[None]):
     def _update_mesh_status_line(
         self, working_set: tuple[MeshNodeState, ...], now: float
     ) -> None:
-        """The ONLINE half of #mesh-connection-status: "LAST UPDATE <age>"
+        """The ONLINE half of #mesh-connection-status: a PERSISTENT
 
-        when the working set has no currently-active remote node
-        (is_node_active, the same predicate the board and [3] MESH (N)
-        use) -- so a genuinely stale board still communicates its own
-        age instead of quietly looking current -- otherwise nothing. The
-        age comes from the most recent NodeDB last_heard among the
-        working set's remote nodes -- never derived from CHAT history
-        (see build_mesh_working_set; CHAT is enrichment, not the timing
-        source of record here).
+        "LAST UPDATE <age>" mesh-freshness indicator, always shown while
+        the radio is ONLINE -- not a stale-only warning. Answers "how
+        long ago did this radio last obtain meaningful information about
+        the mesh", so it keeps aging (1s, 2s, ... 1m, ...) between
+        refreshes with no new data, and only resets when a genuinely
+        fresher timestamp arrives -- never merely because this method
+        itself ran again (see _refresh_mesh's 1Hz periodic call).
+
+        The age comes from the single most recent NodeDB last_heard
+        among the working set's remote nodes (excluding YOU) -- never
+        derived from CHAT history (see build_mesh_working_set; CHAT is
+        enrichment, not the timing source of record here) and never a
+        fabricated value: if no working-set remote node carries a
+        trustworthy last_heard at all, this is omitted rather than
+        showing a made-up age.
 
         Never touches the widget while the radio isn't ONLINE --
         _update_chat_connection_state() owns it then, on its own fixed
         animation cadence, so it can stay byte-for-byte in sync with
         CHAT's own status line; recomputing here too, on _refresh_mesh's
         different cadence, previously let the two drift out of phase by
-        a dot.
+        a dot. The two never fight over the widget: this function is a
+        no-op while not ONLINE, and _update_chat_connection_state only
+        ever writes non-empty text, which happens only while not ONLINE.
         """
         if self._radio_state is not RadioState.ONLINE:
             return
@@ -4138,16 +4154,13 @@ class MeshtasticPassApp(App[None]):
         if not widgets:
             return
         widget = widgets[0]
-        text = ""
         remote_last_heard = [
             state.node.last_heard
             for state in working_set
             if not state.node.is_local and state.node.last_heard is not None
         ]
-        has_active = any(
-            is_node_active(last_heard, now) for last_heard in remote_last_heard
-        )
-        if remote_last_heard and not has_active:
+        text = ""
+        if remote_last_heard:
             age = now - max(remote_last_heard)
             if age >= 0:
                 text = f"LAST UPDATE {format_relative_age(age)}"
