@@ -63,6 +63,7 @@ from mesh_topology import (
     compact_node_label,
     directional_target,
     place_within_bounds,
+    project_to_viewport,
     route_chain,
 )
 from node_activity import is_node_active
@@ -446,28 +447,67 @@ class ConnectionPage(VerticalScroll):
 CIRCLE_SOLID_LARGE = "●"
 CIRCLE_STROKED_LARGE = "○"
 
-# --- MESH: real passive-data visualization on a fixed grid -----------------
+# --- MESH: real passive-data visualization on a responsive viewport --------
 #
-# A fixed 21-column x 8-row board driven entirely by real, passively
+# A viewport into a logical topology that may be LARGER than the
+# currently visible terminal grid, driven entirely by real, passively
 # observed Meshtastic data -- no LoRa traffic is ever generated to
 # populate or refresh it (see _refresh_mesh). Real nodes are placed by
 # coarse compass direction/distance ranking when GPS is available
 # (never exact, proportional geography), spread to use more of the
-# fixed grid's available room, and a real CLIENT's truthful nonzero hop
-# count renders as that many anonymous relay-stage placeholders along
-# its path to YOU (see mesh_topology.RelayStage) -- visual/topology
-# decoration only, never selectable, focusable, or a navigation
-# candidate. Intentionally out of scope: Favorites, dynamic node-count
-# growth beyond the bounded working set, and scrolling (the working set
-# is bounded precisely so the whole board always fits one viewport).
-# See mesh_state.py for the working-set/role/staleness/distance model
-# and mesh_topology.py for the pure grid geometry (assign_grid_slots(),
-# place_within_bounds(), directional_target(), build_relay_stages(),
-# route_chain()) reused here.
-MESH_GRID_ROWS = 8
-MESH_GRID_COLUMNS = 21
-MESH_GRID_CENTER_ROW = 5
-MESH_GRID_CENTER_COLUMN = 11
+# visible grid's available room, and a real CLIENT's truthful nonzero
+# hop count renders as that many anonymous relay-stage placeholders
+# along its path to YOU (see mesh_topology.RelayStage) -- visual/
+# topology decoration only, never selectable, focusable, or a
+# navigation candidate. The visible grid's own row/column count is
+# computed fresh from the MESH view's actual rendered size every
+# refresh (see _compute_mesh_grid_dimensions), never a hardcoded
+# per-font-size table -- a node whose logical position falls outside
+# that grid renders as an edge indicator instead of being force-fit
+# inside it (see mesh_topology.project_to_viewport). Intentionally out
+# of scope: Favorites, dynamic node-count growth beyond the bounded
+# working set, and free-form scrolling (navigation is always node-to-
+# node via the arrow keys, never a scrollable viewport). See
+# mesh_state.py for the working-set/role/staleness/distance model and
+# mesh_topology.py for the pure grid geometry (assign_grid_slots(),
+# place_within_bounds(), project_to_viewport(), directional_target(),
+# build_relay_stages(), route_chain()) reused here.
+MESH_GRID_MIN_ROWS = 5
+MESH_GRID_MIN_COLUMNS = 9
+# A node's label renders one terminal row ABOVE its glyph (see
+# set_nodes) -- reserving this one row of headroom at the top of the
+# computed grid keeps a glyph from ever being placed so close to
+# #mesh-view's own top edge that its label would render outside this
+# container entirely.
+MESH_GRID_LABEL_MARGIN_ROWS = 1
+# The LOGICAL topology's own bounded extent (assign_grid_slots()'s
+# `max_radius`/min_radius_by_id-boosted grid steps, mapped onto real
+# row/column coordinates by place_within_bounds() in _refresh_mesh) --
+# a FIXED coordinate space, entirely independent of the current
+# VIEWPORT's own row/column count (see
+# MeshTopologyView.current_grid_dimensions/on_resize, which never
+# touch these). A live viewport resize can only ever clip/reveal more
+# or less of this SAME stable layout afterward (see
+# mesh_topology.project_to_viewport) -- never re-derive it from a
+# different origin (see item 11/12 of the responsive-viewport task).
+#
+# Deliberately NOT dramatically larger than a typical viewport:
+# place_within_bounds() actively STRETCHES the lone farthest node on
+# each half-axis to use all available room up to this bound (see its
+# own docstring) -- an enormous bound here would stretch even a single
+# nearby remote node far out into empty space for no rendering
+# benefit, making nearly everything an edge indicator regardless of
+# viewport size. Kept at the same size that comfortably filled the
+# previous fixed 8x21 board -- still genuinely independent of the
+# viewport (a SMALL-font viewport, computed larger, can now reveal
+# this entire logical extent at once with room to spare; an XL-sized
+# one, computed smaller, or a client legitimately boosted farther out
+# by a large truthful hop count, can genuinely exceed it and need edge
+# indicators -- see item 26's tests).
+MESH_LOGICAL_GRID_ROWS = 8
+MESH_LOGICAL_GRID_COLUMNS = 21
+MESH_LOGICAL_GRID_CENTER_ROW = 5
+MESH_LOGICAL_GRID_CENTER_COLUMN = 11
 # Selected-node "visually larger" treatment: a 3-cell-wide composite
 # (small dot + role glyph + small dot) replacing the ordinary 1-cell
 # glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
@@ -530,21 +570,31 @@ def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
 
 
 def _mesh_translated_positions(
-    base_positions: Mapping[str, tuple[int, int]], selected_node_id: str
+    base_positions: Mapping[str, tuple[int, int]],
+    selected_node_id: str,
+    *,
+    center_row: int,
+    center_column: int,
 ) -> dict[str, tuple[int, int]]:
     """Translate the whole current layout so the selected node sits at the
 
-    center grid position. This is a pure whole-mesh translation: every
-    node shifts by the same row/column delta, so relative geometry
-    between nodes never changes -- it is never an independent per-node
-    recomputation, and it never touches `base_positions` (the working
-    set's fixed geographic/fallback layout) itself.
+    given center grid position (the CURRENT viewport's own center --
+    see MeshTopologyView.current_grid_dimensions, computed fresh from
+    the view's actual rendered size, never a fixed constant). This is a
+    pure whole-mesh translation: every node shifts by the same row/
+    column delta, so relative geometry between nodes never changes --
+    it is never an independent per-node recomputation, and it never
+    touches `base_positions` (the working set's fixed geographic/
+    fallback layout, itself independent of the viewport entirely) --
+    only a later clip into the visible grid (see
+    mesh_topology.project_to_viewport) can move a node off this exact
+    translated position, never this function.
     """
     selected = base_positions.get(selected_node_id)
     if selected is None:
         return dict(base_positions)
-    row_delta = MESH_GRID_CENTER_ROW - selected[0]
-    column_delta = MESH_GRID_CENTER_COLUMN - selected[1]
+    row_delta = center_row - selected[0]
+    column_delta = center_column - selected[1]
     return {
         node_id: (row + row_delta, column + column_delta)
         for node_id, (row, column) in base_positions.items()
@@ -580,8 +630,8 @@ def _mesh_directional_target(
             PositionedNode(node=NodeMetadata(node_id), x=column, y=row, region="UNKNOWN")
             for node_id, (row, column) in base_positions.items()
         ),
-        width=MESH_GRID_COLUMNS,
-        height=MESH_GRID_ROWS,
+        width=MESH_LOGICAL_GRID_COLUMNS,
+        height=MESH_LOGICAL_GRID_ROWS,
     )
     target = directional_target(current_node_id, layout, direction)  # type: ignore[arg-type]
     return target.node.node_id if target is not None else None
@@ -764,13 +814,54 @@ def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
 
 
 DOT_GRID_GLYPH = "·"
-# The fixed MESH grid must fit entirely inside the MESH viewport on the
-# supported uConsole/test terminal size (~90 columns) with no scrolling.
 # 4x2 keeps a 2:1 x:y ratio (so the grid reads as roughly square against
-# typical terminal cell proportions); at the current 9x21 grid that renders
-# an 84x18 board, with margin inside that viewport.
+# typical terminal cell proportions) between one logical grid step and
+# its rendered terminal-cell size -- this ratio itself never changes
+# with font size or viewport size (see item 3 of the responsive-
+# viewport task: glyphs are never scaled to fill space; the GRID gains
+# or loses cells instead).
 DOT_GRID_SPACING_X = 4
 DOT_GRID_SPACING_Y = 2
+
+
+def _compute_mesh_grid_dimensions(
+    view_width: int, view_height: int
+) -> tuple[int, int, int, int]:
+    """Derive (rows, columns, center_row, center_column) for the
+
+    visible MESH grid from the MESH viewport's OWN actual rendered
+    size -- never a hardcoded per-font-size table (see
+    MeshTopologyView.current_grid_dimensions, this function's only
+    caller). #mesh-view already flexes to fill whatever space remains
+    once the top connection/status line and the bottom selected-node
+    context line (both separate sibling widgets outside this
+    container -- see MeshtasticPassApp.compose) take their own rows,
+    so `view_width`/`view_height` -- that container's own self.size --
+    already IS "the available MESH content area", with no further
+    reservation needed for those two specifically.
+
+    MESH_GRID_LABEL_MARGIN_ROWS is reserved from the row count for
+    label headroom (see set_nodes). Dimensions are forced ODD so there
+    is always an exact, unambiguous center cell for YOU to occupy when
+    the viewport is YOU-centered, floored at MESH_GRID_MIN_ROWS/
+    MESH_GRID_MIN_COLUMNS so a not-yet-laid-out or pathologically small
+    container never produces a degenerate 0- or 1-cell grid. A pure
+    function of its two inputs: unchanged geometry always yields
+    identical dimensions, and nothing about node activity, selection,
+    or connectors ever feeds into it.
+    """
+    columns = max(MESH_GRID_MIN_COLUMNS, view_width // DOT_GRID_SPACING_X)
+    if columns % 2 == 0:
+        columns -= 1
+    usable_rows = (
+        max(1, view_height // DOT_GRID_SPACING_Y) - MESH_GRID_LABEL_MARGIN_ROWS
+    )
+    rows = max(MESH_GRID_MIN_ROWS, usable_rows)
+    if rows % 2 == 0:
+        rows -= 1
+    center_row = rows // 2 + 1
+    center_column = columns // 2 + 1
+    return rows, columns, center_row, center_column
 
 
 def _render_mesh_canvas(
@@ -845,14 +936,18 @@ class MeshCanvas(Static):
 
 
 class MeshTopologyView(Container):
-    """A fixed 8x21 grid MESH board driven by a real, bounded MESH working set.
+    """A responsive VIEWPORT into a MESH working set that may be larger
 
-    No scrolling, no scrollbars -- the working set is bounded precisely
-    so the whole board always fits this one fixed viewport (see
-    mesh_state.build_mesh_working_set). Node identity, positions
+    than the currently visible terminal grid (see
+    current_grid_dimensions/mesh_topology.project_to_viewport). No
+    scrolling, no scrollbars -- navigation is always node-to-node via
+    the arrow keys (see MeshtasticPassApp._move_mesh_focus); a node
+    whose translated position falls outside the visible grid renders
+    as an edge indicator instead. Node identity, positions
     (base_positions, from mesh_topology.assign_grid_slots() +
-    place_within_bounds()), and roles all come from the current working
-    set passed to set_nodes(); this view only lays out and renders them.
+    place_within_bounds() -- STABLE, viewport-independent logical
+    coordinates) and roles all come from the current working set passed
+    to set_nodes(); this view only lays out, clips, and renders them.
     """
 
     can_focus = True
@@ -866,6 +961,8 @@ class MeshTopologyView(Container):
         self._working_set: tuple[MeshNodeState, ...] = ()
         self._base_positions: dict[str, tuple[int, int]] = {}
         self._relay_stages: tuple[RelayStage, ...] = ()
+        self._edge_node_ids: frozenset[str] = frozenset()
+        self._last_now: float = 0.0
 
     @property
     def board(self) -> Container:
@@ -881,10 +978,13 @@ class MeshTopologyView(Container):
 
     @property
     def base_positions(self) -> dict[str, tuple[int, int]]:
-        """Real-node AND anonymous-relay-stage logical (row, column)
+        """Real-node AND anonymous-relay-stage STABLE logical (row,
 
-        positions, merged -- rendering and connector routing need both
-        kinds of coordinate together. This is NOT the arrow-navigation
+        column) positions, merged -- the fixed layout produced by
+        assign_grid_slots()/place_within_bounds()/build_relay_stages(),
+        entirely independent of the current viewport/selection (see
+        mesh_topology.project_to_viewport, applied only at render time
+        in set_nodes -- never here). This is NOT the arrow-navigation
         candidate set: a RelayStage's ID is included here (its glyph
         must be positioned and translated exactly like a real node's)
         but is never itself navigable -- see
@@ -898,6 +998,60 @@ class MeshTopologyView(Container):
     @property
     def relay_stages(self) -> tuple[RelayStage, ...]:
         return self._relay_stages
+
+    @property
+    def edge_node_ids(self) -> frozenset[str]:
+        """Real working-set node IDs currently rendered as an edge
+
+        indicator rather than normally -- i.e. their translated
+        position fell outside the visible viewport this render and was
+        clipped onto its boundary (see mesh_topology.
+        project_to_viewport). Never includes anonymous relay-stage IDs:
+        those are excluded from this set even when their own position
+        was likewise clipped, since a relay stage is never a selectable
+        "edge" concept, just clipped visual topology (see set_nodes).
+        """
+        return self._edge_node_ids & {state.node.node_id for state in self._working_set}
+
+    def current_grid_dimensions(self) -> tuple[int, int, int, int]:
+        """(rows, columns, center_row, center_column) for the visible
+
+        grid, computed fresh from this container's OWN actual rendered
+        size (see _compute_mesh_grid_dimensions) -- never a hardcoded
+        per-font-size table. Calling this repeatedly with no layout
+        change in between always returns the identical result: it is a
+        pure function of self.size, never of activity, selection, or
+        connectors.
+        """
+        return _compute_mesh_grid_dimensions(self.size.width, self.size.height)
+
+    def on_resize(self) -> None:
+        """The MESH viewport's available terminal-cell area just
+
+        changed (a real terminal resize, or -- in the real deployment
+        -- reopening after a font-size change reconfigured how many
+        cells fit; see item 24 of the responsive-viewport task) --
+        relayout immediately against the new size rather than waiting
+        for the next unrelated refresh.
+
+        Re-renders the SAME already-known working set/positions against
+        the new size, reusing the exact "now" set_nodes was last called
+        with (`_last_now`) rather than sampling a fresh, unsynchronized
+        time() here: a resize is a pure LAYOUT event and must only ever
+        change screen coordinates, never re-derive activity/counts from
+        a different "now" than the rest of the current refresh cycle
+        used (see _refresh_mesh's own "computed exactly ONCE per cycle"
+        principle -- this must not become a second, independent source
+        of "now"). A no-op before the working set has ever been
+        populated (nothing to relayout yet, and no "now" to reuse).
+        """
+        if self._working_set:
+            self.set_nodes(
+                self._working_set,
+                self._base_positions,
+                theme=self.app._current_theme,
+                now=self._last_now,
+            )
 
     def set_nodes(
         self,
@@ -915,10 +1069,21 @@ class MeshTopologyView(Container):
         nodes that actually entered/left the working set -- unchanged
         nodes keep their existing widget, so unchanged data never
         reshuffles or remounts anything.
+
+        The visible grid's own dimensions are recomputed fresh from
+        this container's actual current size every call (see
+        current_grid_dimensions) -- a resize (real terminal resize, or
+        a later call after a font-size-driven relaunch) is picked up
+        automatically the next time this runs, with no separate
+        per-font-size table anywhere.
         """
+        self._last_now = now
         board = self.board
-        board_width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        board_height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        row_count, column_count, center_row, center_column = (
+            self.current_grid_dimensions()
+        )
+        board_width = column_count * DOT_GRID_SPACING_X
+        board_height = row_count * DOT_GRID_SPACING_Y
         board.styles.width = board_width
         board.styles.height = board_height
         # Horizontally center the whole board as one rigid block inside the
@@ -961,12 +1126,19 @@ class MeshTopologyView(Container):
         # rendered connectors, and "what else does my radio remember"
         # via dim, disconnected real nodes.
         active_hop_counts = _mesh_active_hop_counts(working_set, now=now)
+        # Relay-stage interpolation happens in the STABLE logical
+        # coordinate space (MESH_LOGICAL_GRID_*), never the current
+        # viewport's dynamic row/column count -- a relay chain's
+        # placement must not shift merely because the visible grid grew
+        # or shrank (see item 12 of the responsive-viewport task); only
+        # the later viewport-projection step below may move it on
+        # screen.
         relay_stages, relay_positions = build_relay_stages(
             real_positions,
             you_id=you_id or "",
             hop_counts=active_hop_counts,
-            row_count=MESH_GRID_ROWS,
-            column_count=MESH_GRID_COLUMNS,
+            row_count=MESH_LOGICAL_GRID_ROWS,
+            column_count=MESH_LOGICAL_GRID_COLUMNS,
         )
         self._relay_stages = relay_stages
         self._base_positions = {**real_positions, **relay_positions}
@@ -980,6 +1152,25 @@ class MeshTopologyView(Container):
                 working_set[0].node.node_id if working_set else ""
             )
 
+        # A real working-set node whose translated position falls
+        # outside the current viewport renders as an edge indicator:
+        # its glyph still gets the ordinary real-node treatment (see
+        # MeshNodeWidget.refresh_visual -- FILLED/BASE or STROKED/
+        # DIM_BASE per the same is_node_active predicate as always,
+        # never a new "off-screen" color), but it gets no label -- a
+        # normal label always implies a normal in-viewport node.
+        positions = _mesh_translated_positions(
+            self._base_positions,
+            self._selected_node_id,
+            center_row=center_row,
+            center_column=center_column,
+        )
+        viewport_positions, edge_ids = project_to_viewport(
+            positions, row_count=row_count, column_count=column_count
+        )
+        self._edge_node_ids = edge_ids
+        labelable_ids = current_ids - edge_ids
+
         states_by_id = {state.node.node_id: state for state in working_set}
         stages_by_id = {stage.node_id: stage for stage in relay_stages}
         # Widget.remove() only schedules removal -- it does not take effect
@@ -990,7 +1181,7 @@ class MeshTopologyView(Container):
             if widget.node_id not in current_ids:
                 widget.remove()
         for widget in list(self.query(MeshNodeLabelWidget)):
-            if widget.node_id not in current_ids:
+            if widget.node_id not in labelable_ids:
                 widget.remove()
         for widget in list(self.query(MeshRelayWidget)):
             if widget.node_id not in relay_ids:
@@ -1003,7 +1194,7 @@ class MeshTopologyView(Container):
         existing_label_ids = {
             widget.node_id
             for widget in self.query(MeshNodeLabelWidget)
-            if widget.node_id in current_ids
+            if widget.node_id in labelable_ids
         }
         existing_relay_ids = {
             widget.node_id
@@ -1017,7 +1208,7 @@ class MeshTopologyView(Container):
         ]
         new_labels = [
             MeshNodeLabelWidget(states_by_id[node_id])
-            for node_id in states_by_id
+            for node_id in labelable_ids
             if node_id not in existing_label_ids
         ]
         # Anonymous relay-stage placeholders are never labeled -- no
@@ -1039,7 +1230,7 @@ class MeshTopologyView(Container):
         label_widgets = [
             widget
             for widget in self.query(MeshNodeLabelWidget)
-            if widget.node_id in current_ids
+            if widget.node_id in labelable_ids
         ]
         relay_widgets = [
             widget for widget in self.query(MeshRelayWidget) if widget.node_id in relay_ids
@@ -1051,9 +1242,6 @@ class MeshTopologyView(Container):
         for widget in relay_widgets:
             widget.stage = stages_by_id[widget.node_id]
 
-        positions = _mesh_translated_positions(
-            self._base_positions, self._selected_node_id
-        )
         centers: dict[str, tuple[int, int]] = {}
         # The glyph is the sole coordinate authority: it is always a 1x1
         # (or, selected, 3x1) widget centered exactly on (grid_x, grid_y),
@@ -1061,7 +1249,7 @@ class MeshTopologyView(Container):
         # `centers` (used for connector endpoints below) only ever
         # reflects glyph coordinates.
         for widget in glyph_widgets:
-            row, column = positions[widget.node_id]
+            row, column = viewport_positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
             selected = widget.node_id == self._selected_node_id
             # Selected nodes render a 3-cell-wide composite (see
@@ -1080,7 +1268,7 @@ class MeshTopologyView(Container):
         # enlarged selected composite -- a relay stage is never selected
         # (see MeshRelayWidget), so it is always exactly 1 cell wide.
         for widget in relay_widgets:
-            row, column = positions[widget.node_id]
+            row, column = viewport_positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
             widget.styles.width = 1
             widget.styles.height = 1
@@ -1172,6 +1360,7 @@ class MeshTopologyView(Container):
         self._base_positions = {}
         self._relay_stages = ()
         self._selected_node_id = ""
+        self._edge_node_ids = frozenset()
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
     def select_node(self, node_id: str) -> None:
@@ -3285,12 +3474,17 @@ class MeshtasticPassApp(App[None]):
             max_radius=DEFAULT_MAX_GRID_RADIUS,
             min_radius_by_id=min_radius_by_id,
         )
+        # Placed in the STABLE logical coordinate space, entirely
+        # independent of the current viewport's own row/column count
+        # (see MESH_LOGICAL_GRID_ROWS) -- MeshTopologyView.set_nodes is
+        # the only place that later translates/clips this same layout
+        # into whatever is currently visible.
         base_positions = place_within_bounds(
             slots,
-            center_row=MESH_GRID_CENTER_ROW,
-            center_column=MESH_GRID_CENTER_COLUMN,
-            row_count=MESH_GRID_ROWS,
-            column_count=MESH_GRID_COLUMNS,
+            center_row=MESH_LOGICAL_GRID_CENTER_ROW,
+            center_column=MESH_LOGICAL_GRID_CENTER_COLUMN,
+            row_count=MESH_LOGICAL_GRID_ROWS,
+            column_count=MESH_LOGICAL_GRID_COLUMNS,
         )
         view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
         self._update_mesh_context_status()

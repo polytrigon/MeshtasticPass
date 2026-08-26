@@ -565,6 +565,122 @@ def place_within_bounds(
     return result
 
 
+def project_to_viewport(
+    positions: Mapping[str, tuple[int, int]],
+    *,
+    row_count: int,
+    column_count: int,
+) -> tuple[dict[str, tuple[int, int]], frozenset[str]]:
+    """Clip a set of already-translated (row, column) positions into a
+
+    visible row_count x column_count viewport, returning (a) every
+    node's final on-screen cell and (b) the subset that had to be
+    clipped to get there -- the real off-screen "edge indicator" set
+    (see app.py's MeshTopologyView.set_nodes, the only caller).
+
+    A node already inside [1, row_count] x [1, column_count] is left
+    exactly where it is -- this never moves an already-visible node,
+    only ever pulls a genuinely off-screen one onto the nearest in-
+    bounds cell. Clamping each axis independently toward the boundary
+    is exactly the direction-preserving projection this needs: a point
+    beyond only one axis lands on the matching cardinal edge; a point
+    beyond both axes lands on the corresponding corner, preserving its
+    NE/NW/SE/SW relationship rather than collapsing every off-screen
+    node onto one of four cardinal cells regardless of its real
+    direction.
+
+    In-bounds nodes are placed first and reserve their cells, so an
+    off-screen node's clamped landing point can never displace an
+    already-correctly-positioned visible one. Multiple off-screen nodes
+    that clamp to the identical cell are then deterministically spread
+    along the boundary ring outward from that cell (see
+    _reserve_edge_cell), processed in node_id order so the outcome is
+    stable across repeated refreshes with the same input -- never a
+    different arrangement from run to run, and never a random or
+    arrival-order-dependent choice.
+    """
+    row_count = max(1, row_count)
+    column_count = max(1, column_count)
+    in_bounds: list[tuple[str, int, int]] = []
+    out_of_bounds: list[tuple[str, int, int]] = []
+    for node_id, (row, column) in sorted(
+        positions.items(), key=lambda item: item[0].casefold()
+    ):
+        if 1 <= row <= row_count and 1 <= column <= column_count:
+            in_bounds.append((node_id, row, column))
+        else:
+            out_of_bounds.append((node_id, row, column))
+
+    occupied: set[tuple[int, int]] = set()
+    viewport: dict[str, tuple[int, int]] = {}
+    for node_id, row, column in in_bounds:
+        viewport[node_id] = (row, column)
+        occupied.add((row, column))
+
+    edge_ids: set[str] = set()
+    for node_id, row, column in out_of_bounds:
+        clamped_row = _clamp(row, 1, row_count)
+        clamped_column = _clamp(column, 1, column_count)
+        clamped_row, clamped_column = _reserve_edge_cell(
+            clamped_row,
+            clamped_column,
+            occupied,
+            row_count=row_count,
+            column_count=column_count,
+        )
+        occupied.add((clamped_row, clamped_column))
+        viewport[node_id] = (clamped_row, clamped_column)
+        edge_ids.add(node_id)
+    return viewport, frozenset(edge_ids)
+
+
+def _reserve_edge_cell(
+    row: int,
+    column: int,
+    occupied: set[tuple[int, int]],
+    *,
+    row_count: int,
+    column_count: int,
+) -> tuple[int, int]:
+    """Claim (row, column) for an off-screen node, or the nearest free
+
+    cell that is ALSO still on the grid's outer boundary ring -- so a
+    nudged-aside edge indicator never drifts into the interior and
+    starts looking like an ordinary in-viewport node. Falls back to
+    _reserve_bounded_cell's any-free-cell search (which may leave the
+    boundary) only in the degenerate case where the entire boundary
+    ring within reach is already occupied -- exactly as rare, and
+    handled exactly as deterministically, as that function's own
+    full-grid-scan fallback.
+    """
+    if (row, column) not in occupied:
+        return row, column
+    radius = 1
+    max_span = row_count + column_count
+    while radius <= max_span:
+        for delta_row, delta_column in _square_ring(radius):
+            candidate_row = row + delta_row
+            candidate_column = column + delta_column
+            if not (
+                1 <= candidate_row <= row_count
+                and 1 <= candidate_column <= column_count
+            ):
+                continue
+            candidate = (candidate_row, candidate_column)
+            if candidate in occupied:
+                continue
+            on_boundary = (
+                candidate_row in (1, row_count)
+                or candidate_column in (1, column_count)
+            )
+            if on_boundary:
+                return candidate
+        radius += 1
+    return _reserve_bounded_cell(
+        row, column, occupied, row_count=row_count, column_count=column_count
+    )
+
+
 def _spread_scale(farthest_logical_step: int, available_room: int) -> float:
     """Stretch factor for one half-axis: only ever >= 1.0 (never shrinks).
 
