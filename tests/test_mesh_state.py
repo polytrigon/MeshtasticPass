@@ -13,6 +13,7 @@ from mesh_state import (
     format_mesh_context_line,
     normalize_mesh_node_id,
 )
+from node_activity import ACTIVE_WINDOW_SECONDS
 from radio_service import NodeMetadata
 
 
@@ -117,41 +118,73 @@ class MeshNodeStateGlyphRuleTests(unittest.TestCase):
         )
         self.assertFalse(state.glyph_is_solid())
 
-    def test_neither_role_defaults_solid(self) -> None:
+    def test_neither_role_renders_stroked_not_fabricated_client(self) -> None:
+        """A passively-known-only node (NodeDB-first admission, never a
+
+        CLIENT message observed) is genuinely reachable now -- see
+        BuildMeshWorkingSetTests.test_nodedb_only_node_is_not_fabricated_
+        as_client -- and must not render as if it had earned the CLIENT
+        glyph merely by existing.
+        """
         state = MeshNodeState(
             node=NodeMetadata("!a", "A"),
             is_client=False,
             is_relay=False,
             last_interaction_at=None,
         )
-        self.assertTrue(state.glyph_is_solid())
+        self.assertFalse(state.glyph_is_solid())
 
 
 class BuildMeshWorkingSetTests(unittest.TestCase):
     def test_you_is_always_included_when_present(self) -> None:
-        result = build_mesh_working_set([YOU], last_message_at={})
+        result = build_mesh_working_set([YOU], now=NOW, last_message_at={})
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0].node.is_local)
 
     def test_you_absent_when_local_node_unknown(self) -> None:
-        result = build_mesh_working_set([], last_message_at={})
+        result = build_mesh_working_set([], now=NOW, last_message_at={})
         self.assertEqual(result, ())
 
     def test_incoming_message_makes_a_node_client(self) -> None:
-        alice = NodeMetadata("!alice", "Alice", "ALC", 1, NOW)
+        alice = NodeMetadata("!alice", "Alice", "ALC", 1, NOW - 500)
         result = build_mesh_working_set(
-            [YOU, alice], last_message_at={"!alice": NOW - 10}
+            [YOU, alice], now=NOW, last_message_at={"!alice": NOW - 10}
         )
         remote = next(state for state in result if not state.node.is_local)
         self.assertTrue(remote.is_client)
         self.assertFalse(remote.is_relay)
         self.assertEqual(remote.last_interaction_at, NOW - 10)
 
-    def test_node_with_no_message_history_is_excluded(self) -> None:
+    def test_nodedb_only_node_with_no_chat_history_still_appears(self) -> None:
+        """The core NodeDB-first behavior: a node the radio has passively
+
+        heard from -- with no CHAT message ever observed for it -- is a
+        MESH candidate on its own. A CHAT message must never be required
+        for a real node to appear on the board. last_interaction_at
+        stays specifically CHAT interaction time (None here, since there
+        is none) -- unchanged meaning from before; NodeDB last_heard is
+        a separate signal used for ranking only (see
+        test_currently_active_nodes_outrank_more_recent_stale_ones).
+        """
         heard_only = NodeMetadata("!heard", "HeardOnly", None, None, NOW - 5)
-        result = build_mesh_working_set([YOU, heard_only], last_message_at={})
-        self.assertEqual(len(result), 1)
-        self.assertTrue(result[0].node.is_local)
+        result = build_mesh_working_set([YOU, heard_only], now=NOW, last_message_at={})
+        self.assertEqual(len(result), 2)
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertEqual(remote.node.node_id, "!heard")
+        self.assertIsNone(remote.last_interaction_at)
+
+    def test_nodedb_only_node_is_not_fabricated_as_client(self) -> None:
+        """A node admitted purely from passive NodeDB data has never
+
+        originated a message we received, so it must not be fabricated
+        as CLIENT merely for existing -- see MeshNodeState.
+        glyph_is_solid and format_mesh_context_line's "?" ROLE fallback.
+        """
+        heard_only = NodeMetadata("!heard", "HeardOnly", None, None, NOW - 5)
+        result = build_mesh_working_set([YOU, heard_only], now=NOW, last_message_at={})
+        remote = next(state for state in result if not state.node.is_local)
+        self.assertFalse(remote.is_client)
+        self.assertFalse(remote.is_relay)
 
     def test_client_node_missing_from_known_nodes_still_appears(self) -> None:
         """A CLIENT node absent from the passive node database (e.g. its
@@ -160,7 +193,9 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         known -- CHAT history, not the node database, is authoritative
         for CLIENT.
         """
-        result = build_mesh_working_set([YOU], last_message_at={"!ghost": NOW - 5})
+        result = build_mesh_working_set(
+            [YOU], now=NOW, last_message_at={"!ghost": NOW - 5}
+        )
         remote = next(state for state in result if not state.node.is_local)
         self.assertEqual(remote.node.node_id, "!ghost")
         self.assertTrue(remote.is_client)
@@ -168,7 +203,7 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
     def test_case_insensitive_node_id_matching(self) -> None:
         alice = NodeMetadata("!AlIcE", "Alice", "ALC", 1, NOW)
         result = build_mesh_working_set(
-            [YOU, alice], last_message_at={"!alice": NOW - 10}
+            [YOU, alice], now=NOW, last_message_at={"!alice": NOW - 10}
         )
         remote = next(state for state in result if not state.node.is_local)
         self.assertEqual(remote.node.long_name, "Alice")
@@ -186,7 +221,7 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         """
         north_node = NodeMetadata("!075bcd15", "North Node", "NORTH", 1, NOW)
         result = build_mesh_working_set(
-            [YOU, north_node], last_message_at={"123456789": NOW - 10}
+            [YOU, north_node], now=NOW, last_message_at={"123456789": NOW - 10}
         )
         self.assertEqual(len(result), 2)
         remote = next(state for state in result if not state.node.is_local)
@@ -205,6 +240,7 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         """
         result = build_mesh_working_set(
             [YOU],
+            now=NOW,
             last_message_at={"123456789": NOW - 500, "!075bcd15": NOW - 10},
         )
         self.assertEqual(len(result), 2)
@@ -214,19 +250,50 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
 
     def test_working_set_is_bounded_to_max_remote_nodes(self) -> None:
         last_message_at = {f"!n{i:04x}": NOW - i for i in range(20)}
-        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        result = build_mesh_working_set(
+            [YOU], now=NOW, last_message_at=last_message_at
+        )
         self.assertEqual(len(result) - 1, DEFAULT_MAX_REMOTE_NODES)
 
     def test_never_renders_the_full_historical_client_list(self) -> None:
         last_message_at = {f"!n{i:04x}": NOW - i for i in range(200)}
-        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        result = build_mesh_working_set(
+            [YOU], now=NOW, last_message_at=last_message_at
+        )
         self.assertLess(len(result), len(last_message_at))
 
     def test_most_recent_interaction_ranks_first(self) -> None:
         last_message_at = {"!old": NOW - 5_000, "!new": NOW - 10}
-        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        result = build_mesh_working_set(
+            [YOU], now=NOW, last_message_at=last_message_at
+        )
         remote_ids = [state.node.node_id for state in result if not state.node.is_local]
         self.assertEqual(remote_ids[0], "!new")
+
+    def test_currently_active_nodes_outrank_more_recent_stale_ones(self) -> None:
+        """Tier 1 (currently active, per the shared is_node_active
+
+        predicate) outranks tier 3 (most-recently-interacted) even when
+        the stale-but-more-recent node's raw timestamp is closer to now
+        -- activity is a coarser, more meaningful signal than raw
+        recency once a node has fallen out of the active window.
+        """
+        active = NodeMetadata("!active", "Active", None, None, NOW - 60)
+        barely_stale = NodeMetadata(
+            "!stale", "Stale", None, None, NOW - ACTIVE_WINDOW_SECONDS - 1
+        )
+        result = build_mesh_working_set([YOU, barely_stale, active], now=NOW)
+        remote_ids = [state.node.node_id for state in result if not state.node.is_local]
+        self.assertEqual(remote_ids, ["!active", "!stale"])
+
+    def test_favorite_outranks_non_favorite_among_non_active_nodes(self) -> None:
+        favorite = NodeMetadata("!fav", "Favorite", None, None, NOW - 10_000)
+        plain = NodeMetadata("!plain", "Plain", None, None, NOW - 1_000)
+        result = build_mesh_working_set(
+            [YOU, plain, favorite], now=NOW, favorite_ids={"!fav"}
+        )
+        remote_ids = [state.node.node_id for state in result if not state.node.is_local]
+        self.assertEqual(remote_ids, ["!fav", "!plain"])
 
     def test_stale_fallback_shows_most_recent_historical_nodes(self) -> None:
         """When nothing is recent, ranking naturally surfaces the most
@@ -236,7 +303,9 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         """
         very_old = NOW - MESH_STALE_THRESHOLD_SECONDS * 10
         last_message_at = {f"!n{i:04x}": very_old - i for i in range(5)}
-        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        result = build_mesh_working_set(
+            [YOU], now=NOW, last_message_at=last_message_at
+        )
         self.assertEqual(len(result) - 1, 5)
         remotes = [state for state in result if not state.node.is_local]
         self.assertTrue(all(state.is_stale(now=NOW) for state in remotes))
@@ -246,9 +315,11 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         nodes = [YOU] + [
             NodeMetadata(f"!n{i:04x}", f"Node{i}") for i in range(10)
         ]
-        forward = build_mesh_working_set(nodes, last_message_at=last_message_at)
+        forward = build_mesh_working_set(
+            nodes, now=NOW, last_message_at=last_message_at
+        )
         backward = build_mesh_working_set(
-            list(reversed(nodes)), last_message_at=last_message_at
+            list(reversed(nodes)), now=NOW, last_message_at=last_message_at
         )
         self.assertEqual(
             [state.node.node_id for state in forward],
@@ -257,7 +328,9 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
 
     def test_tie_break_on_node_id_is_stable(self) -> None:
         last_message_at = {"!bbb": NOW - 10, "!aaa": NOW - 10}
-        result = build_mesh_working_set([YOU], last_message_at=last_message_at)
+        result = build_mesh_working_set(
+            [YOU], now=NOW, last_message_at=last_message_at
+        )
         remote_ids = [state.node.node_id for state in result if not state.node.is_local]
         self.assertEqual(remote_ids, ["!aaa", "!bbb"])
 

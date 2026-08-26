@@ -12,6 +12,7 @@ from typing import Iterable, Mapping
 
 from geo import distance_between
 from mesh_topology import compact_node_label
+from node_activity import is_node_active
 from radio_service import NodeMetadata
 from relative_time import format_relative_age
 
@@ -92,56 +93,87 @@ class MeshNodeState:
         return (now - self.last_interaction_at) > MESH_STALE_THRESHOLD_SECONDS
 
     def glyph_is_solid(self) -> bool:
-        """CLIENT appearance (solid) takes priority over RELAY-only (stroked).
+        """SOLID means exclusively "confirmed CLIENT" -- never fabricated.
 
-        CLIENT and CLIENT+RELAY both render solid; only RELAY-with-no-
-        CLIENT renders stroked. YOU (is_client=False, is_relay=False) has
-        no observed role and is always solid -- callers render YOU solid
-        unconditionally rather than through this method; see
-        MeshNodeWidget in app.py.
+        A remote node admitted into the working set purely from passive
+        NodeDB/mesh state (see build_mesh_working_set) that has never
+        actually originated a message we received is_client=False, and
+        renders STROKED, the same shape a RELAY-only node uses -- it has
+        not earned the CLIENT glyph just by being known to exist. YOU
+        (is_client=False, is_relay=False) has no observed role either,
+        but is always solid -- callers render YOU solid unconditionally
+        rather than through this method; see MeshNodeWidget in app.py.
         """
-        if self.is_client:
-            return True
-        return not self.is_relay
+        return self.is_client
 
 
 def build_mesh_working_set(
     nodes: Iterable[NodeMetadata],
     *,
+    now: float,
     last_message_at: Mapping[str, float] | None = None,
+    favorite_ids: Iterable[str] | None = None,
     max_remote_nodes: int = DEFAULT_MAX_REMOTE_NODES,
 ) -> tuple[MeshNodeState, ...]:
-    """Rank observed CLIENT nodes and return YOU plus the top N most recent.
+    """NodeDB-first working set: YOU plus a bounded, ranked set of real nodes.
 
-    Every remote MeshNodeState here is CLIENT by construction: with no
-    trustworthy relay-identity source available (see MeshNodeState),
-    CLIENT is the only observed communication role this app can currently
-    establish, so a node is included here if and only if it appears in
-    `last_message_at` -- the caller's merged view of persisted CHAT
-    history plus any not-yet-persisted in-memory activity, so this
-    reflects true history rather than just the current session.
+    `nodes` (the radio's own passively-learned NodeDB, e.g.
+    RadioService.get_known_nodes()) is the PRIMARY admission source -- a
+    node the radio already knows about (last_heard, hops_away, position,
+    names) is a MESH candidate on its own; a CHAT message is never
+    required for a node to exist on the board. `last_message_at` (the
+    caller's merged view of persisted CHAT history plus any
+    not-yet-persisted in-memory activity) is an ENRICHMENT on top of
+    that: it marks a candidate CLIENT (see MeshNodeState.glyph_is_solid),
+    and its timestamp competes with the node's own `last_heard` for
+    `last_interaction_at` (whichever is fresher wins -- either one is
+    real evidence the node was recently relevant). It can also admit a
+    node NodeDB has no record for yet (e.g. its passive record has not
+    synced), exactly as before, but for any node NodeDB already reports
+    it is enrichment, never the sole gate.
 
-    Ranking is purely by recency of that last interaction, most recent
-    first. There is no separate "recent" vs "historical" priority tier:
-    with only one observed role, "most recently relevant" and "most
-    recently active" are the same criterion, so the same ranking
-    naturally falls through to the most recent stale nodes instead of
-    leaving the board empty when nothing is recent (see MeshNodeState.
-    is_stale for the recent/stale boundary, applied independently at
-    render/context time -- ranking never excludes a node merely for
-    being stale). Ties break on node_id for determinism.
+    A node that is only ever admitted from NodeDB and has never
+    originated a message we received keeps is_client=False, is_relay=
+    False -- the same "no observed role" shape YOU already uses -- and
+    is never fabricated as CLIENT merely for existing; see
+    format_mesh_context_line (ROLE renders "?") and glyph_is_solid
+    (renders STROKED). `last_interaction_at` remains specifically CHAT
+    interaction time (None when there is none) -- unchanged meaning
+    from before, still what format_mesh_context_line's AGE segment and
+    is_stale() describe; a passively-known-only node's more general
+    NodeDB recency (`node.last_heard`) is a separate signal, used below
+    for ranking only, never folded into this field.
 
-    `nodes` supplies richer NodeMetadata (name, hops_away, position) when
-    available, matched against `last_message_at`'s keys through
+    Bounded to `max_remote_nodes` (never every known node -- readability
+    over completeness), ranked by a single deterministic key so ranking
+    never depends on arrival order or which source reported a node:
+
+      1. currently ACTIVE remote nodes first -- is_node_active(
+         node.last_heard, now), the exact same predicate the board's own
+         BASE/DIM_BASE styling and [3] MESH (N) use; not a second
+         activity definition.
+      2. favorites (`favorite_ids`) among the rest.
+      3. remaining nodes, most-recently-relevant first, where "relevant"
+         is whichever is fresher of CHAT interaction time and NodeDB
+         last_heard -- either one is real evidence a node was recently
+         worth surfacing, so ranking (unlike last_interaction_at above)
+         considers both.
+      4. nodes with no timing information from either source, last.
+
+    Ties within a tier break on node_id for determinism.
+
+    `nodes` also supplies richer NodeMetadata (name, hops_away, position)
+    when available, matched against `last_message_at`'s keys through
     normalize_mesh_node_id() (case-insensitive, and tolerant of a bare
     decimal node number where the standard "!hex" form is expected) so a
     node can never split into two silently-different identities depending
-    on which source reported it; a CLIENT node absent from `nodes` (e.g.
-    its passive node-database record has not synced yet) still appears,
-    with only its node ID known. Every MeshNodeState this function
+    on which source reported it. Every MeshNodeState this function
     returns carries that same normalized ID.
     """
     last_message_at = last_message_at or {}
+    favorites = {
+        normalize_mesh_node_id(favorite_id) for favorite_id in (favorite_ids or ())
+    }
     local: NodeMetadata | None = None
     known_by_id: dict[str, NodeMetadata] = {}
     for node in nodes:
@@ -170,16 +202,24 @@ def build_mesh_working_set(
         ):
             normalized_interactions[node_id] = interaction_at
 
+    # Admission is the union of both sources: every node NodeDB knows
+    # about, plus every node that has originated a CHAT message we
+    # received even if NodeDB has no record for it (yet). Sorting and
+    # bounding below keeps the OUTPUT small regardless of how large this
+    # candidate pool is.
+    candidate_ids = set(known_by_id) | set(normalized_interactions)
+
     local_position = local.position if local is not None else None
     candidates: list[MeshNodeState] = []
-    for node_id, interaction_at in normalized_interactions.items():
+    for node_id in candidate_ids:
         node = known_by_id.get(node_id) or NodeMetadata(node_id)
+        chat_interaction_at = normalized_interactions.get(node_id)
         candidates.append(
             MeshNodeState(
                 node=node,
-                is_client=True,
+                is_client=chat_interaction_at is not None,
                 is_relay=False,
-                last_interaction_at=interaction_at,
+                last_interaction_at=chat_interaction_at,
                 # Straight-line geographic distance from YOU, derived only
                 # from stored GPS coordinates -- never from grid position,
                 # hop count, or relay-chain length (see RelayStage). "? mi"
@@ -189,12 +229,23 @@ def build_mesh_working_set(
             )
         )
 
-    candidates.sort(
-        key=lambda state: (
-            -(state.last_interaction_at or 0.0),
+    def rank_key(state: MeshNodeState) -> tuple[int, int, float, str]:
+        active = is_node_active(state.node.last_heard, now)
+        favorite = state.node.node_id in favorites
+        recency_candidates = [
+            timestamp
+            for timestamp in (state.last_interaction_at, state.node.last_heard)
+            if timestamp is not None
+        ]
+        recency = max(recency_candidates) if recency_candidates else float("-inf")
+        return (
+            0 if active else 1,
+            0 if favorite else 1,
+            -recency,
             state.node.node_id.casefold(),
         )
-    )
+
+    candidates.sort(key=rank_key)
     bounded = tuple(candidates[: max(0, max_remote_nodes)])
 
     if local is None:

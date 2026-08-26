@@ -16,6 +16,35 @@ from node_activity import count_active_other_nodes
 from serial_devices import discover_serial_devices
 
 
+RX_DEBUG_ENV_VAR = "MESHTASTICPASS_RX_DEBUG"
+
+
+def rx_debug_enabled() -> bool:
+    """Whether the read-only production receive-pipeline diagnostic is on.
+
+    Enable with e.g. `MESHTASTICPASS_RX_DEBUG=1 python app.py`. Checked
+    fresh each time (not cached at import) so tests can toggle it via
+    os.environ without needing a process restart. Purely observational:
+    gates only extra print() calls and one extra pubsub subscription to
+    a topic this app never publishes to -- it never changes a routing/
+    filtering decision, never polls the radio, and never adds RF
+    traffic. Disabled (the default) costs nothing beyond this one
+    environment lookup per check.
+    """
+    value = os.environ.get(RX_DEBUG_ENV_VAR, "").strip().lower()
+    return value not in ("", "0", "false")
+
+
+def rx_debug_log(line: str) -> None:
+    """Print one concise receive-pipeline diagnostic line.
+
+    Deliberately plain print() (not logging.*): this is a lightweight,
+    opt-in terminal trace meant to run for hours in a normal foreground
+    session on the uConsole, not a structured log file.
+    """
+    print(f"[RX] {line}", flush=True)
+
+
 class RadioState(Enum):
     """Connection states that callers can display without knowing SDK details."""
 
@@ -681,11 +710,92 @@ class RadioService:
             )
             raise
 
+        # Read-only diagnostic only: "meshtastic.receive" is the generic
+        # topic the Meshtastic library publishes to for EVERY decoded
+        # packet type (position, telemetry, nodeinfo, text, ...), in
+        # addition to (never instead of) the type-specific topic above.
+        # Subscribing here adds no RF traffic and changes no routing/
+        # filtering decision this app makes -- it only lets
+        # rx_debug_enabled() prove the production subscription is alive
+        # for passive traffic too, which CHAT itself has no reason to
+        # ever look at. Gated so a disabled diagnostic costs nothing
+        # beyond the one-time environment check.
+        if rx_debug_enabled():
+            try:
+                pub.subscribe(self._on_any_packet_for_debug, "meshtastic.receive")
+            except Exception:
+                pass
+
         self._pub = pub
 
     def _on_connection_lost(self, interface: Any, **_kwargs: Any) -> None:
         if interface is self._interface:
             self._connection_lost.set()
+
+    def _on_any_packet_for_debug(
+        self,
+        packet: Any = None,
+        interface: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Read-only diagnostic observer for every decoded packet type.
+
+        Never touches _message_handlers, ChatStore, or any application
+        state -- purely a print() for MESHTASTICPASS_RX_DEBUG=1. Skips
+        TEXT_MESSAGE_APP entirely: _on_text_received already logs its
+        own accept/reject decision for that portnum, and logging it
+        twice here would be noise, not signal. Re-checks
+        rx_debug_enabled() itself (in addition to _subscribe_to_events'
+        one-time check before ever wiring this up) so this can never
+        print if called directly with the diagnostic off.
+        """
+        if not rx_debug_enabled():
+            return
+        if interface is not None and interface is not self._interface:
+            return
+        from_id = self._format_from_id(packet)
+        if not isinstance(packet, dict):
+            return
+        decoded = packet.get("decoded")
+        if not isinstance(decoded, dict):
+            rx_debug_log(f"{from_id} ENCRYPTED undecodable")
+            return
+        portnum = decoded.get("portnum")
+        if portnum in ("TEXT_MESSAGE_APP", 1):
+            return
+        channel = packet.get("channel", 0)
+        rx_debug_log(f"{from_id} {portnum} channel={channel} observed")
+
+    @staticmethod
+    def _format_from_id(packet: Any) -> str:
+        if not isinstance(packet, dict):
+            return "!unknown"
+        sender_id = packet.get("fromId")
+        if isinstance(sender_id, str) and sender_id:
+            return sender_id
+        sender_number = RadioService._optional_int(packet.get("from"))
+        return f"!{sender_number:08x}" if sender_number is not None else "!unknown"
+
+    @staticmethod
+    def _text_packet_reject_reason(packet: Any) -> str:
+        """Diagnostic-only: classify why _parse_text_packet returned None,
+
+        mirroring its checks in the same order. Never used to make an
+        actual filtering decision -- only to answer "why was this
+        decoded text packet not accepted" in the RX debug log.
+        """
+        if not isinstance(packet, dict):
+            return "not_a_packet"
+        decoded = packet.get("decoded")
+        if not isinstance(decoded, dict):
+            return "undecoded_or_encrypted"
+        portnum = decoded.get("portnum")
+        if portnum not in ("TEXT_MESSAGE_APP", 1):
+            return f"not_text_message_app(portnum={portnum!r})"
+        text = RadioService._decode_text(decoded)
+        if text is None or text == "":
+            return "empty_or_undecodable_text"
+        return "unknown"
 
     def _on_text_received(
         self,
@@ -693,12 +803,30 @@ class RadioService:
         interface: Any = None,
         **_kwargs: Any,
     ) -> None:
+        debug = rx_debug_enabled()
         if interface is not None and interface is not self._interface:
+            if debug:
+                rx_debug_log(
+                    f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
+                    "ignored reason=stale_interface"
+                )
             return
 
         message = self._parse_text_packet(packet, self._interface)
         if message is None:
+            if debug:
+                reason = self._text_packet_reject_reason(packet)
+                rx_debug_log(
+                    f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
+                    f"ignored reason={reason}"
+                )
             return
+
+        if debug:
+            rx_debug_log(
+                f"{message.sender_node_id} TEXT_MESSAGE_APP "
+                f"channel={message.channel_index} accepted"
+            )
 
         self._record_direct_observation(message.sender_node_id)
 
@@ -730,6 +858,7 @@ class RadioService:
             subscriptions = (
                 (self._on_connection_lost, "meshtastic.connection.lost"),
                 (self._on_text_received, "meshtastic.receive.text"),
+                (self._on_any_packet_for_debug, "meshtastic.receive"),
             )
             for callback, topic in subscriptions:
                 try:

@@ -223,7 +223,11 @@ class ReceivedMessageTests(unittest.TestCase):
         )
 
         self.service._unsubscribe_from_events()
-        self.assertEqual(pub.unsubscribe.call_count, 2)
+        # Always attempts to unsubscribe the RX-debug diagnostic topic
+        # too (see rx_debug_enabled()), even when it was never actually
+        # subscribed -- each attempt is independently wrapped so an
+        # unsubscribe for a topic that was never joined is harmless.
+        self.assertEqual(pub.unsubscribe.call_count, 3)
 
     def test_delivers_one_clean_message_to_each_handler(self) -> None:
         handler = Mock()

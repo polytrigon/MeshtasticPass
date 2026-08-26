@@ -19,6 +19,7 @@ from textual.color import Color
 from textual.containers import ScrollableContainer
 
 from app import (
+    ANIMATED_STATUS,
     CIRCLE_SOLID_LARGE,
     CIRCLE_STROKED_LARGE,
     DOT_GRID_GLYPH,
@@ -73,7 +74,7 @@ from mesh_topology import (
 )
 import mesh_topology as mesh_topology_module
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
-from radio_service import NodeMetadata
+from radio_service import NodeMetadata, RadioState
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
@@ -1023,16 +1024,26 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(alice.is_client)
 
     async def test_outgoing_message_does_not_make_a_remote_node_client(self) -> None:
+        """An outgoing message must never mark ANY remote node CLIENT.
+
+        Remote nodes may still appear here -- NodeDB-first admission
+        (see build_mesh_working_set) means SimulatedRadioService's own
+        passively-known nodes are candidates on their own -- but none of
+        them may be is_client, since no incoming message was ever
+        received from any of them.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             app._accepted_send("hello from me")
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            remote_ids = {
-                state.node.node_id for state in view.working_set if not state.node.is_local
+            remote_clients = {
+                state.node.node_id
+                for state in view.working_set
+                if not state.node.is_local and state.is_client
             }
-            self.assertEqual(remote_ids, set())
+            self.assertEqual(remote_clients, set())
 
     async def test_persisted_incoming_history_survives_a_fresh_app_instance(self) -> None:
         """Simulates a process restart: a new ChatStore/App reading the same
@@ -1526,10 +1537,17 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
 
-            # Alice no longer has any recorded interaction at all -- she
-            # can no longer exist in a CLIENT-only working set.
+            # Alice no longer has any recorded interaction (CHAT cleared)
+            # NOR any passive NodeDB record (get_known_nodes overridden
+            # to YOU only) -- under NodeDB-first admission (see
+            # build_mesh_working_set), losing CHAT history alone is no
+            # longer enough to make a real known node disappear, so both
+            # sources must be removed to genuinely test this fallback.
             app._channel_states.clear()
             app.chat_store = None
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+            )
             app._refresh_mesh(wall_now=1_700_000_100.0)
             await pilot.pause()
             self.assertTrue(view.selected_node_id)
@@ -2179,8 +2197,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            title = str(app.query_one("#mesh-title").render())
-            self.assertEqual(title, "> MESH · ACTIVE 4")
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn("MESH (4)", tab_bar)
 
             view = app.query_one(MeshTopologyView)
             self.assertNotIn(view.selected_node_id, client_ids)
@@ -2235,63 +2253,42 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 stage_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
-            title = str(app.query_one("#mesh-title").render())
-            self.assertEqual(title, "> MESH · ACTIVE 1")
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn("MESH (1)", tab_bar)
 
-    async def test_active_header_excludes_known_nodes_outside_displayed_working_set(
+    async def test_active_header_never_counts_nodes_outside_the_displayed_working_set(
         self,
     ) -> None:
-        """Regression for the exact observed uConsole bug: MESH showed 9
+        """Regression, updated for NodeDB-first admission (see
 
-        real nodes all DIM_BASE while the header said ACTIVE 2. Root
-        cause was a population mismatch -- ACTIVE previously counted
-        activity across the FULL known-node population (get_known_nodes()),
-        independent of the bounded CLIENT-derived working set actually
-        rendered, so a passively-active node with no CHAT history could
-        inflate the header without ever appearing on the board at all.
+        build_mesh_working_set): the original observed uConsole bug was
+        a population mismatch -- ACTIVE counted activity across the FULL
+        known-node population (get_known_nodes()), independent of the
+        bounded working set actually rendered, so an active node that
+        never made the bounded cut could inflate the header without ever
+        appearing on the board.
 
-        Fixture: YOU + 8 real remote CLIENTs (all displayed, exactly 2
-        satisfying is_node_active()) + 2 additional known nodes that are
-        ALSO passively active but have never sent a CHAT message, so
-        they are excluded from the working set entirely. ACTIVE must
-        read exactly 2 -- the hidden active nodes must not count -- and
-        exactly those same 2 displayed nodes must render BASE.
+        A CHAT message is no longer what keeps a node off the board --
+        NodeDB-first admission means any known node is a candidate, so
+        the only way a real active node now fails to appear is by
+        losing the bound (max_remote_nodes) to higher-ranked candidates
+        (see build_mesh_working_set's tiered ranking). This fixture
+        supplies MORE currently-active real nodes than the bound allows,
+        confirming the displayed board and [3] MESH (N) still agree
+        exactly: N equals precisely how many of the DISPLAYED nodes are
+        active, never the size of the broader known-node population.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
             now = 1_700_000_000.0
-            displayed_ids = [f"!disp000{i}" for i in range(8)]
-            active_displayed_ids = set(displayed_ids[:2])
-            hidden_active_ids = ["!hidn0001", "!hidn0002"]
+            active_ids = [f"!ac00000{i}" for i in range(DEFAULT_MAX_REMOTE_NODES + 2)]
 
             nodes = [NodeMetadata(app.radio.info.node_id, is_local=True)]
-            for node_id in displayed_ids:
-                last_heard = (
-                    now - 10 if node_id in active_displayed_ids
-                    else now - ACTIVE_WINDOW_SECONDS - 100
-                )
-                nodes.append(NodeMetadata(node_id, node_id, last_heard=last_heard))
-            for node_id in hidden_active_ids:
-                # Passively active (recent last_heard) but never a
-                # CLIENT -- no _accept_received_message call for these.
+            for node_id in active_ids:
                 nodes.append(NodeMetadata(node_id, node_id, last_heard=now - 10))
             app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
 
-            for index, node_id in enumerate(displayed_ids):
-                app._accept_received_message(
-                    SIMULATED_MESSAGES[0].__class__(
-                        sender_node_id=node_id,
-                        sender_long_name=node_id,
-                        sender_short_name=None,
-                        channel_index=0,
-                        text="hi",
-                        rssi=None,
-                        snr=None,
-                        packet_id=9_700_000 + index,
-                        radio_rx_at=now - index,
-                    )
-                )
             await self._open_mesh(pilot)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
@@ -2300,48 +2297,18 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             displayed_remote_ids = {
                 state.node.node_id for state in view.working_set if not state.node.is_local
             }
-            self.assertEqual(displayed_remote_ids, set(displayed_ids))
-            for hidden_id in hidden_active_ids:
-                self.assertNotIn(hidden_id, displayed_remote_ids)
-                self.assertNotIn(
-                    hidden_id, {w.node_id for w in app.query(MeshNodeWidget)}
-                )
+            self.assertEqual(len(displayed_remote_ids), DEFAULT_MAX_REMOTE_NODES)
+            self.assertLess(len(displayed_remote_ids), len(active_ids))
+            # Every candidate here is equally active -- the bound simply
+            # keeps the board readable, but every node it DOES keep must
+            # still count, and none of the ones it drops may leak in.
+            all_displayed_ids = {state.node.node_id for state in view.working_set}
+            self.assertEqual(
+                {w.node_id for w in app.query(MeshNodeWidget)}, all_displayed_ids
+            )
 
-            title = str(app.query_one("#mesh-title").render())
-            self.assertEqual(title, "> MESH · ACTIVE 2")
-
-            palette = THEME_PALETTES[app._current_theme]
-            bright_ids = set()
-            for node_id in displayed_ids:
-                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
-                color = widget.render().spans[0].style.foreground
-                if color == Color.parse(palette.base):
-                    bright_ids.add(node_id)
-                else:
-                    self.assertEqual(color, Color.parse(palette.dim_base))
-            self.assertEqual(bright_ids, active_displayed_ids)
-
-            # Selecting an inactive node shows ACCENT; deselecting it
-            # restores DIM_BASE. Selecting an active node shows ACCENT;
-            # deselecting it restores BASE. Rendered directly at the
-            # FIXED simulated `now` (not via _mesh_select_node, which
-            # always uses real wall-clock time()) so is_node_active()
-            # evaluates against the same timestamp as the setup above.
-            inactive_id = next(iter(set(displayed_ids) - active_displayed_ids))
-            active_id = next(iter(active_displayed_ids))
-            for node_id, restored in ((inactive_id, palette.dim_base), (active_id, palette.base)):
-                view.select_node(node_id)
-                view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=now)
-                await pilot.pause()
-                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
-                self.assertEqual(
-                    widget.render().spans[0].style.foreground, Color.parse(palette.accent)
-                )
-                view.select_node(app.radio.info.node_id)
-                view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=now)
-                await pilot.pause()
-                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
-                self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(restored))
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn(f"MESH ({DEFAULT_MAX_REMOTE_NODES})", tab_bar)
 
     async def test_activity_styling_refreshes_without_leaving_mesh_tab(self) -> None:
         """The user should not have to leave/re-enter MESH for active
@@ -2381,7 +2348,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=heard_at + 10)
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
-            self.assertEqual(str(app.query_one("#mesh-title").render()), "> MESH · ACTIVE 1")
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
             self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(palette.base))
 
@@ -2390,12 +2357,503 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=heard_at + ACTIVE_WINDOW_SECONDS + 50)
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
-            self.assertEqual(str(app.query_one("#mesh-title").render()), "> MESH · ACTIVE 0")
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
             self.assertEqual(
                 widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
             self.assertEqual(app.radio.sent_messages, ())
+
+    # ---- UI consolidation: [3] MESH (N) replaces the internal header ---
+
+    async def test_mesh_internal_view_no_longer_shows_active_status_text(
+        self,
+    ) -> None:
+        """The in-view "> MESH · ACTIVE N" heading is gone entirely --
+
+        the count now lives only in the top-nav tab label. The
+        topology board and the bottom-left selected-node context line
+        are unaffected.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            node_id = "!ac71ve01"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(node_id, "Active", last_heard=now - 5),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Active",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertEqual(list(app.query("#mesh-title")), [])
+            status_text = str(app.query_one("#mesh-status").render())
+            context_text = str(app.query_one("#mesh-context-status").render())
+            for text in (status_text, context_text):
+                self.assertNotIn("ACTIVE", text)
+                self.assertNotIn("> MESH", text)
+            # The board and bottom-left context are untouched.
+            self.assertIsNotNone(app.query_one(MeshTopologyView))
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertIsNotNone(widget)
+
+    async def test_mesh_shows_shared_status_while_connecting(self) -> None:
+        """MESH's top status must use the exact same normalized value
+
+        CONNECTION/CONFIG and CHAT use -- never MESH-specific wording
+        like the old "NO MESH DATA -- RADIO DISCONNECTED".
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+
+            status_widget = app.query_one("#mesh-connection-status")
+            self.assertTrue(status_widget.display)
+            text = str(status_widget.render())
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", text)
+            self.assertNotIn("RADIO DISCONNECTED", text)
+            self.assertNotIn("RECONNECTING", text)
+
+    async def test_mesh_connection_status_disappears_once_connected(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            for _ in range(5):
+                await pilot.pause()
+                if app._radio_state is RadioState.ONLINE:
+                    break
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+
+            status_widget = app.query_one("#mesh-connection-status")
+            self.assertFalse(status_widget.display)
+            self.assertEqual(str(status_widget.render()), "")
+
+    async def test_mesh_topology_not_rebuilt_by_connection_status_change(
+        self,
+    ) -> None:
+        """Stale topology intentionally remains visible during a
+
+        connection drop -- only the shared top status communicates
+        "not live right now"; the board itself must not be cleared or
+        rebuilt by the status change alone.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            node_id = "!sta1e001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(node_id, "Stale", last_heard=now - 5),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Stale",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.working_set), 2)
+            before_positions = dict(view.base_positions)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertEqual(app.current_tab, "mesh")
+            status_widget = app.query_one("#mesh-connection-status")
+            self.assertTrue(status_widget.display)
+            self.assertEqual(len(view.working_set), 2)
+            self.assertEqual(dict(view.base_positions), before_positions)
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertIsNotNone(widget)
+
+    async def test_mesh_tab_shows_zero_when_no_active_displayed_remote_nodes(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            node_id = "!1nact1ve"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(
+                    node_id, "Stale", last_heard=now - ACTIVE_WINDOW_SECONDS - 100
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Stale",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+
+    async def test_mesh_tab_shows_two_when_two_displayed_real_nodes_are_active(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            active_ids = ["!act1ve01", "!act1ve02"]
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(active_ids[0], "A1", last_heard=now - 5),
+                NodeMetadata(active_ids[1], "A2", last_heard=now - 5),
+            )
+            for index, node_id in enumerate(active_ids):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=f"A{index + 1}",
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_800_000 + index,
+                        radio_rx_at=now - index,
+                    )
+                )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("MESH (2)", str(app.query_one("#tab-bar").render()))
+
+    async def test_anonymous_relay_placeholders_do_not_affect_tab_count(self) -> None:
+        """A distant CLIENT generates anonymous relay-stage placeholders
+
+        along its path to YOU -- those placeholders must never be
+        counted, only the real, active CLIENT itself.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            distant_id = "!d1stant1"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    distant_id,
+                    "Distant",
+                    "DIST",
+                    2,
+                    last_heard=now - 5,
+                    position=north_of_local(20),
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=distant_id,
+                    sender_long_name="Distant",
+                    sender_short_name="DIST",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertGreaterEqual(len(view.relay_stages), 1)
+            # Exactly one real, active remote node -- the relay stage(s)
+            # it generated along the way must not inflate the count.
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+
+    async def test_you_does_not_count_toward_tab_count(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            # YOU given a suspiciously recent last_heard -- if the
+            # predicate ever forgot to exclude is_local, this would
+            # wrongly count as 1.
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True, last_heard=now - 1),
+            )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+
+    async def test_mesh_tab_count_updates_without_leaving_or_reentering_mesh(
+        self,
+    ) -> None:
+        """Same guarantee as test_activity_styling_refreshes_without_
+
+        leaving_mesh_tab, but observed from a DIFFERENT tab -- the count
+        must update via the same periodic refresh even while MESH isn't
+        the visible tab, and must never force a topology rebuild to do
+        it (see _mesh_active_count's docstring).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            node_id = "!crossing"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(node_id, "Crosser", last_heard=now),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Crosser",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=now,
+                )
+            )
+            app.show_tab("connection")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+
+            app._refresh_chat_timestamps(wall_now=now)
+            await pilot.pause()
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+
+            app._refresh_chat_timestamps(wall_now=now + ACTIVE_WINDOW_SECONDS + 50)
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertEqual(app.radio.sent_messages, ())
+
+    # ---- Screenshot regression: relay count vs line-bend count ----------
+
+    @staticmethod
+    def _client_chain_points(view, you_id, remote_id):
+        stages = sorted(
+            (stage for stage in view.relay_stages if stage.source_node_id == remote_id),
+            key=lambda stage: stage.index,
+        )
+        node_ids = [you_id, *(stage.node_id for stage in stages), remote_id]
+        return tuple(_mesh_grid_pixel(*view.base_positions[node_id]) for node_id in node_ids)
+
+    @classmethod
+    def _count_bends(cls, view, you_id, remote_id):
+        chain_points = cls._client_chain_points(view, you_id, remote_id)
+        elbow_glyphs = {"┐", "┘", "┌", "└"}
+        return sum(1 for _x, _y, glyph in route_chain(chain_points) if glyph in elbow_glyphs)
+
+    async def _diagnose_topology(self, app, pilot, *, clients, now):
+        """Build the given {node_id: (name, hops_away)} clients NE/around
+
+        YOU, refresh MESH, and return a per-client diagnostic dict of
+        {node_id: {hops_away, relay_count, bend_count}} -- exactly the
+        report requested to distinguish (A) wrong hop-count
+        interpretation, (B) duplicated relays, (C) waypoints rendered
+        as relays, or (D) something else, before any fix is written.
+        """
+        you_id = app.radio.info.node_id
+        nodes = [NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)]
+        for node_id, (name, hops, position) in clients.items():
+            nodes.append(
+                NodeMetadata(
+                    node_id, name, name[:4].upper(), hops, last_heard=now - 5, position=position
+                )
+            )
+        app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+        for index, (node_id, (name, _hops, _position)) in enumerate(clients.items()):
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name=name,
+                    sender_short_name=name[:4].upper(),
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=9_900_000 + index,
+                    radio_rx_at=now - index,
+                )
+            )
+        await self._open_mesh(pilot)
+        app._refresh_mesh(wall_now=now)
+        await pilot.pause()
+
+        view = app.query_one(MeshTopologyView)
+        report = {}
+        for node_id, (_name, hops, _position) in clients.items():
+            relay_count = sum(
+                1 for stage in view.relay_stages if stage.source_node_id == node_id
+            )
+            bend_count = self._count_bends(view, you_id, node_id)
+            report[node_id] = {
+                "hops_away": hops,
+                "relay_count": relay_count,
+                "bend_count": bend_count,
+            }
+            print(
+                f"[MESH DIAGNOSTIC] node={node_id} hops_away={hops} "
+                f"synthetic_relays={relay_count} line_waypoints(bends)={bend_count}"
+            )
+        return report
+
+    async def test_relay_count_is_determined_only_by_hop_count_not_by_line_bends(
+        self,
+    ) -> None:
+        """Screenshot regression: a chain of many anonymous relay circles
+
+        must only ever appear if the client's own reported hop count is
+        genuinely that large -- never as a side effect of how many
+        orthogonal bends its connector line happens to need. Two
+        topologies with the IDENTICAL client/hop-count set, one client
+        positioned to produce few line bends and the other positioned
+        (northeast, off-axis) to force several, must report the exact
+        same relay count per client -- geometry must never manufacture
+        topology.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            few_bends_clients = {
+                "!ax1a1000": ("AxisA", 2, north_of_local(6)),
+                "!ax1b2000": ("AxisB", 1, GeoPosition(0.0, 6 / 69.0)),
+            }
+            report_few_bends = await self._diagnose_topology(
+                app, pilot, clients=few_bends_clients, now=now
+            )
+            self.assertGreaterEqual(
+                sum(info["bend_count"] for info in report_few_bends.values()), 0
+            )
+
+        app2 = self._make_app()
+        async with app2.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            # Same node IDs, same hop counts -- but off-axis (northeast)
+            # positions, which force the orthogonal router to take
+            # several elbow turns per segment instead of a straight run.
+            many_bends_clients = {
+                "!ax1a1000": ("AxisA", 2, GeoPosition(6 / 69.0, 6 / 69.0)),
+                "!ax1b2000": ("AxisB", 1, GeoPosition(4 / 69.0, 7 / 69.0)),
+            }
+            report_many_bends = await self._diagnose_topology(
+                app2, pilot, clients=many_bends_clients, now=now
+            )
+
+        for node_id in few_bends_clients:
+            with self.subTest(node_id=node_id):
+                few = report_few_bends[node_id]
+                many = report_many_bends[node_id]
+                self.assertEqual(few["hops_away"], many["hops_away"])
+                self.assertEqual(
+                    few["relay_count"],
+                    few["hops_away"],
+                    "relay count must equal hop count exactly",
+                )
+                self.assertEqual(
+                    many["relay_count"],
+                    many["hops_away"],
+                    "relay count must equal hop count exactly regardless of bends",
+                )
+                self.assertEqual(
+                    few["relay_count"],
+                    many["relay_count"],
+                    "changing the number of line bends must not change the relay count",
+                )
+
+    async def test_northeast_client_many_bends_still_matches_hop_count_exactly(
+        self,
+    ) -> None:
+        """The exact screenshot shape: YOU, several real clients, one
+
+        positioned northeast, orthogonally routed with several bends.
+        Logs the full diagnostic report and asserts every displayed
+        client's relay count is determined solely by its own hop count.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            clients = {
+                "!ne000001": ("Northeast5", 3, GeoPosition(6 / 69.0, 9 / 69.0)),
+                "!n0000002": ("North2", 1, north_of_local(5)),
+                "!e0000003": ("East3", 2, GeoPosition(0.0, 8 / 69.0)),
+                "!d0000004": ("Direct4", 0, GeoPosition(-3 / 69.0, 2 / 69.0)),
+            }
+            report = await self._diagnose_topology(app, pilot, clients=clients, now=now)
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                len(view.relay_stages),
+                sum(hops for _name, hops, _position in clients.values()),
+            )
+            for node_id, (_name, hops, _position) in clients.items():
+                with self.subTest(node_id=node_id):
+                    self.assertEqual(report[node_id]["relay_count"], hops)
+                    # Every relay for this client is a genuine RelayStage,
+                    # never a raw line-waypoint glyph: relay circles are
+                    # mounted MeshRelayWidgets with this client's own
+                    # node_id baked in, entirely independent of however
+                    # many background connector-line cells were drawn.
+                    relay_ids = {
+                        stage.node_id
+                        for stage in view.relay_stages
+                        if stage.source_node_id == node_id
+                    }
+                    self.assertEqual(len(relay_ids), hops)
+                    mounted = {
+                        widget.node_id
+                        for widget in app.query(MeshRelayWidget)
+                        if widget.node_id in relay_ids
+                    }
+                    self.assertEqual(mounted, relay_ids)
 
     # ---- Expanded selected-node context (spec section 21-27) -----------
 
@@ -2688,6 +3146,309 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
             app._refresh_mesh(wall_now=1_700_000_100.0)
             await pilot.pause()
+
+
+class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """MESH's board must consume the same fresh NodeDB state driving
+
+    [3] MESH (N) -- count and board are computed from ONE shared
+    working-set snapshot per refresh (see app._refresh_mesh), and
+    admission is NodeDB-first (see build_mesh_working_set): a real node
+    the radio has passively heard from is a candidate whether or not it
+    has ever sent a CHAT message.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    def _mounted_ids(self, app: MeshtasticPassApp) -> set[str]:
+        return {w.node_id for w in app.query(MeshNodeWidget)}
+
+    async def test_count_and_board_agree_when_previously_unknown_nodes_go_active(
+        self,
+    ) -> None:
+        """The exact reported mismatch: [3] MESH (N) must never change
+
+        without the board changing too. Start with zero known remote
+        nodes (count 0, empty board); mutate the underlying RadioService
+        as real hardware would (two nodes newly heard); a normal refresh
+        (no tab switch, no reconnect) must bring both the count AND the
+        board into agreement, with no stale snapshot left mounted.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local_only = (NodeMetadata(app.radio.info.node_id, is_local=True),)
+            app.radio.get_known_nodes = lambda: local_only
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertEqual(
+                {state.node.node_id for state in view.working_set if not state.node.is_local},
+                set(),
+            )
+
+            fresh_nodes = local_only + (
+                NodeMetadata("!fresh001", "Fresh One", last_heard=now - 5),
+                NodeMetadata("!fresh002", "Fresh Two", last_heard=now - 5),
+            )
+            app.radio.get_known_nodes = lambda: fresh_nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn("MESH (2)", tab_bar)
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertEqual(remote_ids, {"!fresh001", "!fresh002"})
+            self.assertEqual(self._mounted_ids(app), {n.node_id for n in fresh_nodes})
+            palette = THEME_PALETTES[app._current_theme]
+            for node_id in ("!fresh001", "!fresh002"):
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(
+                    widget.render().spans[0].style.foreground, Color.parse(palette.base)
+                )
+
+    async def test_new_nodedb_node_appears_without_any_chat_history(self) -> None:
+        """A brand-new node the radio starts hearing mid-session appears
+
+        on refresh with no TEXT_MESSAGE_APP required -- NodeDB-first
+        admission, not CHAT-history admission (see
+        build_mesh_working_set).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            a = NodeMetadata("!aaaaaaaa", "Node A", last_heard=stale_last_heard)
+            b = NodeMetadata("!bbbbbbbb", "Node B", last_heard=stale_last_heard)
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            app.radio.get_known_nodes = lambda: (local, a, b)
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertNotIn(
+                "!cccccccc",
+                {state.node.node_id for state in view.working_set},
+            )
+
+            c = NodeMetadata("!cccccccc", "Node C", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda: (local, a, b, c)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertIn("!cccccccc", remote_ids)
+            self.assertIn("!cccccccc", self._mounted_ids(app))
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            c_state = next(
+                state for state in view.working_set if state.node.node_id == "!cccccccc"
+            )
+            self.assertFalse(c_state.is_client)
+
+    async def test_live_hops_away_change_updates_relay_stage_count(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            far = NodeMetadata("!far00001", "Far Node", hops_away=1, last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, far): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                len(
+                    [
+                        s
+                        for s in view.relay_stages
+                        if s.node_id.startswith("relay:!far00001:")
+                    ]
+                ),
+                1,
+            )
+
+            far_now_3_hops = NodeMetadata(
+                "!far00001", "Far Node", hops_away=3, last_heard=now - 4
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_now_3_hops): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(
+                len(
+                    [
+                        s
+                        for s in view.relay_stages
+                        if s.node_id.startswith("relay:!far00001:")
+                    ]
+                ),
+                3,
+            )
+
+    async def test_live_position_change_updates_placement(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            position_a = GeoPosition(10.0, 10.0)
+            moving = NodeMetadata(
+                "!move0001", "Mover", hops_away=1, last_heard=now - 5, position=position_a
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, moving): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            position_before = view.base_positions["!move0001"]
+
+            position_b = GeoPosition(-40.0, 130.0)
+            moved = NodeMetadata(
+                "!move0001", "Mover", hops_away=1, last_heard=now - 4, position=position_b
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, moved): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            position_after = view.base_positions["!move0001"]
+            self.assertNotEqual(position_before, position_after)
+
+    async def test_live_last_heard_transition_updates_color_and_count(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            crosser = NodeMetadata("!cross001", "Crosser", last_heard=stale_last_heard)
+            app.radio.get_known_nodes = lambda nodes=(local, crosser): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!cross001")
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+
+            fresh_crosser = NodeMetadata("!cross001", "Crosser", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, fresh_crosser): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!cross001")
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+
+
+class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
+    """The shared #mesh-connection-status widget's fallback priority:
+
+    connection status text first, then "LAST UPDATE <age>" once ONLINE
+    but stale, else nothing -- see app._update_mesh_status_line.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _mesh_status_text(self, app: MeshtasticPassApp) -> str:
+        from textual.widgets import Static
+
+        return str(app.query_one("#mesh-connection-status", Static).render())
+
+    async def test_stale_board_shows_last_update_age(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            stale = NodeMetadata(
+                "!stale001", "Stale", last_heard=now - ACTIVE_WINDOW_SECONDS - 3 * 60
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            text = await self._mesh_status_text(app)
+            self.assertIn("LAST UPDATE", text)
+            self.assertIn("8m", text)
+
+    async def test_fresh_board_hides_last_update_indicator(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            fresh = NodeMetadata("!fresh999", "Fresh", last_heard=now - 5)
+            app.radio.get_known_nodes = lambda nodes=(local, fresh): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            text = await self._mesh_status_text(app)
+            self.assertNotIn("LAST UPDATE", text)
+            self.assertEqual(text, "")
+            self.assertFalse(app.query_one("#mesh-connection-status").display)
+
+    async def test_connecting_status_overrides_stale_last_update(self) -> None:
+        """While CONNECTING/RECONNECTING, the shared connection-status
+
+        text always wins over "LAST UPDATE" -- see
+        _update_mesh_status_line's priority order.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            stale = NodeMetadata(
+                "!stale002", "Stale", last_heard=now - ACTIVE_WINDOW_SECONDS - 100
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            text = await self._mesh_status_text(app)
+            self.assertIn("LAST UPDATE", text)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            text = await self._mesh_status_text(app)
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", text)
+            self.assertNotIn("LAST UPDATE", text)
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):

@@ -80,6 +80,8 @@ from radio_service import (
     ReceivedMessage,
     SendStatus,
     SentMessage,
+    rx_debug_enabled,
+    rx_debug_log,
     validate_long_name,
     validate_short_name,
 )
@@ -1693,7 +1695,7 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
-    #mesh-title, #mesh-status, #mesh-context-status {
+    #mesh-status, #mesh-context-status {
         height: 1;
     }
 
@@ -2112,16 +2114,14 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
             with Vertical(id="mesh", classes="tab-page"):
-                yield Static(
-                    "> MESH · ACTIVE —",
-                    id="mesh-title",
-                    classes="page-title",
-                )
-                yield Static(
-                    "NO MESH DATA — RADIO DISCONNECTED",
-                    id="mesh-status",
-                    markup=False,
-                )
+                # Shown/hidden and populated by _update_chat_connection_state()
+                # with the exact same _connection_status_text() CHAT's
+                # heading uses -- never MESH-specific terminology. Not the
+                # removed permanent "> MESH · ACTIVE N" heading: this
+                # exists ONLY while a connection state needs to be
+                # communicated, and collapses to nothing otherwise.
+                yield Static(id="mesh-connection-status", classes="page-title", markup=False)
+                yield Static(id="mesh-status", markup=False)
                 yield MeshTopologyView()
                 yield Static(id="mesh-context-status", markup=False)
         yield Static("1-3 switch tabs    F4 quit", id="footer")
@@ -2678,7 +2678,13 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
-        self._refresh_mesh()
+        try:
+            self._refresh_mesh()
+        except Exception:
+            # A passive-topology refresh problem must never be able to
+            # silently swallow a legitimate incoming CHAT message --
+            # persistence below still has to run regardless.
+            pass
         channel_index = message.channel_index or 0
         state = self._ensure_channel_loaded(channel_index)
         app_received_at = time()
@@ -2695,7 +2701,19 @@ class MeshtasticPassApp(App[None]):
             is_new=True,
         )
         self._assign_arrival_order(entry)
-        if not self._persist_incoming(entry):
+        inserted = self._persist_incoming(entry)
+        if rx_debug_enabled():
+            if entry.message_id is not None:
+                rx_debug_log(
+                    f"CHAT STORE id={entry.message_id} channel={channel_index} "
+                    + ("inserted" if inserted else "duplicate, ignored")
+                )
+            else:
+                rx_debug_log(
+                    f"CHAT STORE not persisted channel={channel_index} "
+                    "reason=no_chat_store_attached"
+                )
+        if not inserted:
             return
         tail_key = state.entries[-1].order_key if state.entries else None
         is_older = (
@@ -2717,10 +2735,12 @@ class MeshtasticPassApp(App[None]):
             state.new_message_ids.add(entry.message_id)
             if not chat_is_visible:
                 state.unread_message_ids.add(entry.message_id)
+        delivered_to_ui = False
         if not outside_mounted_window:
             state.entries.insert(insert_index, entry)
             if channel_index == self.current_channel_index:
                 self._insert_chat_widget(entry, insert_index, older=is_older)
+                delivered_to_ui = True
         else:
             state.has_older_history = True
             if channel_index == self.current_channel_index:
@@ -2729,13 +2749,26 @@ class MeshtasticPassApp(App[None]):
                     self.query_one("#chat-log", ChatTranscript)
                 )
                 self._capture_current_channel_state()
+        if rx_debug_enabled():
+            if delivered_to_ui:
+                rx_debug_log(f"CHAT UI id={entry.message_id} delivered")
+            elif channel_index != self.current_channel_index:
+                rx_debug_log(
+                    f"CHAT UI id={entry.message_id} not displayed "
+                    f"reason=current_channel={self.current_channel_index}"
+                    f",message_channel={channel_index}"
+                )
+            else:
+                rx_debug_log(
+                    f"CHAT UI id={entry.message_id} not displayed "
+                    "reason=outside_mounted_history_window"
+                )
         if is_older:
             self._show_older_message_notice(channel_index, entry)
         if not chat_is_visible:
             state.unread_count += 1
             self._recount_unread()
-            self._update_tab_bar()
-        self._render_chat_heading()
+        self._update_tab_bar()
 
     def _assign_arrival_order(self, entry: ChatEntry) -> None:
         self._arrival_sequence += 1
@@ -2823,7 +2856,6 @@ class MeshtasticPassApp(App[None]):
         selector = self.query_one(ChannelSelector)
         selector.value = channel_index
         selector.close_menu()
-        self._render_chat_heading()
         self._update_tab_bar()
         self._update_transcript_indicator()
         self.call_after_refresh(self._jump_to_newest)
@@ -2963,24 +2995,7 @@ class MeshtasticPassApp(App[None]):
         current_time = monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
-        self._render_chat_heading(wall_now)
         self._refresh_mesh(wall_now)
-
-    def _render_chat_heading(self, wall_now: float | None = None) -> None:
-        selectors = list(self.query(ChannelSelector))
-        if not selectors:
-            # A final timer tick may race with Textual dismantling the screen.
-            return
-        active: int | None = None
-        if self._radio_state is RadioState.ONLINE:
-            counter = getattr(self.radio, "active_node_count", None)
-            if callable(counter):
-                try:
-                    active = counter(now=time() if wall_now is None else wall_now)
-                except Exception:
-                    active = None
-        value = "—" if active is None else str(active)
-        selectors[0].set_suffix(f"· ACTIVE {value}")
 
     def _mesh_last_message_activity(self) -> dict[str, float]:
         """Most recent trustworthy incoming-message timestamp per node.
@@ -3022,24 +3037,27 @@ class MeshtasticPassApp(App[None]):
                     activity[key] = timestamp
         return activity
 
-    def _refresh_mesh(self, wall_now: float | None = None) -> None:
-        """Refresh passive topology data without causing Meshtastic traffic."""
-        views = list(self.query(MeshTopologyView))
-        titles = list(self.query("#mesh-title"))
-        statuses = list(self.query("#mesh-status"))
-        if not views or not titles or not statuses:
-            return
-        if self.current_tab != "mesh":
-            return
-        view = views[0]
-        title = titles[0]
-        status = statuses[0]
+    def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
+        """Build MESH's displayed real-node set without touching the board.
+
+        The single place that turns known nodes + CHAT activity into
+        MESH's displayed working set. NodeDB-first: `RadioService.
+        get_known_nodes()` (the radio's own passively-learned node
+        database) is the primary admission source -- a node the radio
+        already knows about from passive mesh traffic is a candidate on
+        its own, no CHAT message required. `_mesh_last_message_activity()`
+        enriches a candidate already admitted (marking it CLIENT) rather
+        than gating admission; see build_mesh_working_set.
+
+        Callers that need the count and the rendered board to describe
+        the exact same moment (see _refresh_mesh) must compute this
+        ONCE per cycle and pass the SAME `wall_now` -- and ideally the
+        same resulting tuple -- to every consumer that cycle, rather
+        than calling this again and risking a second, independent read
+        of live, thread-mutable radio state.
+        """
         if self._radio_state is not RadioState.ONLINE:
-            view.clear_nodes()
-            title.update("> MESH · ACTIVE —")
-            status.update("NO MESH DATA — RADIO DISCONNECTED")
-            self._update_mesh_context_status()
-            return
+            return ()
         getter = getattr(self.radio, "get_known_nodes", None)
         try:
             nodes = tuple(getter()) if callable(getter) else ()
@@ -3048,25 +3066,87 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = time() if wall_now is None else wall_now
-        working_set = build_mesh_working_set(
-            nodes, last_message_at=self._mesh_last_message_activity()
+        return build_mesh_working_set(
+            nodes,
+            now=current_time,
+            last_message_at=self._mesh_last_message_activity(),
+            favorite_ids=self.settings.favorite_node_ids,
         )
-        # ACTIVE describes the real remote nodes CURRENTLY DISPLAYED on
-        # this MESH view -- the same bounded working set rendered below,
-        # not the full known-node population (which may include nodes
-        # this view never shows at all, e.g. passively heard but never a
-        # CLIENT). Uses the EXACT SAME predicate (is_node_active) that
-        # _mesh_node_color() uses for each node's own BASE/DIM_BASE
-        # styling, so the header and the board can never disagree about
-        # which/how many displayed nodes are active. Anonymous relay
-        # stages are never part of `working_set` and so never affect
-        # this count either way (see mesh_topology.RelayStage).
-        active = sum(
+
+    def _mesh_active_count(
+        self,
+        wall_now: float | None = None,
+        working_set: tuple[MeshNodeState, ...] | None = None,
+    ) -> int:
+        """Authoritative count of active REAL remote nodes MESH displays.
+
+        Describes the real remote nodes CURRENTLY DISPLAYED on MESH --
+        the same bounded working set the board renders, not the full
+        known-node population (which may include nodes MESH never shows
+        at all). Uses the EXACT SAME predicate (is_node_active) that
+        _mesh_node_color() uses for each node's own BASE/DIM_BASE
+        styling, so the [3] MESH (N) tab label and the board can never
+        disagree about which/how many displayed nodes are active.
+        Anonymous relay stages are never part of the working set and so
+        never affect this count either way (see mesh_topology.
+        RelayStage); YOU is excluded via is_local.
+
+        `working_set`, when supplied by a caller that already computed
+        one this cycle (see _refresh_mesh), is used as-is instead of
+        triggering a second independent _mesh_working_set() read of live
+        radio state -- this is what keeps the count and the rendered
+        board from ever describing two different snapshots. Safe to
+        call regardless of the current tab -- unlike _refresh_mesh(),
+        this never touches the topology board/widget, only computes a
+        number, so refreshing it periodically (see
+        _refresh_chat_timestamps) to catch a node aging out while MESH
+        isn't even the visible tab can never "reshuffle" anything.
+        """
+        current_time = time() if wall_now is None else wall_now
+        if working_set is None:
+            working_set = self._mesh_working_set(current_time)
+        return sum(
             1
             for state in working_set
             if not state.node.is_local and is_node_active(state.node.last_heard, current_time)
         )
-        title.update(f"> MESH · ACTIVE {active}")
+
+    def _refresh_mesh(self, wall_now: float | None = None) -> None:
+        """Refresh passive topology data without causing Meshtastic traffic."""
+        current_time = time() if wall_now is None else wall_now
+        # Computed exactly ONCE per cycle and threaded into every
+        # consumer below -- the count ([3] MESH (N), via _update_tab_bar)
+        # and the rendered board must describe the SAME snapshot of live
+        # NodeDB state, never two independent reads of it (that mismatch
+        # -- count updating live while the board stayed visually stale
+        # -- was the exact bug this closes).
+        working_set = self._mesh_working_set(current_time)
+        # [3] MESH (N) must stay live wherever _refresh_mesh() is called
+        # from, regardless of whether MESH is the tab currently showing
+        # (see _mesh_active_count -- it never touches the board/widget,
+        # so this can never "reshuffle" the topology).
+        self._update_tab_bar(current_time, mesh_working_set=working_set)
+        self._update_mesh_status_line(working_set, current_time)
+        views = list(self.query(MeshTopologyView))
+        statuses = list(self.query("#mesh-status"))
+        if not views or not statuses:
+            return
+        if self.current_tab != "mesh":
+            return
+        if self._radio_state is not RadioState.ONLINE:
+            # Stale topology intentionally stays visible while
+            # connecting/reconnecting -- the shared top-of-view
+            # connection status (see _update_chat_connection_state/
+            # _connection_status_text) already communicates "not live
+            # right now"; clearing or rebuilding the board here would be
+            # a needless reshuffle of useful stale data over a
+            # connection-status change alone. Never MESH-specific
+            # wording like the old "RADIO DISCONNECTED" either -- that
+            # was exactly the kind of independent reinterpretation this
+            # is meant to eliminate.
+            return
+        view = views[0]
+        status = statuses[0]
         if not working_set:
             view.clear_nodes()
             status.update("NO MESH DATA")
@@ -3900,33 +3980,122 @@ class MeshtasticPassApp(App[None]):
         identity_status.update("")
         self._render_connection_details()
         self._render_identity(force_value=True)
-        self._render_chat_heading()
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
 
-    def _update_chat_connection_state(self) -> None:
-        """Disable CHAT message entry/sending while the radio isn't ONLINE.
+    def _connection_status_text(self) -> str:
+        """The single authoritative connection-status line CHAT and MESH
 
-        Purely observational: reacts to the already-authoritative
-        self._radio_state (see _show_connection) and never triggers a
-        new connection attempt or any other radio traffic on its own.
-        The input's own `.value` (the draft) is never touched here --
-        Textual's `disabled` only affects focus/interaction, so a draft
-        typed before a drop survives completely untouched and is
-        exactly what the user sees once connection is restored.
+        show at the top of their view while the radio isn't ONLINE.
+
+        Built from the EXACT SAME ANIMATED_STATUS mapping and
+        _status_dot_count animation counter CONNECTION/CONFIG's own
+        status row already uses (see _render_connection_details) --
+        never a tab-specific reinterpretation. This is why CHAT could
+        previously show "RECONNECTING..." while CONNECTION/CONFIG showed
+        "CONNECTING...": CHAT's old _render_chat_status() hardcoded its
+        own literal string instead of reading this shared value. There
+        is no separate RECONNECTING state in RadioState -- a dropped
+        connection re-enters RadioState.CONNECTING exactly like the
+        first attempt (see radio_service.connection_events()), so both
+        report identically here too. Returns "" when ONLINE (nothing to
+        show; callers should hide/restore their normal presentation).
         """
-        widgets = list(self.query("#chat-input"))
+        if self._radio_state is RadioState.ONLINE:
+            return ""
+        return f"STATUS {ANIMATED_STATUS[self._radio_state]}" + "." * self._status_dot_count
+
+    def _update_chat_connection_state(self) -> None:
+        """Keep CHAT's connection-status presentation in sync with the
+
+        authoritative self._radio_state (see _show_connection) --
+        purely observational, never triggers a new connection attempt
+        or any other radio traffic on its own.
+
+        Disables CHAT message entry/sending while the radio isn't
+        ONLINE (Textual's `disabled` only affects focus/interaction, so
+        a draft typed before a drop survives completely untouched and
+        is exactly what the user sees once connection is restored).
+        Also overrides CHAT's channel heading, and -- while the radio
+        isn't ONLINE -- writes that exact same text to MESH's own status
+        line (#mesh-connection-status) in this SAME call, so the two can
+        never show different animation-dot phases (see
+        _advance_connection_animation, which calls this on a fixed
+        ~0.45s cadence). Once ONLINE (status_text == ""), this leaves
+        that widget untouched -- _update_mesh_status_line (called from
+        _refresh_mesh) becomes the writer for the "LAST UPDATE" fallback
+        instead. The two never fight over ownership: this function only
+        ever writes while NOT ONLINE, that one only ever writes while
+        ONLINE.
+        """
+        status_text = self._connection_status_text()
+
+        chat_inputs = list(self.query("#chat-input"))
+        if chat_inputs:
+            chat_inputs[0].disabled = self._radio_state is not RadioState.ONLINE
+        self._render_chat_status()
+
+        selectors = list(self.query(ChannelSelector))
+        if selectors:
+            selectors[0].set_status_override(status_text or None)
+
+        if status_text:
+            mesh_status_widgets = list(self.query("#mesh-connection-status"))
+            if mesh_status_widgets:
+                widget = mesh_status_widgets[0]
+                widget.update(status_text)
+                widget.display = True
+
+    def _update_mesh_status_line(
+        self, working_set: tuple[MeshNodeState, ...], now: float
+    ) -> None:
+        """The ONLINE half of #mesh-connection-status: "LAST UPDATE <age>"
+
+        when the working set has no currently-active remote node
+        (is_node_active, the same predicate the board and [3] MESH (N)
+        use) -- so a genuinely stale board still communicates its own
+        age instead of quietly looking current -- otherwise nothing. The
+        age comes from the most recent NodeDB last_heard among the
+        working set's remote nodes -- never derived from CHAT history
+        (see build_mesh_working_set; CHAT is enrichment, not the timing
+        source of record here).
+
+        Never touches the widget while the radio isn't ONLINE --
+        _update_chat_connection_state() owns it then, on its own fixed
+        animation cadence, so it can stay byte-for-byte in sync with
+        CHAT's own status line; recomputing here too, on _refresh_mesh's
+        different cadence, previously let the two drift out of phase by
+        a dot.
+        """
+        if self._radio_state is not RadioState.ONLINE:
+            return
+        widgets = list(self.query("#mesh-connection-status"))
         if not widgets:
             return
-        widgets[0].disabled = self._radio_state is not RadioState.ONLINE
-        self._render_chat_status()
+        widget = widgets[0]
+        text = ""
+        remote_last_heard = [
+            state.node.last_heard
+            for state in working_set
+            if not state.node.is_local and state.node.last_heard is not None
+        ]
+        has_active = any(
+            is_node_active(last_heard, now) for last_heard in remote_last_heard
+        )
+        if remote_last_heard and not has_active:
+            age = now - max(remote_last_heard)
+            if age >= 0:
+                text = f"LAST UPDATE {format_relative_age(age)}"
+        widget.update(text)
+        widget.display = bool(text)
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:
             return
         self._status_dot_count = self._status_dot_count % 3 + 1
         self._render_connection_details()
+        self._update_chat_connection_state()
 
     def _render_connection_details(self) -> None:
         statuses = list(self.query("#connection-status"))
@@ -4054,19 +4223,19 @@ class MeshtasticPassApp(App[None]):
         self._render_chat_status()
 
     def _render_chat_status(self) -> None:
+        """Send-error / older-message notice only -- connection status
+
+        lives solely in CHAT's top heading now (see
+        _update_chat_connection_state/_connection_status_text), never
+        duplicated here. Message entry is disabled while not ONLINE
+        (see _update_chat_connection_state), so this renders whatever
+        it normally would regardless of connection state -- there is
+        nothing connection-specific left for it to say.
+        """
         widgets = list(self.query("#send-error"))
         if not widgets:
             return
         widget = widgets[0]
-        if self._radio_state is not RadioState.ONLINE:
-            # Reconnecting is the most operationally important thing to
-            # tell the user here -- message entry is disabled regardless
-            # (see _update_chat_connection_state), so a stale send error
-            # or older-message notice underneath it is never actionable
-            # right now anyway.
-            widget.set_class(False, "older-message-notice")
-            widget.update("RECONNECTING…")
-            return
         state = self._state_for(self.current_channel_index)
         count = len(state.pending_older_ids)
         show_notice = not self._send_error_message and count > 0
@@ -4079,14 +4248,26 @@ class MeshtasticPassApp(App[None]):
         else:
             widget.update("")
 
-    def _update_tab_bar(self) -> None:
+    def _update_tab_bar(
+        self,
+        wall_now: float | None = None,
+        *,
+        mesh_working_set: tuple[MeshNodeState, ...] | None = None,
+    ) -> None:
+        tab_bars = list(self.query("#tab-bar"))
+        if not tab_bars:
+            # A final timer tick may race with Textual dismantling the screen.
+            return
         labels = []
         for number, (tab_id, name) in enumerate(TAB_NAMES.items(), start=1):
             if tab_id == "chat" and self.unread_count:
                 name = f"{name}({self.unread_count})"
+            elif tab_id == "mesh":
+                count = self._mesh_active_count(wall_now, working_set=mesh_working_set)
+                name = f"{name} ({count})"
             label = f"[{number}] {name}"
             labels.append(f"[reverse]{label}[/reverse]" if tab_id == self.current_tab else label)
-        self.query_one("#tab-bar", Static).update("   ".join(labels))
+        tab_bars[0].update("   ".join(labels))
 
     @staticmethod
     def _escape(value: str) -> str:
