@@ -18,7 +18,13 @@ FONT_SIZE_CHOICES = (
     ("XXL", 22),
 )
 VALID_FONT_SIZES = tuple(size for _name, size in FONT_SIZE_CHOICES)
-DEFAULT_FONT_SIZE = 13
+# XL, not MEDIUM: this is the fallback used only when no saved font_size
+# preference exists at all (missing file, unreadable file, or a file
+# with no valid font_size key) -- see AppSettings.load. An existing
+# user's already-saved SMALL/MEDIUM/LARGE/XL/XXL choice always wins,
+# since load() only ever falls back to this constant, never overwrites
+# a value found in the config file.
+DEFAULT_FONT_SIZE = 18
 COLOR_CHOICES = (
     ("WHITE", "white"),
     ("GREEN", "green"),

@@ -1105,19 +1105,25 @@ class MeshTopologyView(Container):
 
         # Connector semantics: a YOU-to-node path means "we currently
         # believe this node is active in the mesh" -- CLIENT history
-        # alone is not enough, and neither is a merely-known hop count;
-        # see _mesh_active_hop_counts. A stale node keeps its last-known
-        # position but no path back to YOU: it answers "what else does
-        # my radio remember", not "what's active right now". It is drawn
-        # through exactly that client's own anonymous relay stages
-        # (hops_away of them, in order -- see RelayStage/
-        # build_relay_stages), representing observed path DEPTH, never
-        # discovered relay identity: "Alice is 3 relay stages away",
-        # never "these are three identified radios". A `? HOPS` client
-        # gets no path at all -- any line, direct or through relay
-        # stages, would imply a specific, unverified hop depth, which is
-        # never fabricated (see the MESH spec's "UNKNOWN HOPS" / "? HOPS
-        # CONNECTORS" sections).
+        # alone is not enough; see _mesh_active_hop_counts. A stale node
+        # keeps its last-known position but no path back to YOU: it
+        # answers "what else does my radio remember", not "what's active
+        # right now". The amount of known route detail determines relay
+        # visualization, never whether a connection exists at all: a
+        # known nonzero hop count draws through exactly that many
+        # anonymous relay stages (see RelayStage/build_relay_stages),
+        # representing observed path DEPTH, never discovered relay
+        # identity ("Alice is 3 relay stages away", never "these are
+        # three identified radios"); a known zero hop count, or an
+        # UNKNOWN hop count, draws a direct line with zero relay stages
+        # -- "we know this real node is currently participating, but we
+        # do not know its intermediate route" is not the same claim as
+        # "draw an isolated active dot with no connection at all", and
+        # treating it that way previously left active nodes with unknown
+        # hops rendered with no connector whatsoever. The selected-node
+        # context line's own "? HOPS" still reports the hop count
+        # honestly (see format_mesh_context_line) -- this only concerns
+        # whether a connector renders, never fabricates a hop count.
         palette = THEME_PALETTES[theme]
         stages_by_client: dict[str, list[RelayStage]] = {}
         for stage in relay_stages:
@@ -1129,11 +1135,9 @@ class MeshTopologyView(Container):
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
-                hops = state.node.hops_away
                 if (
                     state.node.is_local
                     or remote_id not in centers
-                    or hops is None
                     or not is_node_active(state.node.last_heard, now)
                 ):
                     continue
@@ -2172,7 +2176,7 @@ class MeshtasticPassApp(App[None]):
                 yield Static("Coming in a future milestone.")
             with Vertical(id="mesh", classes="tab-page"):
                 # Shown/hidden and populated by _update_chat_connection_state()
-                # with the exact same _connection_status_text() CHAT's
+                # with the exact same _connection_status_rich_text() CHAT's
                 # heading uses -- never MESH-specific terminology. Not the
                 # removed permanent "> MESH · ACTIVE N" heading: this
                 # exists ONLY while a connection state needs to be
@@ -3251,7 +3255,7 @@ class MeshtasticPassApp(App[None]):
             # Stale topology intentionally stays visible while
             # connecting/reconnecting -- the shared top-of-view
             # connection status (see _update_chat_connection_state/
-            # _connection_status_text) already communicates "not live
+            # _connection_status_rich_text) already communicates "not live
             # right now"; clearing or rebuilding the board here would be
             # a needless reshuffle of useful stale data over a
             # connection-status change alone. Never MESH-specific
@@ -3403,10 +3407,18 @@ class MeshtasticPassApp(App[None]):
         to navigate at all (`if not targets`, also unchanged) -- e.g. a
         freshly opened, empty CHAT, satisfying "DOWN begins composing"
         (see show_tab's CHAT branch) without disturbing the ordinary
-        walk-through-messages-then-reach-composer flow a non-empty
-        transcript still uses. UP (direction < 0) from the neutral
-        post-tab-entry/post-Escape state lands on the newest visible
-        message, exactly as it always has.
+        walk-through-messages-then-reach-composer flow once focus is
+        already on a specific message.
+
+        The NEUTRAL state -- focus is on the transcript itself or
+        anything else not among `targets`, e.g. right after opening
+        CHAT or pressing Escape (see show_tab/on_key) -- is treated as
+        "positioned at the latest message" for BOTH directions, not
+        merely for UP: DOWN goes straight to the composer, the same as
+        if one more message existed past the newest and DOWN had
+        stepped past it, with no need to first walk forward through
+        every older message. UP still lands on the newest visible
+        message itself, exactly as it always has.
         """
         targets = self._chat_navigation_targets()
         if not targets:
@@ -3421,7 +3433,10 @@ class MeshtasticPassApp(App[None]):
                 return
             target = targets[max(0, min(len(targets) - 1, next_index))]
         except ValueError:
-            target = targets[-1] if direction < 0 else targets[0]
+            if direction > 0:
+                self._focus_chat_composer()
+                return
+            target = targets[-1]
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
@@ -4002,7 +4017,23 @@ class MeshtasticPassApp(App[None]):
         packet_id: int | None = None,
         detail: str = "",
     ) -> None:
+        previous_state = entry.delivery_state
         entry.delivery_state = state
+        # A manual resend (send_generation > 1) that actually,
+        # successfully re-enters the mesh moves the message to its new
+        # chronological position -- see _update_effective_transmission_
+        # time. Gated on the OLD state being SENDING specifically so
+        # this fires exactly once per resend generation, at the
+        # SENDING -> SENT/HEARD transition only: a later SENT -> HEARD
+        # acknowledgement (previous_state is already SENT here, not
+        # SENDING) never re-triggers it, and an ordinary first attempt
+        # (send_generation == 1) is never affected at all.
+        if (
+            entry.send_generation > 1
+            and previous_state is DeliveryState.SENDING
+            and state in (DeliveryState.SENT, DeliveryState.HEARD)
+        ):
+            self._update_effective_transmission_time(entry)
         if packet_id is not None:
             entry.packet_id = packet_id
         if state is not DeliveryState.SENT:
@@ -4033,6 +4064,74 @@ class MeshtasticPassApp(App[None]):
                 widget.refresh_delivery_state(self._send_dot_count)
                 break
         self._update_footer()
+
+    def _update_effective_transmission_time(self, entry: ChatEntry) -> None:
+        """Move `entry` to reflect WHEN it actually, successfully
+
+        retransmitted -- not when the user originally composed it (see
+        item 3, MANUAL RESEND SHOULD UPDATE CHAT CHRONOLOGY). Only
+        `local_sent_at` (ChatEntry.message_time/order_key's source for
+        an outgoing entry, and the persisted column of the same name)
+        changes; the message keeps its identity, message_id, and every
+        send_attempt row exactly as before -- nothing is deleted,
+        recreated, or duplicated. `created_at` (persisted separately,
+        never touched here) still truthfully answers "when was this
+        message first composed", regardless of how many attempts it
+        took to actually land.
+
+        `age_reference` is updated too so the DISPLAYED elapsed age
+        reflects the same new moment. It is never itself persisted (see
+        ChatEntry.age_reference / stored_chat_entry) -- a fresh restart
+        recomputes it correctly from the persisted local_sent_at alone,
+        so this in-memory update only matters for the current session.
+        """
+        wall_now = time()
+        entry.local_sent_at = wall_now
+        entry.age_reference = monotonic()
+        if self.chat_store is not None and entry.message_id is not None:
+            try:
+                self.chat_store.update_message_chronology(entry.message_id, wall_now)
+            except ChatStoreError as error:
+                self._show_send_error(str(error))
+        self._reposition_chat_entry(entry)
+
+    def _reposition_chat_entry(self, entry: ChatEntry) -> None:
+        """Move `entry` (and its mounted widget, if any) to the list
+
+        position its current order_key now implies, without destroying
+        or recreating the widget -- so any live selection/focus on it
+        (see Widget.move_child) survives the move exactly. Manual resend
+        is only ever offered on an already-visible, currently-mounted
+        message (see can_manual_resend/_rebroadcast's callers), so
+        `entry` is always a member of the CURRENT channel's
+        self.chat_history when this runs.
+        """
+        if entry not in self.chat_history:
+            return
+        self.chat_history.remove(entry)
+        new_index = self._insert_entry_in_order(self.chat_history, entry)
+        if self.current_tab != "chat":
+            return
+        widget = next(
+            (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
+            None,
+        )
+        if widget is None:
+            return
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        following = self._following_chat_widget(new_index)
+        if following is widget:
+            return
+        if following is not None:
+            transcript.move_child(widget, before=following)
+            return
+        others = [
+            candidate
+            for candidate in transcript.query(ChatEntryWidget)
+            if candidate is not widget
+        ]
+        if others:
+            transcript.move_child(widget, after=others[-1])
 
     def _rebroadcast(self, entry: ChatEntry) -> None:
         if not can_manual_resend(entry):
@@ -4119,28 +4218,6 @@ class MeshtasticPassApp(App[None]):
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
 
-    def _connection_status_text(self) -> str:
-        """The single authoritative connection-status line CHAT and MESH
-
-        show at the top of their view while the radio isn't ONLINE.
-
-        Built from the EXACT SAME ANIMATED_STATUS mapping and
-        _status_dot_count animation counter CONNECTION/CONFIG's own
-        status row already uses (see _render_connection_details) --
-        never a tab-specific reinterpretation. This is why CHAT could
-        previously show "RECONNECTING..." while CONNECTION/CONFIG showed
-        "CONNECTING...": CHAT's old _render_chat_status() hardcoded its
-        own literal string instead of reading this shared value. There
-        is no separate RECONNECTING state in RadioState -- a dropped
-        connection re-enters RadioState.CONNECTING exactly like the
-        first attempt (see radio_service.connection_events()), so both
-        report identically here too. Returns "" when ONLINE (nothing to
-        show; callers should hide/restore their normal presentation).
-        """
-        if self._radio_state is RadioState.ONLINE:
-            return ""
-        return f"STATUS {ANIMATED_STATUS[self._radio_state]}" + "." * self._status_dot_count
-
     def _connection_status_color(self) -> str:
         """The semantic color for the current non-ONLINE radio state --
 
@@ -4149,18 +4226,52 @@ class MeshtasticPassApp(App[None]):
         duplicating the ternary): ERROR for RadioState.ERROR, ACCENT for
         every other non-ONLINE state (CONNECTING, OFFLINE). CHAT (see
         _update_chat_connection_state) and MESH (same function, which
-        writes #mesh-connection-status) both reuse this exact value for
-        _connection_status_text(), so all three surfaces always agree on
-        what a given radio state visually means -- one authoritative
-        color decision, never three independent ones. Uses the current
-        theme's own semantic tokens (never a hardcoded literal color),
-        so it stays correct across WHITE/GREEN/ORANGE. Meaningless while
-        ONLINE; callers only use this alongside non-empty status text,
-        which _connection_status_text() only ever produces when not
-        ONLINE.
+        writes #mesh-connection-status) both reuse this exact value via
+        _connection_status_rich_text(), so all three surfaces always
+        agree on what a given radio state visually means -- one
+        authoritative color decision, never three independent ones.
+        Uses the current theme's own semantic tokens (never a hardcoded
+        literal color), so it stays correct across WHITE/GREEN/ORANGE.
+        Meaningless while ONLINE; callers only use this alongside
+        non-empty status text, which _connection_status_rich_text()
+        only ever produces when not ONLINE.
         """
         palette = THEME_PALETTES[self._current_theme]
         return palette.error if self._radio_state is RadioState.ERROR else palette.accent
+
+    def _connection_status_rich_text(self) -> Text | None:
+        """The single authoritative connection-status line CHAT and MESH
+
+        show at the top of their view while the radio isn't ONLINE, styled
+        component-level: the "STATUS" word in BASE, the animated state
+        word (CONNECTING..., OFFLINE -- RETRYING..., ...) in its own
+        semantic color from _connection_status_color() -- the same
+        label-in-BASE/value-in-its-own-style grammar
+        _render_connection_details() already uses for CONNECTION/
+        CONFIG's own status row, reused verbatim here so CHAT's heading
+        and MESH's status line always agree with it at the SPAN level,
+        not merely "some color somewhere in the string" (see
+        _update_chat_connection_state, this function's only caller).
+        Built from the EXACT SAME ANIMATED_STATUS mapping and
+        _status_dot_count animation counter CONNECTION/CONFIG's own
+        status row already uses -- never a tab-specific reinterpretation.
+        There is no separate RECONNECTING state in RadioState -- a
+        dropped connection re-enters RadioState.CONNECTING exactly like
+        the first attempt (see radio_service.connection_events()), so
+        both report identically here too. Returns None when ONLINE
+        (nothing to show; callers should hide/restore their normal
+        presentation).
+        """
+        if self._radio_state is RadioState.ONLINE:
+            return None
+        palette = THEME_PALETTES[self._current_theme]
+        text = Text()
+        text.append("STATUS ", style=palette.base)
+        text.append(
+            ANIMATED_STATUS[self._radio_state] + "." * self._status_dot_count,
+            style=self._connection_status_color(),
+        )
+        return text
 
     def _update_chat_connection_state(self) -> None:
         """Keep CHAT's connection-status presentation in sync with the
@@ -4185,9 +4296,6 @@ class MeshtasticPassApp(App[None]):
         ever writes while NOT ONLINE, that one only ever writes while
         ONLINE.
         """
-        status_text = self._connection_status_text()
-        status_color = self._connection_status_color() if status_text else None
-
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
             chat_inputs[0].disabled = self._radio_state is not RadioState.ONLINE
@@ -4195,13 +4303,14 @@ class MeshtasticPassApp(App[None]):
 
         selectors = list(self.query(ChannelSelector))
         if selectors:
-            selectors[0].set_status_override(status_text or None, color=status_color)
+            selectors[0].set_status_override(self._connection_status_rich_text())
 
-        if status_text:
+        status_rich_text = self._connection_status_rich_text()
+        if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:
                 widget = mesh_status_widgets[0]
-                widget.update(Text(status_text, style=status_color))
+                widget.update(status_rich_text)
                 widget.display = True
 
     def _update_mesh_status_line(
@@ -4387,7 +4496,7 @@ class MeshtasticPassApp(App[None]):
         """Send-error / older-message notice only -- connection status
 
         lives solely in CHAT's top heading now (see
-        _update_chat_connection_state/_connection_status_text), never
+        _update_chat_connection_state/_connection_status_rich_text), never
         duplicated here. Message entry is disabled while not ONLINE
         (see _update_chat_connection_state), so this renders whatever
         it normally would regardless of connection state -- there is

@@ -309,6 +309,23 @@ class ChatStore:
                     ),
                 )
 
+    def update_message_chronology(self, message_id: int, local_sent_at: float) -> None:
+        """Move an outgoing message's effective chronological position.
+
+        Updates ONLY `local_sent_at` -- the field StoredMessage.
+        message_time/order_key actually read for an outgoing row -- so
+        the transcript re-sorts to reflect when this message actually,
+        successfully re-entered the mesh (see app.py's manual-resend
+        handling). `created_at` is never touched: it remains the true,
+        original moment this message was first composed, regardless of
+        how many times it was later retried or when a retry succeeded.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE messages SET local_sent_at = ? WHERE id = ? AND direction = 'outgoing'",
+                (local_sent_at, message_id),
+            )
+
     def load_recent(
         self,
         channel_index: int = 0,

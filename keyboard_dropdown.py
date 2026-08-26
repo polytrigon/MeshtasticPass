@@ -57,8 +57,7 @@ class KeyboardDropdown(Static):
         self.options = tuple(options)
         self.value = value
         self.is_open = False
-        self._status_override: str | None = None
-        self._status_override_color: str | None = None
+        self._status_override: Text | None = None
         self._highlighted_index = self._selected_index()
         default_palette = THEME_PALETTES["white"]
         self._base_color = default_palette.base
@@ -92,7 +91,7 @@ class KeyboardDropdown(Static):
         self.suffix = suffix
         self._render_dropdown()
 
-    def set_status_override(self, text: str | None, *, color: str | None = None) -> None:
+    def set_status_override(self, status: Text | None) -> None:
         """Temporarily replace this dropdown's normal heading with a
 
         plain, non-interactive status line (e.g. "STATUS CONNECTING...")
@@ -104,18 +103,16 @@ class KeyboardDropdown(Static):
         keypress can never edit a setting the UI is telling the user is
         currently unavailable.
 
-        `color`, when given, styles this status text with that semantic
-        color instead of the ordinary BASE this widget's other content
-        uses -- e.g. the caller's own shared connection-status color
-        (see MeshtasticPassApp._connection_status_color), so this status
-        text visually agrees with wherever else that same state is
-        shown. Ignored once `text` is None -- there's no override text
-        left for it to color.
+        `status` is rendered exactly as given, span styling included --
+        the caller is expected to have already built it component-level
+        (e.g. the "STATUS" word in BASE, the state word in its own
+        semantic ACCENT/ERROR), matching whatever other surface shows
+        that same underlying state, rather than this widget imposing
+        one uniform color over the whole line itself.
         """
-        self._status_override = text
-        self._status_override_color = color
-        self.disabled = text is not None
-        if text is not None:
+        self._status_override = status
+        self.disabled = status is not None
+        if status is not None:
             self.close_menu()
         else:
             self._render_dropdown()
@@ -212,12 +209,7 @@ class KeyboardDropdown(Static):
 
     def _render_dropdown(self, *, focused: bool | None = None) -> None:
         if self._status_override is not None:
-            self.update(
-                Text(
-                    self._status_override,
-                    style=self._status_override_color or self._base_color,
-                )
-            )
+            self.update(self._status_override)
             return
         marker = ">" if (self.has_focus if focused is None else focused) else " "
         label = f"{self.prefix}{self.label}"

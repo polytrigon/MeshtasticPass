@@ -44,6 +44,7 @@ from geo import format_distance_miles
 from keyboard_dropdown import KeyboardDropdown
 from radio_service import (
     DeliveryState,
+    ReceivedMessage,
     RadioEvent,
     RadioInfo,
     RadioIdentityError,
@@ -309,7 +310,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             selector = app.query_one(FontSizeSelector)
-            self.assertEqual(selector.font_size, 13)
+            # A fresh install's default is XL (item 4), not MEDIUM.
+            self.assertEqual(selector.font_size, 18)
             self.assertIn(
                 "CONNECTION/CONFIG",
                 str(app.query_one("#tab-bar", Static).render()),
@@ -318,8 +320,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
-            self.assertEqual(selector.font_size, 16)
-            self.assertEqual(self.settings.font_size, 16)
+            self.assertEqual(selector.font_size, 22)
+            self.assertEqual(self.settings.font_size, 22)
             self.assertIn(
                 "APPLIES ON NEXT LAUNCH",
                 str(app.query_one("#style-status", Static).render()),
@@ -329,9 +331,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             config_path=self.settings.config_path,
             profile_path=self.settings.profile_path,
         )
-        self.assertEqual(reloaded.font_size, 16)
+        self.assertEqual(reloaded.font_size, 22)
         self.assertIn(
-            "fontname=Monospace 16",
+            "fontname=Monospace 22",
             self.settings.profile_path.read_text(encoding="utf-8"),
         )
 
@@ -883,7 +885,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up", "enter", "down", "enter")
             await pilot.pause()
             self.assertTrue(font_selector.has_focus)
-            self.assertEqual(font_selector.font_size, 16)
+            # A fresh install's default is XL (item 4), one DOWN from
+            # which is XXL.
+            self.assertEqual(font_selector.font_size, 22)
             self.assertEqual(color_selector.color, "orange")
 
         reloaded = AppSettings.load(config_path=self.settings.config_path)
@@ -1348,7 +1352,17 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, app.query_one(ChatTranscript))
             targets = app._chat_navigation_targets()
             self.assertEqual(len(targets), 3)
-            for target in targets:
+
+            # Seed focus directly on the oldest message (neutral+DOWN now
+            # goes straight to the composer -- see item 6/test_neutral_
+            # down_focuses_composer_without_walking_messages_first) so
+            # this keeps testing message-to-message forward navigation
+            # itself, ending with the final message's own DOWN reaching
+            # the composer with the draft intact.
+            targets[0].focus()
+            await pilot.pause()
+            self.assertIs(app.focused, targets[0])
+            for target in targets[1:]:
                 await pilot.press("down")
                 self.assertIs(app.focused, target)
             self.assertIsNot(app.focused, chat_input)
@@ -1381,7 +1395,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             chat_input = app.query_one("#chat-input", Input)
             chat_input.value = "draft"
 
-            await pilot.press("escape", "down")
+            # Seed focus directly on the message (neutral+DOWN now goes
+            # straight to the composer -- see item 6) so this keeps
+            # testing the intra-message walk itself: the message's own
+            # MessageActionControl before the composer.
+            await pilot.press("escape")
+            app._chat_navigation_targets()[0].focus()
+            await pilot.pause()
             self.assertIsInstance(app.focused, ChatEntryWidget)
             await pilot.press("down")
             self.assertIsInstance(app.focused, MessageActionControl)
@@ -1418,8 +1438,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             await pilot.pause()
             chat_input.focus()
-            await pilot.press("escape", "down", "down")
+            await pilot.press("escape")
             targets = app._chat_navigation_targets()
+            targets[1].focus()
+            await pilot.pause()
             self.assertIs(app.focused, targets[1])
             self.assertIsNot(app.focused, chat_input)
             await pilot.press("right")
@@ -2651,6 +2673,378 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     raw.close()
                     self.assertEqual(row["delivery_state"], target_state.value)
 
+    # ---- Manual resend updates chat chronology (item 3) ------------------
+
+    @staticmethod
+    def _plain_incoming_message(
+        node_id: str, long_name: str, short_name: str, text: str, packet_id: int
+    ) -> ReceivedMessage:
+        """An incoming message with no origin_sent_at/radio_rx_at, so its
+
+        order_key falls back to app_received_at -- the real wall-clock
+        moment _accept_received_message actually ran -- giving each
+        sequential call in a test a strictly later, deterministic
+        chronological position with no timestamp fabrication needed.
+        """
+        return ReceivedMessage(
+            sender_node_id=node_id,
+            sender_long_name=long_name,
+            sender_short_name=short_name,
+            channel_index=0,
+            text=text,
+            rssi=-80,
+            snr=5.0,
+            packet_id=packet_id,
+        )
+
+    async def test_failed_resend_that_fails_again_does_not_move_message(
+        self,
+    ) -> None:
+        """FAILED -> (wait) -> RESEND -> FAILED again must leave the
+
+        message's chronological position and local_sent_at exactly as
+        they were -- a failed retry is only another send_attempt row,
+        never a chronology update (see _set_delivery_state's SENDING ->
+        SENT/HEARD gate in app.py).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("first attempt failed")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            message_id = entry.message_id
+            original_local_sent_at = entry.local_sent_at
+            original_index = app.chat_history.index(entry)
+
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+            radio.send_text = Mock(side_effect=lambda *args, **kwargs: sleep(3))
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+            self.assertEqual(entry.send_generation, 2)
+
+            # Simulate the resend itself definitively failing, the same
+            # direct completion path used elsewhere in this file (the
+            # blocked worker thread above never resolves during this test).
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.FAILED)
+            self.assertEqual(entry.message_id, message_id)
+            self.assertEqual(entry.local_sent_at, original_local_sent_at)
+            self.assertEqual(app.chat_history.index(entry), original_index)
+
+            raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
+            raw.row_factory = sqlite3.Row
+            row = raw.execute(
+                "SELECT local_sent_at FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            attempts = raw.execute(
+                "SELECT state FROM send_attempts WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            ).fetchall()
+            raw.close()
+            self.assertEqual(row["local_sent_at"], original_local_sent_at)
+            self.assertEqual([a["state"] for a in attempts], ["FAILED", "FAILED"])
+
+    async def test_successful_resend_moves_message_after_intervening_incoming(
+        self,
+    ) -> None:
+        """Reproduces the exact item-3 scenario: a FAILED message, then
+
+        three incoming messages, then a delayed manual RESEND that
+        succeeds -- the transcript must show the ORIGINAL message (same
+        message_id, same widget, no duplicate) moved to after all three
+        incoming messages, with its displayed age now reflecting the
+        successful resend rather than the original failed attempt.
+        Also covers: send_attempt history for both attempts preserved,
+        and the intervening incoming messages' own order is untouched.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(SimulatedSendOutcome.SENT,),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            entry = app._start_outgoing("will fail then resend after others arrive")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            message_id = entry.message_id
+
+            for node_id, name, short, text, packet_id in (
+                ("!a1", "Alice", "ALCE", "hi from alice", 91001),
+                ("!b2", "Bob", "BOB1", "hi from bob", 91002),
+                ("!c3", "Charlie", "CHR1", "hi from charlie", 91003),
+            ):
+                app._accept_received_message(
+                    self._plain_incoming_message(node_id, name, short, text, packet_id)
+                )
+                await pilot.pause()
+
+            incoming_authors = ["Alice", "Bob", "Charlie"]
+            self.assertEqual(
+                [e.author for e in app.chat_history if e.author in incoming_authors],
+                incoming_authors,
+            )
+            self.assertLess(
+                app.chat_history.index(entry),
+                min(
+                    i
+                    for i, e in enumerate(app.chat_history)
+                    if e.author in incoming_authors
+                ),
+            )
+
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+            self.assertEqual(entry.message_id, message_id)
+            self.assertEqual(entry.send_generation, 2)
+
+            # Same logical message: identity preserved, no duplicate row
+            # or widget.
+            self.assertEqual(
+                sum(1 for e in app.chat_history if e.message_id == message_id), 1
+            )
+            self.assertEqual(
+                sum(
+                    1
+                    for w in app.query(ChatEntryWidget)
+                    if w.entry.message_id == message_id
+                ),
+                1,
+            )
+            self.assertIs(widget.entry, entry)
+
+            # Moved to after all three incoming messages, both in the
+            # model and in the mounted widget order.
+            self.assertGreater(
+                app.chat_history.index(entry),
+                max(
+                    i
+                    for i, e in enumerate(app.chat_history)
+                    if e.author in incoming_authors
+                ),
+            )
+            mounted_authors = [
+                (w.entry.author if not w.entry.outgoing else "YOU")
+                for w in app.query(ChatEntryWidget)
+            ]
+            self.assertEqual(mounted_authors[-1], "YOU")
+            self.assertEqual(mounted_authors[-4:-1], incoming_authors)
+            self.assertEqual(
+                [a for a in incoming_authors if a in mounted_authors],
+                incoming_authors,
+            )
+
+            # Displayed age now reflects the resend, not the original
+            # failed attempt from well before the incoming messages.
+            self.assertIn("0s", str(widget.timestamp_label.render()))
+
+            raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
+            raw.row_factory = sqlite3.Row
+            attempts = raw.execute(
+                "SELECT state FROM send_attempts WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            ).fetchall()
+            row = raw.execute(
+                "SELECT local_sent_at, created_at FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            raw.close()
+            self.assertEqual([a["state"] for a in attempts], ["FAILED", "SENT"])
+            self.assertEqual(row["local_sent_at"], entry.local_sent_at)
+            self.assertLess(row["created_at"], row["local_sent_at"])
+
+    async def test_restart_preserves_resend_reordered_chronology(self) -> None:
+        """A successful resend's reordering survives not just one but
+
+        two consecutive restarts -- proving the persisted local_sent_at
+        update, not merely in-process widget/list state, is what
+        actually controls chronology after reload.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(SimulatedSendOutcome.SENT,),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("resend then restart twice")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            message_id = entry.message_id
+
+            app._accept_received_message(
+                self._plain_incoming_message("!a1", "Alice", "ALCE", "hi", 92001)
+            )
+            await pilot.pause()
+
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+        for _ in range(2):
+            reopened = ChatStore.open(self.chat_db_path)
+            reopened_radio = SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
+            )
+            reopened_app = MeshtasticPassApp(
+                reopened_radio, self.settings, chat_store=reopened
+            )
+            async with reopened_app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                reloaded = next(
+                    e for e in reopened_app.chat_history if e.message_id == message_id
+                )
+                alice_index = next(
+                    i
+                    for i, e in enumerate(reopened_app.chat_history)
+                    if e.author == "Alice"
+                )
+                self.assertGreater(
+                    reopened_app.chat_history.index(reloaded), alice_index
+                )
+                self.assertEqual(reloaded.delivery_state, DeliveryState.UNCONFIRMED)
+
+    async def test_later_heard_after_resent_sent_does_not_retimestamp(self) -> None:
+        """A resend that reaches SENT, then later HEARD, must not move
+
+        the message a second time or change local_sent_at again -- the
+        chronology timestamp represents successful TRANSMISSION, not a
+        later acknowledgement (see _set_delivery_state's previous_state
+        gate: HEARD arriving with previous_state already SENT, not
+        SENDING, correctly no-ops the reposition).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(SimulatedSendOutcome.SENT,),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("resend then later heard")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+            sent_local_sent_at = entry.local_sent_at
+            sent_index = app.chat_history.index(entry)
+
+            app._set_delivery_state(entry, DeliveryState.HEARD)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.HEARD)
+            self.assertEqual(entry.local_sent_at, sent_local_sent_at)
+            self.assertEqual(app.chat_history.index(entry), sent_index)
+
+    async def test_ordinary_first_attempt_message_chronology_unaffected(self) -> None:
+        """An ordinary, never-resent successful send (send_generation
+
+        == 1) must never trigger the resend-chronology reposition path,
+        regardless of what delivery states it passes through.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(SimulatedSendOutcome.SENT,),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("ordinary first attempt")
+            original_local_sent_at = entry.local_sent_at
+            original_index = app.chat_history.index(entry)
+            app.run_worker(lambda: app._send_from_thread(entry), thread=True)
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+            self.assertEqual(entry.send_generation, 1)
+            self.assertEqual(entry.local_sent_at, original_local_sent_at)
+            self.assertEqual(app.chat_history.index(entry), original_index)
+
+    async def test_focused_selection_survives_resend_reposition(self) -> None:
+        """If the resent message's widget is focused/selected when the
+
+        successful resend repositions it, that selection/focus must
+        remain on the SAME widget afterward -- move_child relocates the
+        existing mounted widget rather than destroying/recreating it.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(SimulatedSendOutcome.SENT,),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("focused during resend")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+
+            app._accept_received_message(
+                self._plain_incoming_message("!a1", "Alice", "ALCE", "hi", 93001)
+            )
+            await pilot.pause()
+
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+            await pilot.pause()
+            self.assertTrue(widget.has_focus)
+
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+            self.assertTrue(widget.has_focus)
+            self.assertIs(widget.entry, entry)
+            self.assertEqual(
+                sum(1 for w in app.query(ChatEntryWidget) if w.entry is entry), 1
+            )
+
     # ---- Receive path health during/after an unresolved resend ----------
 
     async def test_unrelated_incoming_message_still_processed_during_stuck_resend(
@@ -2792,6 +3186,206 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             chat_input = app.query_one("#chat-input", Input)
             self.assertFalse(chat_input.has_focus)
             self.assertIs(app.focused, app.query_one(ChatTranscript))
+
+    # ---- Neutral position is effectively "at the latest message" (item 6) --
+
+    async def test_neutral_down_focuses_composer_without_walking_messages_first(
+        self,
+    ) -> None:
+        """Case A: several messages, enter CHAT, DOWN once focuses the
+
+        composer directly -- never first walking forward through every
+        older message the way the neutral fallback used to.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for index in range(3):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=94_000 + index,
+                        text=f"message {index}",
+                    )
+                )
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one(ChatTranscript))
+            chat_input = app.query_one("#chat-input", Input)
+
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+
+    async def test_neutral_up_begins_at_newest_not_oldest_or_middle(self) -> None:
+        """Case B: several messages, enter CHAT, UP begins navigating
+
+        backward FROM the newest message -- not the oldest or some
+        middle position.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for index in range(3):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=95_000 + index,
+                        text=f"message {index}",
+                    )
+                )
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            targets = app._chat_navigation_targets()
+            self.assertEqual(len(targets), 3)
+
+            await pilot.press("up")
+            self.assertIs(app.focused, targets[-1])
+            self.assertIsNot(app.focused, targets[0])
+
+    async def test_neutral_down_on_empty_chat_focuses_composer(self) -> None:
+        """Case C: empty CHAT, DOWN focuses the composer -- unchanged."""
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertEqual(len(app._chat_navigation_targets()), 0)
+            chat_input = app.query_one("#chat-input", Input)
+
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+
+    async def test_neutral_draft_survives_entry_and_down_focus(self) -> None:
+        """Case D: an existing draft is untouched by entering CHAT
+
+        (unfocused, as before) and by the neutral DOWN that follows --
+        DOWN focuses the composer without changing the draft text.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for index in range(2):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=96_000 + index,
+                        text=f"message {index}",
+                    )
+                )
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "unsent draft"
+
+            await pilot.press("escape", "1")
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertFalse(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "unsent draft")
+
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+            self.assertEqual(chat_input.value, "unsent draft")
+
+    async def test_neutral_printable_key_still_focuses_and_inserts(self) -> None:
+        """Case E: printable-key behavior from the previous pass is
+
+        unchanged by the neutral-position refinement -- still focuses
+        the composer and inserts the typed character.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+
+            await pilot.press("h")
+            self.assertTrue(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "h")
+
+    async def test_neutral_escape_from_composer_still_reaches_transcript(self) -> None:
+        """Case F: Escape from the composer still lands back on the
+
+        transcript's neutral state coherently, and a subsequent DOWN
+        from there still reaches the composer directly (not the oldest
+        message) -- navigation stays internally consistent, not merely
+        correct once.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for index in range(2):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=97_000 + index,
+                        text=f"message {index}",
+                    )
+                )
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            transcript = app.query_one(ChatTranscript)
+
+            await pilot.press("right")
+            self.assertIs(app.focused, chat_input)
+            await pilot.press("escape")
+            self.assertIs(app.focused, transcript)
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
+
+    async def test_neutral_position_reestablished_after_switching_tabs_away_and_back(
+        self,
+    ) -> None:
+        """Case G: leaving CHAT and coming back reestablishes the
+
+        latest-message neutral position from scratch -- DOWN still
+        reaches the composer directly, without leftover state from
+        before the switch corrupting it.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for index in range(3):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=98_000 + index,
+                        text=f"message {index}",
+                    )
+                )
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            targets = app._chat_navigation_targets()
+            targets[0].focus()
+            await pilot.pause()
+            self.assertIs(app.focused, targets[0])
+
+            app.show_tab("connection")
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one(ChatTranscript))
+            chat_input = app.query_one("#chat-input", Input)
+
+            await pilot.press("down")
+            self.assertIs(app.focused, chat_input)
 
     async def test_existing_draft_survives_entering_chat_unfocused(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -3036,7 +3630,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         """Every RadioState CONNECTION/CONFIG can show, CHAT must echo
 
         verbatim (as "STATUS <value>...") -- proving they share one
-        source (_connection_status_text) rather than each interpreting
+        source (_connection_status_rich_text) rather than each interpreting
         self._radio_state on its own.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -3150,13 +3744,20 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- Connection-status color reuses CONNECTION/CONFIG's own ---------
 
+    @staticmethod
+    def _span_hex(span) -> str:
+        return span.style.foreground.hex.upper()
+
     async def test_connecting_status_uses_accent_color_on_chat_and_mesh(self) -> None:
         """CONNECTING uses ACCENT -- the same semantic color
 
         CONNECTION/CONFIG's own status row uses (see
         _render_connection_details/_connection_status_color) -- on both
         CHAT's heading and MESH's status line, never a hardcoded literal
-        color duplicated in either place.
+        color duplicated in either place. Also checks the "STATUS" word
+        ITSELF stays BASE, matching CONNECTION/CONFIG's own component-
+        level grammar (label in BASE, value in its own semantic color)
+        exactly -- never the whole line colored uniformly.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
         app = MeshtasticPassApp(radio, self.settings)
@@ -3167,18 +3768,23 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             palette = THEME_PALETTES[app._current_theme]
 
             chat_title = app.query_one("#chat-title", Static)
-            self.assertEqual(chat_title.render().spans[0].style, palette.accent)
+            chat_spans = chat_title.render().spans
+            self.assertEqual(self._span_hex(chat_spans[0]), palette.base.upper())
+            self.assertEqual(self._span_hex(chat_spans[-1]), palette.accent.upper())
 
             await pilot.press("3")
             await pilot.pause()
             mesh_status = app.query_one("#mesh-connection-status", Static)
-            self.assertEqual(mesh_status.render().spans[0].style, palette.accent)
+            mesh_spans = mesh_status.render().spans
+            self.assertEqual(self._span_hex(mesh_spans[0]), palette.base.upper())
+            self.assertEqual(self._span_hex(mesh_spans[-1]), palette.accent.upper())
 
     async def test_error_status_uses_error_color_not_accent(self) -> None:
         """RadioState.ERROR mirrors CONNECTION/CONFIG's own ERROR
 
         semantic color -- distinct from ACCENT, never forced to ACCENT
-        just because it's also a "temporary status" state.
+        just because it's also a "temporary status" state. "STATUS"
+        itself still stays BASE even though the value is ERROR.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
         app = MeshtasticPassApp(radio, self.settings)
@@ -3190,12 +3796,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(palette.error, palette.accent)
 
             chat_title = app.query_one("#chat-title", Static)
-            self.assertEqual(chat_title.render().spans[0].style, palette.error)
+            chat_spans = chat_title.render().spans
+            self.assertEqual(self._span_hex(chat_spans[0]), palette.base.upper())
+            self.assertEqual(self._span_hex(chat_spans[-1]), palette.error.upper())
 
             await pilot.press("3")
             await pilot.pause()
             mesh_status = app.query_one("#mesh-connection-status", Static)
-            self.assertEqual(mesh_status.render().spans[0].style, palette.error)
+            mesh_spans = mesh_status.render().spans
+            self.assertEqual(self._span_hex(mesh_spans[0]), palette.base.upper())
+            self.assertEqual(self._span_hex(mesh_spans[-1]), palette.error.upper())
 
     async def test_offline_status_uses_accent_color(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -3206,13 +3816,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             palette = THEME_PALETTES[app._current_theme]
             chat_title = app.query_one("#chat-title", Static)
-            self.assertEqual(chat_title.render().spans[0].style, palette.accent)
+            chat_spans = chat_title.render().spans
+            self.assertEqual(self._span_hex(chat_spans[0]), palette.base.upper())
+            self.assertEqual(self._span_hex(chat_spans[-1]), palette.accent.upper())
 
     async def test_connection_status_color_tracks_theme_switches(self) -> None:
         """Switching WHITE/GREEN/ORANGE while a temporary status is showing
 
-        must immediately remap to that theme's own ACCENT -- never leave
-        a previous theme's color stuck on CHAT or MESH's status line.
+        must immediately remap to that theme's own BASE+ACCENT at the
+        component level -- never leave a previous theme's color stuck
+        on CHAT or MESH's status line.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
         app = MeshtasticPassApp(radio, self.settings)
@@ -3225,7 +3838,52 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 palette = THEME_PALETTES[theme]
                 chat_title = app.query_one("#chat-title", Static)
-                self.assertEqual(chat_title.render().spans[0].style, palette.accent)
+                chat_spans = chat_title.render().spans
+                self.assertEqual(self._span_hex(chat_spans[0]), palette.base.upper())
+                self.assertEqual(self._span_hex(chat_spans[-1]), palette.accent.upper())
+
+    async def test_connection_chat_and_mesh_share_identical_component_styling(
+        self,
+    ) -> None:
+        """The exact item-5 requirement: CONNECTION/CONFIG, CHAT, and
+
+        MESH must show "same wording + same component-level semantic
+        styling", not merely "same color somewhere" -- checked across
+        every non-ONLINE RadioState and every theme.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for theme in ("white", "green", "orange"):
+                app._apply_color_theme(theme)
+                palette = THEME_PALETTES[theme]
+                for state, expected in (
+                    (RadioState.CONNECTING, palette.accent),
+                    (RadioState.OFFLINE, palette.accent),
+                    (RadioState.ERROR, palette.error),
+                ):
+                    with self.subTest(theme=theme, state=state):
+                        app._show_connection(state, message="detail")
+                        await pilot.pause()
+
+                        connection_status = app.query_one(
+                            "#connection-status", Static
+                        ).render()
+                        chat_title = app.query_one("#chat-title", Static).render()
+                        mesh_status = app.query_one(
+                            "#mesh-connection-status", Static
+                        ).render()
+
+                        for rendered in (connection_status, chat_title, mesh_status):
+                            self.assertEqual(
+                                self._span_hex(rendered.spans[0]), palette.base.upper()
+                            )
+                            self.assertEqual(
+                                self._span_hex(rendered.spans[-1]), expected.upper()
+                            )
+
+                        self.assertEqual(str(chat_title), str(mesh_status))
 
     # ---- Empty-message error lifecycle ---------------------------------
 

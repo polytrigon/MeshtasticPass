@@ -12,6 +12,7 @@ from app_settings import (
     DEFAULT_COLOR,
     DEFAULT_DEVICE_PATH,
     DEFAULT_FONT_SIZE,
+    FONT_SIZE_CHOICES,
     VALID_COLORS,
     VALID_FONT_SIZES,
 )
@@ -154,6 +155,71 @@ class AppSettingsTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     settings.set_font_size(invalid)  # type: ignore[arg-type]
+
+    # ---- First-run default text size = XL (item 4) -----------------------
+
+    def test_fresh_install_with_no_config_file_defaults_to_xl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = Path(temporary_directory) / "config.json"
+
+            settings = AppSettings.load(config_path=config)
+
+            self.assertEqual(settings.font_size, 18)
+            self.assertEqual(DEFAULT_FONT_SIZE, 18)
+
+    def test_config_file_missing_font_size_key_defaults_to_xl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = Path(temporary_directory) / "config.json"
+            config.write_text(json.dumps({"color": "green"}), encoding="utf-8")
+
+            settings = AppSettings.load(config_path=config)
+
+            self.assertEqual(settings.font_size, 18)
+
+    def test_config_file_with_invalid_font_size_defaults_to_xl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = Path(temporary_directory) / "config.json"
+            config.write_text(json.dumps({"font_size": 999}), encoding="utf-8")
+
+            settings = AppSettings.load(config_path=config)
+
+            self.assertEqual(settings.font_size, 18)
+
+    def test_each_existing_saved_font_size_survives_reload_unreset(self) -> None:
+        """A user who already saved ANY size -- including the ones that
+
+        are not XL -- must never be silently bumped to the new XL
+        default on their next load.
+        """
+        for name, size in FONT_SIZE_CHOICES:
+            with self.subTest(size=name), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.json"
+                config.write_text(
+                    json.dumps({"font_size": size}), encoding="utf-8"
+                )
+
+                settings = AppSettings.load(config_path=config)
+
+                self.assertEqual(settings.font_size, size)
+
+    def test_saved_font_size_persists_across_restart_even_when_it_is_xl(
+        self,
+    ) -> None:
+        """Explicitly saving XL itself must persist as a REAL saved
+
+        preference, not be indistinguishable from "no preference was
+        ever saved" on the next load.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            settings = AppSettings.load(config_path=config)
+            settings.set_font_size(11)
+            settings.save()
+            settings.set_font_size(18)
+            settings.save()
+
+            reloaded = AppSettings.load(config_path=config)
+            self.assertEqual(reloaded.font_size, 18)
 
     def test_generates_and_updates_only_dedicated_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

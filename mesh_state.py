@@ -139,9 +139,12 @@ def build_mesh_working_set(
     format_mesh_context_line (ROLE renders "?") and glyph_is_solid
     (renders STROKED). `last_interaction_at` remains specifically CHAT
     interaction time (None when there is none) -- unchanged meaning
-    from before, still what format_mesh_context_line's AGE segment and
-    is_stale() describe; a passively-known-only node's more general
-    NodeDB recency (`node.last_heard`) is a separate signal, used below
+    from before, still what is_stale() describes. format_mesh_context_
+    line's own LAST SEEN segment additionally considers `node.last_heard`
+    (taking whichever of the two is fresher), so a NodeDB-only node that
+    is_node_active() already counts as ACTIVE from last_heard alone can
+    never display "?" there just for lacking CHAT history. This same
+    `node.last_heard` recency is otherwise a separate signal, used below
     for ranking only, never folded into this field.
 
     Bounded to `max_remote_nodes` (never every known node -- readability
@@ -332,10 +335,26 @@ def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
     hops = state.node.hops_away
     segments.append(f"{hops} HOPS" if hops is not None else "? HOPS")
 
-    if state.last_interaction_at is None or state.last_interaction_at > now:
+    # LAST SEEN: the more recent of CHAT interaction time and NodeDB
+    # last_heard -- the SAME "freshest known signal" combination
+    # build_mesh_working_set's own ranking already uses (see its
+    # rank_key), so a NodeDB-only node that is_node_active() already
+    # counted as ACTIVE from last_heard alone can never display "?"
+    # here just because it has no CHAT history. Using
+    # state.last_interaction_at alone (CHAT-only) previously produced
+    # exactly that inconsistency: ACTIVE + FILLED + counted, yet LAST
+    # SEEN "?". A node with neither timestamp still renders "?", never
+    # a fabricated age.
+    last_seen_candidates = [
+        timestamp
+        for timestamp in (state.last_interaction_at, state.node.last_heard)
+        if timestamp is not None
+    ]
+    last_seen_at = max(last_seen_candidates) if last_seen_candidates else None
+    if last_seen_at is None or last_seen_at > now:
         segments.append("?")
     else:
-        segments.append(format_relative_age(now - state.last_interaction_at))
+        segments.append(format_relative_age(now - last_seen_at))
 
     segments.append(_format_distance(state.distance_miles))
 
