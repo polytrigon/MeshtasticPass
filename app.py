@@ -22,7 +22,7 @@ from textual.containers import (
     Vertical,
     VerticalScroll,
 )
-from textual.events import Click, Focus, Key
+from textual.events import Blur, Click, Focus, Key
 from textual.message import Message
 from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
@@ -45,8 +45,14 @@ from chat_store import (
     ChatStoreError,
 )
 from geo import format_distance_miles
+from grapheme_text import install_flag_pair_protection
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
-from mesh_state import MeshNodeState, build_mesh_working_set, format_mesh_context_line
+from mesh_state import (
+    MeshNodeState,
+    _remote_name_segments,
+    build_mesh_working_set,
+    format_mesh_context_line,
+)
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
     PositionedNode,
@@ -84,10 +90,24 @@ from theme_palette import ERROR, THEME_PALETTES
 from viewport_menu import PopupItem, ViewportMenu
 
 
+# Patches Rich's grapheme splitter (used by Static/Content's word-wrap
+# fallback) so a regional-indicator flag pair can never be severed
+# across a wrap boundary -- see grapheme_text.install_flag_pair_protection
+# for the full rationale. Installed once at import time, process-wide,
+# rather than per-message, since it corrects Rich's own wrap engine
+# rather than any particular string.
+install_flag_pair_protection()
+
+
+# PROFILE is intentionally omitted here: it remains fully implemented
+# (composed inside the "#content" ContentSwitcher, its widgets/settings/
+# models/tests all untouched) but is hidden from the visible top nav and
+# unreachable via any digit key -- see tab_for_key below. This is a
+# navigation/UI-only change, not a deletion; restoring PROFILE to the
+# nav later only requires re-adding it to this dict and to tab_for_key.
 TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
-    "profile": "PROFILE",
     "mesh": "MESH",
 }
 
@@ -101,15 +121,26 @@ CONNECTION_LABEL_WIDTH = 12
 CONNECTION_ROW_PREFIX = "  "
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
+SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
-    (DeliveryState.UNCONFIRMED, DeliveryState.FAILED)
+    (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
 )
 
 
 def can_manual_resend(entry: ChatEntry) -> bool:
     """Return whether the existing explicit rebroadcast action is valid."""
     return entry.outgoing and entry.delivery_state in MANUAL_RESEND_STATES
+
+
+def _reply_mention_name(metadata: NodeMetadata) -> str:
+    """Long Name -> Short Name -> compact Node ID, reusing the exact same
+
+    name-fallback precedence mesh_state.format_mesh_context_line already
+    uses for a real node's display name, rather than a second,
+    independently-defined fallback rule.
+    """
+    return _remote_name_segments(metadata)[0]
 
 
 class ThinScrollBarRender(ScrollBarRender):
@@ -360,6 +391,15 @@ class ChatTranscript(VerticalScroll):
     def on_key(self, event: Key) -> None:
         """Keep transcript navigation deterministic when this widget has focus."""
         app = self.app
+        if getattr(app, "_user_menu", None) is not None:
+            # A node-context menu (e.g. opened via Enter on this exact
+            # widget) is showing -- up/down must move ITS highlight
+            # (handled by the app-level on_key this event still bubbles
+            # to), not the chat message selection underneath it. Focus
+            # never actually moves off this ChatEntryWidget/transcript
+            # while the menu is open (see _open_node_menu), so without
+            # this guard up/down would always be captured here first.
+            return
         if event.key in ("up", "down"):
             app._move_chat_focus(-1 if event.key == "up" else 1)
             event.stop()
@@ -377,6 +417,21 @@ class ChatTranscript(VerticalScroll):
         elif event.key == "end":
             app._jump_to_newest()
             event.stop()
+
+
+class ChatMessageInput(Input):
+    """The CHAT draft input; posts Left so the app can react to focus
+
+    loss without needing to know every possible reason it happened
+    (Escape, a tab switch, a mouse click elsewhere) -- see the
+    empty-message error's auto-dismiss-on-focus-loss requirement.
+    """
+
+    class Left(Message):
+        pass
+
+    def on_blur(self, _event: Blur) -> None:
+        self.post_message(self.Left())
 
 
 class ConnectionPage(VerticalScroll):
@@ -1306,6 +1361,14 @@ class ChatEntryWidget(Vertical):
                 ]
             )
         header = Horizontal(*header_parts, classes="chat-entry-header")
+        # Flag-pair wrap-severing (a regional-indicator pair split
+        # across a wrap boundary, corrupting whatever renders to its
+        # right -- here, the transcript's scrollbar) is fixed at the
+        # rendering boundary via grapheme_text.install_flag_pair_protection(),
+        # called once at module import time -- the text here is never
+        # touched. Selection styling likewise never touches this text
+        # or its width -- see ChatEntryWidget.on_focus/on_blur, which
+        # only ever update the separate, fixed-width selection_marker.
         self.message_label = Static(
             self.entry.text,
             classes="chat-entry-text",
@@ -1892,7 +1955,8 @@ class MeshtasticPassApp(App[None]):
         color: #ff8c00;
     }
 
-    .chat-entry.delivery-failed .chat-entry-delivery {
+    .chat-entry.delivery-failed .chat-entry-delivery,
+    .chat-entry.delivery-interrupted .chat-entry-delivery {
         color: $error;
     }
 
@@ -1995,6 +2059,7 @@ class MeshtasticPassApp(App[None]):
         self._chat_timestamp_timer: Timer | None = None
         self._delivery_timer: Timer | None = None
         self._send_error_message = ""
+        self._send_error_dismiss_timer: Timer | None = None
         self._arrival_sequence = 0
         self._send_dot_count = 1
         self._has_older_history = False
@@ -2038,7 +2103,7 @@ class MeshtasticPassApp(App[None]):
                 yield ChatTranscript(id="chat-log")
                 yield Static(id="chat-new-below")
                 yield Static(id="send-error")
-                yield Input(
+                yield ChatMessageInput(
                     placeholder="> message",
                     id="chat-input",
                     select_on_focus=False,
@@ -2059,7 +2124,7 @@ class MeshtasticPassApp(App[None]):
                 )
                 yield MeshTopologyView()
                 yield Static(id="mesh-context-status", markup=False)
-        yield Static("1-4 switch tabs    F4 quit", id="footer")
+        yield Static("1-3 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -2094,10 +2159,56 @@ class MeshtasticPassApp(App[None]):
             self._chat_timestamp_timer.stop()
         if self._delivery_timer is not None:
             self._delivery_timer.stop()
+        if self._send_error_dismiss_timer is not None:
+            self._send_error_dismiss_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
+        self._reconcile_interrupted_sends_before_shutdown()
         if self.chat_store is not None:
             self.chat_store.close()
+
+    def _reconcile_interrupted_sends_before_shutdown(self) -> None:
+        """Persist INTERRUPTED for every still-SENDING outgoing message
+
+        this process owns, before the store closes.
+
+        This is additional cleanup, not the authoritative fix:
+        correctness no longer depends on it. ChatStore.open() now
+        rewrites any abandoned SENDING row to INTERRUPTED directly in
+        SQLite the moment a store is opened -- covering every row in
+        the database regardless of channel, pagination, or whether
+        anything is currently loaded into memory (see
+        ChatStore.reconcile_abandoned_sending()), which is what actually
+        repairs a row this process never even loads. What this method
+        adds on top: while this process is still running, catching a
+        send up front (before the NEXT process's startup reconciliation
+        would) means a row this process gives up on shows INTERRUPTED
+        immediately rather than sitting as SENDING until the next
+        restart. Runs after _monitor.stop() so no late radio callback
+        can race a write in after this pass runs. Every channel's
+        entries are checked, not just the currently displayed one -- a
+        send can be left in flight in a channel the user has since
+        switched away from.
+        """
+        if self.chat_store is None:
+            return
+        for state in self._channel_states.values():
+            for entry in state.entries:
+                if not entry.outgoing or entry.delivery_state is not DeliveryState.SENDING:
+                    continue
+                entry.delivery_state = DeliveryState.INTERRUPTED
+                if entry.message_id is None:
+                    continue
+                try:
+                    self.chat_store.update_delivery_state(
+                        entry.message_id,
+                        DeliveryState.INTERRUPTED.value,
+                        attempt_id=entry.active_attempt_id,
+                    )
+                except ChatStoreError:
+                    # Shutting down regardless; there is no user-facing
+                    # surface left to report this failure to.
+                    pass
 
     def on_key(self, event: Key) -> None:
         """Handle global keys only while the chat input is not focused."""
@@ -2204,11 +2315,14 @@ class MeshtasticPassApp(App[None]):
                     event.stop()
                 return
 
+        # PROFILE is intentionally absent: hidden from the visible top
+        # nav (see TAB_NAMES), so no digit key may reach it -- key "4"
+        # is simply not mapped to anything, rather than falling through
+        # to the now-hidden tab.
         tab_for_key = {
             "1": "connection",
             "2": "chat",
-            "3": "profile",
-            "4": "mesh",
+            "3": "mesh",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -2415,6 +2529,12 @@ class MeshtasticPassApp(App[None]):
 
     @on(Input.Submitted, "#chat-input")
     def send_chat_message(self, event: Input.Submitted) -> None:
+        # Belt-and-suspenders: a disabled Input should already refuse to
+        # focus/submit, but this guarantees sending stays refused even
+        # if focus was already on the input at the moment reconnecting
+        # began (see _update_chat_connection_state).
+        if self._radio_state is not RadioState.ONLINE:
+            return
         text = event.value
         if not text.strip():
             self._show_send_error("Message text cannot be empty.")
@@ -2425,6 +2545,22 @@ class MeshtasticPassApp(App[None]):
             lambda: self._send_from_thread(entry, generation),
             thread=True,
         )
+
+    @on(Input.Changed, "#chat-input")
+    def chat_input_changed(self, _event: Input.Changed) -> None:
+        """Typing dismisses the empty-message error immediately."""
+        if self._send_error_message:
+            self._show_send_error("")
+
+    @on(ChatMessageInput.Left)
+    def chat_input_lost_focus(self, _event: ChatMessageInput.Left) -> None:
+        """Leaving the message-entry box dismisses the empty-message
+
+        error immediately -- this also covers switching to a different
+        top-level tab, since show_tab() moves focus away from here.
+        """
+        if self._send_error_message:
+            self._show_send_error("")
 
     def _send_from_thread(
         self,
@@ -3244,10 +3380,15 @@ class MeshtasticPassApp(App[None]):
         """Open the shared CHAT/MESH node-details menu."""
 
         items: list[PopupItem] = []
-        if metadata.long_name:
-            items.append(PopupItem(metadata.long_name, actionable=False))
-        if metadata.short_name:
-            items.append(PopupItem(metadata.short_name, actionable=False))
+        long_name = metadata.long_name.strip() if metadata.long_name else None
+        short_name = metadata.short_name.strip() if metadata.short_name else None
+        if long_name:
+            items.append(PopupItem(long_name, actionable=False))
+        # Never repeat Short Name as its own row when it's the same
+        # displayed value as Long Name -- never a blank/fake "?" row
+        # either; an unavailable name is simply omitted.
+        if short_name and short_name != long_name:
+            items.append(PopupItem(short_name, actionable=False))
         if metadata.hops_away is not None:
             unit = "HOP" if metadata.hops_away == 1 else "HOPS"
             items.append(
@@ -3271,15 +3412,20 @@ class MeshtasticPassApp(App[None]):
             items.append(PopupItem(metadata.node_id, actionable=False))
             highlighted = 0
         else:
+            items.append(PopupItem("REPLY", "reply", actionable=True))
             favorite = self.settings.is_favorite(metadata.node_id)
             action = "unfavorite" if favorite else "favorite"
             items.append(PopupItem(action.upper(), action, actionable=True))
+            # Preserve the existing FAVORITE/UNFAVORITE default highlight
+            # (the established Enter-Enter toggle gesture) -- REPLY is a
+            # newly added item, reached with one extra arrow press, not
+            # a change to what pressing Enter immediately does.
             highlighted = len(items) - 1
         menu = ViewportMenu(
             items,
             highlighted_index=highlighted,
-            on_activate=lambda _index, item: self._activate_node_action(
-                metadata.node_id, str(item.value)
+            on_activate=lambda _index, item: self._activate_menu_item(
+                metadata, str(item.value)
             ),
             menu_id="node-context-menu",
         )
@@ -3296,6 +3442,42 @@ class MeshtasticPassApp(App[None]):
         width = max(cell_len(item.label) for item in items) + 4
         self.screen.mount(menu)
         menu.place(origin.region, self.screen.region, width)
+
+    def _activate_menu_item(self, metadata: NodeMetadata, action: str) -> None:
+        """Dispatch a node-context-menu action -- REPLY needs the node's
+
+        name fields (for the @mention), so it is handled separately
+        from the existing node_id-only favorite/unfavorite path.
+        """
+        if action == "reply":
+            self._activate_reply(metadata)
+            return
+        self._activate_node_action(metadata.node_id, action)
+
+    def _activate_reply(self, metadata: NodeMetadata) -> None:
+        """Insert an @mention for this node at the start of the CHAT
+
+        draft, then hand focus back to the input for continued typing.
+        A text-entry convenience only -- never changes Meshtastic
+        addressing/routing based on the textual @mention.
+        """
+        self._close_user_menu(restore_focus=False)
+        mention = f"@{_reply_mention_name(metadata)}"
+        chat_input = self.query_one("#chat-input", Input)
+        draft = chat_input.value
+        if draft == mention or draft.startswith(f"{mention} "):
+            # Already mentioned at the start of the draft -- preserve it
+            # exactly, never duplicate the mention.
+            new_value = draft
+        elif draft:
+            new_value = f"{mention} {draft}"
+        else:
+            new_value = f"{mention} "
+        chat_input.value = new_value
+        if self.current_tab != "chat":
+            self.show_tab("chat")
+        chat_input.focus()
+        chat_input.cursor_position = len(chat_input.value)
 
     def _activate_node_action(self, node_id: str, action: str) -> None:
         if not node_id or action not in ("favorite", "unfavorite"):
@@ -3669,9 +3851,9 @@ class MeshtasticPassApp(App[None]):
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
             text = (
-                "↑↓←→ select    1-4 tabs    F4 quit"
+                "↑↓←→ select    1-3 tabs    F4 quit"
                 if self.current_tab == "mesh"
-                else "1-4 switch tabs    F4 quit"
+                else "1-3 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 
@@ -3721,6 +3903,24 @@ class MeshtasticPassApp(App[None]):
         self._render_chat_heading()
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
+        self._update_chat_connection_state()
+
+    def _update_chat_connection_state(self) -> None:
+        """Disable CHAT message entry/sending while the radio isn't ONLINE.
+
+        Purely observational: reacts to the already-authoritative
+        self._radio_state (see _show_connection) and never triggers a
+        new connection attempt or any other radio traffic on its own.
+        The input's own `.value` (the draft) is never touched here --
+        Textual's `disabled` only affects focus/interaction, so a draft
+        typed before a drop survives completely untouched and is
+        exactly what the user sees once connection is restored.
+        """
+        widgets = list(self.query("#chat-input"))
+        if not widgets:
+            return
+        widgets[0].disabled = self._radio_state is not RadioState.ONLINE
+        self._render_chat_status()
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:
@@ -3821,7 +4021,23 @@ class MeshtasticPassApp(App[None]):
 
     def _show_send_error(self, message: str) -> None:
         self._send_error_message = message
+        # Replace, never accumulate, the auto-dismiss timer: any earlier
+        # attempt's callback is stopped outright before a new one (if
+        # any) is scheduled, so a stale timer can never later clear a
+        # newer, unrelated status -- there is only ever at most one
+        # pending dismissal for this widget at a time.
+        if self._send_error_dismiss_timer is not None:
+            self._send_error_dismiss_timer.stop()
+            self._send_error_dismiss_timer = None
+        if message:
+            self._send_error_dismiss_timer = self.set_timer(
+                SEND_ERROR_AUTO_DISMISS_SECONDS, self._auto_dismiss_send_error
+            )
         self._render_chat_status()
+
+    def _auto_dismiss_send_error(self) -> None:
+        self._send_error_dismiss_timer = None
+        self._show_send_error("")
 
     def _show_older_message_notice(
         self,
@@ -3842,6 +4058,15 @@ class MeshtasticPassApp(App[None]):
         if not widgets:
             return
         widget = widgets[0]
+        if self._radio_state is not RadioState.ONLINE:
+            # Reconnecting is the most operationally important thing to
+            # tell the user here -- message entry is disabled regardless
+            # (see _update_chat_connection_state), so a stale send error
+            # or older-message notice underneath it is never actionable
+            # right now anyway.
+            widget.set_class(False, "older-message-notice")
+            widget.update("RECONNECTING…")
+            return
         state = self._state_for(self.current_channel_index)
         count = len(state.pending_older_ids)
         show_notice = not self._send_error_message and count > 0

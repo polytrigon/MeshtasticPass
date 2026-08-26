@@ -89,6 +89,16 @@ class DeliveryState(Enum):
     HEARD = "HEARD"
     UNCONFIRMED = "UNCONFIRMED"
     FAILED = "FAILED"
+    # A message reloaded from persistence still showing SENDING belonged
+    # to a process that no longer exists -- that process's radio worker,
+    # ACK callback, and confirmation timer are all gone with it, so
+    # SENDING can never resolve on its own again. INTERRUPTED says
+    # exactly and only what is truthfully known: submission was in
+    # progress when the app stopped tracking it, and what happened next
+    # (sent, heard, lost) is unknown -- never SENT (that would claim
+    # knowledge the app doesn't have) and never silently left as
+    # SENDING forever (see app_controller.stored_chat_entry).
+    INTERRUPTED = "INTERRUPTED"
 
 
 @dataclass(frozen=True)

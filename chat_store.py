@@ -99,6 +99,7 @@ class ChatStore:
             connection.row_factory = sqlite3.Row
             store = cls(connection, database_path)
             store._create_schema()
+            store.reconcile_abandoned_sending()
             return store
         except (OSError, sqlite3.DatabaseError, ChatStoreError) as error:
             if connection is not None:
@@ -106,6 +107,73 @@ class ChatStore:
             if isinstance(error, ChatStoreError):
                 raise
             raise ChatStoreError(f"Could not open CHAT history: {error}") from error
+
+    def reconcile_abandoned_sending(self) -> int:
+        """Rewrite every persisted outgoing SENDING row to INTERRUPTED,
+
+        directly in SQLite. Called once, automatically, by open() --
+        before any caller can hydrate history from this store.
+
+        This is the authoritative fix for a message stuck on SENDING
+        forever: a SENDING row already persisted at the moment a store
+        is opened cannot belong to the process now opening it (that
+        process has not attempted a send yet), so it is abandoned state
+        left behind by a previous process -- regardless of whether that
+        process shut down gracefully, crashed, lost power, or predates
+        this app version, and regardless of channel, pagination, or
+        whether anything currently loads it into memory. Covers every
+        row in the table in one UPDATE, not just whatever happens to be
+        mounted in a widget or held in an in-memory ChatEntry.
+
+        Never marks SENT/HEARD -- this store has no way to know the
+        real send outcome, only that nothing is tracking the attempt
+        anymore. Never retransmits -- this issues no radio traffic, it
+        only rewrites rows. This is a one-time startup pass, not a
+        write trigger: a message legitimately sent later in the same
+        process, by the same open store, is untouched (reconciliation
+        has already finished by the time that INSERT happens).
+
+        Also reconciles any lingering send_attempts row for those
+        messages, so the whole persisted record stays internally
+        consistent even though nothing currently reads that table at
+        runtime.
+
+        Returns the number of `messages` rows rewritten (for logging
+        and tests).
+
+        Assumes at most one ChatStore is ever open against a given
+        database file at a time -- true of how the app itself uses
+        this (main() opens exactly one, for the process's whole
+        lifetime). Opening a SECOND store against a database another
+        still-running process/store already owns would incorrectly
+        interrupt a send that store has legitimately in flight, since
+        this method cannot distinguish "abandoned by a dead process"
+        from "owned by a live one" other than by that single-open
+        assumption. A read-only inspection tool (see
+        inspect_chat_store.py) must never call open() on a database
+        that might still be live for exactly this reason.
+        """
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE messages
+                SET delivery_state = 'INTERRUPTED'
+                WHERE direction = 'outgoing'
+                    AND delivery_state = 'SENDING'
+                """
+            )
+            reconciled = cursor.rowcount
+            connection.execute(
+                """
+                UPDATE send_attempts
+                SET state = 'INTERRUPTED'
+                WHERE state = 'SENDING'
+                    AND message_id IN (
+                        SELECT id FROM messages WHERE direction = 'outgoing'
+                    )
+                """
+            )
+            return reconciled
 
     def add_incoming(
         self,

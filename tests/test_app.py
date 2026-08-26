@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 import tempfile
 from threading import Event
-from time import monotonic, time
+from time import monotonic, sleep, time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -18,6 +19,7 @@ from textual.events import MouseScrollDown
 from textual.widgets import Input, Static
 
 from app import (
+    TAB_NAMES,
     ConnectionPage,
     ChatTranscript,
     ChatEntryWidget,
@@ -31,6 +33,7 @@ from app import (
     MessageActionControl,
     MeshtasticPassApp,
     ThinScrollBarRender,
+    can_manual_resend,
 )
 from app_controller import received_chat_entry
 from app_settings import AppSettings
@@ -116,9 +119,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.current_tab, "chat")
             chat_input = app.query_one("#chat-input", Input)
 
-            await pilot.press("1")
+            await pilot.press("2")
             self.assertEqual(app.current_tab, "chat")
-            self.assertEqual(chat_input.value, "1")
+            self.assertEqual(chat_input.value, "2")
 
             chat_input.value = "hello from test"
             await pilot.press("enter")
@@ -127,12 +130,88 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.chat_history[-1].text, "hello from test")
             self.assertEqual(chat_input.value, "")
 
-            await pilot.press("escape", "3")
-            self.assertEqual(app.current_tab, "profile")
-            await pilot.press("4")
+            await pilot.press("escape", "1")
+            self.assertEqual(app.current_tab, "connection")
+            await pilot.press("3")
             self.assertEqual(app.current_tab, "mesh")
 
         self.assertTrue(radio.is_closed)
+
+    # ---- Top-nav reorder: PROFILE hidden, CONNECTION/CHAT/MESH [1]-[3] --
+
+    async def test_visible_top_nav_is_connection_chat_mesh_in_order(self) -> None:
+        """TAB_NAMES drives both the numbering and the visible labels --
+
+        assert its exact order/membership directly, the same source
+        _update_tab_bar() renders from.
+        """
+        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh"])
+        self.assertNotIn("profile", TAB_NAMES)
+
+    async def test_key_1_selects_connection_key_2_selects_chat_key_3_selects_mesh(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+
+            await pilot.press("2")
+            self.assertEqual(app.current_tab, "chat")
+
+            await pilot.press("escape", "1")
+            self.assertEqual(app.current_tab, "connection")
+
+            await pilot.press("3")
+            self.assertEqual(app.current_tab, "mesh")
+
+    async def test_key_4_does_not_select_mesh_or_hidden_profile(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+            await pilot.press("4")
+            self.assertEqual(app.current_tab, "connection")
+
+            await pilot.press("2")
+            self.assertEqual(app.current_tab, "chat")
+            await pilot.press("escape", "4")
+            self.assertEqual(app.current_tab, "chat")
+
+    async def test_footer_help_text_reflects_1_through_3(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            footer_text = str(app.query_one("#footer", Static).render())
+            self.assertIn("1-3", footer_text)
+            self.assertNotIn("1-4", footer_text)
+
+            await pilot.press("3")
+            await pilot.pause()
+            footer_text = str(app.query_one("#footer", Static).render())
+            self.assertIn("1-3", footer_text)
+            self.assertNotIn("1-4", footer_text)
+
+    async def test_profile_implementation_still_composed_but_unreachable(self) -> None:
+        """PROFILE is hidden from navigation, not deleted: its content pane
+
+        remains mounted inside the ContentSwitcher (proving the
+        implementation still exists and could be restored by re-adding
+        it to TAB_NAMES/tab_for_key), but current_tab can never become
+        "profile" through any digit key the visible nav exposes.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertIsNotNone(app.query_one("#profile"))
+            for key in ("1", "2", "3", "4", "escape"):
+                await pilot.press(key)
+                await pilot.pause()
+                self.assertNotEqual(app.current_tab, "profile")
 
     async def test_simulated_messages_reach_chat_history_once(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
@@ -1744,11 +1823,965 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     for entry in second_app.chat_history
                 )
             )
+            # Not DeliveryState.SENT: a restored SENT row has no way to
+            # ever receive a HEARD confirmation or age out on its own
+            # (see stored_chat_entry's SENT->UNCONFIRMED reconciliation),
+            # so it reloads as the honest UNCONFIRMED instead.
             self.assertEqual(
                 second_app.chat_history[-1].delivery_state,
-                DeliveryState.SENT,
+                DeliveryState.UNCONFIRMED,
             )
             self.assertEqual(second_app.unread_count, 0)
+
+    async def test_message_stuck_sending_at_restart_reconciles_to_interrupted(
+        self,
+    ) -> None:
+        """Regression for the observed hardware bug: send a message, quit
+
+        while it is still SENDING, reopen -- it must not remain stuck
+        showing SENDING forever, must not be falsely marked SENT/HEARD,
+        and reopening must not automatically create a duplicate
+        transmission.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            # Persist as SENDING and never resolve it -- simulating the
+            # app being killed before any ACK/failure callback fires.
+            app._start_outgoing("Meet at 8?")
+            await pilot.pause()
+            self.assertEqual(app.chat_history[-1].delivery_state, DeliveryState.SENDING)
+        # No RadioMonitor is running in this headless test, so nothing
+        # else will ever advance this message's state -- closing the
+        # store here stands in for the process terminating.
+        store.close()
+
+        reopened = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=reopened)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            reloaded = second_app.chat_history[-1]
+            self.assertEqual(reloaded.text, "Meet at 8?")
+            self.assertNotEqual(reloaded.delivery_state, DeliveryState.SENDING)
+            self.assertNotIn(
+                reloaded.delivery_state, (DeliveryState.SENT, DeliveryState.HEARD)
+            )
+            self.assertEqual(reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            # No automatic retransmission: reopening never calls send.
+            self.assertEqual(second_radio.sent_messages, ())
+            # The reconciled message is offered for manual resend, same
+            # as any other genuinely-failed outgoing message.
+            self.assertTrue(can_manual_resend(reloaded))
+
+    async def test_normal_current_process_sending_is_unaffected_by_reconciliation(
+        self,
+    ) -> None:
+        """A message actively SENDING in the CURRENT process must display
+
+        exactly as before -- reconciliation only ever applies to a row
+        freshly loaded from a previous process, never to a live in-
+        memory entry this session itself created.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._start_outgoing("still sending")
+            await pilot.pause()
+            self.assertEqual(app.chat_history[-1].delivery_state, DeliveryState.SENDING)
+            widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry is app.chat_history[-1]
+            )
+            self.assertIn("SENDING", str(widget.delivery_label.render()))
+
+    async def test_normal_graceful_close_while_sending_persists_interrupted(
+        self,
+    ) -> None:
+        """Regression for the real-device report: a message left SENDING
+
+        through an ORDINARY app close (not a killed process) must come
+        back as INTERRUPTED -- not SENDING -- and must stay that way
+        across a history refresh/tab switch and a further restart.
+
+        Unlike test_message_stuck_sending_at_restart_reconciles_to_interrupted
+        (which simulates a process that vanished without running any
+        shutdown code), this drives the app through its REAL on_unmount
+        lifecycle by exiting run_test()'s context normally, and checks
+        the raw DB row itself -- not just the in-memory view -- to prove
+        the shutdown-time write lands, not only the load-time read fix.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._start_outgoing("still on the way?")
+            await pilot.pause()
+            self.assertEqual(app.chat_history[-1].delivery_state, DeliveryState.SENDING)
+
+        check = ChatStore.open(self.chat_db_path)
+        raw_after_first_close = check.load_recent()[-1].delivery_state
+        check.close()
+        self.assertEqual(raw_after_first_close, DeliveryState.INTERRUPTED.value)
+
+        second_store = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            reloaded = second_app.chat_history[-1]
+            self.assertEqual(reloaded.text, "still on the way?")
+            self.assertEqual(reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            widget = next(
+                w for w in second_app.query(ChatEntryWidget) if w.entry is reloaded
+            )
+            self.assertIn("INTERRUPTED", str(widget.delivery_label.render()))
+            self.assertEqual(second_radio.sent_messages, ())
+
+            # A normal history refresh / tab switch must not disturb it.
+            second_app.show_tab("connection")
+            await pilot.pause()
+            second_app.show_tab("chat")
+            await pilot.pause()
+            reloaded_again = second_app.chat_history[-1]
+            self.assertEqual(reloaded_again.delivery_state, DeliveryState.INTERRUPTED)
+
+        # Second instance also shut down gracefully with nothing left
+        # SENDING -- its own shutdown reconciliation must be a safe
+        # no-op, not something that could ever regress an already-
+        # resolved state.
+        check_after_second_close = ChatStore.open(self.chat_db_path)
+        raw_after_second_close = check_after_second_close.load_recent()[-1].delivery_state
+        check_after_second_close.close()
+        self.assertEqual(raw_after_second_close, DeliveryState.INTERRUPTED.value)
+
+        third_store = ChatStore.open(self.chat_db_path)
+        third_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        third_app = MeshtasticPassApp(third_radio, self.settings, chat_store=third_store)
+        async with third_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            still_reloaded = third_app.chat_history[-1]
+            self.assertEqual(still_reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            self.assertEqual(third_radio.sent_messages, ())
+
+    async def test_legacy_sending_row_seeded_outside_the_app_is_interrupted_on_fresh_start(
+        self,
+    ) -> None:
+        """The closest reproduction of the real uConsole report: a
+
+        SENDING row that predates this app instance entirely -- seeded
+        directly against the database, never through an app that then
+        shuts down -- must already read INTERRUPTED by the time CHAT
+        hydrates it, because ChatStore.open() itself repairs the
+        persisted row before any history load happens (see
+        ChatStore.reconcile_abandoned_sending()). Also proves the fix
+        survives a normal history refresh/tab switch and a second
+        restart, and that reopening never causes a retransmission.
+        """
+        seeding_store = ChatStore.open(self.chat_db_path)
+        legacy_message_id = seeding_store.add_outgoing(
+            text="abandoned before this app version existed",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENDING",
+        )
+        seeding_store.add_send_attempt(legacy_message_id, 100.0, "SENDING")
+        seeding_store.close()
+
+        store = ChatStore.open(self.chat_db_path)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app.chat_history[-1]
+            self.assertEqual(entry.delivery_state, DeliveryState.INTERRUPTED)
+            widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry is entry
+            )
+            self.assertIn("INTERRUPTED", str(widget.delivery_label.render()))
+            self.assertEqual(radio.sent_messages, ())
+
+            app.show_tab("connection")
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertEqual(app.chat_history[-1].delivery_state, DeliveryState.INTERRUPTED)
+
+        check = ChatStore.open(self.chat_db_path)
+        raw_state = check.load_recent()[-1].delivery_state
+        check.close()
+        self.assertEqual(raw_state, "INTERRUPTED")
+
+        second_store = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(
+                second_app.chat_history[-1].delivery_state, DeliveryState.INTERRUPTED
+            )
+            self.assertEqual(second_radio.sent_messages, ())
+
+    async def test_failed_resend_left_sending_at_f4_shutdown_is_interrupted(
+        self,
+    ) -> None:
+        """Reproduces the real-device report exactly: a message that
+
+        FAILED, was RESENT (not sent for the first time), never
+        resolved before the user quit with F4, and the same row must
+        not come back as SENDING across two further restarts.
+
+        Drives the actual production RESEND handler (_rebroadcast, via
+        the same UI path -- focus, down to the action control, enter --
+        as test_outgoing_states_timeout_failure_and_manual_rebroadcast
+        uses) rather than manually constructing a stored row, and exits
+        through the real F4 key handler rather than merely leaving
+        run_test()'s context.
+
+        The resend's own radio.send_text call is replaced with one that
+        blocks past this test's lifetime, so its worker thread never
+        reaches the point of posting SendSubmitted/SendFailed --
+        deterministically reproducing "the resend attempt never got a
+        completion callback before shutdown" without any timing race
+        against the real worker thread. (post_message() on an
+        already-shut-down app is a documented no-op, so the thread
+        harmlessly finding nothing left to post to afterwards is safe.)
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("original send that failed")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            message_id = entry.message_id
+            self.assertIsNotNone(message_id)
+
+            widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry is entry
+            )
+            self.assertTrue(can_manual_resend(entry))
+            widget.focus()
+            radio.send_text = Mock(side_effect=lambda *args, **kwargs: sleep(3))
+            await pilot.press("down", "enter")
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+            self.assertIn("SENDING", str(widget.delivery_label.render()))
+
+            # A raw read-only connection here, deliberately NOT another
+            # ChatStore.open() call: opening a second store against a
+            # database another still-running process/store owns would
+            # itself invoke startup reconciliation and incorrectly
+            # interrupt this legitimately in-flight resend -- exactly
+            # the failure mode ChatStore.reconcile_abandoned_sending()
+            # assumes can't happen (it assumes a fresh process, not a
+            # second concurrent open against a live one). This mirrors
+            # exactly how inspect_chat_store.py inspects a live database
+            # safely.
+            raw_connection = sqlite3.connect(
+                f"file:{self.chat_db_path}?mode=ro", uri=True
+            )
+            raw_connection.row_factory = sqlite3.Row
+            raw_message = raw_connection.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            self.assertEqual(raw_message["delivery_state"], "SENDING")
+            raw_attempts = raw_connection.execute(
+                "SELECT state FROM send_attempts WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            ).fetchall()
+            self.assertEqual(len(raw_attempts), 2)
+            self.assertEqual(raw_attempts[-1]["state"], "SENDING")
+            raw_connection.close()
+
+            await pilot.press("f4")
+            await pilot.pause()
+
+        raw_after_shutdown = ChatStore.open(self.chat_db_path)
+        after_shutdown_state = raw_after_shutdown.load_recent()[0].delivery_state
+        raw_after_shutdown.close()
+        self.assertEqual(after_shutdown_state, "INTERRUPTED")
+
+        second_store = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            reloaded = next(
+                e for e in second_app.chat_history if e.message_id == message_id
+            )
+            self.assertEqual(reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            self.assertNotIn(
+                reloaded.delivery_state, (DeliveryState.SENT, DeliveryState.HEARD)
+            )
+            widget = next(
+                w for w in second_app.query(ChatEntryWidget) if w.entry is reloaded
+            )
+            self.assertIn("INTERRUPTED", str(widget.delivery_label.render()))
+            self.assertEqual(second_radio.sent_messages, ())
+
+        third_store = ChatStore.open(self.chat_db_path)
+        third_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        third_app = MeshtasticPassApp(third_radio, self.settings, chat_store=third_store)
+        async with third_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            still_reloaded = next(
+                e for e in third_app.chat_history if e.message_id == message_id
+            )
+            self.assertEqual(still_reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            self.assertEqual(third_radio.sent_messages, ())
+
+    # ---- Correction: message_id 81 was SENT, not SENDING, in SQLite -----
+
+    async def test_fresh_hydration_of_persisted_sent_row_renders_unconfirmed(
+        self,
+    ) -> None:
+        """Exact reproduction of the real message_id 81 dump: messages.
+
+        delivery_state = SENT, an earlier FAILED/MAX_RETRANSMIT attempt,
+        and a later SENT attempt with completed_at = NULL (expected --
+        see _set_delivery_state, which deliberately never stamps
+        completed_at for SENT since it isn't a final outcome). A fresh
+        app instance must never render this as SENDING, and must offer
+        manual resend since nothing can ever confirm it now. Also
+        proves a SECOND restart doesn't regress it back toward SENDING
+        or SENT -- the real device survived a full reboot still showing
+        the bug.
+        """
+        seeding_store = ChatStore.open(self.chat_db_path)
+        message_id = seeding_store.add_outgoing(
+            text="so and intermediaey received, stored, then resent it at a later time",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENDING",
+        )
+        first_attempt = seeding_store.add_send_attempt(message_id, 100.0, "SENDING")
+        seeding_store.update_delivery_state(
+            message_id,
+            "FAILED",
+            attempt_id=first_attempt,
+            error="MAX_RETRANSMIT",
+            completed_at=105.0,
+        )
+        second_attempt = seeding_store.add_send_attempt(message_id, 110.0, "SENDING")
+        seeding_store.update_delivery_state(
+            message_id,
+            "SENT",
+            attempt_id=second_attempt,
+            packet_id=838484544,
+        )
+        seeding_store.close()
+
+        store = ChatStore.open(self.chat_db_path)
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app.chat_history[-1]
+            self.assertEqual(entry.message_id, message_id)
+            self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
+            self.assertNotEqual(entry.delivery_state, DeliveryState.SENT)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            rendered = str(widget.delivery_label.render())
+            self.assertIn("UNCONFIRMED", rendered)
+            self.assertNotIn("SENDING", rendered)
+            self.assertTrue(can_manual_resend(entry))
+            self.assertTrue(widget.action_control.display)
+            self.assertEqual(radio.sent_messages, ())
+
+        second_store = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            reloaded = next(
+                e for e in second_app.chat_history if e.message_id == message_id
+            )
+            self.assertEqual(reloaded.delivery_state, DeliveryState.UNCONFIRMED)
+            widget = next(
+                w for w in second_app.query(ChatEntryWidget) if w.entry is reloaded
+            )
+            rendered = str(widget.delivery_label.render())
+            self.assertIn("UNCONFIRMED", rendered)
+            self.assertNotIn("SENDING", rendered)
+            self.assertEqual(second_radio.sent_messages, ())
+
+    async def test_live_resend_to_sent_updates_store_entry_and_widget_together(
+        self,
+    ) -> None:
+        """Drives FAILED -> RESEND -> SENT entirely within one live
+
+        process (no restart, no tab switch, no history reload) and
+        proves the store, the in-memory ChatEntry, and the mounted
+        widget all agree at every step -- ruling out the object-
+        identity/stale-widget-reference hypothesis: the SAME entry
+        object is used throughout _rebroadcast/_send_from_thread/
+        send_was_submitted/_set_delivery_state, so widget.entry is
+        entry holds the whole way through.
+
+        SENT is deliberately rendered identically to SENDING by
+        ChatEntryWidget.refresh_delivery_state() (an intentional
+        "still awaiting confirmation" display, unrelated to this bug)
+        -- so the widget correctly still reads "SENDING..." immediately
+        after reaching SENT. What must also hold, with zero restart,
+        is that once the confirmation window elapses,
+        _advance_delivery_states() promotes it to UNCONFIRMED and the
+        store/entry/widget move together again.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+            send_outcomes=(SimulatedSendOutcome.SENT,),
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("will fail then resend to success")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            message_id = entry.message_id
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            self.assertIs(widget.entry, entry)
+
+            widget.focus()
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+            self.assertIs(widget.entry, entry)
+
+            raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
+            raw.row_factory = sqlite3.Row
+            row = raw.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            raw.close()
+            self.assertEqual(row["delivery_state"], "SENT")
+            self.assertIn("SENDING", str(widget.delivery_label.render()))
+
+            entry.confirmation_deadline = monotonic() - 1
+            app._advance_delivery_states()
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
+            self.assertIs(widget.entry, entry)
+            self.assertIn("UNCONFIRMED", str(widget.delivery_label.render()))
+            self.assertNotIn("SENDING", str(widget.delivery_label.render()))
+
+            raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
+            raw.row_factory = sqlite3.Row
+            row = raw.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            raw.close()
+            self.assertEqual(row["delivery_state"], "UNCONFIRMED")
+
+    async def test_live_resend_terminal_transitions_stay_in_sync(self) -> None:
+        """For every terminal state a live RESEND can reach, the store,
+
+        ChatEntry, and mounted widget must all agree immediately, with
+        no restart/tab-switch/history-reload required.
+        """
+        cases = (
+            (SimulatedSendOutcome.SENT, DeliveryState.SENT, "SENDING"),
+            (SimulatedSendOutcome.HEARD, DeliveryState.HEARD, "HEARD"),
+        )
+        for outcome, expected_state, expected_text in cases:
+            with self.subTest(outcome=outcome):
+                radio = SimulatedRadioService(
+                    connect_delay=0,
+                    message_interval=0,
+                    scripted_messages=(),
+                    send_outcomes=(outcome,),
+                )
+                store = ChatStore.open(
+                    Path(self.temporary_directory.name) / f"{outcome.value}.db"
+                )
+                app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.pause()
+                    entry = app._start_outgoing("resend target")
+                    app._set_delivery_state(entry, DeliveryState.FAILED)
+                    await pilot.pause()
+                    widget = next(
+                        w for w in app.query(ChatEntryWidget) if w.entry is entry
+                    )
+                    widget.focus()
+                    await pilot.press("down", "enter")
+                    for _ in range(10):
+                        await pilot.pause()
+                        if entry.delivery_state is expected_state:
+                            break
+                    self.assertEqual(entry.delivery_state, expected_state)
+                    self.assertIs(widget.entry, entry)
+                    self.assertIn(expected_text, str(widget.delivery_label.render()))
+                    raw = sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)
+                    raw.row_factory = sqlite3.Row
+                    row = raw.execute(
+                        "SELECT delivery_state FROM messages WHERE id = ?",
+                        (entry.message_id,),
+                    ).fetchone()
+                    raw.close()
+                    self.assertEqual(row["delivery_state"], expected_state.value)
+
+        # FAILED and INTERRUPTED are reached via direct completion paths
+        # (a real definite send failure, and app-owned shutdown
+        # reconciliation, respectively) rather than an immediate_state
+        # from the radio -- exercised directly here for the same
+        # three-way agreement guarantee.
+        for target_state, expected_text in (
+            (DeliveryState.FAILED, "FAILED"),
+            (DeliveryState.INTERRUPTED, "INTERRUPTED"),
+        ):
+            with self.subTest(target_state=target_state):
+                radio = SimulatedRadioService(
+                    connect_delay=0, message_interval=0, scripted_messages=()
+                )
+                store = ChatStore.open(
+                    Path(self.temporary_directory.name) / f"{target_state.value}.db"
+                )
+                app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.pause()
+                    entry = app._start_outgoing("resend target 2")
+                    app._set_delivery_state(entry, DeliveryState.FAILED)
+                    await pilot.pause()
+                    widget = next(
+                        w for w in app.query(ChatEntryWidget) if w.entry is entry
+                    )
+                    app._set_delivery_state(entry, target_state)
+                    await pilot.pause()
+                    self.assertEqual(entry.delivery_state, target_state)
+                    self.assertIs(widget.entry, entry)
+                    self.assertIn(expected_text, str(widget.delivery_label.render()))
+                    raw = sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)
+                    raw.row_factory = sqlite3.Row
+                    row = raw.execute(
+                        "SELECT delivery_state FROM messages WHERE id = ?",
+                        (entry.message_id,),
+                    ).fetchone()
+                    raw.close()
+                    self.assertEqual(row["delivery_state"], target_state.value)
+
+    # ---- Receive path health during/after an unresolved resend ----------
+
+    async def test_unrelated_incoming_message_still_processed_during_stuck_resend(
+        self,
+    ) -> None:
+        """A resend stuck on SENDING must not block the receive path.
+
+        Uses radio.emit_message() -- the SAME dispatch RadioMonitor
+        registers for real incoming packets (add_message_handler ->
+        _message_from_thread -> post_message -> _accept_received_message)
+        -- rather than calling _accept_received_message directly, so
+        this actually exercises whether the registered callback still
+        fires, not just whether the app-level handler function works in
+        isolation.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("failed then resent")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+            radio.send_text = Mock(side_effect=lambda *args, **kwargs: sleep(3))
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+
+            incoming = replace(
+                SIMULATED_MESSAGES[0],
+                packet_id=88001,
+                text="are you still there?",
+            )
+            radio.emit_message(incoming)
+            await pilot.pause()
+
+            self.assertIn(
+                "are you still there?",
+                [e.text for e in app.chat_history],
+            )
+            if self.chat_db_path.exists():
+                store = ChatStore.open(self.chat_db_path)
+                self.assertIn(
+                    "are you still there?",
+                    [m.text for m in store.load_recent()],
+                )
+                store.close()
+
+    async def test_receive_path_survives_simulated_disconnect_and_reconnect(
+        self,
+    ) -> None:
+        """An ordinary connection-loss/auto-reconnect cycle -- the
+
+        common real-world case, distinct from an explicit USB device
+        change -- must not leave the receive callback unregistered or
+        CHAT believing the radio is still reconnecting once it's back
+        online.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+
+            radio.simulate_disconnect()
+            for _ in range(10):
+                await pilot.pause()
+                if app._radio_state is RadioState.OFFLINE:
+                    break
+            self.assertEqual(app._radio_state, RadioState.OFFLINE)
+
+            radio.simulate_reconnect()
+            for _ in range(10):
+                await pilot.pause()
+                if app._radio_state is RadioState.ONLINE:
+                    break
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+
+            incoming = replace(
+                SIMULATED_MESSAGES[0],
+                packet_id=88002,
+                text="reconnected and still receiving",
+            )
+            radio.emit_message(incoming)
+            await pilot.pause()
+            self.assertIn(
+                "reconnected and still receiving",
+                [e.text for e in app.chat_history],
+            )
+
+    async def test_receive_callback_still_registered_after_explicit_device_switch(
+        self,
+    ) -> None:
+        """The one path that actually replaces RadioMonitor
+
+        (_switch_device) must correctly re-register the receive
+        callback on the new monitor -- not silently drop it.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await app._switch_device("/dev/ttyUSB1")
+            for _ in range(10):
+                await pilot.pause()
+                if app._radio_state is RadioState.ONLINE:
+                    break
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+
+            incoming = replace(
+                SIMULATED_MESSAGES[0],
+                packet_id=88003,
+                text="received after device switch",
+            )
+            radio.emit_message(incoming)
+            await pilot.pause()
+            self.assertIn(
+                "received after device switch",
+                [e.text for e in app.chat_history],
+            )
+
+    # ---- RECONNECTING message bar --------------------------------------
+
+    async def test_reconnecting_disables_chat_input_and_shows_status(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            self.assertTrue(chat_input.disabled)
+            status = str(app.query_one("#send-error", Static).render())
+            self.assertIn("RECONNECTING", status)
+
+    async def test_reconnecting_blocks_send_even_if_submitted_is_forced(self) -> None:
+        """Belt-and-suspenders: even if an Input.Submitted event somehow
+
+        fires while disabled, send_chat_message itself refuses while not
+        ONLINE.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "should not send"
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            before = len(app.chat_history)
+            app.send_chat_message(Input.Submitted(chat_input, "should not send"))
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), before)
+            self.assertEqual(radio.sent_messages, ())
+
+    async def test_reconnect_preserves_existing_draft(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "Meet at 8?"
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            self.assertTrue(chat_input.disabled)
+            self.assertEqual(chat_input.value, "Meet at 8?")
+
+    async def test_restored_connection_reenables_input_and_restores_draft(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "Meet at 8?"
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+
+            app._show_connection(
+                RadioState.ONLINE,
+                info=RadioInfo(
+                    device_path="/dev/test",
+                    node_id="!51a00001",
+                    long_name="Test Radio",
+                    short_name="TEST",
+                    firmware_version="test",
+                    known_nodes=0,
+                ),
+            )
+            await pilot.pause()
+            self.assertFalse(chat_input.disabled)
+            self.assertEqual(chat_input.value, "Meet at 8?")
+            status = str(app.query_one("#send-error", Static).render())
+            self.assertNotIn("RECONNECTING", status)
+
+    async def test_displaying_reconnecting_generates_no_radio_traffic(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            self.assertEqual(radio.sent_messages, ())
+
+    # ---- Empty-message error lifecycle ---------------------------------
+
+    async def test_empty_and_whitespace_input_rejected_with_no_send(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            before = len(app.chat_history)
+
+            chat_input.value = ""
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), before)
+            self.assertEqual(radio.sent_messages, ())
+            status = str(app.query_one("#send-error", Static).render())
+            self.assertTrue(status)
+
+            chat_input.value = "   "
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), before)
+            self.assertEqual(radio.sent_messages, ())
+
+    async def test_typing_clears_the_empty_message_error_immediately(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._send_error_message)
+
+            await pilot.press("h")
+            await pilot.pause()
+            self.assertEqual(app._send_error_message, "")
+            status = str(app.query_one("#send-error", Static).render())
+            self.assertEqual(status, "")
+
+    async def test_losing_focus_clears_the_empty_message_error_immediately(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._send_error_message)
+
+            app.query_one("#chat-log", ChatTranscript).focus()
+            await pilot.pause()
+            self.assertEqual(app._send_error_message, "")
+
+    async def test_leaving_chat_tab_clears_the_empty_message_error(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._send_error_message)
+
+            await pilot.press("escape", "1")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+            self.assertEqual(app._send_error_message, "")
+
+            await pilot.press("2")
+            await pilot.pause()
+            status = str(app.query_one("#send-error", Static).render())
+            self.assertEqual(status, "")
+
+    async def test_ten_second_timer_dismisses_the_error(self) -> None:
+        """Simulates elapsed time by invoking the scheduled callback
+
+        directly, matching this codebase's existing convention for
+        testing long real-world durations (see _advance_delivery_states'
+        confirmation-timeout tests) -- never a real 10-second sleep.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._send_error_message)
+            self.assertIsNotNone(app._send_error_dismiss_timer)
+
+            app._auto_dismiss_send_error()
+            await pilot.pause()
+            self.assertEqual(app._send_error_message, "")
+            self.assertIsNone(app._send_error_dismiss_timer)
+
+    async def test_repeated_invalid_sends_replace_not_stack_the_timer(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            first_timer = app._send_error_dismiss_timer
+            self.assertIsNotNone(first_timer)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            second_timer = app._send_error_dismiss_timer
+            self.assertIsNotNone(second_timer)
+            self.assertIsNot(first_timer, second_timer)
+
+    async def test_stale_timer_cannot_clear_a_newer_unrelated_status(self) -> None:
+        """_send_error_dismiss_timer holds at most one Timer at a time --
+
+        _show_send_error always stops the previous one before scheduling
+        a new one, so a stale dismissal is never left pending to fire
+        later against a newer, unrelated status. Proven at the only
+        level that matters observably: after replacing the status, the
+        newer one is what is actually showing, and only one timer
+        object exists to ever fire again.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._show_send_error("first error")
+            first_timer = app._send_error_dismiss_timer
+            app._show_send_error("second, unrelated status")
+            second_timer = app._send_error_dismiss_timer
+            await pilot.pause()
+            self.assertIsNot(first_timer, second_timer)
+            self.assertEqual(app._send_error_message, "second, unrelated status")
+            # Only the current timer can ever fire again; dismissing it
+            # clears the CURRENT (newer) status, never a phantom older one.
+            app._auto_dismiss_send_error()
+            self.assertEqual(app._send_error_message, "")
+
+    async def test_callback_is_safe_if_widget_no_longer_exists(self) -> None:
+        """The dismiss callback must not raise if #send-error is gone by
+
+        the time it fires (e.g. the app is mid-shutdown).
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("2")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+        # The app (and #send-error with it) is torn down after run_test
+        # exits; calling the callback post-teardown must not raise.
+        app._auto_dismiss_send_error()
 
     async def test_history_pagination_is_bounded_and_preserves_ui_state(self) -> None:
         store = ChatStore.open(self.chat_db_path)

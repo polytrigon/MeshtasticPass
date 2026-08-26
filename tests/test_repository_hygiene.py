@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +16,18 @@ from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def repository_python_files() -> list[Path]:
+    """Every tracked-shaped .py file outside ignored tool directories."""
+    excluded_roots = {".git", ".venv", "venv", "__pycache__"}
+    matches: list[Path] = []
+    for path in PROJECT_ROOT.rglob("*.py"):
+        relative = path.relative_to(PROJECT_ROOT)
+        if relative.parts and relative.parts[0] in excluded_roots:
+            continue
+        matches.append(path)
+    return matches
 
 
 def repository_runtime_files() -> set[Path]:
@@ -154,6 +168,100 @@ class RepositoryHygieneTests(unittest.TestCase):
             )
 
         self.assertEqual(repository_runtime_files(), before)
+
+    def test_no_source_file_contains_a_lone_surrogate_code_point(self) -> None:
+        """Regression for a real production crash: a \\uD8xx/\\uDFxx-range
+
+        escape written inside a non-raw string literal (describing an
+        astral emoji codepoint-by-codepoint in a docstring) is not
+        combined into the intended character -- Python creates two
+        separate, genuine lone surrogate code points instead. Such a
+        string cannot be encoded as UTF-8, which crashed module import
+        on strict-UTF-8 Linux (a uConsole in the field) with
+        UnicodeEncodeError, even though the exact same file imported
+        fine on macOS. There must be zero surrogate code points
+        (U+D800-U+DFFF) in any project source file, full stop -- not
+        worked around via encoding/errors settings.
+        """
+        offenders: list[str] = []
+        for path in repository_python_files():
+            text = path.read_text(encoding="utf-8")
+            bad = [
+                (index, hex(ord(character)))
+                for index, character in enumerate(text)
+                if 0xD800 <= ord(character) <= 0xDFFF
+            ]
+            if bad:
+                offenders.append(
+                    f"{path.relative_to(PROJECT_ROOT)}: {bad[:5]}"
+                    + (" ..." if len(bad) > 5 else "")
+                )
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def _assert_fresh_import_does_not_raise_unicode_encode_error(
+        self, module_name: str
+    ) -> None:
+        """Import `module_name` in a brand-new subprocess and fail if that
+
+        raises UnicodeEncodeError.
+
+        Deliberately a fresh subprocess rather than importlib.reload() in
+        this process: app.py is a live Textual App module, and reloading
+        it re-executes CSS/widget-registration side effects shared with
+        every other already-imported reference to it in this same test
+        run, corrupting unrelated tests that hold the original class
+        objects (confirmed by reproducing exactly that breakage while
+        developing this test).
+        """
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {module_name}"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "PYTHONUTF8": "1", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"},
+        )
+        self.assertNotIn("UnicodeEncodeError", result.stderr, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_importing_grapheme_text_does_not_raise_unicode_encode_error(
+        self,
+    ) -> None:
+        self._assert_fresh_import_does_not_raise_unicode_encode_error("grapheme_text")
+
+    def test_importing_app_does_not_raise_unicode_encode_error(self) -> None:
+        self._assert_fresh_import_does_not_raise_unicode_encode_error("app")
+
+    def test_app_simulate_gets_past_module_import_under_strict_utf8(self) -> None:
+        """Launch the real entry point exactly as production does
+
+        (python app.py --simulate) in a subprocess forced to strict
+        UTF-8 (mirroring the uConsole's Linux environment, where the
+        default was not permissive like macOS's), and confirm it gets
+        past module import and actually starts driving the TUI (it
+        keeps running without a real TTY, so it is deliberately
+        terminated after a few seconds rather than waited on).
+        """
+        process = subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "app.py"), "--simulate"],
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONUTF8": "1", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"},
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=5)
+        self.assertNotIn("UnicodeEncodeError", stderr, stderr)
+        self.assertNotIn("Traceback", stderr, stderr)
 
 
 if __name__ == "__main__":

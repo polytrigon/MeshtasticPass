@@ -8,7 +8,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from chat_store import ChatStore, ChatStoreError, default_chat_db_path
+from chat_store import (
+    DEFAULT_HISTORY_LIMIT,
+    ChatStore,
+    ChatStoreError,
+    default_chat_db_path,
+)
 
 
 class ChatStoreTests(unittest.TestCase):
@@ -447,6 +452,261 @@ class ChatStoreTests(unittest.TestCase):
         detail = " ".join(str(row["detail"]) for row in plan)
         self.assertIn("USING INDEX incoming_node_message_time", detail)
         self.assertNotIn("SCAN messages", detail)
+
+
+class ReconcileAbandonedSendingTests(unittest.TestCase):
+    """ChatStore.open() must repair every abandoned SENDING row itself,
+
+    directly in SQLite, before any caller can hydrate history -- not
+    only the rows a particular app session happens to load into
+    memory. Each test opens a store, seeds rows, closes it, then opens
+    a COMPLETELY FRESH ChatStore on the same file (never reusing the
+    seeding instance) to reproduce the real scenario: a database
+    already on disk from a previous process, being opened for the
+    first time by a new one.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "chat.db"
+
+    def _seed_outgoing(
+        self,
+        store: ChatStore,
+        text: str,
+        *,
+        channel_index: int = 0,
+        local_sent_at: float = 100.0,
+        delivery_state: str = "SENDING",
+    ) -> int:
+        message_id = store.add_outgoing(
+            text=text,
+            channel_index=channel_index,
+            local_sent_at=local_sent_at,
+            delivery_state=delivery_state,
+        )
+        store.add_send_attempt(message_id, local_sent_at, delivery_state)
+        return message_id
+
+    def _raw_delivery_state(self, message_id: int) -> str:
+        # A completely independent read-only connection, never the
+        # ChatStore instance under test -- proves the value is really
+        # in SQLite, not just what one particular Python object reports.
+        connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return row[0]
+
+    def _raw_send_attempt_state(self, message_id: int) -> str:
+        connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT state FROM send_attempts WHERE message_id = ?", (message_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return row[0]
+
+    def test_preexisting_sending_row_becomes_interrupted_on_open(self) -> None:
+        """The closest reproduction of the real uConsole report: a
+
+        SENDING row already on disk from an earlier process, repaired
+        the moment a brand-new store opens it -- before history is
+        hydrated, without that process ever having sent anything.
+        """
+        seeding_store = ChatStore.open(self.path)
+        message_id = self._seed_outgoing(seeding_store, "still on the way?")
+        seeding_store.close()
+
+        fresh_store = ChatStore.open(self.path)
+        self.addCleanup(fresh_store.close)
+
+        self.assertEqual(self._raw_delivery_state(message_id), "INTERRUPTED")
+        stored = fresh_store.load_recent()[0]
+        self.assertEqual(stored.delivery_state, "INTERRUPTED")
+
+    def test_reconcile_abandoned_sending_returns_count_of_rewritten_rows(
+        self,
+    ) -> None:
+        """Exercises the method directly (not via open()'s automatic
+
+        call) so its return value can be observed in isolation: two
+        genuinely-abandoned outgoing rows plus one incoming row whose
+        delivery_state has been force-corrupted to SENDING (incoming
+        rows never legitimately have one) -- only the two outgoing
+        rows may be counted or rewritten.
+        """
+        store = ChatStore.open(self.path)  # reconciles the empty db: a no-op
+        self.addCleanup(store.close)
+        first_id = self._seed_outgoing(store, "one")
+        second_id = self._seed_outgoing(store, "two")
+        incoming_id = store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="not outgoing, must not count",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        ).message_id
+        # pylint: disable=protected-access
+        store._connection.execute(
+            "UPDATE messages SET delivery_state = 'SENDING' WHERE id = ?",
+            (incoming_id,),
+        )
+        store._connection.commit()
+
+        self.assertEqual(store.reconcile_abandoned_sending(), 2)
+        stored_by_id = {message.id: message for message in store.load_recent()}
+        self.assertEqual(stored_by_id[first_id].delivery_state, "INTERRUPTED")
+        self.assertEqual(stored_by_id[second_id].delivery_state, "INTERRUPTED")
+        self.assertEqual(stored_by_id[incoming_id].delivery_state, "SENDING")
+
+    def test_multiple_channels_and_ages_all_reconciled_in_one_pass(self) -> None:
+        seeding_store = ChatStore.open(self.path)
+        current_channel_id = self._seed_outgoing(
+            seeding_store, "recent, current channel", channel_index=0, local_sent_at=900.0
+        )
+        other_channel_id = self._seed_outgoing(
+            seeding_store, "recent, other channel", channel_index=1, local_sent_at=900.0
+        )
+        very_old_id = self._seed_outgoing(
+            seeding_store, "ancient, outside any initial page", channel_index=0, local_sent_at=1.0
+        )
+        # Enough intervening incoming history that the old row would
+        # only surface via OLD MESSAGES pagination in the real app.
+        for index in range(DEFAULT_HISTORY_LIMIT + 20):
+            seeding_store.add_incoming(
+                packet_id=1000 + index,
+                node_id="!a11ce001",
+                sender_name="Alice",
+                sender_short_name="ALCE",
+                channel_index=0,
+                text=f"filler {index}",
+                radio_rx_at=10.0 + index,
+                received_at=10.0 + index,
+            )
+        seeding_store.close()
+
+        fresh_store = ChatStore.open(self.path)
+        self.addCleanup(fresh_store.close)
+
+        for message_id in (current_channel_id, other_channel_id, very_old_id):
+            with self.subTest(message_id=message_id):
+                self.assertEqual(self._raw_delivery_state(message_id), "INTERRUPTED")
+
+        # Confirm the old row is genuinely reachable only via pagination,
+        # and still reads INTERRUPTED once actually loaded that way.
+        page = fresh_store.load_recent_page(channel_index=0, limit=DEFAULT_HISTORY_LIMIT)
+        self.assertTrue(page.has_older)
+        self.assertNotIn(very_old_id, [message.id for message in page.messages])
+        older_page = fresh_store.load_older_page(
+            page.messages[0].id, channel_index=0, limit=DEFAULT_HISTORY_LIMIT
+        )
+        oldest_loaded = next(
+            message for message in older_page.messages if message.id == very_old_id
+        )
+        self.assertEqual(oldest_loaded.delivery_state, "INTERRUPTED")
+
+    def test_incoming_rows_are_never_touched(self) -> None:
+        seeding_store = ChatStore.open(self.path)
+        result = seeding_store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text="hello",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        seeding_store.close()
+
+        fresh_store = ChatStore.open(self.path)
+        self.addCleanup(fresh_store.close)
+        stored = fresh_store.load_recent()[0]
+        self.assertEqual(stored.id, result.message_id)
+        self.assertIsNone(stored.delivery_state)
+
+    def test_terminal_outgoing_states_are_never_touched(self) -> None:
+        for state in ("SENT", "HEARD", "UNCONFIRMED", "FAILED", "INTERRUPTED"):
+            with self.subTest(state=state):
+                path = Path(self.temporary_directory.name) / f"{state}.db"
+                seeding_store = ChatStore.open(path)
+                message_id = self._seed_outgoing(
+                    seeding_store, f"already {state}", delivery_state=state
+                )
+                seeding_store.close()
+
+                fresh_store = ChatStore.open(path)
+                try:
+                    self.assertEqual(self._raw_delivery_state_at(path, message_id), state)
+                    stored = fresh_store.load_recent()[0]
+                    self.assertEqual(stored.delivery_state, state)
+                finally:
+                    fresh_store.close()
+
+    def _raw_delivery_state_at(self, path: Path, message_id: int) -> str:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return row[0]
+
+    def test_send_attempts_rows_are_also_reconciled(self) -> None:
+        seeding_store = ChatStore.open(self.path)
+        message_id = self._seed_outgoing(seeding_store, "attempt row too")
+        seeding_store.close()
+
+        fresh_store = ChatStore.open(self.path)
+        self.addCleanup(fresh_store.close)
+        self.assertEqual(self._raw_send_attempt_state(message_id), "INTERRUPTED")
+
+    def test_new_send_after_open_can_still_persist_sending(self) -> None:
+        """Startup reconciliation is a one-time pass, not a write
+
+        trigger: a message legitimately sent later in the SAME open
+        store must still persist as SENDING.
+        """
+        seeding_store = ChatStore.open(self.path)
+        self._seed_outgoing(seeding_store, "old abandoned one")
+        seeding_store.close()
+
+        store = ChatStore.open(self.path)  # runs reconciliation once, here
+        self.addCleanup(store.close)
+        new_message_id = store.add_outgoing(
+            text="brand new, sent by this very process",
+            channel_index=0,
+            local_sent_at=999.0,
+            delivery_state="SENDING",
+        )
+        self.assertEqual(self._raw_delivery_state(new_message_id), "SENDING")
+        stored = [m for m in store.load_recent() if m.id == new_message_id][0]
+        self.assertEqual(stored.delivery_state, "SENDING")
+
+    def test_second_restart_remains_interrupted(self) -> None:
+        seeding_store = ChatStore.open(self.path)
+        message_id = self._seed_outgoing(seeding_store, "restart me twice")
+        seeding_store.close()
+
+        first_restart = ChatStore.open(self.path)
+        self.assertEqual(self._raw_delivery_state(message_id), "INTERRUPTED")
+        first_restart.close()
+
+        second_restart = ChatStore.open(self.path)
+        self.addCleanup(second_restart.close)
+        self.assertEqual(self._raw_delivery_state(message_id), "INTERRUPTED")
+        stored = second_restart.load_recent()[0]
+        self.assertEqual(stored.delivery_state, "INTERRUPTED")
 
 
 if __name__ == "__main__":
