@@ -2159,8 +2159,49 @@ class MeshtasticPassApp(App[None]):
             self._send_error_dismiss_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
+        self._reconcile_interrupted_sends_before_shutdown()
         if self.chat_store is not None:
             self.chat_store.close()
+
+    def _reconcile_interrupted_sends_before_shutdown(self) -> None:
+        """Persist INTERRUPTED for every still-SENDING outgoing message
+
+        this process owns, before the store closes.
+
+        stored_chat_entry() already reconciles a stale SENDING row to
+        INTERRUPTED whenever it is loaded from disk -- but that is a
+        read-time, in-memory-only correction; the persisted row itself
+        still says SENDING until something writes over it. Doing that
+        write here, at the one point this process definitely knows a
+        message will never resolve on its own again (its own send
+        lifecycle -- the ACK/NAK callback, the confirmation-deadline
+        timer -- is about to stop existing along with the process),
+        makes the persisted data itself correct rather than relying
+        solely on every future reader to re-derive it. Runs after
+        _monitor.stop() so no late radio callback can race a write in
+        after this pass runs. Every channel's entries are checked, not
+        just the currently displayed one -- a send can be left in
+        flight in a channel the user has since switched away from.
+        """
+        if self.chat_store is None:
+            return
+        for state in self._channel_states.values():
+            for entry in state.entries:
+                if not entry.outgoing or entry.delivery_state is not DeliveryState.SENDING:
+                    continue
+                entry.delivery_state = DeliveryState.INTERRUPTED
+                if entry.message_id is None:
+                    continue
+                try:
+                    self.chat_store.update_delivery_state(
+                        entry.message_id,
+                        DeliveryState.INTERRUPTED.value,
+                        attempt_id=entry.active_attempt_id,
+                    )
+                except ChatStoreError:
+                    # Shutting down regardless; there is no user-facing
+                    # surface left to report this failure to.
+                    pass
 
     def on_key(self, event: Key) -> None:
         """Handle global keys only while the chat input is not focused."""

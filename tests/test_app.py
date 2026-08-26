@@ -1900,6 +1900,83 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn("SENDING", str(widget.delivery_label.render()))
 
+    async def test_normal_graceful_close_while_sending_persists_interrupted(
+        self,
+    ) -> None:
+        """Regression for the real-device report: a message left SENDING
+
+        through an ORDINARY app close (not a killed process) must come
+        back as INTERRUPTED -- not SENDING -- and must stay that way
+        across a history refresh/tab switch and a further restart.
+
+        Unlike test_message_stuck_sending_at_restart_reconciles_to_interrupted
+        (which simulates a process that vanished without running any
+        shutdown code), this drives the app through its REAL on_unmount
+        lifecycle by exiting run_test()'s context normally, and checks
+        the raw DB row itself -- not just the in-memory view -- to prove
+        the shutdown-time write lands, not only the load-time read fix.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._start_outgoing("still on the way?")
+            await pilot.pause()
+            self.assertEqual(app.chat_history[-1].delivery_state, DeliveryState.SENDING)
+
+        check = ChatStore.open(self.chat_db_path)
+        raw_after_first_close = check.load_recent()[-1].delivery_state
+        check.close()
+        self.assertEqual(raw_after_first_close, DeliveryState.INTERRUPTED.value)
+
+        second_store = ChatStore.open(self.chat_db_path)
+        second_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
+        async with second_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            reloaded = second_app.chat_history[-1]
+            self.assertEqual(reloaded.text, "still on the way?")
+            self.assertEqual(reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            widget = next(
+                w for w in second_app.query(ChatEntryWidget) if w.entry is reloaded
+            )
+            self.assertIn("INTERRUPTED", str(widget.delivery_label.render()))
+            self.assertEqual(second_radio.sent_messages, ())
+
+            # A normal history refresh / tab switch must not disturb it.
+            second_app.show_tab("connection")
+            await pilot.pause()
+            second_app.show_tab("chat")
+            await pilot.pause()
+            reloaded_again = second_app.chat_history[-1]
+            self.assertEqual(reloaded_again.delivery_state, DeliveryState.INTERRUPTED)
+
+        # Second instance also shut down gracefully with nothing left
+        # SENDING -- its own shutdown reconciliation must be a safe
+        # no-op, not something that could ever regress an already-
+        # resolved state.
+        check_after_second_close = ChatStore.open(self.chat_db_path)
+        raw_after_second_close = check_after_second_close.load_recent()[-1].delivery_state
+        check_after_second_close.close()
+        self.assertEqual(raw_after_second_close, DeliveryState.INTERRUPTED.value)
+
+        third_store = ChatStore.open(self.chat_db_path)
+        third_radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        third_app = MeshtasticPassApp(third_radio, self.settings, chat_store=third_store)
+        async with third_app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            still_reloaded = third_app.chat_history[-1]
+            self.assertEqual(still_reloaded.delivery_state, DeliveryState.INTERRUPTED)
+            self.assertEqual(third_radio.sent_messages, ())
+
     # ---- RECONNECTING message bar --------------------------------------
 
     async def test_reconnecting_disables_chat_input_and_shows_status(self) -> None:
