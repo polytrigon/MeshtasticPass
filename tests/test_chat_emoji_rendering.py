@@ -1,14 +1,15 @@
 """CHAT emoji/scrollbar-corruption regression tests.
 
 See tests/test_grapheme_text.py for the pure-function proof of the
-underlying fix (Rich's own wrap engine already protects ZWJ sequences,
-skin-tone modifiers, and variation-selector pairs on its own; the one
-confirmed gap -- a regional-indicator flag pair -- is what
-grapheme_text.protect_flag_pairs_from_wrap_severing() actually changes).
-This file proves that fix is wired into CHAT's real rendering path and
-that selection/navigation through Unicode-containing messages behaves
-exactly like plain ASCII: no crash, no change in scrollbar/container
-geometry, and the message displays intact.
+underlying fix (grapheme_text.install_flag_pair_protection() patches
+Rich's own grapheme splitter so a regional-indicator pair can never be
+severed by its hard-wrap fallback -- the same fallback that already
+protects ZWJ sequences, skin-tone modifiers, and variation-selector
+pairs on its own). This file proves that fix is wired into CHAT's real
+rendering path and that selection/navigation through Unicode-containing
+messages behaves exactly like plain ASCII: no crash, no change in
+scrollbar/container geometry, the message text renders completely
+unmutated, and the message displays intact.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from textual.widgets import Static
 
 from app import ChatEntryWidget, ChatTranscript, MeshtasticPassApp, ThinScrollBarRender
 from app_settings import AppSettings
-from grapheme_text import protect_flag_pairs_from_wrap_severing
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 
 
@@ -101,12 +101,12 @@ class ChatEmojiRenderingTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             widget = await self._mount_message(pilot, app, text)
 
-            # Exactly what protect_flag_pairs_from_wrap_severing() would
-            # produce -- identical to the original text for every
-            # category except a flag pair, which deliberately gains an
-            # internal joiner (see tests/test_grapheme_text.py).
+            # The rendered text is always exactly the stored text --
+            # flag-pair wrap protection is applied at the rendering
+            # boundary (see grapheme_text.install_flag_pair_protection),
+            # never by mutating the string.
             rendered = str(widget.message_label.render())
-            self.assertEqual(rendered, protect_flag_pairs_from_wrap_severing(text))
+            self.assertEqual(rendered, text)
 
             widget.focus()
             await pilot.pause()

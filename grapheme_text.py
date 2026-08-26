@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import unicodedata
 
+import rich.cells
 from rich.cells import cell_len
 
 
@@ -83,47 +84,84 @@ def truncate_to_cells(value: str, width: int) -> str:
     return f"{visible}…"
 
 
-def protect_flag_pairs_from_wrap_severing(value: str) -> str:
-    """Prevent a hard-wrap fallback from severing a regional-indicator
+def _merge_regional_indicator_spans(
+    spans: list[tuple[int, int, int]], text: str
+) -> list[tuple[int, int, int]]:
+    """Combine two adjacent single-codepoint regional-indicator spans
 
-    flag pair.
+    (a flag pair, e.g. U+1F1FA U+1F1F8) into one span covering both.
 
-    Word-wrap algorithms only break on whitespace; a run of non-
-    whitespace text wider than the available width falls back to a raw
-    per-codepoint hard wrap. Verified directly against Rich's own
-    wrapping engine (rich._wrap.chop_cells -> rich.cells.
-    split_graphemes): it ALREADY keeps a ZWJ sequence (e.g. a family
-    emoji), a skin-tone-modified emoji, and a base character plus its
-    variation selector intact through that fallback on its own -- no
-    intervention needed, and none is applied here for those. The one
-    confirmed gap is two adjacent regional-indicator symbols (a flag,
-    e.g. "US" -> \ud83c\uddfa\ud83c\uddf8): they are NOT recognized as one unit by that
-    fallback and can be split apart, leaving one line with the first
-    letter and the next with the second -- an orphaned regional-
-    indicator glyph renders unpredictably in a terminal and corrupts
-    everything drawn after it (in CHAT, the scrollbar).
-
-    The fix: insert a zero-width joiner between the two codepoints of
-    each flag pair. Rich's own grapheme splitter explicitly keeps
-    whatever follows a ZWJ attached to what came before it, so the pair
-    can never be cut apart by the hard-wrap fallback again. Trade-off,
-    and the reason this transform is applied ONLY to flag pairs and
-    nothing else: Rich's ZWJ handling assumes -- correctly, for a real
-    ZWJ emoji sequence -- that the combined glyph renders at the same
-    width as the first character alone, so a protected pair's *reported*
-    cell width for wrapping purposes drops from 2 to 1. A guaranteed-
-    safe pairing is worth that trade: a severed flag is a certain,
-    visually severe corruption; an occasional single-cell wrap
-    misjudgment for a message containing flag emoji is a rare, minor
-    one. Every other cluster kind (already handled correctly by Rich,
-    per above) is left completely untouched.
+    Mirrors how Rich's own split_graphemes already merges a ZWJ
+    sequence or a variation-selector pair into a single span -- the
+    same treatment, extended to the one cluster kind Rich's own
+    implementation does not yet cover. The merged span's cell length is
+    the sum of the two constituent spans', so total cell_len() output
+    for the string is unchanged; only the span boundary between the two
+    codepoints is removed, so a hard-wrap fold can no longer land
+    between them.
     """
-    pieces: list[str] = []
-    for cluster in grapheme_clusters(value):
-        if len(cluster) == 2 and all(
-            ord(codepoint) in REGIONAL_INDICATOR_RANGE for codepoint in cluster
+    merged: list[tuple[int, int, int]] = []
+    index = 0
+    total = len(spans)
+    while index < total:
+        start, end, cell_length = spans[index]
+        if (
+            index + 1 < total
+            and end - start == 1
+            and ord(text[start]) in REGIONAL_INDICATOR_RANGE
         ):
-            pieces.append(cluster[0] + ZERO_WIDTH_JOINER + cluster[1])
-        else:
-            pieces.append(cluster)
-    return "".join(pieces)
+            next_start, next_end, next_cell_length = spans[index + 1]
+            if next_end - next_start == 1 and ord(text[next_start]) in REGIONAL_INDICATOR_RANGE:
+                merged.append((start, next_end, cell_length + next_cell_length))
+                index += 2
+                continue
+        merged.append((start, end, cell_length))
+        index += 1
+    return merged
+
+
+def install_flag_pair_protection() -> None:
+    """Teach Rich's grapheme splitter that a regional-indicator flag
+
+    pair is one indivisible unit, so its own hard-wrap fallback (used
+    for a run of non-whitespace text wider than the available render
+    width) can never sever the two codepoints of a flag onto separate
+    lines. An orphaned regional-indicator glyph renders unpredictably
+    in a terminal and corrupts whatever is drawn to its right -- in
+    CHAT, the scrollbar.
+
+    Verified directly against Rich's real wrapping engine
+    (rich._wrap.divide_line -> rich.cells.chop_cells ->
+    rich.cells.split_graphemes, the same path Textual's Static/Content
+    rendering uses): split_graphemes already merges a ZWJ sequence
+    (e.g. a family emoji), a skin-tone modifier, and a base character
+    plus its variation selector into one non-severable span on its own
+    -- no help needed, and none is applied here for those. Its one
+    confirmed gap is two adjacent regional-indicator symbols. This
+    patches that single gap, at the one place both Rich's own wrapping
+    and Textual's widget rendering resolve split_graphemes from
+    (chop_cells looks it up as a bare name in the rich.cells module
+    namespace at call time, so patching the module attribute here
+    reaches every caller).
+
+    This changes ONLY where wrap breaks may fall -- never the text
+    itself. No caller's string is mutated, no synthetic character is
+    ever inserted, and the reported cell_len() of any string is
+    unchanged (cell_len() itself is not patched; the merge preserves
+    the original spans' combined width). Idempotent: calling this more
+    than once (e.g. across multiple app instances in tests) re-wraps
+    the same underlying original only once.
+    """
+    current = rich.cells.split_graphemes
+    if getattr(current, "_flag_pair_protected", False):
+        return
+    original = current
+
+    def _split_graphemes_with_flag_pairs(
+        text: str, unicode_version: str = "auto"
+    ) -> "tuple[list[tuple[int, int, int]], int]":
+        spans, total_width = original(text, unicode_version)
+        return _merge_regional_indicator_spans(spans, text), total_width
+
+    _split_graphemes_with_flag_pairs._flag_pair_protected = True  # type: ignore[attr-defined]
+    rich.cells.split_graphemes = _split_graphemes_with_flag_pairs

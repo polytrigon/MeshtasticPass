@@ -45,7 +45,7 @@ from chat_store import (
     ChatStoreError,
 )
 from geo import format_distance_miles
-from grapheme_text import protect_flag_pairs_from_wrap_severing
+from grapheme_text import install_flag_pair_protection
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshNodeState,
@@ -88,6 +88,15 @@ from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 from terminal_cursor import TerminalCursor
 from theme_palette import ERROR, THEME_PALETTES
 from viewport_menu import PopupItem, ViewportMenu
+
+
+# Patches Rich's grapheme splitter (used by Static/Content's word-wrap
+# fallback) so a regional-indicator flag pair can never be severed
+# across a wrap boundary -- see grapheme_text.install_flag_pair_protection
+# for the full rationale. Installed once at import time, process-wide,
+# rather than per-message, since it corrects Rich's own wrap engine
+# rather than any particular string.
+install_flag_pair_protection()
 
 
 # PROFILE is intentionally omitted here: it remains fully implemented
@@ -1352,21 +1361,16 @@ class ChatEntryWidget(Vertical):
                 ]
             )
         header = Horizontal(*header_parts, classes="chat-entry-header")
-        # Rich's own hard-wrap fallback (for a run of non-whitespace text
-        # wider than the available width) already keeps a ZWJ sequence,
-        # a skin-tone-modified emoji, and a variation-selector pair
-        # intact on its own -- verified directly, no help needed. Its
-        # one gap is a regional-indicator flag pair, which it can sever;
-        # the orphaned half then renders as an unpredictable glyph that
-        # visibly corrupts whatever is drawn to its right -- here, the
-        # transcript's scrollbar. protect_flag_pairs_from_wrap_severing()
-        # closes exactly that gap (see grapheme_text.py for the verified
-        # trade-off this makes). Selection styling never touches this
-        # text or its width -- see ChatEntryWidget.on_focus/on_blur,
-        # which only ever update the separate, fixed-width
-        # selection_marker.
+        # Flag-pair wrap-severing (a regional-indicator pair split
+        # across a wrap boundary, corrupting whatever renders to its
+        # right -- here, the transcript's scrollbar) is fixed at the
+        # rendering boundary via grapheme_text.install_flag_pair_protection(),
+        # called once at module import time -- the text here is never
+        # touched. Selection styling likewise never touches this text
+        # or its width -- see ChatEntryWidget.on_focus/on_blur, which
+        # only ever update the separate, fixed-width selection_marker.
         self.message_label = Static(
-            protect_flag_pairs_from_wrap_severing(self.entry.text),
+            self.entry.text,
             classes="chat-entry-text",
             markup=False,
         )

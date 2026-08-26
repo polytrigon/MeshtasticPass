@@ -1,31 +1,36 @@
-"""Tests for the shared grapheme-cluster-safe text helpers.
+"""Tests for grapheme_text.install_flag_pair_protection().
 
 MESH's existing grapheme-safety tests (tests/test_mesh_topology.py)
 continue to prove grapheme_clusters()/truncate_to_cells() indirectly via
 mesh_topology.compact_node_label(), which re-exports these names for
-backward compatibility. This file specifically covers
-protect_flag_pairs_from_wrap_severing(), the CHAT-emoji/scrollbar-
+backward compatibility. This file covers the CHAT-emoji/scrollbar-
 corruption fix.
 
-The fix's scope was determined empirically against the actually
-installed Rich version's own wrap engine (rich._wrap.chop_cells ->
-rich.cells.split_graphemes), not assumed: Rich already keeps a ZWJ
-sequence, a skin-tone-modified emoji, and a variation-selector pair
-intact through its own raw hard-wrap fallback, so those are left
-completely untouched here (touching them further isn't just
-unnecessary -- see test_zwj/skin_tone/cjk_are_left_untouched). The one
-confirmed, reproduced gap is a regional-indicator flag pair, which is
-what this transform actually changes.
+An earlier version of this fix mutated the rendered string (inserting a
+zero-width joiner between the two codepoints of a flag pair). That
+approach was replaced: it altered rendered semantic text, and a
+malformed \\uXXXX escape describing it in a docstring introduced actual
+lone surrogate code points into the source, crashing on strict-UTF-8
+Linux at import time. The current fix instead patches Rich's own
+grapheme splitter (rich.cells.split_graphemes, used by
+rich._wrap.divide_line -> rich.cells.chop_cells, the same path
+Textual's Static/Content rendering uses) so it treats a regional-
+indicator pair as one indivisible span -- exactly how it already treats
+a ZWJ sequence or a variation-selector pair -- without ever touching
+any caller's string.
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
 
+from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
-from grapheme_text import grapheme_clusters, protect_flag_pairs_from_wrap_severing
+from grapheme_text import grapheme_clusters, install_flag_pair_protection
 
 
 def _wrapped_lines(text: str, width: int) -> list[str]:
@@ -34,59 +39,28 @@ def _wrapped_lines(text: str, width: int) -> list[str]:
     return [str(line) for line in Text(text).wrap(console, width)]
 
 
-class ProtectFlagPairsFromWrapSeveringTests(unittest.TestCase):
-    def test_plain_ascii_is_unchanged(self) -> None:
-        text = "hello world, this is a normal message"
-        self.assertEqual(protect_flag_pairs_from_wrap_severing(text), text)
+def _is_lone_regional_indicator(cluster: str) -> bool:
+    return len(cluster) == 1 and 0x1F1E6 <= ord(cluster) < 0x1F200
 
-    def test_zwj_family_emoji_is_left_untouched(self) -> None:
-        """Rich already protects ZWJ sequences on its own -- confirmed by
 
-        test_zwj_family_emoji_never_severed_by_rich_directly below --
-        so this function must not alter them at all.
-        """
-        family = "👨‍👩‍👧‍👦"
-        text = f"a{family}b"
-        self.assertEqual(protect_flag_pairs_from_wrap_severing(text), text)
+class FlagPairProtectionInstalledTests(unittest.TestCase):
+    """Exercised with the protection installed -- the real, always-on
 
-    def test_skin_tone_modifier_is_left_untouched(self) -> None:
-        waving_medium = "👋🏽"
-        text = f"hi{waving_medium}!"
-        self.assertEqual(protect_flag_pairs_from_wrap_severing(text), text)
+    production state, since app.py installs it once at module import
+    time and every other test module transitively triggers that by
+    importing app.
+    """
 
-    def test_cjk_wide_characters_are_left_untouched(self) -> None:
-        text = "你好世界"
-        self.assertEqual(protect_flag_pairs_from_wrap_severing(text), text)
-
-    def test_single_flag_gains_an_internal_joiner(self) -> None:
-        result = protect_flag_pairs_from_wrap_severing("go 🇺🇸 team")
-        self.assertNotEqual(result, "go 🇺🇸 team")
-        self.assertEqual(result, "go 🇺‍🇸 team")
-
-    def test_stripping_the_joiner_restores_the_original_flag(self) -> None:
-        original = "🇺🇸🇬🇧🇫🇷 flags"
-        protected = protect_flag_pairs_from_wrap_severing(original)
-        self.assertEqual(protected.replace("‍", ""), original)
-
-    def test_multiple_flags_each_get_protected(self) -> None:
-        result = protect_flag_pairs_from_wrap_severing("🇺🇸🇬🇧🇫🇷")
-        self.assertEqual(result, "🇺‍🇸🇬‍🇧🇫‍🇷")
+    @classmethod
+    def setUpClass(cls) -> None:
+        install_flag_pair_protection()
 
     def test_never_severs_a_flag_pair_at_any_wrap_width(self) -> None:
-        """The actual regression: force Rich's real hard-wrap fallback
-
-        (a run with no whitespace, wider than the target width) across
-        every plausible width and confirm no line ever ends with an
-        unpaired regional-indicator half.
-        """
-        original = "🇺🇸🇬🇧🇫🇷🇩🇪🇮🇹🇪🇸"
-        protected = protect_flag_pairs_from_wrap_severing(original)
+        text = "🇺🇸🇬🇧🇫🇷🇩🇪🇮🇹🇪🇸"
         for width in range(2, 12):
             with self.subTest(width=width):
-                for line in _wrapped_lines(protected, width):
-                    reconstructed = line.replace("‍", "")
-                    clusters = grapheme_clusters(reconstructed)
-                    for cluster in clusters:
+                for line in _wrapped_lines(text, width):
+                    for cluster in grapheme_clusters(line):
                         self.assertFalse(
                             _is_lone_regional_indicator(cluster),
                             msg=(
@@ -95,25 +69,21 @@ class ProtectFlagPairsFromWrapSeveringTests(unittest.TestCase):
                             ),
                         )
 
-    def test_zwj_family_emoji_never_severed_by_rich_directly(self) -> None:
-        """Establishes the baseline this fix deliberately does not touch:
+    def test_zwj_family_emoji_never_severed(self) -> None:
+        """Baseline this fix deliberately does not touch: Rich already
 
-        Rich's OWN wrap engine already keeps a ZWJ sequence together
-        without any help, at every width, for a repeated no-whitespace
-        run (the scenario that forces the raw hard-wrap fallback).
+        keeps a ZWJ sequence together on its own, at every width.
         """
         family = "👨‍👩‍👧‍👦"
         text = family * 4
         for width in range(2, 10):
             with self.subTest(width=width):
                 for line in _wrapped_lines(text, width):
-                    # Every non-blank cluster in every wrapped line is a
-                    # complete family emoji -- never a partial one.
                     for cluster in grapheme_clusters(line):
                         if cluster.strip():
                             self.assertEqual(cluster, family)
 
-    def test_skin_tone_emoji_never_severed_by_rich_directly(self) -> None:
+    def test_skin_tone_emoji_never_severed(self) -> None:
         waving_medium = "👋🏽"
         text = waving_medium * 4
         for width in range(2, 10):
@@ -123,26 +93,72 @@ class ProtectFlagPairsFromWrapSeveringTests(unittest.TestCase):
                         if cluster.strip():
                             self.assertEqual(cluster, waving_medium)
 
-    def test_flag_pair_is_severed_without_the_fix_confirming_the_bug_is_real(
-        self,
-    ) -> None:
-        """Sanity-check the bug this closes is genuine, not hypothetical:
+    def test_cjk_wide_characters_still_wrap_within_width(self) -> None:
+        text = "你好世界" * 4
+        for width in range(2, 10):
+            with self.subTest(width=width):
+                for line in _wrapped_lines(text, width):
+                    self.assertLessEqual(cell_len(line.rstrip("\n")), width)
 
-        the UNPROTECTED text really does get a regional indicator
-        severed by Rich's real wrap engine at some width.
+    def test_flag_pair_cell_width_is_unchanged(self) -> None:
+        """The patch changes only where wrap breaks may fall -- never
+
+        how wide anything is reported to be.
         """
-        original = "🇺🇸🇬🇧🇫🇷"
-        found_a_split = False
-        for width in range(1, 8):
-            for line in _wrapped_lines(original, width):
+        self.assertEqual(cell_len("🇺🇸"), 2)
+        self.assertEqual(cell_len("🇺🇸🇬🇧"), 4)
+
+    def test_does_not_mutate_any_string(self) -> None:
+        original = "go 🇺🇸 team 👨‍👩‍👧‍👦 👋🏽 你好"
+        copy = str(original)
+        _wrapped_lines(original, 5)
+        self.assertEqual(original, copy)
+
+    def test_installing_twice_is_a_safe_no_op(self) -> None:
+        install_flag_pair_protection()
+        install_flag_pair_protection()
+        text = "🇺🇸🇬🇧🇫🇷"
+        for width in range(2, 8):
+            for line in _wrapped_lines(text, width):
                 for cluster in grapheme_clusters(line):
-                    if _is_lone_regional_indicator(cluster):
-                        found_a_split = True
-        self.assertTrue(found_a_split, "expected the unprotected text to split somewhere")
+                    self.assertFalse(_is_lone_regional_indicator(cluster))
 
 
-def _is_lone_regional_indicator(cluster: str) -> bool:
-    return len(cluster) == 1 and 0x1F1E6 <= ord(cluster) < 0x1F200
+class FlagPairSeveringIsARealBugWithoutTheFixTests(unittest.TestCase):
+    """Proves the bug this closes is genuine, not hypothetical.
+
+    Runs in a pristine subprocess that never imports grapheme_text or
+    app, so Rich's real, unpatched wrap engine is exercised directly --
+    by the time any in-process test runs, some other test module has
+    almost certainly already imported app and installed the patch
+    process-wide, so this cannot be demonstrated in-process.
+    """
+
+    def test_flag_pair_is_severed_by_unpatched_rich(self) -> None:
+        script = (
+            "from rich.console import Console\n"
+            "from rich.text import Text\n"
+            "def wrapped_lines(text, width):\n"
+            "    console = Console(width=max(width, 1), legacy_windows=False, file=open('/dev/null', 'w'))\n"
+            "    return [str(line) for line in Text(text).wrap(console, width)]\n"
+            "def count_ri(line):\n"
+            "    return sum(1 for ch in line if 0x1F1E6 <= ord(ch) < 0x1F200)\n"
+            "found = False\n"
+            "original = '\\U0001F1FA\\U0001F1F8\\U0001F1EC\\U0001F1E7\\U0001F1EB\\U0001F1F7'\n"
+            "for width in range(1, 8):\n"
+            "    for line in wrapped_lines(original, width):\n"
+            "        if count_ri(line) % 2 == 1:\n"
+            "            found = True\n"
+            "print('SEVERED' if found else 'NOT_SEVERED')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "SEVERED")
 
 
 if __name__ == "__main__":
