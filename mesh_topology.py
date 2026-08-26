@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import sqrt
 from typing import Iterable, Literal, Mapping
 
 from rich.cells import cell_len
 
-from geo import bearing_and_distance
+from geo import GeoPosition, bearing_and_distance, project_local_plane
 from grapheme_text import (
     EMOJI_MODIFIER_RANGE as _EMOJI_MODIFIER_RANGE,
     REGIONAL_INDICATOR_RANGE as _REGIONAL_INDICATOR_RANGE,
@@ -212,6 +213,93 @@ def compact_node_label(node: NodeMetadata, max_cells: int = NODE_WIDTH - 2) -> s
     return f"…{node_id[-(max_cells - 1):]}"
 
 
+def _project_remote_gps_cluster(
+    nodes: Iterable[NodeMetadata], *, max_radius: int
+) -> dict[str, tuple[int, int]]:
+    """MODE B: when YOU has no GPS, project 2+ GPS-equipped remote nodes
+
+    into shared local grid-step coordinates that preserve their
+    geography RELATIVE TO EACH OTHER -- north/south, east/west, and
+    approximate relative separation -- since that is real, known
+    information independent of anything about YOU.
+
+    This NEVER assigns YOU a position and NEVER assumes YOU sits at the
+    cluster's centroid -- it is not triangulation of YOU's location.
+    YOU remains an independently placed visual/topology origin (see
+    assign_grid_slots, which always places YOU at logical (0, 0)
+    regardless of this projection's results). Returns {} for fewer than
+    2 positioned nodes: a single GPS point has no relative geometry of
+    its own to preserve, so that caller falls through to the ordinary
+    deterministic fallback instead (see MODE B's single-remote rule).
+
+    The reference point for geo.project_local_plane() is this cluster's
+    own mean latitude/longitude -- a representative anchor for the
+    projection math, again never a stand-in for YOU's position. The
+    projected cluster is then normalized with a SINGLE uniform scale
+    factor on both axes (never independently stretched per axis, which
+    would distort real shape/aspect ratio just to fill more of the
+    grid), chosen so that the single POINT FARTHEST from the shared
+    local origin -- not merely half the bounding box's raw span, which
+    understates the true maximum offset whenever the cluster isn't
+    symmetric around its own mean -- lands at exactly `max_radius` grid
+    steps out; every other point is guaranteed to land at or within
+    that same radius. Coordinates are then rounded to integer grid
+    steps. Collision avoidance and any hop-based radius boost are the
+    caller's job, exactly as for every other coordinate this module
+    produces.
+    """
+    positioned = [(node, node.position) for node in nodes if node.position is not None]
+    if len(positioned) < 2:
+        return {}
+    reference = GeoPosition(
+        sum(position.latitude for _, position in positioned) / len(positioned),
+        sum(position.longitude for _, position in positioned) / len(positioned),
+    )
+    local_xy = {
+        node.node_id: project_local_plane(reference, position)
+        for node, position in positioned
+    }
+    max_abs_offset = max(
+        max(abs(x), abs(y)) for x, y in local_xy.values()
+    )
+    if max_abs_offset <= 0:
+        # Degenerate cluster (all effectively coincident) -- no
+        # meaningful spread to preserve; every node starts at the
+        # shared origin and the caller's ordinary collision avoidance
+        # separates them exactly as it would for any other coincident
+        # placement.
+        return {node_id: (0, 0) for node_id in local_xy}
+    scale = max_radius / max_abs_offset
+    return {
+        # North (higher latitude) is negative grid-y; east (higher
+        # longitude) is positive grid-x -- matching _DIRECTION_VECTORS'
+        # existing convention ("y increases downward").
+        node_id: (round(x * scale), round(-y * scale))
+        for node_id, (x, y) in local_xy.items()
+    }
+
+
+def _apply_min_radius(x: int, y: int, min_radius: int) -> tuple[int, int]:
+    """Push (x, y) outward to at least `min_radius` from the origin,
+
+    preserving its exact direction/angle -- never rotating a node or
+    reassigning which side of the board it falls on, only extending its
+    distance when relay-chain room genuinely requires it (see
+    assign_grid_slots' min_radius_by_id). Geography (or, in MODE B,
+    relative geography) sets the direction; hop depth may only push a
+    node farther out along that same direction, never redefine it.
+    """
+    if min_radius <= 0:
+        return x, y
+    current = sqrt(x * x + y * y)
+    if current >= min_radius:
+        return x, y
+    if current == 0:
+        return (0, -min_radius)
+    scale = min_radius / current
+    return (round(x * scale), round(y * scale))
+
+
 def assign_grid_slots(
     nodes: Iterable[NodeMetadata],
     *,
@@ -225,23 +313,31 @@ def assign_grid_slots(
     that node have trustworthy position data; distance only orders nodes
     outward within their direction bucket as a discrete grid-step rank,
     clamped to `max_radius` so one very distant node can never explode
-    the board -- it is never proportional to real distance. Nodes
-    without a resolvable bearing are placed deterministically around the
-    outer ring instead of being mixed into the directional grid with a
-    fabricated direction. Coordinates never imply literal geography,
-    routing edges, or exact scale.
+    the board -- it is never proportional to real distance. Coordinates
+    never imply literal geography, routing edges, or exact scale.
 
-    `min_radius_by_id` (default: none) raises a specific node's grid-step
-    rank to at least the given value, overriding `max_radius` for that
-    node only -- everything else about its placement (direction bucket,
-    ordering against its bucket-mates) is unchanged. Every other caller,
-    and every node not named in the mapping, sees identical behavior to
-    before this parameter existed. MESH's real-data pipeline uses this
-    so a real client with a truthful nonzero hop count is placed far
-    enough from YOU to leave room for its own anonymous relay-stage
-    placeholders as genuinely interior cells (see build_relay_stages) --
-    hop depth, not just geography, legitimately extends how far out a
-    node's chain (and so the node itself) renders.
+    MODE B: when YOU has no trustworthy position but 2+ remotes do,
+    those remotes are placed instead via _project_remote_gps_cluster(),
+    preserving their geography RELATIVE TO EACH OTHER without assuming
+    or fabricating a position for YOU (see that function's docstring --
+    this is never triangulation of YOU's location). A lone GPS remote
+    with no other positioned remote to be relative to, and every node
+    with no position at all, falls back to the deterministic outer-ring
+    placement below instead of being mixed into either directional
+    scheme with a fabricated direction.
+
+    `min_radius_by_id` (default: none) raises a specific node's distance
+    from the origin to at least the given value, overriding `max_radius`
+    for that node only -- everything else about its placement (compass
+    direction or, in MODE B, relative-geography direction) is unchanged;
+    see _apply_min_radius. Every other caller, and every node not named
+    in the mapping, sees identical behavior to before this parameter
+    existed. MESH's real-data pipeline uses this so a real client with a
+    truthful nonzero hop count is placed far enough from YOU to leave
+    room for its own anonymous relay-stage placeholders as genuinely
+    interior cells (see build_relay_stages) -- hop depth, not just
+    geography, legitimately extends how far out a node's chain (and so
+    the node itself) renders, without changing its actual direction.
 
     This is the shared core reused both by build_topology() (which scales
     these steps into pixel positions for its own auto-sized board) and by
@@ -266,9 +362,26 @@ def assign_grid_slots(
         occupied.add((0, 0))
 
     local_position = local.position if local is not None else None
+    # MODE B: YOU has no trustworthy position -- if 2+ remotes do, place
+    # them by their own relative geography instead of falling back to
+    # the fabricated-direction-free outer ring (see
+    # _project_remote_gps_cluster). A single positioned remote has no
+    # relative geometry to preserve on its own, so it (and every
+    # unpositioned remote) still falls through to that same outer ring,
+    # exactly as before this mode existed.
+    gps_cluster_positions: dict[str, tuple[int, int]] = {}
+    if local_position is None:
+        gps_remotes = [node for node in remotes if node.position is not None]
+        if len(gps_remotes) >= 2:
+            gps_cluster_positions = _project_remote_gps_cluster(
+                gps_remotes, max_radius=max_radius
+            )
+
     buckets: dict[str, list[tuple[float, NodeMetadata]]] = {}
     unknown: list[NodeMetadata] = []
     for node in remotes:
+        if node.node_id in gps_cluster_positions:
+            continue
         resolved = bearing_and_distance(local_position, node.position)
         if resolved is None:
             unknown.append(node)
@@ -288,6 +401,23 @@ def assign_grid_slots(
             )
             slot_x, slot_y = _reserve_slot(dx * clamped_rank, dy * clamped_rank, occupied)
             logical.append((node, slot_x, slot_y, direction))
+
+    # MODE B placement -- reserved BEFORE the unpositioned-fallback loop
+    # below, so those nodes route around the GPS cluster rather than the
+    # other way around (GPS positions are the higher-priority
+    # reservation; see _project_remote_gps_cluster). Deterministic
+    # node_id order keeps this arrival-order independent, matching every
+    # other placement loop in this function.
+    for node in sorted(
+        (node for node in remotes if node.node_id in gps_cluster_positions),
+        key=lambda node: node.node_id.casefold(),
+    ):
+        raw_x, raw_y = gps_cluster_positions[node.node_id]
+        boosted_x, boosted_y = _apply_min_radius(
+            raw_x, raw_y, min_radius_by_id.get(node.node_id, 0)
+        )
+        slot_x, slot_y = _reserve_slot(boosted_x, boosted_y, occupied)
+        logical.append((node, slot_x, slot_y, "GPS_RELATIVE"))
 
     unknown.sort(key=_node_sort_key)
     if unknown:

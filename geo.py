@@ -83,6 +83,27 @@ def bearing_and_distance(
     return bearing_degrees(origin, target), haversine_miles(origin, target)
 
 
+def project_local_plane(reference: GeoPosition, position: GeoPosition) -> tuple[float, float]:
+    """Project `position` onto a local tangent-plane (x, y) relative to
+
+    `reference`, in degree-equivalent units: x is the eastward offset,
+    y the northward offset. A lightweight equirectangular approximation
+    -- adequate for the small geographic areas one mesh network spans,
+    never a general-purpose map projection -- that corrects for
+    longitude convergence via cos(reference latitude): a degree of
+    longitude covers less real ground at high latitudes than at the
+    equator, so a naive raw-degree delta would distort east/west
+    separation away from the equator. Used to preserve the RELATIVE
+    geography among a cluster of remote GPS-equipped nodes when YOU has
+    no GPS of its own to serve as the origin -- see
+    mesh_topology._project_remote_gps_cluster, which chooses the
+    reference point and never treats it as YOU's real position.
+    """
+    x = (position.longitude - reference.longitude) * cos(radians(reference.latitude))
+    y = position.latitude - reference.latitude
+    return x, y
+
+
 def distance_between(
     local_position: GeoPosition | None,
     sender_position: GeoPosition | None,

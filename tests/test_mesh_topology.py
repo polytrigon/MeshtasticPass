@@ -470,6 +470,141 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertEqual(plain_positions, emoji_positions)
 
 
+class MeshRemoteRelativeGeographyTests(unittest.TestCase):
+    """MODE B: when YOU has no GPS but 2+ displayed remotes do, they are
+
+    placed via their own relative geography (see
+    mesh_topology._project_remote_gps_cluster) instead of the
+    fabricated-direction-free outer-ring fallback. YOU is never assigned
+    a fake position and never assumed to sit at the cluster's centroid.
+    """
+
+    def test_relative_cluster_preserves_shape_when_local_has_no_gps(self) -> None:
+        """Case A: ALICE (NW) / BOB (NE) / CHARLIE (S), YOU with no GPS."""
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        offset = 3.0 / _MILES_PER_DEGREE_AT_EQUATOR
+        alice = NodeMetadata(
+            "!alice", "Alice", "ALC", None, position=GeoPosition(offset, -offset)
+        )
+        bob = NodeMetadata(
+            "!bob", "Bob", "BOB", None, position=GeoPosition(offset, offset)
+        )
+        charlie = NodeMetadata("!charlie", "Charlie", "CHR", None, position=south_of_local(3))
+        slots = assign_grid_slots([you, alice, bob, charlie], max_radius=3)
+        by_id = {item.node.node_id: item for item in slots}
+
+        self.assertEqual((by_id["!you"].x, by_id["!you"].y), (0, 0))
+        self.assertEqual(by_id["!you"].region, "LOCAL")
+        for node_id in ("!alice", "!bob", "!charlie"):
+            self.assertEqual(by_id[node_id].region, "GPS_RELATIVE")
+
+        self.assertLess(by_id["!alice"].x, by_id["!bob"].x)  # ALICE west of BOB
+        self.assertLess(by_id["!alice"].y, by_id["!charlie"].y)  # ALICE north of CHARLIE
+        self.assertLess(by_id["!bob"].y, by_id["!charlie"].y)  # BOB north of CHARLIE
+        self.assertEqual(by_id["!alice"].y, by_id["!bob"].y)  # symmetric fixture
+        for item in slots:
+            self.assertLessEqual(abs(item.x), 3)
+            self.assertLessEqual(abs(item.y), 3)
+
+    def test_relative_cluster_is_stable_across_repeated_calls(self) -> None:
+        """Case B: identical GPS inputs over repeated calls -> identical
+
+        positions, no jitter.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        alice = NodeMetadata("!alice", "Alice", "ALC", None, position=GeoPosition(0.02, -0.03))
+        bob = NodeMetadata("!bob", "Bob", "BOB", None, position=GeoPosition(-0.01, 0.04))
+        first = assign_grid_slots([you, alice, bob], max_radius=3)
+        second = assign_grid_slots([you, alice, bob], max_radius=3)
+        self.assertEqual(first, second)
+
+    def test_single_gps_remote_uses_fallback_not_fabricated_bearing(self) -> None:
+        """Case F: with YOU GPS-less, one GPS remote alone has no relative
+
+        geometry to construct -- it must use the existing deterministic
+        fallback, never a fabricated bearing from YOU.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        alice = NodeMetadata("!alice", "Alice", "ALC", None, position=north_of_local(3))
+        slots = assign_grid_slots([you, alice], max_radius=3)
+        by_id = {item.node.node_id: item for item in slots}
+        self.assertEqual(by_id["!alice"].region, "UNKNOWN")
+
+    def test_two_gps_remotes_preserve_east_west_ordering(self) -> None:
+        """Case G: exactly two GPS remotes -- their relative ordering is
+
+        meaningful and must survive arrival-order reversal.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        alice = NodeMetadata("!alice", "Alice", "ALC", None, position=west_of_local(2))
+        bob = NodeMetadata("!bob", "Bob", "BOB", None, position=east_of_local(2))
+        slots = assign_grid_slots([you, alice, bob], max_radius=3)
+        by_id = {item.node.node_id: item for item in slots}
+        self.assertEqual(by_id["!alice"].region, "GPS_RELATIVE")
+        self.assertEqual(by_id["!bob"].region, "GPS_RELATIVE")
+        self.assertLess(by_id["!alice"].x, by_id["!bob"].x)
+
+        reversed_slots = assign_grid_slots([you, bob, alice], max_radius=3)
+        reversed_by_id = {item.node.node_id: item for item in reversed_slots}
+        self.assertLess(reversed_by_id["!alice"].x, reversed_by_id["!bob"].x)
+
+    def test_uniform_scale_preserves_aspect_ratio_not_independent_stretch(
+        self,
+    ) -> None:
+        """A cluster twice as wide (east-west) as it is tall (north-south)
+
+        must render twice as wide as it is tall -- a single uniform
+        scale factor on both axes, never independently stretched per
+        axis merely to fill more of the available grid.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        west_node = NodeMetadata("!w", "W", None, None, position=GeoPosition(0.0, -1.0))
+        east_node = NodeMetadata("!e", "E", None, None, position=GeoPosition(0.0, 1.0))
+        north_node = NodeMetadata("!n", "N", None, None, position=GeoPosition(0.5, 0.0))
+        south_node = NodeMetadata("!s", "S", None, None, position=GeoPosition(-0.5, 0.0))
+        slots = assign_grid_slots(
+            [you, west_node, east_node, north_node, south_node], max_radius=6
+        )
+        by_id = {item.node.node_id: item for item in slots}
+        ew_span = by_id["!e"].x - by_id["!w"].x
+        ns_span = by_id["!s"].y - by_id["!n"].y
+        # Real-world ratio is 2:1 (2.0 degrees longitude vs 1.0 degree
+        # latitude, at the equator where cos(0) == 1).
+        self.assertEqual(ew_span, 12)
+        self.assertEqual(ns_span, 6)
+
+    def test_longitude_convergence_is_corrected_away_from_equator(self) -> None:
+        """At a non-equatorial latitude, the same-sized longitude delta
+
+        covers noticeably less real ground than the same-sized latitude
+        delta -- the projection must reflect that via cos(reference
+        latitude), never treat one degree of longitude as equal to one
+        degree of latitude everywhere.
+        """
+        you = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True, position=None)
+        west_node = NodeMetadata(
+            "!west1", "West1", None, None, position=GeoPosition(80.0, -100.5)
+        )
+        east_node = NodeMetadata(
+            "!east1", "East1", None, None, position=GeoPosition(80.0, -99.5)
+        )
+        north_node = NodeMetadata(
+            "!north1", "North1", None, None, position=GeoPosition(80.5, -100.0)
+        )
+        south_node = NodeMetadata(
+            "!south1", "South1", None, None, position=GeoPosition(79.5, -100.0)
+        )
+        slots = assign_grid_slots(
+            [you, west_node, east_node, north_node, south_node], max_radius=10
+        )
+        by_id = {item.node.node_id: item for item in slots}
+        ew_span = abs(by_id["!east1"].x - by_id["!west1"].x)
+        ns_span = abs(by_id["!south1"].y - by_id["!north1"].y)
+        # Identical 1.0-degree raw deltas on each axis -- without the
+        # cos(latitude) correction these spans would come out equal.
+        self.assertLess(ew_span, ns_span)
+
+
 class RouteConnectorTests(unittest.TestCase):
     def test_straight_lines_use_a_single_glyph_no_elbow(self) -> None:
         horizontal = route_connector(0, 0, 5, 0)
@@ -3848,6 +3983,276 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             # itself says should exist.
             relay_widget_ids = {w.node_id for w in app.query(MeshRelayWidget)}
             self.assertEqual(relay_widget_ids, {s.node_id for s in view.relay_stages})
+
+
+class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
+    """App-level integration coverage for MODE A/MODE B geographic
+
+    placement transitions, coexistence with non-GPS fallback nodes, and
+    the invariant that neither activity nor selection ever triggers a
+    fresh geographic projection -- see mesh_topology.assign_grid_slots
+    and _project_remote_gps_cluster for the underlying pure logic
+    (covered independently by MeshRemoteRelativeGeographyTests).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_you_gaining_gps_switches_to_true_you_relative_mode(self) -> None:
+        """Case C: YOU gains GPS mid-session -- placement switches to real
+
+        YOU-relative geography and actual distance becomes available on
+        a normal refresh, with no fake YOU coordinate ever having
+        existed beforehand.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!al1cegps", "!b0bgps00"
+            no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                alice_id, "Alice", "ALC", None, last_heard=now - 5,
+                position=north_of_local(2),
+            )
+            bob = NodeMetadata(
+                bob_id, "Bob", "BOB", None, last_heard=now - 5, position=south_of_local(2)
+            )
+            app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                {s.node.node_id for s in view.working_set if not s.node.is_local},
+                {alice_id, bob_id},
+            )
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            self.assertTrue(str(app.query_one("#mesh-context-status").render()).endswith("? mi"))
+
+            gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertFalse(status.endswith("? mi"))
+
+    async def test_you_losing_gps_returns_to_remote_relative_mode(self) -> None:
+        """Case D: YOU loses GPS -- returns cleanly to remote-relative
+
+        placement on the next normal refresh.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            alice_id, bob_id = "!al1cegps", "!b0bgps00"
+            alice = NodeMetadata(
+                alice_id, "Alice", "ALC", None, last_heard=now - 5, position=west_of_local(2)
+            )
+            bob = NodeMetadata(
+                bob_id, "Bob", "BOB", None, last_heard=now - 5, position=east_of_local(2)
+            )
+            gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            self.assertFalse(
+                str(app.query_one("#mesh-context-status").render()).endswith("? mi")
+            )
+
+            no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
+            app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertLess(
+                view.base_positions[alice_id][1], view.base_positions[bob_id][1]
+            )
+            _mesh_select_node(app, alice_id)
+            await pilot.pause()
+            self.assertTrue(
+                str(app.query_one("#mesh-context-status").render()).endswith("? mi")
+            )
+
+    async def test_gps_cluster_coexists_with_fallback_nodes_without_collision(
+        self,
+    ) -> None:
+        """Case E: 3 GPS remotes + 2 no-GPS remotes, YOU with no GPS.
+
+        The GPS cluster keeps its relative geometry; the fallback nodes
+        get deterministic free positions that never collide with the
+        GPS cluster or distort it.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!al1ce001", "Alice", "ALC", None, last_heard=now - 5,
+                position=north_of_local(3),
+            )
+            bob = NodeMetadata(
+                "!b0b00001", "Bob", "BOB", None, last_heard=now - 5, position=west_of_local(3)
+            )
+            david = NodeMetadata(
+                "!dav1d001", "David", "DAV", None, last_heard=now - 5,
+                position=east_of_local(3),
+            )
+            charlie = NodeMetadata(
+                "!char1001", "Charlie", "CHR", None, last_heard=now - 5, position=None
+            )
+            erin = NodeMetadata(
+                "!er1n0001", "Erin", "ERN", None, last_heard=now - 5, position=None
+            )
+            nodes = (local, alice, bob, david, charlie, erin)
+            app.radio.get_known_nodes = lambda: nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            positions = view.base_positions
+            all_ids = ["!al1ce001", "!b0b00001", "!dav1d001", "!char1001", "!er1n0001"]
+            position_values = [positions[n] for n in all_ids] + [
+                positions[app.radio.info.node_id]
+            ]
+            self.assertEqual(len(position_values), len(set(position_values)))
+            # Bob (west) still strictly west of David (east) -- the
+            # fallback nodes did not distort the GPS cluster's geometry.
+            self.assertLess(positions["!b0b00001"][1], positions["!dav1d001"][1])
+
+    async def test_activity_change_alone_never_moves_a_gps_node(self) -> None:
+        """Case H: ACTIVE -> STALE for a MODE B GPS-relative node changes
+
+        only its styling/topology, never its position.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!ag1nggps", "Ager", "AGR", None, last_heard=now - 5, position=north_of_local(3)
+            )
+            bob = NodeMetadata(
+                "!b0bstblx", "Bob", "BOB", None, last_heard=now - 5, position=south_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            position_before = view.base_positions["!ag1nggps"]
+
+            stale_alice = NodeMetadata(
+                "!ag1nggps", "Ager", "AGR", None,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale_alice, bob): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(view.base_positions["!ag1nggps"], position_before)
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!ag1nggps")
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+    async def test_selection_change_never_reprojects_gps_cluster(self) -> None:
+        """Case I: selecting a different node must not trigger a fresh
+
+        geographic projection with different normalization -- the
+        underlying relative geometry is exactly preserved, only the
+        recentering translation changes (see _mesh_translated_positions).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!al1cesel", "Alice", "ALC", None, last_heard=now - 5,
+                position=north_of_local(3),
+            )
+            bob = NodeMetadata(
+                "!b0bselec", "Bob", "BOB", None, last_heard=now - 5, position=south_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            base_positions_before = dict(view.base_positions)
+
+            _mesh_select_node(app, "!al1cesel")
+            await pilot.pause()
+            self.assertEqual(view.base_positions, base_positions_before)
+
+    async def test_live_gps_update_reflows_placement_on_normal_refresh(self) -> None:
+        """Case J: a remote node gaining/changing valid GPS mid-session
+
+        updates the geographic placement on the next normal refresh --
+        no tab switch, reconnect, or restart required.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=None)
+            alice = NodeMetadata(
+                "!al1velv1", "Alice", "ALC", None, last_heard=now - 5, position=None
+            )
+            bob = NodeMetadata(
+                "!b0blivea", "Bob", "BOB", None, last_heard=now - 5, position=west_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                {s.node.node_id for s in view.working_set if s.node.node_id == "!al1velv1"},
+                {"!al1velv1"},
+            )
+            # Only one GPS remote (Bob) so far -- fallback placement.
+            alice_before = view.base_positions["!al1velv1"]
+
+            gps_alice = NodeMetadata(
+                "!al1velv1", "Alice", "ALC", None, last_heard=now - 5,
+                position=east_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, gps_alice, bob): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            # Now two GPS remotes -- relative geography kicks in, and
+            # Alice (east) must land strictly east of Bob (west).
+            self.assertLess(
+                view.base_positions["!b0blivea"][1], view.base_positions["!al1velv1"][1]
+            )
+            self.assertNotEqual(view.base_positions["!al1velv1"], alice_before)
 
 
 class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
