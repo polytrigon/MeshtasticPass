@@ -588,12 +588,18 @@ def _mesh_directional_target(
 
 
 def _mesh_hop_counts(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
-    """Real remote CLIENTs with a trustworthy, nonzero hop count -- the
+    """Real remote CLIENTs with a trustworthy, nonzero hop count -- used
 
-    number of anonymous relay-stage placeholders each needs (see
-    mesh_topology.RelayStage). A `? HOPS` client (hops_away is None) is
-    deliberately absent: an unknown hop count must never be treated as
-    zero or imply any specific path depth.
+    ONLY for grid PLACEMENT (see _refresh_mesh's min_radius_by_id):
+    every such node, active or stale, reserves enough outward room for
+    its potential relay chain, so a node's position never needs to jump
+    outward the moment it later becomes active (see item 5 -- placement
+    stability is independent of current activity). An unknown hop count
+    (hops_away is None) is deliberately absent here and below: it must
+    never be treated as zero or imply any specific path depth.
+
+    NOT used for deciding which nodes actually render a relay chain or
+    connector -- see _mesh_active_hop_counts for that.
     """
     return {
         state.node.node_id: state.node.hops_away
@@ -601,6 +607,34 @@ def _mesh_hop_counts(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
         if not state.node.is_local
         and state.node.hops_away is not None
         and state.node.hops_away > 0
+    }
+
+
+def _mesh_active_hop_counts(
+    working_set: tuple[MeshNodeState, ...], *, now: float
+) -> dict[str, int]:
+    """Real remote CLIENTs with a trustworthy, nonzero hop count AND
+
+    currently active (is_node_active(last_heard, now) -- the same
+    predicate the board's BASE/DIM_BASE styling and [3] MESH (N) use).
+
+    This -- not _mesh_hop_counts -- is what decides which nodes get an
+    anonymous relay chain and a connector line drawn back to YOU (see
+    MeshTopologyView.set_nodes): a stale node remains visible at its
+    last-known position as useful historical context, but the board
+    should never look like it is CURRENTLY connected to something it
+    hasn't heard from recently. Active connectivity is a rendering-only
+    decision, made fresh every refresh -- it never affects grid
+    placement (see _mesh_hop_counts), so a node's position stays stable
+    across an activity transition.
+    """
+    return {
+        state.node.node_id: state.node.hops_away
+        for state in working_set
+        if not state.node.is_local
+        and state.node.hops_away is not None
+        and state.node.hops_away > 0
+        and is_node_active(state.node.last_heard, now)
     }
 
 
@@ -912,11 +946,18 @@ class MeshTopologyView(Container):
             for node_id, position in base_positions.items()
             if node_id in current_ids
         }
-        hop_counts = _mesh_hop_counts(working_set)
+        # Relay chains render ONLY for currently ACTIVE clients (see
+        # _mesh_active_hop_counts) -- a stale node keeps its last-known
+        # position (see _mesh_hop_counts, used for placement only, above
+        # in _refresh_mesh) but gets no anonymous relay chain: the board
+        # answers "what does my radio currently believe is active" via
+        # rendered connectors, and "what else does my radio remember"
+        # via dim, disconnected real nodes.
+        active_hop_counts = _mesh_active_hop_counts(working_set, now=now)
         relay_stages, relay_positions = build_relay_stages(
             real_positions,
             you_id=you_id or "",
-            hop_counts=hop_counts,
+            hop_counts=active_hop_counts,
             row_count=MESH_GRID_ROWS,
             column_count=MESH_GRID_COLUMNS,
         )
@@ -1055,17 +1096,21 @@ class MeshTopologyView(Container):
             selected = widget.node_id == self._selected_node_id
             widget.refresh_visual(selected=selected, theme=theme, now=now)
 
-        # Connector semantics: a YOU-to-node path means "we have observed
-        # communication with this node" (it is CLIENT), never proven RF
-        # adjacency. It is drawn through exactly that client's own
-        # anonymous relay stages (hops_away of them, in order -- see
-        # RelayStage/build_relay_stages), representing observed path
-        # DEPTH, never discovered relay identity: "Alice is 3 relay
-        # stages away", never "these are three identified radios". A
-        # `? HOPS` client gets no path at all -- any line, direct or
-        # through relay stages, would imply a specific, unverified hop
-        # depth, which is never fabricated (see the MESH spec's
-        # "UNKNOWN HOPS" / "? HOPS CONNECTORS" sections).
+        # Connector semantics: a YOU-to-node path means "we currently
+        # believe this node is active in the mesh" -- CLIENT history
+        # alone is not enough, and neither is a merely-known hop count;
+        # see _mesh_active_hop_counts. A stale node keeps its last-known
+        # position but no path back to YOU: it answers "what else does
+        # my radio remember", not "what's active right now". It is drawn
+        # through exactly that client's own anonymous relay stages
+        # (hops_away of them, in order -- see RelayStage/
+        # build_relay_stages), representing observed path DEPTH, never
+        # discovered relay identity: "Alice is 3 relay stages away",
+        # never "these are three identified radios". A `? HOPS` client
+        # gets no path at all -- any line, direct or through relay
+        # stages, would imply a specific, unverified hop depth, which is
+        # never fabricated (see the MESH spec's "UNKNOWN HOPS" / "? HOPS
+        # CONNECTORS" sections).
         palette = THEME_PALETTES[theme]
         stages_by_client: dict[str, list[RelayStage]] = {}
         for stage in relay_stages:
@@ -1078,7 +1123,12 @@ class MeshTopologyView(Container):
             for state in working_set:
                 remote_id = state.node.node_id
                 hops = state.node.hops_away
-                if state.node.is_local or remote_id not in centers or hops is None:
+                if (
+                    state.node.is_local
+                    or remote_id not in centers
+                    or hops is None
+                    or not is_node_active(state.node.last_heard, now)
+                ):
                     continue
                 chain_stages = stages_by_client.get(remote_id, ())
                 chain_ids = {remote_id, *(stage.node_id for stage in chain_stages)}
@@ -2442,6 +2492,20 @@ class MeshtasticPassApp(App[None]):
             self.query_one(FontSizeSelector).focus()
         elif tab_id == "mesh":
             self._refresh_mesh()
+            # MESH's own arrow-key navigation is handled by the App's
+            # on_key -- gated on current_tab, not on any particular
+            # widget holding focus (see _move_mesh_focus and
+            # test_navigation_works_even_when_focus_is_on_the_board_
+            # container) -- EXCEPT that on_key returns early whenever
+            # self.focused is an Input, before current_tab is even
+            # checked. Arriving here from CHAT left #chat-input focused
+            # (CHAT's own branch above claims it and never releases it),
+            # so every arrow press on MESH was silently swallowed by
+            # that Input check instead of ever reaching _move_mesh_focus.
+            # Clearing focus here, exactly like the "profile" fallback
+            # below, is what CONNECTION and CHAT already do for
+            # themselves by claiming their own widget's focus.
+            self.set_focus(None)
         else:
             self.set_focus(None)
         self._update_footer()
