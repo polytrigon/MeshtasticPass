@@ -2333,6 +2333,33 @@ class MeshtasticPassApp(App[None]):
                 self._jump_to_newest()
                 event.stop()
                 return
+            if (
+                event.is_printable
+                and event.character
+                # "1"/"2"/"3" must still reach the tab-switch dispatch
+                # below even from CHAT's neutral state -- see
+                # tab_for_key -- or the keyboard could never leave CHAT
+                # once on it (they only ever type into the composer when
+                # it is ALREADY focused, via the isinstance(self.focused,
+                # Input) branch above, which returns before this code
+                # even runs).
+                and event.key not in ("1", "2", "3")
+            ):
+                # Any other printable character begins composing: focus
+                # the input and insert exactly what was typed, appending
+                # after whatever draft already exists. A silent no-op
+                # while the composer is disabled (radio not ONLINE).
+                # Checked directly on the widget, not via self.focused
+                # afterward -- Textual's Widget.focus() defers the
+                # actual focus change via call_later, so self.focused
+                # would still report the OLD widget synchronously within
+                # this same handler.
+                chat_input = self.query_one("#chat-input", Input)
+                if not chat_input.disabled:
+                    self._focus_chat_composer()
+                    chat_input.insert_text_at_cursor(event.character)
+                    event.stop()
+                    return
 
         if self.current_tab == "mesh" and event.key in (
             "up",
@@ -2490,7 +2517,15 @@ class MeshtasticPassApp(App[None]):
         self.query_one("#content", ContentSwitcher).current = tab_id
         self._update_tab_bar()
         if tab_id == "chat":
-            self.query_one("#chat-input", Input).focus()
+            # Neutral navigation state -- NOT the message composer. The
+            # user must explicitly begin composing, either by pressing a
+            # printable character (focuses #chat-input and inserts it --
+            # see on_key's chat branch) or DOWN (focuses it without
+            # inserting anything -- see _move_chat_focus's fallback).
+            # #chat-log is the same neutral destination Escape already
+            # returns to from the composer, so entering CHAT and
+            # escaping out of a draft land in the identical state.
+            self.query_one("#chat-log", ChatTranscript).focus()
             if self._chat_open_scroll_pending:
                 self._chat_open_scroll_pending = False
                 self.call_after_refresh(self._jump_to_newest)
@@ -2505,10 +2540,8 @@ class MeshtasticPassApp(App[None]):
             # test_navigation_works_even_when_focus_is_on_the_board_
             # container) -- EXCEPT that on_key returns early whenever
             # self.focused is an Input, before current_tab is even
-            # checked. Arriving here from CHAT left #chat-input focused
-            # (CHAT's own branch above claims it and never releases it),
-            # so every arrow press on MESH was silently swallowed by
-            # that Input check instead of ever reaching _move_mesh_focus.
+            # checked (e.g. mid-edit on a CONNECTION name field, or a
+            # focused CHAT message widget from before the switch).
             # Clearing focus here, exactly like the "profile" fallback
             # below, is what CONNECTION and CHAT already do for
             # themselves by claiming their own widget's focus.
@@ -2597,6 +2630,16 @@ class MeshtasticPassApp(App[None]):
             self._render_identity()
         if len(self.query("#mesh-view")):
             self._refresh_mesh()
+        # set_palette() above only refreshes a KeyboardDropdown's BASE
+        # color -- CHAT's connection-status override (see
+        # _update_chat_connection_state/_connection_status_color) is a
+        # separately stored color, computed once when the override was
+        # set, that set_palette() has no way to know needs recomputing
+        # for the new theme. Recomputing it here keeps CHAT (and via the
+        # same call, MESH's own status line) from briefly showing the
+        # PREVIOUS theme's accent/error color until the next ~0.45s
+        # animation tick naturally refreshed it.
+        self._update_chat_connection_state()
 
     @on(Input.Submitted, "#chat-input")
     def send_chat_message(self, event: Input.Submitted) -> None:
@@ -3353,6 +3396,18 @@ class MeshtasticPassApp(App[None]):
         return targets
 
     def _move_chat_focus(self, direction: int) -> None:
+        """DOWN (direction > 0) moves toward the composer boundary --
+
+        reached once forward navigation runs out of messages (existing
+        behavior, unchanged), or immediately when there are no messages
+        to navigate at all (`if not targets`, also unchanged) -- e.g. a
+        freshly opened, empty CHAT, satisfying "DOWN begins composing"
+        (see show_tab's CHAT branch) without disturbing the ordinary
+        walk-through-messages-then-reach-composer flow a non-empty
+        transcript still uses. UP (direction < 0) from the neutral
+        post-tab-entry/post-Escape state lands on the newest visible
+        message, exactly as it always has.
+        """
         targets = self._chat_navigation_targets()
         if not targets:
             if direction > 0:
@@ -3470,8 +3525,17 @@ class MeshtasticPassApp(App[None]):
         self.call_after_refresh(widget.scroll_visible, animate=False)
 
     def _focus_chat_composer(self) -> None:
-        """Return to typing without changing the current draft or read state."""
+        """Return to typing without changing the current draft or read state.
+
+        A no-op while the composer is disabled (radio not ONLINE -- see
+        _update_chat_connection_state) -- never focuses a control the
+        user cannot actually type into, regardless of which caller
+        (DOWN-navigation, a printable keypress, RIGHT/jump-to-present)
+        asked for it.
+        """
         chat_input = self.query_one("#chat-input", Input)
+        if chat_input.disabled:
+            return
         chat_input.focus()
         chat_input.cursor_position = len(chat_input.value)
 
@@ -4077,6 +4141,27 @@ class MeshtasticPassApp(App[None]):
             return ""
         return f"STATUS {ANIMATED_STATUS[self._radio_state]}" + "." * self._status_dot_count
 
+    def _connection_status_color(self) -> str:
+        """The semantic color for the current non-ONLINE radio state --
+
+        the SAME mapping CONNECTION/CONFIG's own status row uses (see
+        _render_connection_details, which calls this too rather than
+        duplicating the ternary): ERROR for RadioState.ERROR, ACCENT for
+        every other non-ONLINE state (CONNECTING, OFFLINE). CHAT (see
+        _update_chat_connection_state) and MESH (same function, which
+        writes #mesh-connection-status) both reuse this exact value for
+        _connection_status_text(), so all three surfaces always agree on
+        what a given radio state visually means -- one authoritative
+        color decision, never three independent ones. Uses the current
+        theme's own semantic tokens (never a hardcoded literal color),
+        so it stays correct across WHITE/GREEN/ORANGE. Meaningless while
+        ONLINE; callers only use this alongside non-empty status text,
+        which _connection_status_text() only ever produces when not
+        ONLINE.
+        """
+        palette = THEME_PALETTES[self._current_theme]
+        return palette.error if self._radio_state is RadioState.ERROR else palette.accent
+
     def _update_chat_connection_state(self) -> None:
         """Keep CHAT's connection-status presentation in sync with the
 
@@ -4101,6 +4186,7 @@ class MeshtasticPassApp(App[None]):
         ONLINE.
         """
         status_text = self._connection_status_text()
+        status_color = self._connection_status_color() if status_text else None
 
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
@@ -4109,13 +4195,13 @@ class MeshtasticPassApp(App[None]):
 
         selectors = list(self.query(ChannelSelector))
         if selectors:
-            selectors[0].set_status_override(status_text or None)
+            selectors[0].set_status_override(status_text or None, color=status_color)
 
         if status_text:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:
                 widget = mesh_status_widgets[0]
-                widget.update(status_text)
+                widget.update(Text(status_text, style=status_color))
                 widget.display = True
 
     def _update_mesh_status_line(
@@ -4189,9 +4275,7 @@ class MeshtasticPassApp(App[None]):
         status_style = (
             palette.base
             if self._radio_state is RadioState.ONLINE
-            else palette.error
-            if self._radio_state is RadioState.ERROR
-            else palette.accent
+            else self._connection_status_color()
         )
         status_text = Text()
         status_text.append(
@@ -4341,7 +4425,7 @@ class MeshtasticPassApp(App[None]):
                 name = f"{name}({self.unread_count})"
             elif tab_id == "mesh":
                 count = self._mesh_active_count(wall_now, working_set=mesh_working_set)
-                name = f"{name} ({count})"
+                name = f"{name}({count})"
             label = f"[{number}] {name}"
             labels.append(f"[reverse]{label}[/reverse]" if tab_id == self.current_tab else label)
         tab_bars[0].update("   ".join(labels))

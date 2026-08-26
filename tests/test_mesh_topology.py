@@ -1892,19 +1892,19 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         """Real-hardware regression: switching CHAT -> MESH (the ordinary
 
         workflow -- connect, check CHAT, then open MESH) left CHAT's own
-        focused widget (e.g. #chat-log, ChatTranscript) untouched, since
-        show_tab()'s "mesh" branch never claimed/cleared focus for
-        itself the way "chat" and "connection" already do for their own
-        widgets. ChatTranscript.on_key unconditionally handles up/down/
-        left/right/end for chat message navigation -- it never checks
+        focused widget (e.g. #chat-log, ChatTranscript -- CHAT's neutral
+        navigation state; see show_tab, it no longer auto-focuses
+        #chat-input on entry) untouched, since show_tab()'s "mesh"
+        branch never claimed/cleared focus for itself the way "chat"
+        and "connection" already do for their own widgets.
+        ChatTranscript.on_key unconditionally handles up/down/left/
+        right/end for chat message navigation -- it never checks
         app.current_tab -- so once it kept focus across the tab switch,
         every arrow press on the now-visible MESH board was silently
         redirected into invisible CHAT message navigation instead of
         ever reaching _move_mesh_focus. Reproduces the exact
         key/event/focus path (pilot.press, real tab switches via the
-        "2"/"3" bindings and the same Escape that moves focus off
-        #chat-input in real use), not just the selection helper
-        directly.
+        "2"/"3" bindings), not just the selection helper directly.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1929,10 +1929,6 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("2")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            self.assertIsInstance(app.focused, Input)
-
-            await pilot.press("escape")
-            await pilot.pause()
             self.assertEqual(app.focused.id, "chat-log")
 
             await pilot.press("3")
@@ -2426,7 +2422,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             tab_bar = str(app.query_one("#tab-bar").render())
-            self.assertIn("MESH (4)", tab_bar)
+            self.assertIn("MESH(4)", tab_bar)
 
             view = app.query_one(MeshTopologyView)
             self.assertNotIn(view.selected_node_id, client_ids)
@@ -2482,7 +2478,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 stage_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
             tab_bar = str(app.query_one("#tab-bar").render())
-            self.assertIn("MESH (1)", tab_bar)
+            self.assertIn("MESH(1)", tab_bar)
 
     async def test_active_header_never_counts_nodes_outside_the_displayed_working_set(
         self,
@@ -2536,7 +2532,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             )
 
             tab_bar = str(app.query_one("#tab-bar").render())
-            self.assertIn(f"MESH ({DEFAULT_MAX_REMOTE_NODES})", tab_bar)
+            self.assertIn(f"MESH({DEFAULT_MAX_REMOTE_NODES})", tab_bar)
 
     async def test_activity_styling_refreshes_without_leaving_mesh_tab(self) -> None:
         """The user should not have to leave/re-enter MESH for active
@@ -2576,7 +2572,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=heard_at + 10)
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
             self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(palette.base))
 
@@ -2585,7 +2581,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=heard_at + ACTIVE_WINDOW_SECONDS + 50)
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
             self.assertEqual(
                 widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
@@ -2770,7 +2766,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
 
     async def test_mesh_tab_shows_two_when_two_displayed_real_nodes_are_active(
         self,
@@ -2802,7 +2798,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("MESH (2)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(2)", str(app.query_one("#tab-bar").render()))
 
     async def test_anonymous_relay_placeholders_do_not_affect_tab_count(self) -> None:
         """A distant CLIENT generates anonymous relay-stage placeholders
@@ -2847,7 +2843,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(view.relay_stages), 1)
             # Exactly one real, active remote node -- the relay stage(s)
             # it generated along the way must not inflate the count.
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
 
     async def test_you_does_not_count_toward_tab_count(self) -> None:
         app = self._make_app()
@@ -2863,7 +2859,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
 
     async def test_mesh_tab_count_updates_without_leaving_or_reentering_mesh(
         self,
@@ -2903,12 +2899,12 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             app._refresh_chat_timestamps(wall_now=now)
             await pilot.pause()
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
 
             app._refresh_chat_timestamps(wall_now=now + ACTIVE_WINDOW_SECONDS + 50)
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
             self.assertEqual(app.radio.sent_messages, ())
 
     # ---- Screenshot regression: relay count vs line-bend count ----------
@@ -3442,7 +3438,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
             self.assertEqual(
                 {state.node.node_id for state in view.working_set if not state.node.is_local},
                 set(),
@@ -3457,7 +3453,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             tab_bar = str(app.query_one("#tab-bar").render())
-            self.assertIn("MESH (2)", tab_bar)
+            self.assertIn("MESH(2)", tab_bar)
             remote_ids = {
                 state.node.node_id for state in view.working_set if not state.node.is_local
             }
@@ -3504,7 +3500,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertIn("!cccccccc", remote_ids)
             self.assertIn("!cccccccc", self._mounted_ids(app))
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
             c_state = next(
                 state for state in view.working_set if state.node.node_id == "!cccccccc"
             )
@@ -3592,7 +3588,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
 
             fresh_crosser = NodeMetadata("!cross001", "Crosser", last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, fresh_crosser): nodes
@@ -3602,7 +3598,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 widget.render().spans[0].style.foreground, Color.parse(palette.base)
             )
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
 
 
 class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
@@ -3649,7 +3645,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
 
         2 hops) participate in visible connector topology; BOB and DAVID
         (stale) remain visible at their last-known position with no
-        relay chain and no connector. [3] MESH (2) -- exactly the two
+        relay chain and no connector. [3] MESH(2) -- exactly the two
         active endpoints, never the four displayed real nodes.
         """
         app = self._make_app()
@@ -3678,7 +3674,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
 
-            self.assertIn("MESH (2)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(2)", str(app.query_one("#tab-bar").render()))
             view = app.query_one(MeshTopologyView)
 
             source_ids = self._relay_source_ids(view)
@@ -3718,7 +3714,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             view = app.query_one(MeshTopologyView)
             self.assertNotIn("!cr055er0", self._relay_source_ids(view))
             position_before = view.base_positions["!cr055er0"]
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
 
             fresh_crosser = NodeMetadata(
                 "!cr055er0", "Crosser", "CRS", 2,
@@ -3728,7 +3724,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
 
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
             self.assertEqual(view.base_positions["!cr055er0"], position_before)
             self.assertEqual(
                 sum(1 for s in view.relay_stages if s.source_node_id == "!cr055er0"), 2
@@ -3765,7 +3761,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(view.relay_stages), 3)
             self.assertEqual(len(list(app.query(MeshRelayWidget))), 3)
             position_before = view.base_positions["!ag1ng000"]
-            self.assertIn("MESH (1)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
 
             stale_node = NodeMetadata(
                 "!ag1ng000", "Ager", "AGR", 3,
@@ -3775,7 +3771,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
 
-            self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
+            self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
             self.assertEqual(view.relay_stages, ())
             self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
             self.assertIn("!ag1ng000", {w.node_id for w in app.query(MeshNodeWidget)})
@@ -3933,7 +3929,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             tab_bar = str(app.query_one("#tab-bar").render())
-            self.assertIn("MESH (4)", tab_bar)
+            self.assertIn("MESH(4)", tab_bar)
 
             view = app.query_one(MeshTopologyView)
             expected_hops = {"!skugh000": 1, "!b8b80000": 5, "!d0ec0000": 2}
