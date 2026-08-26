@@ -2616,6 +2616,189 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("MESH (0)", str(app.query_one("#tab-bar").render()))
             self.assertEqual(app.radio.sent_messages, ())
 
+    # ---- Screenshot regression: relay count vs line-bend count ----------
+
+    @staticmethod
+    def _client_chain_points(view, you_id, remote_id):
+        stages = sorted(
+            (stage for stage in view.relay_stages if stage.source_node_id == remote_id),
+            key=lambda stage: stage.index,
+        )
+        node_ids = [you_id, *(stage.node_id for stage in stages), remote_id]
+        return tuple(_mesh_grid_pixel(*view.base_positions[node_id]) for node_id in node_ids)
+
+    @classmethod
+    def _count_bends(cls, view, you_id, remote_id):
+        chain_points = cls._client_chain_points(view, you_id, remote_id)
+        elbow_glyphs = {"┐", "┘", "┌", "└"}
+        return sum(1 for _x, _y, glyph in route_chain(chain_points) if glyph in elbow_glyphs)
+
+    async def _diagnose_topology(self, app, pilot, *, clients, now):
+        """Build the given {node_id: (name, hops_away)} clients NE/around
+
+        YOU, refresh MESH, and return a per-client diagnostic dict of
+        {node_id: {hops_away, relay_count, bend_count}} -- exactly the
+        report requested to distinguish (A) wrong hop-count
+        interpretation, (B) duplicated relays, (C) waypoints rendered
+        as relays, or (D) something else, before any fix is written.
+        """
+        you_id = app.radio.info.node_id
+        nodes = [NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)]
+        for node_id, (name, hops, position) in clients.items():
+            nodes.append(
+                NodeMetadata(
+                    node_id, name, name[:4].upper(), hops, last_heard=now - 5, position=position
+                )
+            )
+        app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+        for index, (node_id, (name, _hops, _position)) in enumerate(clients.items()):
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name=name,
+                    sender_short_name=name[:4].upper(),
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=9_900_000 + index,
+                    radio_rx_at=now - index,
+                )
+            )
+        await self._open_mesh(pilot)
+        app._refresh_mesh(wall_now=now)
+        await pilot.pause()
+
+        view = app.query_one(MeshTopologyView)
+        report = {}
+        for node_id, (_name, hops, _position) in clients.items():
+            relay_count = sum(
+                1 for stage in view.relay_stages if stage.source_node_id == node_id
+            )
+            bend_count = self._count_bends(view, you_id, node_id)
+            report[node_id] = {
+                "hops_away": hops,
+                "relay_count": relay_count,
+                "bend_count": bend_count,
+            }
+            print(
+                f"[MESH DIAGNOSTIC] node={node_id} hops_away={hops} "
+                f"synthetic_relays={relay_count} line_waypoints(bends)={bend_count}"
+            )
+        return report
+
+    async def test_relay_count_is_determined_only_by_hop_count_not_by_line_bends(
+        self,
+    ) -> None:
+        """Screenshot regression: a chain of many anonymous relay circles
+
+        must only ever appear if the client's own reported hop count is
+        genuinely that large -- never as a side effect of how many
+        orthogonal bends its connector line happens to need. Two
+        topologies with the IDENTICAL client/hop-count set, one client
+        positioned to produce few line bends and the other positioned
+        (northeast, off-axis) to force several, must report the exact
+        same relay count per client -- geometry must never manufacture
+        topology.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            few_bends_clients = {
+                "!ax1a1000": ("AxisA", 2, north_of_local(6)),
+                "!ax1b2000": ("AxisB", 1, GeoPosition(0.0, 6 / 69.0)),
+            }
+            report_few_bends = await self._diagnose_topology(
+                app, pilot, clients=few_bends_clients, now=now
+            )
+            self.assertGreaterEqual(
+                sum(info["bend_count"] for info in report_few_bends.values()), 0
+            )
+
+        app2 = self._make_app()
+        async with app2.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            # Same node IDs, same hop counts -- but off-axis (northeast)
+            # positions, which force the orthogonal router to take
+            # several elbow turns per segment instead of a straight run.
+            many_bends_clients = {
+                "!ax1a1000": ("AxisA", 2, GeoPosition(6 / 69.0, 6 / 69.0)),
+                "!ax1b2000": ("AxisB", 1, GeoPosition(4 / 69.0, 7 / 69.0)),
+            }
+            report_many_bends = await self._diagnose_topology(
+                app2, pilot, clients=many_bends_clients, now=now
+            )
+
+        for node_id in few_bends_clients:
+            with self.subTest(node_id=node_id):
+                few = report_few_bends[node_id]
+                many = report_many_bends[node_id]
+                self.assertEqual(few["hops_away"], many["hops_away"])
+                self.assertEqual(
+                    few["relay_count"],
+                    few["hops_away"],
+                    "relay count must equal hop count exactly",
+                )
+                self.assertEqual(
+                    many["relay_count"],
+                    many["hops_away"],
+                    "relay count must equal hop count exactly regardless of bends",
+                )
+                self.assertEqual(
+                    few["relay_count"],
+                    many["relay_count"],
+                    "changing the number of line bends must not change the relay count",
+                )
+
+    async def test_northeast_client_many_bends_still_matches_hop_count_exactly(
+        self,
+    ) -> None:
+        """The exact screenshot shape: YOU, several real clients, one
+
+        positioned northeast, orthogonally routed with several bends.
+        Logs the full diagnostic report and asserts every displayed
+        client's relay count is determined solely by its own hop count.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            clients = {
+                "!ne000001": ("Northeast5", 3, GeoPosition(6 / 69.0, 9 / 69.0)),
+                "!n0000002": ("North2", 1, north_of_local(5)),
+                "!e0000003": ("East3", 2, GeoPosition(0.0, 8 / 69.0)),
+                "!d0000004": ("Direct4", 0, GeoPosition(-3 / 69.0, 2 / 69.0)),
+            }
+            report = await self._diagnose_topology(app, pilot, clients=clients, now=now)
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(
+                len(view.relay_stages),
+                sum(hops for _name, hops, _position in clients.values()),
+            )
+            for node_id, (_name, hops, _position) in clients.items():
+                with self.subTest(node_id=node_id):
+                    self.assertEqual(report[node_id]["relay_count"], hops)
+                    # Every relay for this client is a genuine RelayStage,
+                    # never a raw line-waypoint glyph: relay circles are
+                    # mounted MeshRelayWidgets with this client's own
+                    # node_id baked in, entirely independent of however
+                    # many background connector-line cells were drawn.
+                    relay_ids = {
+                        stage.node_id
+                        for stage in view.relay_stages
+                        if stage.source_node_id == node_id
+                    }
+                    self.assertEqual(len(relay_ids), hops)
+                    mounted = {
+                        widget.node_id
+                        for widget in app.query(MeshRelayWidget)
+                        if widget.node_id in relay_ids
+                    }
+                    self.assertEqual(mounted, relay_ids)
+
     # ---- Expanded selected-node context (spec section 21-27) -----------
 
     async def test_selected_context_full_format_with_distance(self) -> None:
