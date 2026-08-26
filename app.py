@@ -1693,7 +1693,7 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
-    #mesh-title, #mesh-status, #mesh-context-status {
+    #mesh-status, #mesh-context-status {
         height: 1;
     }
 
@@ -2112,11 +2112,6 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
             with Vertical(id="mesh", classes="tab-page"):
-                yield Static(
-                    "> MESH · ACTIVE —",
-                    id="mesh-title",
-                    classes="page-title",
-                )
                 yield Static(
                     "NO MESH DATA — RADIO DISCONNECTED",
                     id="mesh-status",
@@ -2734,8 +2729,7 @@ class MeshtasticPassApp(App[None]):
         if not chat_is_visible:
             state.unread_count += 1
             self._recount_unread()
-            self._update_tab_bar()
-        self._render_chat_heading()
+        self._update_tab_bar()
 
     def _assign_arrival_order(self, entry: ChatEntry) -> None:
         self._arrival_sequence += 1
@@ -2823,7 +2817,6 @@ class MeshtasticPassApp(App[None]):
         selector = self.query_one(ChannelSelector)
         selector.value = channel_index
         selector.close_menu()
-        self._render_chat_heading()
         self._update_tab_bar()
         self._update_transcript_indicator()
         self.call_after_refresh(self._jump_to_newest)
@@ -2963,24 +2956,7 @@ class MeshtasticPassApp(App[None]):
         current_time = monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
-        self._render_chat_heading(wall_now)
         self._refresh_mesh(wall_now)
-
-    def _render_chat_heading(self, wall_now: float | None = None) -> None:
-        selectors = list(self.query(ChannelSelector))
-        if not selectors:
-            # A final timer tick may race with Textual dismantling the screen.
-            return
-        active: int | None = None
-        if self._radio_state is RadioState.ONLINE:
-            counter = getattr(self.radio, "active_node_count", None)
-            if callable(counter):
-                try:
-                    active = counter(now=time() if wall_now is None else wall_now)
-                except Exception:
-                    active = None
-        value = "—" if active is None else str(active)
-        selectors[0].set_suffix(f"· ACTIVE {value}")
 
     def _mesh_last_message_activity(self) -> dict[str, float]:
         """Most recent trustworthy incoming-message timestamp per node.
@@ -3022,24 +2998,16 @@ class MeshtasticPassApp(App[None]):
                     activity[key] = timestamp
         return activity
 
-    def _refresh_mesh(self, wall_now: float | None = None) -> None:
-        """Refresh passive topology data without causing Meshtastic traffic."""
-        views = list(self.query(MeshTopologyView))
-        titles = list(self.query("#mesh-title"))
-        statuses = list(self.query("#mesh-status"))
-        if not views or not titles or not statuses:
-            return
-        if self.current_tab != "mesh":
-            return
-        view = views[0]
-        title = titles[0]
-        status = statuses[0]
+    def _mesh_working_set(self) -> tuple[MeshNodeState, ...]:
+        """Build MESH's displayed real-node set without touching the board.
+
+        The single place that turns known nodes + CHAT activity into
+        MESH's displayed working set -- shared by _refresh_mesh() (which
+        renders it) and _mesh_active_count() (which only counts it), so
+        there is exactly one activity/working-set computation, not two.
+        """
         if self._radio_state is not RadioState.ONLINE:
-            view.clear_nodes()
-            title.update("> MESH · ACTIVE —")
-            status.update("NO MESH DATA — RADIO DISCONNECTED")
-            self._update_mesh_context_status()
-            return
+            return ()
         getter = getattr(self.radio, "get_known_nodes", None)
         try:
             nodes = tuple(getter()) if callable(getter) else ()
@@ -3047,26 +3015,61 @@ class MeshtasticPassApp(App[None]):
             nodes = ()
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
-        current_time = time() if wall_now is None else wall_now
-        working_set = build_mesh_working_set(
+        return build_mesh_working_set(
             nodes, last_message_at=self._mesh_last_message_activity()
         )
-        # ACTIVE describes the real remote nodes CURRENTLY DISPLAYED on
-        # this MESH view -- the same bounded working set rendered below,
-        # not the full known-node population (which may include nodes
-        # this view never shows at all, e.g. passively heard but never a
-        # CLIENT). Uses the EXACT SAME predicate (is_node_active) that
-        # _mesh_node_color() uses for each node's own BASE/DIM_BASE
-        # styling, so the header and the board can never disagree about
-        # which/how many displayed nodes are active. Anonymous relay
-        # stages are never part of `working_set` and so never affect
-        # this count either way (see mesh_topology.RelayStage).
-        active = sum(
+
+    def _mesh_active_count(self, wall_now: float | None = None) -> int:
+        """Authoritative count of active REAL remote nodes MESH displays.
+
+        Describes the real remote nodes CURRENTLY DISPLAYED on MESH --
+        the same bounded working set the board renders, not the full
+        known-node population (which may include nodes MESH never shows
+        at all, e.g. passively heard but never a CLIENT). Uses the EXACT
+        SAME predicate (is_node_active) that _mesh_node_color() uses for
+        each node's own BASE/DIM_BASE styling, so the [3] MESH (N) tab
+        label and the board can never disagree about which/how many
+        displayed nodes are active. Anonymous relay stages are never
+        part of the working set and so never affect this count either
+        way (see mesh_topology.RelayStage); YOU is excluded via
+        is_local.
+
+        Safe to call regardless of the current tab -- unlike
+        _refresh_mesh(), this never touches the topology board/widget,
+        only computes a number, so refreshing it periodically (see
+        _refresh_chat_timestamps) to catch a node aging out while MESH
+        isn't even the visible tab can never "reshuffle" anything.
+        """
+        current_time = time() if wall_now is None else wall_now
+        working_set = self._mesh_working_set()
+        return sum(
             1
             for state in working_set
             if not state.node.is_local and is_node_active(state.node.last_heard, current_time)
         )
-        title.update(f"> MESH · ACTIVE {active}")
+
+    def _refresh_mesh(self, wall_now: float | None = None) -> None:
+        """Refresh passive topology data without causing Meshtastic traffic."""
+        # [3] MESH (N) must stay live wherever _refresh_mesh() is called
+        # from, regardless of whether MESH is the tab currently showing
+        # (see _mesh_active_count -- it never touches the board/widget,
+        # so this can never "reshuffle" the topology).
+        self._update_tab_bar(wall_now)
+        views = list(self.query(MeshTopologyView))
+        statuses = list(self.query("#mesh-status"))
+        if not views or not statuses:
+            return
+        if self.current_tab != "mesh":
+            return
+        view = views[0]
+        status = statuses[0]
+        if self._radio_state is not RadioState.ONLINE:
+            view.clear_nodes()
+            status.update("NO MESH DATA — RADIO DISCONNECTED")
+            self._update_mesh_context_status()
+            return
+        current_time = time() if wall_now is None else wall_now
+        working_set = self._mesh_working_set()
         if not working_set:
             view.clear_nodes()
             status.update("NO MESH DATA")
@@ -3900,7 +3903,6 @@ class MeshtasticPassApp(App[None]):
         identity_status.update("")
         self._render_connection_details()
         self._render_identity(force_value=True)
-        self._render_chat_heading()
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
@@ -4079,14 +4081,20 @@ class MeshtasticPassApp(App[None]):
         else:
             widget.update("")
 
-    def _update_tab_bar(self) -> None:
+    def _update_tab_bar(self, wall_now: float | None = None) -> None:
+        tab_bars = list(self.query("#tab-bar"))
+        if not tab_bars:
+            # A final timer tick may race with Textual dismantling the screen.
+            return
         labels = []
         for number, (tab_id, name) in enumerate(TAB_NAMES.items(), start=1):
             if tab_id == "chat" and self.unread_count:
                 name = f"{name}({self.unread_count})"
+            elif tab_id == "mesh":
+                name = f"{name} ({self._mesh_active_count(wall_now)})"
             label = f"[{number}] {name}"
             labels.append(f"[reverse]{label}[/reverse]" if tab_id == self.current_tab else label)
-        self.query_one("#tab-bar", Static).update("   ".join(labels))
+        tab_bars[0].update("   ".join(labels))
 
     @staticmethod
     def _escape(value: str) -> str:

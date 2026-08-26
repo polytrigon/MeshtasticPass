@@ -148,6 +148,30 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh"])
         self.assertNotIn("profile", TAB_NAMES)
 
+    async def test_nav_bar_renders_connection_chat_mesh_with_active_count(
+        self,
+    ) -> None:
+        """The rendered tab bar, not just TAB_NAMES' dict order --
+
+        MESH always carries a "(N)" count (even zero), CHAT only ever
+        carries a bracketed unread count when nonzero (unchanged
+        behavior), and CONNECTION never carries a count at all.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            tab_bar = str(app.query_one("#tab-bar", Static).render())
+            self.assertIn("CONNECTION/CONFIG", tab_bar)
+            self.assertIn("CHAT", tab_bar)
+            self.assertIn("MESH (0)", tab_bar)
+            self.assertNotIn("CONNECTION/CONFIG(", tab_bar)
+            self.assertNotIn("ACTIVE", tab_bar)
+            # CONNECTION appears strictly before CHAT, which appears
+            # strictly before MESH, left to right.
+            self.assertLess(tab_bar.index("CONNECTION"), tab_bar.index("CHAT"))
+            self.assertLess(tab_bar.index("CHAT"), tab_bar.index("MESH"))
+
     async def test_key_1_selects_connection_key_2_selects_chat_key_3_selects_mesh(
         self,
     ) -> None:
@@ -1246,8 +1270,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ] · ACTIVE", heading)
-            self.assertNotIn("CHAT —", heading)
+            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertNotIn("ACTIVE", heading)
             with self.assertRaises(NoMatches):
                 app.query_one("#end-of-chat")
 
@@ -1396,46 +1420,27 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         cursor.hide.assert_called_once_with()
         cursor.restore.assert_called_once_with()
 
-    async def test_active_heading_ages_and_nodes_remain_total_database_count(self) -> None:
+    async def test_chat_header_no_longer_shows_redundant_active_count(self) -> None:
+        """CHAT's header used to duplicate an ACTIVE node count that
+
+        MESH already showed authoritatively (via a different, radio-
+        wide predicate) -- removed as a UI consolidation. All other
+        header content (the channel dropdown) is unchanged.
+        """
         radio = SimulatedRadioService(
-            connect_delay=0,
-            message_interval=0,
-            scripted_messages=(),
+            connect_delay=0, message_interval=0, scripted_messages=()
         )
         app = MeshtasticPassApp(radio, self.settings)
-
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            reference = radio._activity_reference_time
-            self.assertIsNotNone(reference)
-            app._refresh_chat_timestamps(wall_now=reference)
-            self.assertIn(
-                "CHAT · [ LongFast ▾ ] · ACTIVE 2",
-                str(app.query_one("#chat-title", Static).render()),
-            )
-            self.assertIn(
-                "NODES        8",
-                str(app.query_one("#connection-details", Static).render()),
-            )
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertNotIn("ACTIVE", heading)
 
-            app._refresh_chat_timestamps(wall_now=reference + 1)
-            self.assertIn(
-                "ACTIVE 1",
-                str(app.query_one("#chat-title", Static).render()),
-            )
-            self.assertEqual(radio.sent_messages, ())
-
-            app._refresh_chat_timestamps(wall_now=reference + 400)
-            self.assertIn(
-                "ACTIVE 0",
-                str(app.query_one("#chat-title", Static).render()),
-            )
-
-            app._show_connection(RadioState.OFFLINE)
-            self.assertIn(
-                "ACTIVE —",
-                str(app.query_one("#chat-title", Static).render()),
-            )
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertNotIn("ACTIVE", heading)
 
     async def test_chat_primary_heading_and_timestamp_hierarchy(self) -> None:
         radio = SimulatedRadioService(
@@ -1754,10 +1759,6 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(entry.local_sent_at)
             self.assertEqual(str(widget.timestamp_label.render()), "RX 2h")
             self.assertNotIn("DELAYED", str(widget.timestamp_label.render()))
-            self.assertIn(
-                "ACTIVE 1",
-                str(app.query_one("#chat-title", Static).render()),
-            )
             radio.interface.sendText.assert_not_called()
             for part in parts:
                 self.assertEqual(part.visual_style.foreground.hex6, "#FF8C00")
