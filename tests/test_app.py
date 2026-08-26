@@ -10,7 +10,7 @@ from threading import Event
 from time import monotonic, sleep, time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from rich.color import Color
 from textual.containers import Horizontal
@@ -1787,6 +1787,234 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.chat_history[-1].is_new)
             self.assertTrue(app.chat_history[-1].unread)
             self.assertEqual(app.unread_count, 1)
+
+    # ---- Receive-pipeline health (production callback boundary) --------
+
+    async def test_position_app_packet_is_observed_but_creates_no_chat_entry(
+        self,
+    ) -> None:
+        """Injects a real POSITION_APP packet through RadioService's own
+
+        diagnostic observer (_on_any_packet_for_debug, subscribed to the
+        generic meshtastic.receive topic in production) -- proving the
+        callback fires and RadioService notices the activity -- while
+        confirming CHAT correctly ignores it entirely (no ChatEntry).
+        """
+        radio = CallbackRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        packet = {
+            "from": 0x4D7E2195,
+            "fromId": "!4d7e2195",
+            "decoded": {"portnum": "POSITION_APP", "position": {"latitudeI": 1}},
+            "rxSnr": -18.75,
+            "rxRssi": -122,
+            "hopStart": 7,
+            "hopLimit": 3,
+        }
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            before = len(app.chat_history)
+            with patch("radio_service.rx_debug_enabled", return_value=True), patch(
+                "radio_service.rx_debug_log"
+            ) as debug_log:
+                radio._on_any_packet_for_debug(packet=packet, interface=radio.interface)
+            await pilot.pause()
+
+            self.assertEqual(len(app.chat_history), before)
+            debug_log.assert_called_once()
+            line = debug_log.call_args[0][0]
+            self.assertIn("!4d7e2195", line)
+            self.assertIn("POSITION_APP", line)
+
+    async def test_decoded_text_message_reaches_chatstore_and_ui(self) -> None:
+        """The real end-to-end path: RadioService's actual production
+
+        callback (_on_text_received) all the way through ChatStore and
+        the mounted widget -- never a directly-constructed ChatEntry or
+        a call straight into ChatStore.
+        """
+        radio = CallbackRadioService()
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        packet = {
+            "from": 0x87654321,
+            "fromId": "!87654321",
+            "channel": 0,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hello real pipeline"},
+            "id": 42,
+            "rxTime": time(),
+        }
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+
+            with patch("radio_service.rx_debug_log") as debug_log:
+                radio._on_text_received(packet=packet, interface=radio.interface)
+            await pilot.pause()
+
+            entry = app.chat_history[-1]
+            self.assertEqual(entry.text, "hello real pipeline")
+            self.assertIsNotNone(entry.message_id)
+            stored_texts = [message.text for message in store.load_recent()]
+            self.assertIn("hello real pipeline", stored_texts)
+            widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry is entry
+            )
+            self.assertIsNotNone(widget)
+            debug_log.assert_not_called()  # disabled by default
+
+        with patch("radio_service.rx_debug_enabled", return_value=True):
+            radio2 = CallbackRadioService()
+            store2 = ChatStore.open(self.chat_db_path)
+            app2 = MeshtasticPassApp(radio2, self.settings, chat_store=store2)
+            packet2 = {**packet, "id": 43, "fromId": "!87654322"}
+            with patch("app.rx_debug_enabled", return_value=True), patch(
+                "app.rx_debug_log"
+            ) as app_debug_log, patch("radio_service.rx_debug_log") as radio_debug_log:
+                async with app2.run_test(size=(100, 30)) as pilot:
+                    await pilot.pause()
+                    app2.show_tab("chat")
+                    radio2._on_text_received(packet=packet2, interface=radio2.interface)
+                    await pilot.pause()
+            radio_lines = [call.args[0] for call in radio_debug_log.call_args_list]
+            self.assertTrue(any("TEXT_MESSAGE_APP" in line and "accepted" in line for line in radio_lines))
+            app_lines = [call.args[0] for call in app_debug_log.call_args_list]
+            self.assertTrue(any("CHAT STORE" in line and "inserted" in line for line in app_lines))
+            self.assertTrue(any("CHAT UI" in line and "delivered" in line for line in app_lines))
+
+    async def test_rejected_text_packet_has_a_diagnosable_reason(self) -> None:
+        radio = CallbackRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        packet = {"decoded": {"portnum": "TELEMETRY_APP", "telemetry": {}}}
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            before = len(app.chat_history)
+            with patch("radio_service.rx_debug_enabled", return_value=True), patch(
+                "radio_service.rx_debug_log"
+            ) as debug_log:
+                radio._on_text_received(packet=packet, interface=radio.interface)
+            await pilot.pause()
+
+            self.assertEqual(len(app.chat_history), before)
+            debug_log.assert_called_once()
+            line = debug_log.call_args[0][0]
+            self.assertIn("ignored", line)
+            self.assertIn("not_text_message_app", line)
+
+    async def test_stale_interface_rejected_current_interface_accepted(
+        self,
+    ) -> None:
+        """Full-app-level reconnect proof: a packet tagged with a
+
+        superseded interface is rejected, while the SAME live
+        subscription keeps delivering packets tagged with the current
+        interface -- no resubscription needed, matching production
+        (RadioService._subscribe_to_events only ever runs once; see
+        _on_text_received's own interface-generation filter).
+        """
+        radio = CallbackRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        stale_interface = radio.interface
+        packet_template = {
+            "channel": 0,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "reconnect check"},
+        }
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            before = len(app.chat_history)
+
+            # Simulate a reconnect: a brand new interface object replaces
+            # the old one, exactly as RadioService.connect() does.
+            radio._interface = SimpleNamespace(nodesByNum={}, nodes={}, sendText=Mock())
+
+            radio._on_text_received(
+                packet={**packet_template, "fromId": "!aaaa0001", "id": 1},
+                interface=stale_interface,
+            )
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), before)
+
+            radio._on_text_received(
+                packet={**packet_template, "fromId": "!aaaa0002", "id": 2},
+                interface=radio._interface,
+            )
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), before + 1)
+            self.assertEqual(app.chat_history[-1].node_id, "!aaaa0002")
+
+    async def test_many_passive_packets_do_not_interfere_with_later_text_delivery(
+        self,
+    ) -> None:
+        radio = CallbackRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            for index in range(50):
+                radio._on_any_packet_for_debug(
+                    packet={
+                        "fromId": f"!aaaa{index:04x}",
+                        "decoded": {"portnum": "POSITION_APP", "position": {}},
+                    },
+                    interface=radio.interface,
+                )
+            await pilot.pause()
+
+            radio._on_text_received(
+                packet={
+                    "fromId": "!bbbbbbbb",
+                    "channel": 0,
+                    "decoded": {
+                        "portnum": "TEXT_MESSAGE_APP",
+                        "text": "still works after 50 passive packets",
+                    },
+                    "id": 999,
+                },
+                interface=radio.interface,
+            )
+            await pilot.pause()
+            self.assertEqual(
+                app.chat_history[-1].text, "still works after 50 passive packets"
+            )
+
+    async def test_mesh_refresh_failure_cannot_lose_an_incoming_chat_message(
+        self,
+    ) -> None:
+        """Hardening found during the receive-pipeline audit: _accept_
+
+        received_message() used to call _refresh_mesh() with no
+        isolation, so any exception there (a passive-topology refresh
+        concern) would propagate and abort persistence of the SAME
+        incoming CHAT message -- an unrelated failure silently losing a
+        legitimate decoded TEXT_MESSAGE_APP packet with no diagnosable
+        reason. Not confirmed as the active real-device regression, but
+        a genuine structural gap this audit surfaced; verified
+        load-bearing by temporarily removing the isolation and
+        confirming the message is lost.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            before = len(app.chat_history)
+            with patch.object(
+                app, "_refresh_mesh", side_effect=RuntimeError("synthetic mesh failure")
+            ):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=88_888_888,
+                        text="must survive a mesh-refresh exception",
+                    )
+                )
+            await pilot.pause()
+            self.assertEqual(len(app.chat_history), before + 1)
+            self.assertEqual(
+                app.chat_history[-1].text, "must survive a mesh-refresh exception"
+            )
 
     async def test_persisted_history_reloads_read_with_delivery_state(self) -> None:
         radio = SimulatedRadioService(

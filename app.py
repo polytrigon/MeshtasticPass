@@ -80,6 +80,8 @@ from radio_service import (
     ReceivedMessage,
     SendStatus,
     SentMessage,
+    rx_debug_enabled,
+    rx_debug_log,
     validate_long_name,
     validate_short_name,
 )
@@ -2676,7 +2678,13 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
-        self._refresh_mesh()
+        try:
+            self._refresh_mesh()
+        except Exception:
+            # A passive-topology refresh problem must never be able to
+            # silently swallow a legitimate incoming CHAT message --
+            # persistence below still has to run regardless.
+            pass
         channel_index = message.channel_index or 0
         state = self._ensure_channel_loaded(channel_index)
         app_received_at = time()
@@ -2693,7 +2701,19 @@ class MeshtasticPassApp(App[None]):
             is_new=True,
         )
         self._assign_arrival_order(entry)
-        if not self._persist_incoming(entry):
+        inserted = self._persist_incoming(entry)
+        if rx_debug_enabled():
+            if entry.message_id is not None:
+                rx_debug_log(
+                    f"CHAT STORE id={entry.message_id} channel={channel_index} "
+                    + ("inserted" if inserted else "duplicate, ignored")
+                )
+            else:
+                rx_debug_log(
+                    f"CHAT STORE not persisted channel={channel_index} "
+                    "reason=no_chat_store_attached"
+                )
+        if not inserted:
             return
         tail_key = state.entries[-1].order_key if state.entries else None
         is_older = (
@@ -2715,10 +2735,12 @@ class MeshtasticPassApp(App[None]):
             state.new_message_ids.add(entry.message_id)
             if not chat_is_visible:
                 state.unread_message_ids.add(entry.message_id)
+        delivered_to_ui = False
         if not outside_mounted_window:
             state.entries.insert(insert_index, entry)
             if channel_index == self.current_channel_index:
                 self._insert_chat_widget(entry, insert_index, older=is_older)
+                delivered_to_ui = True
         else:
             state.has_older_history = True
             if channel_index == self.current_channel_index:
@@ -2727,6 +2749,20 @@ class MeshtasticPassApp(App[None]):
                     self.query_one("#chat-log", ChatTranscript)
                 )
                 self._capture_current_channel_state()
+        if rx_debug_enabled():
+            if delivered_to_ui:
+                rx_debug_log(f"CHAT UI id={entry.message_id} delivered")
+            elif channel_index != self.current_channel_index:
+                rx_debug_log(
+                    f"CHAT UI id={entry.message_id} not displayed "
+                    f"reason=current_channel={self.current_channel_index}"
+                    f",message_channel={channel_index}"
+                )
+            else:
+                rx_debug_log(
+                    f"CHAT UI id={entry.message_id} not displayed "
+                    "reason=outside_mounted_history_window"
+                )
         if is_older:
             self._show_older_message_notice(channel_index, entry)
         if not chat_is_visible:
