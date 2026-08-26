@@ -26,6 +26,7 @@ from app import (
     DOT_GRID_SPACING_Y,
     MESH_GRID_CENTER_COLUMN,
     MESH_GRID_CENTER_ROW,
+    MESH_BOARD_LABEL_MAX_CELLS,
     MESH_GRID_COLUMNS,
     MESH_GRID_ROWS,
     MESH_SELECTED_GLYPH_WIDTH,
@@ -604,6 +605,116 @@ class MeshGridPlacementTests(unittest.TestCase):
         )
         self.assertEqual(forward, backward)
 
+    # ---- Grid-spread: use more of the available fixed-grid room --------
+
+    def test_lone_direction_node_stretches_to_use_available_room(self) -> None:
+        """A lone north node has 1 raw logical step but 3 rows of
+
+        headroom above center on this 8-row grid (row_count=8,
+        center_row=5, default margin=1: 5-1-1=3) -- it must stretch to
+        use that room instead of clustering one row from center.
+        """
+        node = NodeMetadata("!n", "N", position=north_of_local(3))
+        slots = assign_grid_slots([YOU, node])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        row, _column = positions["!n"]
+        self.assertEqual(row, 2)  # center_row(5) - full up_room(3)
+
+    def test_spread_does_not_shrink_when_room_is_already_fully_used(self) -> None:
+        """Three same-direction nodes already spanning the full 3-row
+
+        headroom must land at exactly their original ranks (4, 3, 2) --
+        spreading only ever stretches outward when there is slack, never
+        compresses when the available room is already fully used.
+        """
+        nodes = [YOU] + [
+            NodeMetadata(f"!n{i}", f"N{i}", position=north_of_local(i + 1)) for i in range(3)
+        ]
+        slots = assign_grid_slots(nodes, max_radius=3)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        rows = sorted(positions[f"!n{i}"][0] for i in range(3))
+        self.assertEqual(rows, [2, 3, 4])
+
+    def test_spread_respects_asymmetric_room_between_axes(self) -> None:
+        """The 21-column grid has far more horizontal headroom (9) than
+
+        this 8-row grid has vertical headroom (3 up / 2 down) around
+        center (11, 5) -- a lone east node and a lone north node, each
+        one raw logical step out, must stretch by different amounts
+        that reflect their own axis's actual available room.
+        """
+        east_node = NodeMetadata("!e", "E", position=east_of_local(3))
+        north_node = NodeMetadata("!n", "N", position=north_of_local(3))
+        slots = assign_grid_slots([YOU, east_node, north_node])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        east_distance = positions["!e"][1] - 11
+        north_distance = 5 - positions["!n"][0]
+        self.assertGreater(east_distance, north_distance)
+
+    def test_spread_preserves_relative_ordering_within_a_direction(self) -> None:
+        near = NodeMetadata("!near", "Near", position=north_of_local(1))
+        far = NodeMetadata("!far", "Far", position=north_of_local(50))
+        slots = assign_grid_slots([YOU, near, far], max_radius=3)
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        # Farther logical rank must still render strictly farther from
+        # center after spreading, never reordered by the stretch.
+        self.assertLess(positions["!far"][0], positions["!near"][0])
+
+    def test_spread_stays_collision_free_and_deterministic_for_a_mixed_fixture(
+        self,
+    ) -> None:
+        """A representative multi-direction, multi-node fixture: spread
+
+        must never collide and must never depend on input order, exactly
+        like the unspread algorithm already guaranteed.
+        """
+        nodes = [YOU] + [
+            NodeMetadata("!n1", "N1", position=north_of_local(2)),
+            NodeMetadata("!s1", "S1", position=south_of_local(3)),
+            NodeMetadata("!e1", "E1", position=east_of_local(4)),
+            NodeMetadata("!e2", "E2", position=east_of_local(20)),
+            NodeMetadata("!w1", "W1", position=west_of_local(5)),
+        ]
+        forward = place_within_bounds(
+            assign_grid_slots(nodes), center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        backward = place_within_bounds(
+            assign_grid_slots(list(reversed(nodes))),
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+        )
+        self.assertEqual(forward, backward)
+        self.assertEqual(len(forward), len(set(forward.values())))
+        for row, column in forward.values():
+            self.assertTrue(1 <= row <= 8)
+            self.assertTrue(1 <= column <= 21)
+
+    def test_spread_never_places_a_node_at_the_true_outer_edge_by_default(
+        self,
+    ) -> None:
+        """The default margin=1 keeps at least one row/column of breathing
+
+        room at the true edge even when a lone node stretches to fill
+        all available headroom (spec: "Do not push everything against
+        the outer edge either; preserve reasonable margins").
+        """
+        node = NodeMetadata("!n", "N", position=north_of_local(3))
+        slots = assign_grid_slots([YOU, node])
+        positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        self.assertGreater(positions["!n"][0], 1)
+
 
 class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
     """Pure tests for app.py's generic (not fixture-specific) whole-mesh
@@ -810,6 +921,58 @@ class RouteChainTests(unittest.TestCase):
 
     def test_single_point_chain_is_empty(self) -> None:
         self.assertEqual(route_chain(((2, 2),)), ())
+
+
+class BoardLabelFiveCellLimitTests(unittest.TestCase):
+    """Pure tests for the new 5-display-cell BOARD label limit.
+
+    This is a DISPLAY-CELL limit (cell_len()), never Python len() --
+    grapheme-safe truncation, emoji/ZWJ/CJK safety, and the underlying
+    compact_node_label() truncation convention are all unchanged; only
+    the max_cells value app.py passes for the label physically above a
+    node's glyph is new. The rich bottom-left context (mesh_state.
+    format_mesh_context_line) is untouched and always uses the full,
+    uncapped Long Name/Short Name -- proven separately in test_mesh_state.py.
+    """
+
+    def test_short_ascii_name_passes_through_unchanged(self) -> None:
+        node = NodeMetadata("!12345678", "ALICE", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertEqual(label, "ALICE")
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+    def test_long_ascii_name_truncates_to_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "CHARLIE THE LONG NAMED NODE", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertTrue(label.endswith("…"))
+
+    def test_emoji_name_stays_within_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "🐔pizza party extra long name", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+    def test_zwj_emoji_never_severed_at_five_cells(self) -> None:
+        node = NodeMetadata(
+            "!12345678", "👨‍👩‍👧‍👦 family extra long descriptive name", None
+        )
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+        if label.endswith("…"):
+            last_kept = label[:-1][-1:]
+            self.assertNotEqual(last_kept, mesh_topology_module._ZERO_WIDTH_JOINER)
+            self.assertNotIn(last_kept, mesh_topology_module._VARIATION_SELECTORS)
+
+    def test_cjk_wide_characters_stay_within_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "CJK漢字測試名稱超長節點標籤", None)
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
+
+    def test_short_name_fallback_also_respects_five_cells(self) -> None:
+        node = NodeMetadata("!12345678", "A Very Long Descriptive Long Name", "SHORT")
+        label = compact_node_label(node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.assertEqual(label, "SHORT")
+        self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
 
 
 class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
@@ -1705,15 +1868,17 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(remote_count, 4)
             self.assertGreater(len(view.relay_stages), 0)
 
-    async def test_navigation_walks_through_relay_stages_and_back(self) -> None:
-        """The exact "YOU -> RELAY -> RELAY -> ALICE and back" contract
+    async def test_navigation_skips_over_relay_stages_directly_to_real_node(
+        self,
+    ) -> None:
+        """Anonymous relay stages are visual topology only -- NOT
 
-        (spec section 16): a single 2-hop client leaves two genuinely
-        interior cells (see the min_radius_by_id boost in _refresh_mesh),
-        so sequential single-key presses visit both relay stages before
-        the real node, and the same sequence in reverse returns to YOU --
-        no wrapping, no scrolling, context text flips correctly at each
-        stop.
+        navigable (spec update: "UNKNOWN RELAYS ARE NOT SELECTABLE"). A
+        single 2-hop client sits with two relay stages geometrically
+        between it and YOU; a single "up" press from YOU must land
+        directly on the real node in one press, never stopping on
+        either relay stage, and a single "down" press from the real
+        node returns directly to YOU. No wrapping, no scrolling.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1741,48 +1906,39 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.selected_node_id, you_id)
             self.assertEqual(len(view.relay_stages), 2)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
             board_offset_before = view.board.styles.offset
 
-            expected_forward = [
-                stage.node_id
-                for stage in sorted(view.relay_stages, key=lambda stage: stage.index)
-            ] + [target_id]
-            visited = []
-            for _ in expected_forward:
-                await pilot.press("up")
-                await pilot.pause()
-                visited.append(view.selected_node_id)
-            self.assertEqual(visited, expected_forward)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
+            self.assertNotIn(view.selected_node_id, relay_ids)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("Target Node"))
 
             # No wrapping: one more "up" from the real node changes nothing.
             await pilot.press("up")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, target_id)
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.startswith("Target Node"))
 
-            visited_back = []
-            for _ in expected_forward:
-                await pilot.press("down")
-                await pilot.pause()
-                visited_back.append(view.selected_node_id)
-            self.assertEqual(visited_back, list(reversed(expected_forward[:-1])) + [you_id])
-            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
-
-            # Context reads exactly "RELAY" while a relay stage is selected.
-            await pilot.press("up")
+            await pilot.press("down")
             await pilot.pause()
-            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "RELAY")
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
 
             self.assertEqual(view.board.styles.offset, board_offset_before)
             self.assertFalse(view.show_vertical_scrollbar)
             self.assertFalse(view.show_horizontal_scrollbar)
 
-    async def test_relay_stage_selection_styling_and_context(self) -> None:
-        """Stroked + DIM_BASE unselected, ACCENT + wider composite
+    async def test_relay_stage_cannot_be_selected_and_always_renders_dim(
+        self,
+    ) -> None:
+        """Anonymous relay stages are never focusable/selectable: no
 
-        selected, never labeled, bottom context exactly "RELAY" (spec
-        sections 6/8).
+        on_click, never ACCENT, never the enlarged composite, never the
+        bottom-left context, and attempting to select one directly falls
+        back exactly like any other invalid ID (spec update section
+        "UNKNOWN RELAYS ARE NOT SELECTABLE").
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1812,6 +1968,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             stage_id = view.relay_stages[0].node_id
             palette = THEME_PALETTES[app._current_theme]
 
+            self.assertFalse(hasattr(MeshRelayWidget, "on_click"))
+            self.assertFalse(MeshRelayWidget.can_focus)
+
             relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
             self.assertEqual(
                 relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
@@ -1823,24 +1982,57 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 None,
             )
 
+            # Directly attempting to select a relay stage ID (there is no
+            # UI path that does this anymore -- proving the model layer
+            # itself refuses, not just the removed click handler) falls
+            # back to YOU exactly like any other invalid ID.
             _mesh_select_node(app, stage_id)
             await pilot.pause()
-            relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
-            self.assertEqual(
-                relay_widget.render().spans[0].style.foreground, Color.parse(palette.accent)
-            )
-            self.assertEqual(int(relay_widget.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
-            self.assertEqual(
-                str(app.query_one("#mesh-context-status").render()), "RELAY"
-            )
-
-            _mesh_select_node(app, you_id)
-            await pilot.pause()
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertNotEqual(view.selected_node_id, stage_id)
             relay_widget = next(w for w in app.query(MeshRelayWidget) if w.node_id == stage_id)
             self.assertEqual(
                 relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
             self.assertEqual(int(relay_widget.styles.width.value), 1)
+            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
+
+    async def test_navigation_candidate_set_excludes_relay_stage_ids(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!ca4d1da1"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Alice", "ALC", 3, position=west_of_local(9)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Alice",
+                    sender_short_name="ALC",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 3)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
+            self.assertEqual(relay_ids & {view.selected_node_id}, set())
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, you_id)
 
     async def test_multiple_clients_same_hop_count_get_independent_relay_stages(
         self,
@@ -1976,6 +2168,165 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             title = str(app.query_one("#mesh-title").render())
             self.assertEqual(title, "> MESH · ACTIVE 1")
 
+    async def test_active_header_excludes_known_nodes_outside_displayed_working_set(
+        self,
+    ) -> None:
+        """Regression for the exact observed uConsole bug: MESH showed 9
+
+        real nodes all DIM_BASE while the header said ACTIVE 2. Root
+        cause was a population mismatch -- ACTIVE previously counted
+        activity across the FULL known-node population (get_known_nodes()),
+        independent of the bounded CLIENT-derived working set actually
+        rendered, so a passively-active node with no CHAT history could
+        inflate the header without ever appearing on the board at all.
+
+        Fixture: YOU + 8 real remote CLIENTs (all displayed, exactly 2
+        satisfying is_node_active()) + 2 additional known nodes that are
+        ALSO passively active but have never sent a CHAT message, so
+        they are excluded from the working set entirely. ACTIVE must
+        read exactly 2 -- the hidden active nodes must not count -- and
+        exactly those same 2 displayed nodes must render BASE.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            now = 1_700_000_000.0
+            displayed_ids = [f"!disp000{i}" for i in range(8)]
+            active_displayed_ids = set(displayed_ids[:2])
+            hidden_active_ids = ["!hidn0001", "!hidn0002"]
+
+            nodes = [NodeMetadata(app.radio.info.node_id, is_local=True)]
+            for node_id in displayed_ids:
+                last_heard = (
+                    now - 10 if node_id in active_displayed_ids
+                    else now - ACTIVE_WINDOW_SECONDS - 100
+                )
+                nodes.append(NodeMetadata(node_id, node_id, last_heard=last_heard))
+            for node_id in hidden_active_ids:
+                # Passively active (recent last_heard) but never a
+                # CLIENT -- no _accept_received_message call for these.
+                nodes.append(NodeMetadata(node_id, node_id, last_heard=now - 10))
+            app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+
+            for index, node_id in enumerate(displayed_ids):
+                app._accept_received_message(
+                    SIMULATED_MESSAGES[0].__class__(
+                        sender_node_id=node_id,
+                        sender_long_name=node_id,
+                        sender_short_name=None,
+                        channel_index=0,
+                        text="hi",
+                        rssi=None,
+                        snr=None,
+                        packet_id=9_700_000 + index,
+                        radio_rx_at=now - index,
+                    )
+                )
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            displayed_remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertEqual(displayed_remote_ids, set(displayed_ids))
+            for hidden_id in hidden_active_ids:
+                self.assertNotIn(hidden_id, displayed_remote_ids)
+                self.assertNotIn(
+                    hidden_id, {w.node_id for w in app.query(MeshNodeWidget)}
+                )
+
+            title = str(app.query_one("#mesh-title").render())
+            self.assertEqual(title, "> MESH · ACTIVE 2")
+
+            palette = THEME_PALETTES[app._current_theme]
+            bright_ids = set()
+            for node_id in displayed_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                color = widget.render().spans[0].style.foreground
+                if color == Color.parse(palette.base):
+                    bright_ids.add(node_id)
+                else:
+                    self.assertEqual(color, Color.parse(palette.dim_base))
+            self.assertEqual(bright_ids, active_displayed_ids)
+
+            # Selecting an inactive node shows ACCENT; deselecting it
+            # restores DIM_BASE. Selecting an active node shows ACCENT;
+            # deselecting it restores BASE. Rendered directly at the
+            # FIXED simulated `now` (not via _mesh_select_node, which
+            # always uses real wall-clock time()) so is_node_active()
+            # evaluates against the same timestamp as the setup above.
+            inactive_id = next(iter(set(displayed_ids) - active_displayed_ids))
+            active_id = next(iter(active_displayed_ids))
+            for node_id, restored in ((inactive_id, palette.dim_base), (active_id, palette.base)):
+                view.select_node(node_id)
+                view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=now)
+                await pilot.pause()
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(
+                    widget.render().spans[0].style.foreground, Color.parse(palette.accent)
+                )
+                view.select_node(app.radio.info.node_id)
+                view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=now)
+                await pilot.pause()
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(restored))
+
+    async def test_activity_styling_refreshes_without_leaving_mesh_tab(self) -> None:
+        """The user should not have to leave/re-enter MESH for active
+
+        styling (or ACTIVE N) to become correct as time passes -- the
+        existing 1s _refresh_chat_timestamps timer already calls
+        _refresh_mesh() while the MESH tab is current; this proves the
+        resulting recompute actually updates both the header and the
+        node's own color, entirely via repeated _refresh_mesh() calls
+        with no additional tab switch and no new radio traffic.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            node_id = "!c0055ing1"
+            heard_at = 1_700_000_000.0
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(app.radio.info.node_id, is_local=True),
+                NodeMetadata(node_id, "Crosser", last_heard=heard_at),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=node_id,
+                    sender_long_name="Crosser",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=heard_at,
+                )
+            )
+            await self._open_mesh(pilot)
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._refresh_mesh(wall_now=heard_at + 10)
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertEqual(str(app.query_one("#mesh-title").render()), "> MESH · ACTIVE 1")
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertEqual(widget.render().spans[0].style.foreground, Color.parse(palette.base))
+
+            # Same session, same tab -- only wall-clock time advanced past
+            # the active window, exactly as the 1s timer would apply it.
+            app._refresh_mesh(wall_now=heard_at + ACTIVE_WINDOW_SECONDS + 50)
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertEqual(str(app.query_one("#mesh-title").render()), "> MESH · ACTIVE 0")
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+            self.assertEqual(app.radio.sent_messages, ())
+
     # ---- Expanded selected-node context (spec section 21-27) -----------
 
     async def test_selected_context_full_format_with_distance(self) -> None:
@@ -2109,6 +2460,70 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(view, ScrollableContainer)
             self.assertFalse(view.show_vertical_scrollbar)
             self.assertFalse(view.show_horizontal_scrollbar)
+
+    # ---- Board label 5-cell limit (app-level) --------------------------
+
+    async def test_board_label_five_cells_stays_centered_and_glyph_unmoved(
+        self,
+    ) -> None:
+        """A long name truncates to <= 5 display cells on the board label,
+
+        the label stays centered over the glyph's fixed grid anchor, and
+        the glyph's own coordinate is completely unaffected by label
+        length (spec: "label width never moves the glyph").
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            long_id = "!10ngname"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    long_id,
+                    "A Very Long Descriptive Node Name",
+                    None,
+                    position=north_of_local(3),
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=long_id,
+                    sender_long_name="A Very Long Descriptive Node Name",
+                    sender_short_name=None,
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=1_700_000_000.0,
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            glyph = next(w for w in app.query(MeshNodeWidget) if w.node_id == long_id)
+            label = next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == long_id)
+
+            label_text = str(label.render())
+            self.assertLessEqual(cell_len(label_text), MESH_BOARD_LABEL_MAX_CELLS)
+            # The label sits exactly one row above the glyph, horizontally
+            # centered on the SAME column anchor -- never the glyph's own
+            # coordinate (see MeshNodeLabelWidget/set_nodes).
+            glyph_x, glyph_y = glyph_screen_position(glyph)
+            label_x, label_y = glyph_screen_position(label)
+            self.assertEqual(label_x, glyph_x)
+            self.assertEqual(label_y, glyph_y - 1)
+
+            # Selecting a neighbor recenters the whole board (glyph moves
+            # with the translation) but the label stays centered on it.
+            _mesh_select_node(app, you_id)
+            await pilot.pause()
+            glyph = next(w for w in app.query(MeshNodeWidget) if w.node_id == long_id)
+            label = next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == long_id)
+            glyph_x, glyph_y = glyph_screen_position(glyph)
+            label_x, label_y = glyph_screen_position(label)
+            self.assertEqual(label_x, glyph_x)
+            self.assertEqual(label_y, glyph_y - 1)
 
     # ---- Preserved visual contract -----------------------------------
 

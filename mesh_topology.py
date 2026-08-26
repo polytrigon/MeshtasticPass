@@ -333,11 +333,32 @@ def place_within_bounds(
     center_column: int,
     row_count: int,
     column_count: int,
+    margin: int = 1,
 ) -> dict[str, tuple[int, int]]:
     """Map assign_grid_slots()'s unbounded logical (x, y) steps from LOCAL
 
     onto a fixed row_count x column_count grid (1-indexed row, column),
     guaranteeing every node lands in-bounds and collision-free.
+
+    Each of the four half-axes (up/down/left/right from center) is
+    independently stretched by the largest factor that still fits its
+    farthest-out node within `margin` cells of that edge -- e.g. a lone
+    node one logical step north of LOCAL, on a board with three rows of
+    headroom above center, renders three rows out rather than one,
+    genuinely using the board's free space rather than clustering
+    everything near center regardless of how much room is available.
+    The factor is 1.0 (no change) whenever the axis is already using at
+    least as much room as is available (many same-direction nodes, or a
+    ring-search overflow from heavy collision pressure) -- this only
+    ever stretches outward, never compresses inward. Every node on one
+    half-axis is scaled by the identical factor, so relative order
+    (farther logical rank stays farther) and any node's own compass
+    direction are both preserved exactly; only the actual grid distance
+    changes. A hop-bearing client's own already-boosted logical rank
+    (see assign_grid_slots' min_radius_by_id) starts from a REAL node's
+    position that's already been pushed out for chain room; this spread
+    only pushes it (and its interior relay-stage cells) out further
+    when the board has headroom to give.
 
     assign_grid_slots()'s own collision avoidance (_reserve_slot) assumes
     an auto-growing board: if several nodes cluster in the same compass
@@ -350,6 +371,23 @@ def place_within_bounds(
     the grid in the extreme case (guaranteed to exist for any working set
     much smaller than the grid's total cell count).
     """
+    up_scale = _spread_scale(
+        max((-item.y for item in slots if item.y < 0), default=0),
+        max(0, center_row - 1 - margin),
+    )
+    down_scale = _spread_scale(
+        max((item.y for item in slots if item.y > 0), default=0),
+        max(0, row_count - center_row - margin),
+    )
+    left_scale = _spread_scale(
+        max((-item.x for item in slots if item.x < 0), default=0),
+        max(0, center_column - 1 - margin),
+    )
+    right_scale = _spread_scale(
+        max((item.x for item in slots if item.x > 0), default=0),
+        max(0, column_count - center_column - margin),
+    )
+
     occupied: set[tuple[int, int]] = set()
     result: dict[str, tuple[int, int]] = {}
     ordered = sorted(
@@ -360,14 +398,43 @@ def place_within_bounds(
         ),
     )
     for item in ordered:
-        row = _clamp(center_row + item.y, 1, row_count)
-        column = _clamp(center_column + item.x, 1, column_count)
+        if item.y < 0:
+            row = center_row - round(-item.y * up_scale)
+        elif item.y > 0:
+            row = center_row + round(item.y * down_scale)
+        else:
+            row = center_row
+        if item.x < 0:
+            column = center_column - round(-item.x * left_scale)
+        elif item.x > 0:
+            column = center_column + round(item.x * right_scale)
+        else:
+            column = center_column
+        row = _clamp(row, 1, row_count)
+        column = _clamp(column, 1, column_count)
         row, column = _reserve_bounded_cell(
             row, column, occupied, row_count=row_count, column_count=column_count
         )
         occupied.add((row, column))
         result[item.node.node_id] = (row, column)
     return result
+
+
+def _spread_scale(farthest_logical_step: int, available_room: int) -> float:
+    """Stretch factor for one half-axis: only ever >= 1.0 (never shrinks).
+
+    farthest_logical_step is the largest raw step assign_grid_slots
+    assigned on this half-axis (0 if nothing is placed there at all --
+    the factor is irrelevant in that case). available_room is how many
+    grid cells that half-axis has between center and its margin-
+    respecting edge. Stretching to fill exactly that room is intentional:
+    place_within_bounds' own clamp+collision-reservation still guarantees
+    an in-bounds, collision-free result even if downstream nudging pushes
+    a cell slightly past this target.
+    """
+    if farthest_logical_step <= 0 or available_room <= farthest_logical_step:
+        return 1.0
+    return available_room / farthest_logical_step
 
 
 def _clamp(value: int, low: int, high: int) -> int:

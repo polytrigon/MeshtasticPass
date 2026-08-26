@@ -412,6 +412,14 @@ MESH_GRID_CENTER_COLUMN = 11
 # an ambiguous-width "big circle" Unicode glyph.
 MESH_SELECTED_GLYPH_WIDTH = 3
 MESH_SELECTED_HALO_GLYPH = "·"
+# The label physically above a node's glyph is a compact hint, not the
+# full identity -- that lives in the rich bottom-left context (see
+# mesh_state.format_mesh_context_line, which always has the full Long
+# Name/Short Name, uncapped). Capped in DISPLAY CELLS (cell_len()), not
+# Python len(), so wide/CJK/emoji glyphs are counted by their actual
+# terminal width -- see mesh_topology.compact_node_label/_truncate for
+# the grapheme-safe truncation this limit is applied through.
+MESH_BOARD_LABEL_MAX_CELLS = 5
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
@@ -439,14 +447,15 @@ def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: f
     return palette.base
 
 
-def _mesh_relay_color(*, selected: bool, theme: str) -> str:
-    """An anonymous relay-stage placeholder is never active/inactive --
+def _mesh_relay_color(theme: str) -> str:
+    """An anonymous relay-stage placeholder is visual topology only: it
 
-    it has no identity to be "heard" from, so it is always DIM_BASE
-    unless selected (ACCENT), regardless of any client's activity.
+    has no identity to be "heard" from, is never active/inactive, and
+    (unlike a real node) is never selectable, so it is always DIM_BASE
+    -- never ACCENT, regardless of theme, activity, or selection state
+    anywhere else on the board.
     """
-    palette = THEME_PALETTES[theme]
-    return palette.accent if selected else palette.dim_base
+    return THEME_PALETTES[theme].dim_base
 
 
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
@@ -495,13 +504,13 @@ def _mesh_directional_target(
     the mesh's logical geometry, not of wherever the selection happens
     to be recentered on screen.
 
-    Candidates come directly from `base_positions` -- MeshTopologyView's
-    own merged real-node-plus-relay-stage layout, i.e. exactly what is
-    currently rendered -- rather than from any node-role data, so a real
-    node and an anonymous relay stage are equally navigable and neither
-    needs a special case here. No node IDs are hardcoded: this is the
-    same general nearest-candidate rule for whatever layout the model
-    produces.
+    Candidates come directly from whatever `base_positions` the caller
+    passes -- e.g. _move_mesh_focus deliberately excludes anonymous
+    relay-stage IDs before calling this, since a relay stage is visual
+    topology only and must never become a navigation target -- rather
+    than from any node-role data baked into this function itself. No
+    node IDs are hardcoded: this is the same general nearest-candidate
+    rule for whatever position set the caller provides.
     """
     layout = TopologyLayout(
         tuple(
@@ -611,18 +620,25 @@ class MeshNodeLabelWidget(Static):
 
     def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
-        self.update(Text(compact_node_label(self.state.node), style=Style(color=color)))
+        label = compact_node_label(self.state.node, MESH_BOARD_LABEL_MAX_CELLS)
+        self.update(Text(label, style=Style(color=color)))
 
     def on_click(self, _event: Click) -> None:
         _mesh_select_node(self.app, self.node_id)
 
 
 class MeshRelayWidget(Static):
-    """An anonymous relay-stage placeholder glyph: always stroked, never
+    """An anonymous relay-stage placeholder glyph: visual topology only.
 
-    labeled, never active/inactive -- see mesh_topology.RelayStage. Only
-    ever DIM_BASE or (selected) ACCENT, using the same enlarged 3-cell
-    composite treatment as a selected real node (see MeshNodeWidget).
+    Always a stroked, DIM_BASE, unlabeled 1-cell glyph -- see
+    mesh_topology.RelayStage. Deliberately NOT interactive: no on_click
+    (a click here does nothing), can_focus is False, and it is excluded
+    from the arrow-navigation candidate set entirely (see
+    MeshtasticPassApp._move_mesh_focus) -- it can never become
+    selected_node_id, never shows ACCENT or the enlarged selected
+    composite, and never appears in the bottom-left context. A hollow
+    dot here means only "an unidentified relay stage exists between two
+    real, inspectable nodes" -- never a thing to inspect itself.
     """
 
     can_focus = False
@@ -632,20 +648,8 @@ class MeshRelayWidget(Static):
         self.node_id = stage.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str) -> None:
-        color = _mesh_relay_color(selected=selected, theme=theme)
-        style = Style(color=color, bold=selected)
-        if selected:
-            content = Text(justify="center")
-            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
-            content.append(CIRCLE_STROKED_LARGE, style=style)
-            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
-        else:
-            content = Text(CIRCLE_STROKED_LARGE, style=style)
-        self.update(content)
-
-    def on_click(self, _event: Click) -> None:
-        _mesh_select_node(self.app, self.node_id)
+    def refresh_visual(self, *, theme: str) -> None:
+        self.update(Text(CIRCLE_STROKED_LARGE, style=Style(color=_mesh_relay_color(theme))))
 
 
 def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
@@ -849,7 +853,10 @@ class MeshTopologyView(Container):
         self._relay_stages = relay_stages
         self._base_positions = {**real_positions, **relay_positions}
         relay_ids = {stage.node_id for stage in relay_stages}
-        if self._selected_node_id not in current_ids and self._selected_node_id not in relay_ids:
+        # Anonymous relay stages are visual topology only -- an anonymous
+        # relay ID is never a valid selection, so it falls back to YOU
+        # exactly like any other ID that isn't a real working-set member.
+        if self._selected_node_id not in current_ids:
             local_id = you_id
             self._selected_node_id = local_id or (
                 working_set[0].node.node_id if working_set else ""
@@ -950,19 +957,18 @@ class MeshTopologyView(Container):
             centers[widget.node_id] = (grid_x, grid_y)
             widget.refresh_visual(selected=selected, theme=theme, now=now)
 
-        # Relay-stage placeholders share the exact same anchor/composite
-        # rules as a real node's glyph (see MeshNodeWidget above) -- only
-        # the color/never-labeled rule differs (MeshRelayWidget).
+        # Relay-stage placeholders share the same glyph anchor formula as
+        # a real node's glyph (see MeshNodeWidget above) but never the
+        # enlarged selected composite -- a relay stage is never selected
+        # (see MeshRelayWidget), so it is always exactly 1 cell wide.
         for widget in relay_widgets:
             row, column = positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
-            selected = widget.node_id == self._selected_node_id
-            width = MESH_SELECTED_GLYPH_WIDTH if selected else 1
-            widget.styles.width = width
+            widget.styles.width = 1
             widget.styles.height = 1
-            widget.styles.offset = (grid_x - width // 2, grid_y)
+            widget.styles.offset = (grid_x, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
-            widget.refresh_visual(selected=selected, theme=theme)
+            widget.refresh_visual(theme=theme)
 
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
@@ -970,7 +976,9 @@ class MeshTopologyView(Container):
         # label widget -- never by resizing or repositioning the glyph.
         for widget in label_widgets:
             grid_x, grid_y = centers[widget.node_id]
-            label_width = max(1, cell_len(compact_node_label(widget.state.node)))
+            label_width = max(
+                1, cell_len(compact_node_label(widget.state.node, MESH_BOARD_LABEL_MAX_CELLS))
+            )
             widget.styles.width = label_width
             widget.styles.height = 1
             widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
@@ -2880,19 +2888,25 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = time() if wall_now is None else wall_now
-        # ACTIVE keeps CHAT's five-minute freshness semantics and counts the
-        # full known-node population -- independent of the bounded MESH
-        # working set below, which represents recent CLIENT relationships,
-        # not every node ever passively heard.
-        active = sum(
-            1
-            for node in nodes
-            if not node.is_local and is_node_active(node.last_heard, current_time)
-        )
-        title.update(f"> MESH · ACTIVE {active}")
         working_set = build_mesh_working_set(
             nodes, last_message_at=self._mesh_last_message_activity()
         )
+        # ACTIVE describes the real remote nodes CURRENTLY DISPLAYED on
+        # this MESH view -- the same bounded working set rendered below,
+        # not the full known-node population (which may include nodes
+        # this view never shows at all, e.g. passively heard but never a
+        # CLIENT). Uses the EXACT SAME predicate (is_node_active) that
+        # _mesh_node_color() uses for each node's own BASE/DIM_BASE
+        # styling, so the header and the board can never disagree about
+        # which/how many displayed nodes are active. Anonymous relay
+        # stages are never part of `working_set` and so never affect
+        # this count either way (see mesh_topology.RelayStage).
+        active = sum(
+            1
+            for state in working_set
+            if not state.node.is_local and is_node_active(state.node.last_heard, current_time)
+        )
+        title.update(f"> MESH · ACTIVE {active}")
         if not working_set:
             view.clear_nodes()
             status.update("NO MESH DATA")
@@ -2925,8 +2939,19 @@ class MeshtasticPassApp(App[None]):
 
     def _move_mesh_focus(self, direction: str) -> None:
         view = self.query_one(MeshTopologyView)
+        # Anonymous relay-stage placeholders are visual topology only --
+        # excluded from the navigation candidate set entirely, so an
+        # arrow press always lands on the nearest sensible REAL node
+        # (YOU, or a real CLIENT/CLIENT+RELAY/RELAY), skipping over any
+        # relay stage that happens to sit geometrically between them.
+        relay_ids = {stage.node_id for stage in view.relay_stages}
+        navigable_positions = {
+            node_id: position
+            for node_id, position in view.base_positions.items()
+            if node_id not in relay_ids
+        }
         target_id = _mesh_directional_target(
-            view.base_positions, view.selected_node_id, direction
+            navigable_positions, view.selected_node_id, direction
         )
         if target_id is not None:
             view.select_node(target_id)
@@ -2960,16 +2985,14 @@ class MeshtasticPassApp(App[None]):
             ),
             None,
         )
-        if state is not None:
-            status_widget.update(format_mesh_context_line(state, now=time()))
-            return
-        # An anonymous relay-stage placeholder is not a MeshNodeState (see
-        # mesh_topology.RelayStage) and always displays exactly "RELAY" --
-        # never its internal synthetic ID, hop count, time, or distance.
-        if any(stage.node_id == view.selected_node_id for stage in view.relay_stages):
-            status_widget.update("RELAY")
-            return
-        status_widget.update("")
+        # An anonymous relay-stage placeholder can never be selected (see
+        # MeshRelayWidget/_move_mesh_focus), so `state` is None here only
+        # for a genuinely stale/invalid ID, never a relay stage -- the
+        # bottom-left context is always either YOU or a real node's full
+        # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
+        status_widget.update(
+            format_mesh_context_line(state, now=time()) if state is not None else ""
+        )
 
     def _advance_delivery_states(self) -> None:
         self._send_dot_count = self._send_dot_count % 3 + 1
