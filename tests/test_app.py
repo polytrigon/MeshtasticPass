@@ -154,9 +154,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         """The rendered tab bar, not just TAB_NAMES' dict order --
 
-        MESH always carries a "(N)" count (even zero), CHAT only ever
-        carries a bracketed unread count when nonzero (unchanged
-        behavior), and CONNECTION never carries a count at all.
+        MESH always carries a "(N)" count, CHAT only ever carries a
+        bracketed unread count when nonzero (unchanged behavior), and
+        CONNECTION never carries a count at all. The exact N isn't
+        asserted here: SimulatedRadioService's default NodeDB fixture
+        (see SIMULATED_NODES) is now, correctly, visible to MESH's
+        NodeDB-first working set on its own with no CHAT history, and
+        its ages sit close enough to the active-window boundary that
+        pinning a literal count would be flaky; dedicated exact-count
+        (including zero-active) coverage lives in
+        test_mesh_topology.MeshRealDataAppTests.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
         app = MeshtasticPassApp(radio, self.settings)
@@ -165,7 +172,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             tab_bar = str(app.query_one("#tab-bar", Static).render())
             self.assertIn("CONNECTION/CONFIG", tab_bar)
             self.assertIn("CHAT", tab_bar)
-            self.assertIn("MESH (0)", tab_bar)
+            self.assertRegex(tab_bar, r"MESH \(\d+\)")
             self.assertNotIn("CONNECTION/CONFIG(", tab_bar)
             self.assertNotIn("ACTIVE", tab_bar)
             # CONNECTION appears strictly before CHAT, which appears
