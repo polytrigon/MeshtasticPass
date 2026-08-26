@@ -391,16 +391,22 @@ CIRCLE_STROKED_LARGE = "○"
 
 # --- MESH: real passive-data visualization on a fixed grid -----------------
 #
-# MESH is being rebuilt one component at a time. This pass wires the
-# approved fixed-grid visual design to real passive Meshtastic data: no
-# LoRa traffic is ever generated to populate it (see _refresh_mesh). It
-# intentionally does NOT yet do Favorites, GPS-derived placement beyond
-# the coarse compass/distance abstraction already in mesh_topology.py,
-# dynamic node-count growth beyond the bounded working set, or scrolling.
-# See mesh_state.py for the working-set/role/staleness model and
-# mesh_topology.py for the pure grid geometry (assign_grid_slots(),
-# place_within_bounds(), directional_target(), route_connector()) reused
-# here.
+# A fixed 21-column x 8-row board driven entirely by real, passively
+# observed Meshtastic data -- no LoRa traffic is ever generated to
+# populate or refresh it (see _refresh_mesh). Real nodes are placed by
+# coarse compass direction/distance ranking when GPS is available
+# (never exact, proportional geography), spread to use more of the
+# fixed grid's available room, and a real CLIENT's truthful nonzero hop
+# count renders as that many anonymous relay-stage placeholders along
+# its path to YOU (see mesh_topology.RelayStage) -- visual/topology
+# decoration only, never selectable, focusable, or a navigation
+# candidate. Intentionally out of scope: Favorites, dynamic node-count
+# growth beyond the bounded working set, and scrolling (the working set
+# is bounded precisely so the whole board always fits one viewport).
+# See mesh_state.py for the working-set/role/staleness/distance model
+# and mesh_topology.py for the pure grid geometry (assign_grid_slots(),
+# place_within_bounds(), directional_target(), build_relay_stages(),
+# route_chain()) reused here.
 MESH_GRID_ROWS = 8
 MESH_GRID_COLUMNS = 21
 MESH_GRID_CENTER_ROW = 5
@@ -779,8 +785,15 @@ class MeshTopologyView(Container):
     def base_positions(self) -> dict[str, tuple[int, int]]:
         """Real-node AND anonymous-relay-stage logical (row, column)
 
-        positions, merged -- the full set of currently rendered,
-        arrow-navigable coordinates (see set_nodes/_mesh_directional_target).
+        positions, merged -- rendering and connector routing need both
+        kinds of coordinate together. This is NOT the arrow-navigation
+        candidate set: a RelayStage's ID is included here (its glyph
+        must be positioned and translated exactly like a real node's)
+        but is never itself navigable -- see
+        MeshtasticPassApp._move_mesh_focus, which explicitly filters
+        every RelayStage ID out of this dict before calling
+        _mesh_directional_target, so only real working-set nodes are
+        ever navigation candidates.
         """
         return self._base_positions
 

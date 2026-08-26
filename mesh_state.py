@@ -246,9 +246,14 @@ def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
     """Build the bottom-left status text for a selected REAL MESH node.
 
     (An anonymous relay-stage placeholder is not a MeshNodeState at all
-    -- see mesh_topology.RelayStage -- and always displays the literal
-    string "RELAY"; callers must special-case that themselves rather
-    than pass a relay stage here.)
+    -- see mesh_topology.RelayStage -- and, being visual/topology-only,
+    can never be selected in the first place (see
+    MeshTopologyView.select_node()), so this function is never called
+    for one; there is no "RELAY" special case to handle here or in any
+    caller. A genuinely identified real RELAY-only node, should
+    trustworthy evidence for one ever exist, is an ordinary
+    MeshNodeState and renders through the normal path below with
+    ROLE=RELAY.)
 
     YOU has no observed communication role, hop count, interaction
     time, or distance of its own, so its line is just its compact label
