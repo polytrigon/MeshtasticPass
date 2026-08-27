@@ -1364,6 +1364,158 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(radio.sync_clock.call_count, 1)
 
+    # ---- CLOCK SYNC color + UNCONFIRMED auto-dismiss ----------------------
+
+    async def test_clock_sync_control_uses_base_not_accent(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            control = app.query_one(SyncClockControl)
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertEqual(
+                control.visual_style.foreground.hex6, palette.base.upper()
+            )
+
+            control.focus()
+            await pilot.pause()
+            self.assertEqual(
+                control.visual_style.foreground.hex6, palette.base.upper()
+            )
+
+    async def test_clock_sync_unconfirmed_disappears_after_ten_seconds(self) -> None:
+        """Item 2: fires the SAME auto-dismiss callback directly (the
+
+        established convention -- see _auto_dismiss_send_error's own
+        tests) instead of waiting the real 10s duration.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "UNCONFIRMED" in str(status.render()):
+                    break
+            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+            self.assertIsNotNone(app._clock_unconfirmed_dismiss_timer)
+
+            app._dismiss_clock_unconfirmed()
+            await pilot.pause()
+
+            self.assertNotIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+            self.assertIn("TIME UNKNOWN", str(status.render()))
+            self.assertIsNone(app._clock_unconfirmed_dismiss_timer)
+
+    async def test_stale_unconfirmed_timer_cannot_clear_a_newer_status(self) -> None:
+        """A fresh SYNCING (or a later terminal result) must supersede
+
+        an UNCONFIRMED message outright: _set_clock_status stops any
+        pending dismiss timer FIRST, before writing anything else, so
+        the OLD Timer object is replaced (and, per Textual's own
+        Timer.stop() contract, can never fire again) the instant a
+        newer sync begins -- confirmed here by identity, not merely by
+        the visible text, since only the Timer itself proves the old
+        callback can no longer run.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            control = app.query_one(SyncClockControl)
+            control.focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "UNCONFIRMED" in str(status.render()):
+                    break
+            stale_timer = app._clock_unconfirmed_dismiss_timer
+            self.assertIsNotNone(stale_timer)
+
+            radio.sync_clock = Mock(
+                return_value=ClockSyncResult(True, 1_700_000_001, 1_700_000_001, "")
+            )
+            control.focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "CLOCK SYNCED" in str(status.render()):
+                    break
+
+            self.assertIsNot(app._clock_unconfirmed_dismiss_timer, stale_timer)
+            self.assertIn("CLOCK SYNCED", str(status.render()))
+
+            # Even if the (already-stopped, per Textual's own Timer.stop()
+            # contract) old timer's callback somehow still ran, calling it
+            # now must reflect the CURRENT state, never revert to the
+            # stale UNCONFIRMED message it was originally scheduled for.
+            app._dismiss_clock_unconfirmed()
+            await pilot.pause()
+            self.assertIn("CLOCK SYNCED", str(status.render()))
+            self.assertNotIn("UNCONFIRMED", str(status.render()))
+
+    async def test_view_refresh_does_not_shorten_or_extend_unconfirmed_window(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "UNCONFIRMED" in str(status.render()):
+                    break
+            timer_before = app._clock_unconfirmed_dismiss_timer
+
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            app._render_radio_settings()
+            await pilot.pause()
+
+            self.assertIs(app._clock_unconfirmed_dismiss_timer, timer_before)
+            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+
+    async def test_syncing_never_auto_dismisses_while_pending(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
+            status = app.query_one("#radio-clock-status", Static)
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("SYNCING", str(status.render()))
+            self.assertIsNone(app._clock_unconfirmed_dismiss_timer)
+
     async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=10,

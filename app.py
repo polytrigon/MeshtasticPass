@@ -169,6 +169,12 @@ SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # cancel a blocking thread -- so a late, orphaned completion is safely
 # ignored via the generation guard on ClockSyncApplied.
 CLOCK_SYNC_WATCHDOG_SECONDS = 25.0
+# Same transient-status auto-dismiss lifecycle already used for the
+# CHAT send-error notice (see SEND_ERROR_AUTO_DISMISS_SECONDS/
+# _show_send_error) -- CLOCK SYNC UNCONFIRMED specifically (never
+# SYNCING, which stays operation-driven) clears itself back to the
+# persistent status line after this many seconds.
+CLOCK_UNCONFIRMED_AUTO_DISMISS_SECONDS = 10.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -2545,11 +2551,11 @@ class MeshtasticPassApp(App[None]):
     }
 
     #sync-clock-control {
-        color: $snow_accent;
+        color: $snow_base;
     }
 
     Screen.theme-amber #sync-clock-control {
-        color: $amber_accent;
+        color: $amber_base;
     }
 
     #sync-clock-control:disabled {
@@ -2928,6 +2934,12 @@ class MeshtasticPassApp(App[None]):
         # already-terminal UI state back to "syncing".
         self._clock_sync_generation = 0
         self._sync_clock_watchdog_timer: Timer | None = None
+        # Non-None only while a CLOCK SYNC UNCONFIRMED message is
+        # showing and hasn't yet auto-dismissed (see _set_clock_status/
+        # _dismiss_clock_unconfirmed) -- also doubles as the guard that
+        # keeps a passive _render_radio_settings() refresh from
+        # overwriting that transient message early.
+        self._clock_unconfirmed_dismiss_timer: Timer | None = None
         # Whether AUTO SYNC has already run once for the CURRENT
         # connection lifecycle (see _maybe_auto_sync_clock/item 17) --
         # reset only when _show_connection sees a genuine non-ONLINE ->
@@ -3590,13 +3602,45 @@ class MeshtasticPassApp(App[None]):
         setting-error (ERROR), setting-syncing (ACCENT), setting-
         unconfirmed (ACCENT2), or None for plain BASE-colored
         informational text.
+
+        Any earlier pending UNCONFIRMED auto-dismiss is always stopped
+        FIRST, before anything else -- whatever this call is setting
+        (a fresh SYNCING, a new terminal result, or a passive refresh)
+        supersedes it outright, so a stale timer can never later clear
+        a newer, unrelated status. A NEW dismiss timer is scheduled
+        only when this call is itself setting UNCONFIRMED.
         """
+        if self._clock_unconfirmed_dismiss_timer is not None:
+            self._clock_unconfirmed_dismiss_timer.stop()
+            self._clock_unconfirmed_dismiss_timer = None
         status = self.query_one("#radio-clock-status", Static)
         for name in self._CLOCK_STATUS_CLASSES:
             status.remove_class(name)
         if css_class is not None:
             status.add_class(css_class)
         status.update(f"{CLOCK_STATUS_INDENT}{text}")
+        if css_class == "setting-unconfirmed":
+            self._clock_unconfirmed_dismiss_timer = self.set_timer(
+                CLOCK_UNCONFIRMED_AUTO_DISMISS_SECONDS,
+                self._dismiss_clock_unconfirmed,
+            )
+
+    def _dismiss_clock_unconfirmed(self) -> None:
+        """Item 2's auto-dismiss firing -- reached only when nothing else
+
+        has touched #radio-clock-status since it was scheduled (any
+        such call would already have stopped this timer via
+        _set_clock_status's own guard above), so this is always the
+        SAME UNCONFIRMED message it was scheduled for. Restores
+        whatever the persistent (non-transient) clock status is --
+        the exact same computation _render_radio_settings' own passive
+        refresh already uses.
+        """
+        self._clock_unconfirmed_dismiss_timer = None
+        if self._last_clock_sync_at is not None:
+            self._set_clock_status(self._clock_status_text(), "setting-success")
+        else:
+            self._set_clock_status(self._clock_status_text(), None)
 
     def _begin_sync_clock(self) -> None:
         control = self.query_one(SyncClockControl)
@@ -3836,7 +3880,12 @@ class MeshtasticPassApp(App[None]):
         info_widget.update(text)
 
         sync_control.disabled = not supports_clock or self._clock_sync_in_progress
-        if not self._clock_sync_in_progress:
+        # While a CLOCK SYNC UNCONFIRMED message is still within its
+        # own 10s auto-dismiss window, a passive refresh here (e.g. an
+        # unrelated reconnect) must leave it alone entirely -- neither
+        # extending nor cutting short its own timer (item 2: "view
+        # refresh must not extend the lifetime").
+        if not self._clock_sync_in_progress and self._clock_unconfirmed_dismiss_timer is None:
             if not supports_clock:
                 self._set_clock_status("TIME UNSUPPORTED", None)
             elif self._last_clock_sync_at is not None:
