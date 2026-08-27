@@ -9,6 +9,7 @@ import tempfile
 from threading import Event
 from time import monotonic, sleep, time
 from types import SimpleNamespace
+from typing import Callable
 import unittest
 from unittest.mock import Mock, patch
 
@@ -38,6 +39,7 @@ from app import (
     MessageActionControl,
     MeshtasticPassApp,
     ScreenTimeoutSelector,
+    SyncClockControl,
     ThinScrollBarRender,
     UnitsSelector,
     can_manual_resend,
@@ -48,6 +50,7 @@ from chat_store import ChatStore
 from geo import format_distance_miles
 from keyboard_dropdown import KeyboardDropdown
 from radio_service import (
+    ClockSyncResult,
     ConfigWriteResult,
     DeliveryState,
     DISPLAY_UNITS_IMPERIAL,
@@ -57,6 +60,8 @@ from radio_service import (
     RadioIdentityError,
     RadioService,
     RadioState,
+    SendStatus,
+    SentMessage,
 )
 from simulated_radio_service import (
     SIMULATED_MESSAGES,
@@ -100,6 +105,281 @@ class CallbackRadioService(RadioService):
         yield RadioEvent(RadioState.CONNECTING)
         yield RadioEvent(RadioState.ONLINE, info=self.info)
         stopped.wait()
+
+
+class ControllableSendRadioService(RadioService):
+    """A REAL RadioService whose send_text() returns immediately (like
+
+    the real one -- see RadioService.send_text's own docstring: this
+    proves nothing about delivery) but never calls status_handler on
+    its own. Tests fire the FIRST routing-response-equivalent event
+    manually via fire_status(), on whatever timeline they choose --
+    this is what makes the exact "confirmation arrives strictly AFTER
+    submission returns" sequence from the real-hardware report
+    reproducible and deterministic, instead of racing a real ack.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("/dev/test-radio")
+        self._interface = SimpleNamespace(nodesByNum={}, nodes={})
+        self.info = RadioInfo(
+            device_path=self.device_path,
+            node_id="!51a00001",
+            long_name="Test Radio",
+            short_name="TEST",
+            firmware_version="test",
+            known_nodes=0,
+        )
+        self._next_packet_id = 1000
+        self.pending_status_handlers: dict[int, Callable[[SendStatus], None]] = {}
+        self.sent_texts: list[str] = []
+
+    def connection_events(
+        self,
+        retry_delay: float = 5.0,
+        stop_event: Event | None = None,
+        poll_interval: float = 0.25,
+    ):
+        stopped = stop_event or Event()
+        yield RadioEvent(RadioState.CONNECTING)
+        yield RadioEvent(RadioState.ONLINE, info=self.info)
+        stopped.wait()
+
+    def send_text(
+        self,
+        text: str,
+        channel_index: int = 0,
+        destination_node_id: str | None = None,
+        status_handler: Callable[[SendStatus], None] | None = None,
+    ) -> SentMessage:
+        self.sent_texts.append(text)
+        packet_id = self._next_packet_id
+        self._next_packet_id += 1
+        if status_handler is not None:
+            self.pending_status_handlers[packet_id] = status_handler
+        return SentMessage(text, channel_index, destination_node_id, packet_id=packet_id)
+
+    def fire_status(self, packet_id: int, status: SendStatus) -> None:
+        handler = self.pending_status_handlers.get(packet_id)
+        assert handler is not None, f"no pending status_handler for packet {packet_id}"
+        handler(status)
+
+
+class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
+    """Reproduces the real-hardware "✓ -> FAILED" report: send_text()
+
+    returning successfully is a purely local event that must NOT, by
+    itself, produce SENT -- a routing failure remains a legitimate,
+    still-open outcome until the first real routing response arrives
+    (see send_was_submitted's own docstring).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=root / "meshtasticpass" / "config.json",
+            profile_path=root / "lxterminal" / "lxterminal-meshtasticpass.conf",
+        )
+
+    async def _send_and_get_entry(self, app, pilot):
+        entry = app._start_outgoing("unresolved delivery")
+        generation = entry.send_generation
+        app.run_worker(
+            lambda: app._send_from_thread(entry, generation), thread=True
+        )
+        for _ in range(10):
+            await pilot.pause()
+            if entry.packet_id is not None:
+                break
+        return entry
+
+    async def test_a_local_send_begins_as_animated_arrow(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            self.assertIn("→", str(widget.delivery_label.render()))
+
+    async def test_b_remains_arrow_while_failure_still_legitimately_possible(
+        self,
+    ) -> None:
+        """send_text() has already returned -- the OLD bug would have
+
+        shown ✓ right here. It must not: a NAK for this exact packet is
+        still a live possibility until the first routing response
+        arrives, which has not happened yet.
+        """
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+            self.assertNotEqual(entry.delivery_state, DeliveryState.SENT)
+
+    async def test_c_later_nak_produces_failed(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+
+            radio.fire_status(
+                entry.packet_id,
+                SendStatus(DeliveryState.FAILED, entry.packet_id, detail="MAX_RETRANSMIT"),
+            )
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.FAILED:
+                    break
+
+            self.assertEqual(entry.delivery_state, DeliveryState.FAILED)
+            self.assertTrue(can_manual_resend(entry))
+
+    async def test_d_stable_local_confirmation_produces_sent_checkmark(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+
+            radio.fire_status(entry.packet_id, SendStatus(DeliveryState.SENT, entry.packet_id))
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            self.assertEqual(str(widget.delivery_label.render()), "✓")
+
+    async def test_e_genuine_remote_confirmation_produces_double_checkmark(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+
+            radio.fire_status(entry.packet_id, SendStatus(DeliveryState.HEARD, entry.packet_id))
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.HEARD:
+                    break
+
+            self.assertEqual(entry.delivery_state, DeliveryState.HEARD)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            self.assertEqual(str(widget.delivery_label.render()), "✓✓")
+
+    async def test_f_rapid_remote_confirmation_skips_sent_entirely(self) -> None:
+        """If the first evidence to ever arrive for this packet is a
+
+        genuine remote confirmation, the message goes straight from the
+        arrow to ✓✓ -- ✓ is never artificially forced in between.
+        """
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+
+            radio.fire_status(entry.packet_id, SendStatus(DeliveryState.HEARD, entry.packet_id))
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.HEARD:
+                    break
+
+            self.assertEqual(entry.delivery_state, DeliveryState.HEARD)
+
+    async def test_g_theme_switch_while_unresolved_uses_new_accent_immediately(
+        self,
+    ) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+
+            app._apply_color_theme("green")
+            await pilot.pause()
+            self.assertEqual(
+                widget.delivery_label.visual_style.foreground.hex6,
+                THEME_PALETTES["green"].accent.upper(),
+            )
+
+    async def test_h_resend_uses_the_same_arrow_semantics(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("will fail then resend")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            widget.focus()
+
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if entry.packet_id is not None:
+                    break
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
+            self.assertIn("→", str(widget.delivery_label.render()))
+
+            radio.fire_status(entry.packet_id, SendStatus(DeliveryState.SENT, entry.packet_id))
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+    async def test_i_no_extra_rf_traffic(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+            radio.fire_status(entry.packet_id, SendStatus(DeliveryState.SENT, entry.packet_id))
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+
+            self.assertEqual(radio.sent_texts, ["unresolved delivery"])
+
+    async def test_arrow_animation_has_exactly_two_positions(self) -> None:
+        """The real animation cycle (_advance_delivery_states, driven by
+
+        the existing 0.45s delivery timer -- no new timer added) must
+        only ever produce "→" and " →", never a longer-padded frame.
+        """
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+
+            seen = set()
+            for _ in range(6):
+                app._advance_delivery_states()
+                seen.add(str(widget.delivery_label.render()))
+            self.assertEqual(seen, {"→", " →"})
+            self.assertEqual(
+                widget.delivery_label.visual_style.foreground.hex6,
+                THEME_PALETTES[app._current_theme].accent.upper(),
+            )
 
 
 class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
@@ -247,6 +527,55 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1-3", footer_text)
             self.assertNotIn("1-4", footer_text)
 
+    async def test_composer_hint_shows_enter_send_ctrl_e_emoji_esc_cancel(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
+            await pilot.pause()
+
+            footer_text = str(app.query_one("#footer", Static).render())
+            self.assertEqual(footer_text, "ENTER SEND    CTRL+E EMOJI    ESC CANCEL")
+
+            # Exact order: SEND, then EMOJI, then CANCEL.
+            self.assertLess(
+                footer_text.index("ENTER SEND"), footer_text.index("CTRL+E EMOJI")
+            )
+            self.assertLess(
+                footer_text.index("CTRL+E EMOJI"), footer_text.index("ESC CANCEL")
+            )
+
+    async def test_ctrl_e_hint_absent_outside_composer_focus(self) -> None:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+
+            # Neutral CHAT (transcript, not composer).
+            app.show_tab("chat")
+            app.query_one("#chat-log", ChatTranscript).focus()
+            await pilot.pause()
+            self.assertNotIn(
+                "CTRL+E", str(app.query_one("#footer", Static).render())
+            )
+
+            # CONNECTION/CONFIG.
+            app.show_tab("connection")
+            await pilot.pause()
+            self.assertNotIn(
+                "CTRL+E", str(app.query_one("#footer", Static).render())
+            )
+
+            # MESH.
+            app.show_tab("mesh")
+            await pilot.pause()
+            self.assertNotIn(
+                "CTRL+E", str(app.query_one("#footer", Static).render())
+            )
+
     async def test_profile_implementation_still_composed_but_unreachable(self) -> None:
         """PROFILE is hidden from navigation, not deleted: its content pane
 
@@ -359,6 +688,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("FIRMWARE     sim-1.0.0", info_text)
             self.assertIn("ROLE         CLIENT", info_text)
             self.assertIn("BLUETOOTH    ON", info_text)
+            self.assertIn("TIMEZONE     NOT SET", info_text)
 
             self.assertIn("5 MIN", str(app.query_one(ScreenTimeoutSelector).render()))
             self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
@@ -372,8 +702,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 app.query_one(CompassSelector),
                 app.query_one(FlipScreenSelector),
                 app.query_one(Clock24HSelector),
+                app.query_one(SyncClockControl),
             ):
                 self.assertFalse(control.disabled)
+            self.assertIn(
+                "TIME UNKNOWN", str(app.query_one("#radio-clock-status", Static).render())
+            )
 
     async def test_radio_section_disabled_while_disconnected(self) -> None:
         radio = SimulatedRadioService(
@@ -397,6 +731,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertTrue(control.disabled)
                 self.assertIn("...", str(control.render()))
+            self.assertTrue(app.query_one(SyncClockControl).disabled)
 
     async def test_changing_screen_timeout_uses_verified_write_and_shows_applied(self) -> None:
         radio = SimulatedRadioService(
@@ -495,6 +830,136 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, app.query_one(FlipScreenSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(Clock24HSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(SyncClockControl))
+
+    async def test_sync_clock_applies_and_shows_last_sync_time(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertIsNone(app._last_clock_sync_at)
+            status = app.query_one("#radio-clock-status", Static)
+            self.assertIn("TIME UNKNOWN", str(status.render()))
+
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "CLOCK SYNCED" in str(status.render()):
+                    break
+            self.assertIn("CLOCK SYNCED", str(status.render()))
+            self.assertIsNotNone(app._last_clock_sync_at)
+            self.assertFalse(app.query_one(SyncClockControl).disabled)
+
+    async def test_sync_clock_only_sends_on_explicit_activation(self) -> None:
+        """Connect, reconnect, tab switches, and a plain settings refresh
+
+        must never call RadioService.sync_clock on their own -- only
+        the user explicitly activating SyncClockControl may (see item
+        14/22).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            app._render_radio_settings()
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 0)
+
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+    async def test_sync_clock_unconfirmed_reaches_terminal_state(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            control = app.query_one(SyncClockControl)
+            control.focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "SYNCING" not in str(status.render()):
+                    break
+            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+            self.assertFalse(control.disabled)  # never left stuck
+
+    async def test_sync_clock_nak_shows_failed_reason(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(False, 1_700_000_000, None, "nak")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "FAILED" in str(status.render()):
+                    break
+            self.assertIn("CLOCK SYNC FAILED", str(status.render()))
+            self.assertIn("REJECTED BY RADIO", str(status.render()))
+
+    async def test_unsupported_clock_sync_shows_unsupported_and_disables_control(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.supports_clock_sync = lambda: False
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertIn(
+                "TIME UNSUPPORTED", str(app.query_one("#radio-clock-status", Static).render())
+            )
+            self.assertTrue(app.query_one(SyncClockControl).disabled)
+
+    async def test_sync_clock_never_changes_timezone(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.read_synced_config_field("device", "tzdef")
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if not app._clock_sync_in_progress:
+                    break
+            self.assertEqual(radio.read_synced_config_field("device", "tzdef"), before)
 
     async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
         radio = SimulatedRadioService(
@@ -1570,7 +2035,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             footer = str(app.query_one("#footer", Static).render())
             self.assertNotIn("composer", footer.lower())
 
-    async def test_chat_down_uses_final_resend_before_composer(self) -> None:
+    async def test_chat_down_uses_final_resend_and_del_before_composer(self) -> None:
         app = MeshtasticPassApp(
             SimulatedRadioService(
                 connect_delay=0,
@@ -1591,13 +2056,17 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             # Seed focus directly on the message (neutral+DOWN now goes
             # straight to the composer -- see item 6) so this keeps
             # testing the intra-message walk itself: the message's own
-            # MessageActionControl before the composer.
+            # RESEND then DEL MessageActionControls before the composer.
             await pilot.press("escape")
             app._chat_navigation_targets()[0].focus()
             await pilot.pause()
             self.assertIsInstance(app.focused, ChatEntryWidget)
             await pilot.press("down")
             self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "resend")
+            await pilot.press("down")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "delete")
             await pilot.press("down")
             self.assertIs(app.focused, chat_input)
             self.assertEqual(chat_input.value, "draft")
@@ -1853,25 +2322,22 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIn(
                     str(widget.delivery_label.render()),
-                    ("SENDING.", "SENDING..", "SENDING..."),
+                    ("→", " →"),
                 )
                 self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
 
                 entry.delivery_state = DeliveryState.SENT
                 widget.refresh_delivery_state(2)
                 await pilot.pause()
-                self.assertIn(
-                    str(widget.delivery_label.render()),
-                    ("SENDING.", "SENDING..", "SENDING..."),
-                )
-                self.assertTrue(widget.has_class("delivery-sending"))
-                self.assertFalse(widget.has_class("delivery-sent"))
+                self.assertEqual(str(widget.delivery_label.render()), "✓")
+                self.assertFalse(widget.has_class("delivery-sending"))
+                self.assertTrue(widget.has_class("delivery-sent"))
                 self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
 
                 entry.delivery_state = DeliveryState.HEARD
                 widget.refresh_delivery_state(1)
                 await pilot.pause()
-                self.assertEqual(str(widget.delivery_label.render()), "HEARD")
+                self.assertEqual(str(widget.delivery_label.render()), "✓✓")
                 self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, base)
 
                 entry.delivery_state = DeliveryState.UNCONFIRMED
@@ -1886,7 +2352,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 entry.delivery_state = DeliveryState.FAILED
                 widget.refresh_delivery_state(1)
                 await pilot.pause()
-                self.assertEqual(str(widget.delivery_label.render()), "FAILED")
+                self.assertEqual(str(widget.delivery_label.render()), "✕")
                 self.assertEqual(
                     widget.delivery_label.visual_style.foreground.hex6,
                     "#FF1744",
@@ -1895,10 +2361,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             entry.delivery_state = DeliveryState.SENT
             widget.refresh_delivery_state(1)
             app._advance_delivery_states()
-            self.assertIn(
-                str(widget.delivery_label.render()),
-                ("SENDING.", "SENDING..", "SENDING..."),
-            )
+            self.assertEqual(str(widget.delivery_label.render()), "✓")
             self.assertIsNone(widget.distance_label)
 
     async def test_delivery_label_reflows_between_visible_states(self) -> None:
@@ -1918,26 +2381,29 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(label)
 
             transitions = (
-                (DeliveryState.SENDING, 3, "SENDING..."),
-                (DeliveryState.HEARD, 1, "HEARD"),
-                (DeliveryState.FAILED, 1, "FAILED"),
+                (DeliveryState.SENDING, 1, "→"),
+                (DeliveryState.SENDING, 2, " →"),
+                (DeliveryState.SENT, 1, "✓"),
+                (DeliveryState.HEARD, 1, "✓✓"),
+                (DeliveryState.FAILED, 1, "✕"),
                 (DeliveryState.UNCONFIRMED, 1, "UNCONFIRMED"),
             )
             widths = []
-            for state, dot_count, expected in transitions:
+            for state, animation_frame, expected in transitions:
                 entry.delivery_state = state
-                widget.refresh_delivery_state(dot_count)
+                widget.refresh_delivery_state(animation_frame)
                 await pilot.pause()
 
                 rendered = str(label.render())
                 self.assertEqual(rendered, expected)
                 self.assertEqual(label.region.width, len(expected))
-                self.assertNotIn(" ", rendered)
                 widths.append(label.region.width)
 
-            self.assertLess(widths[1], widths[0])
-            self.assertGreater(widths[2], widths[1])
+            self.assertGreater(widths[1], widths[0])  # the arrow itself grows frame to frame
+            self.assertLess(widths[2], widths[1])
             self.assertGreater(widths[3], widths[2])
+            self.assertLess(widths[4], widths[3])  # ✕ (1 cell) is narrower than ✓✓ (2 cells)
+            self.assertGreater(widths[5], widths[4])
 
     async def test_terminal_cursor_guard_runs_for_app_lifecycle(self) -> None:
         radio = SimulatedRadioService(
@@ -2369,7 +2835,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             widget = next(
                 w for w in app.query(ChatEntryWidget) if w.entry is app.chat_history[-1]
             )
-            self.assertIn("SENDING", str(widget.delivery_label.render()))
+            self.assertIn("→", str(widget.delivery_label.render()))
 
     async def test_normal_graceful_close_while_sending_persists_interrupted(
         self,
@@ -2559,7 +3025,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
-            self.assertIn("SENDING", str(widget.delivery_label.render()))
+            self.assertIn("→", str(widget.delivery_label.render()))
 
             # A raw read-only connection here, deliberately NOT another
             # ChatStore.open() call: opening a second store against a
@@ -2720,12 +3186,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         send_was_submitted/_set_delivery_state, so widget.entry is
         entry holds the whole way through.
 
-        SENT is deliberately rendered identically to SENDING by
-        ChatEntryWidget.refresh_delivery_state() (an intentional
-        "still awaiting confirmation" display, unrelated to this bug)
-        -- so the widget correctly still reads "SENDING..." immediately
-        after reaching SENT. What must also hold, with zero restart,
-        is that once the confirmation window elapses,
+        SENT renders as the checkmark (✓) -- the strongest truthful
+        evidence of a successful local send without stronger remote
+        confirmation (see RadioService._parse_send_response). What must
+        also hold, with zero restart, is that once the confirmation window elapses,
         _advance_delivery_states() promotes it to UNCONFIRMED and the
         store/entry/widget move together again.
         """
@@ -2762,7 +3226,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
             raw.close()
             self.assertEqual(row["delivery_state"], "SENT")
-            self.assertIn("SENDING", str(widget.delivery_label.render()))
+            self.assertEqual(str(widget.delivery_label.render()), "✓")
 
             entry.confirmation_deadline = monotonic() - 1
             app._advance_delivery_states()
@@ -2771,7 +3235,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
             self.assertIs(widget.entry, entry)
             self.assertIn("UNCONFIRMED", str(widget.delivery_label.render()))
-            self.assertNotIn("SENDING", str(widget.delivery_label.render()))
+            self.assertNotIn("✓", str(widget.delivery_label.render()))
 
             raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
             raw.row_factory = sqlite3.Row
@@ -2788,8 +3252,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         no restart/tab-switch/history-reload required.
         """
         cases = (
-            (SimulatedSendOutcome.SENT, DeliveryState.SENT, "SENDING"),
-            (SimulatedSendOutcome.HEARD, DeliveryState.HEARD, "HEARD"),
+            (SimulatedSendOutcome.SENT, DeliveryState.SENT, "✓"),
+            (SimulatedSendOutcome.HEARD, DeliveryState.HEARD, "✓✓"),
         )
         for outcome, expected_state, expected_text in cases:
             with self.subTest(outcome=outcome):
@@ -2835,7 +3299,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         # from the radio -- exercised directly here for the same
         # three-way agreement guarantee.
         for target_state, expected_text in (
-            (DeliveryState.FAILED, "FAILED"),
+            (DeliveryState.FAILED, "✕"),
             (DeliveryState.INTERRUPTED, "INTERRUPTED"),
         ):
             with self.subTest(target_state=target_state):
@@ -4586,19 +5050,19 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 str(immediate_widget.delivery_label.render()),
-                "SENDING.",
+                "→",
             )
             self.assertEqual(
                 [
                     str(child.render())
                     for child in immediate_widget.query(".chat-entry-header Static")
                 ],
-                ["YOU", " / ", "SENDING.", " / ", "0s"],
+                ["YOU", " / ", "→", " / ", "0s"],
             )
             app._advance_delivery_states()
             self.assertEqual(
                 str(immediate_widget.delivery_label.render()),
-                "SENDING..",
+                " →",
             )
             self.assertIsNotNone(app._delivery_timer)
             self.assertEqual(

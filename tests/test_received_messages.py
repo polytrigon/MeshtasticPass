@@ -207,7 +207,7 @@ class ReceivedMessageTests(unittest.TestCase):
         self.service._subscribe_to_events(pub)
         self.service._subscribe_to_events(pub)
 
-        self.assertEqual(pub.subscribe.call_count, 2)
+        self.assertEqual(pub.subscribe.call_count, 3)
         self.assertEqual(
             pub.subscribe.call_args_list,
             [
@@ -219,6 +219,10 @@ class ReceivedMessageTests(unittest.TestCase):
                     self.service._on_text_received,
                     "meshtastic.receive.text",
                 ),
+                call(
+                    self.service._on_routing_response,
+                    "meshtastic.receive.routing",
+                ),
             ],
         )
 
@@ -227,7 +231,7 @@ class ReceivedMessageTests(unittest.TestCase):
         # too (see rx_debug_enabled()), even when it was never actually
         # subscribed -- each attempt is independently wrapped so an
         # unsubscribe for a topic that was never joined is harmless.
-        self.assertEqual(pub.unsubscribe.call_count, 3)
+        self.assertEqual(pub.unsubscribe.call_count, 4)
 
     def test_delivers_one_clean_message_to_each_handler(self) -> None:
         handler = Mock()

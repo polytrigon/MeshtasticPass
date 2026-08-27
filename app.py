@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from time import monotonic, time
 from typing import Any, Callable
 
@@ -46,7 +47,7 @@ from chat_store import (
     ChatStoreError,
 )
 from geo import format_distance_miles
-from grapheme_text import install_flag_pair_protection
+from grapheme_text import install_flag_pair_protection, truncate_to_cells
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshNodeState,
@@ -71,6 +72,7 @@ from node_activity import is_node_active
 from radio_capabilities import format_hw_model_name
 from radio_service import (
     ChannelInfo,
+    ClockSyncResult,
     ConfigWriteResult,
     DeliveryState,
     DISPLAY_UNITS_IMPERIAL,
@@ -96,7 +98,7 @@ from relative_time import format_relative_age
 from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 from terminal_cursor import TerminalCursor
 from theme_palette import ERROR, THEME_PALETTES
-from viewport_menu import PopupItem, ViewportMenu
+from viewport_menu import PopupItem, ViewportMenu, calculate_popup_placement
 
 
 # Patches Rich's grapheme splitter (used by Static/Content's word-wrap
@@ -129,8 +131,51 @@ ANIMATED_STATUS = {
 CONNECTION_LABEL_WIDTH = 12
 CONNECTION_ROW_PREFIX = "  "
 
+
+def _format_time_of_day(epoch: float, is_24h: bool) -> str:
+    """Host-local wall-clock reading of one epoch moment.
+
+    Used only to show WHEN this app last successfully synced the
+    radio's clock (see _apply_sync_clock) -- never presented as the
+    radio's own live time, since no independent radio-time readback
+    exists (see ClockSyncResult's docstring). Respects the same 24
+    HOUR TIME preference as the RADIO section's own Clock24HSelector
+    (see item 13), never a separate, independently-configured setting.
+    """
+    moment = datetime.fromtimestamp(epoch)
+    if is_24h:
+        return moment.strftime("%H:%M")
+    return moment.strftime("%I:%M %p").lstrip("0")
+
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
+# U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
+# emoji-presentation glyph, so it never unexpectedly renders double-
+# width). SENT/checkmark meaning: the strongest truthful evidence of a
+# successful local send WITHOUT stronger remote confirmation (see
+# RadioService._parse_send_response). HEARD/double-checkmark meaning:
+# a genuinely different node's own routing response reached us -- see
+# the same method's "from" comparison. FAILED/U+2715 MULTIPLICATION X:
+# same reasoning as the checkmark -- a plain, Narrow-width text glyph
+# (never "❌", an emoji-presentation glyph that would render double-
+# width), replacing the literal word "FAILED" as pure presentation;
+# the ERROR-colored CSS rule for this state (.delivery-failed) is
+# already theme-driven and untouched by this change. Does not change
+# what causes DeliveryState.FAILED, nor its meaning: a definitive
+# routing failure/NAK.
+DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
+    DeliveryState.SENT: "✓",
+    DeliveryState.HEARD: "✓✓",
+    DeliveryState.FAILED: "✕",
+}
+# A single narrow glyph (U+2192 RIGHTWARDS ARROW -- plain, non-emoji,
+# never double-width) animated by right-justifying it to a growing
+# field width each frame: "→", " →", "  →", "   →", then loop. Reads as
+# "in flight / still being resolved", never as success -- unlike the
+# checkmarks above, SENDING covers every outgoing message for which a
+# NAK is still a legitimate possible outcome (see send_was_submitted).
+SENDING_ARROW_GLYPH = "→"
+SENDING_ARROW_FRAMES = (1, 2)
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
@@ -374,6 +419,37 @@ class Clock24HSelector(KeyboardDropdown):
         )
 
 
+class SyncClockControl(Static):
+    """Explicit, user-activated "[ SYNC CLOCK ]" action -- see
+
+    RadioService.sync_clock and _apply_sync_clock. Never triggers
+    anything on its own: only Enter while this is focused sends the
+    admin write. Uses Widget's own `disabled` (not `display`) for the
+    unsupported/offline/in-flight states, so it naturally drops out of
+    focus eligibility while still integrating with the CONNECTION
+    page's existing `not getattr(control, "disabled", False)`
+    UP/DOWN navigation filter with no separate list to maintain.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ SYNC CLOCK ]",
+            id="sync-clock-control",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter" and not self.disabled:
+            self.post_message(self.Activated())
+            event.stop()
+
+
 class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
@@ -384,6 +460,142 @@ class ChannelSelector(KeyboardDropdown):
             widget_id="chat-title",
             prefix="",
         )
+
+
+# The first-pass emoji set -- see the CHAT delivery/menu/emoji task.
+# Centralized here for easy future expansion; nothing else in this
+# module hardcodes this list or its length.
+EMOJI_PICKER_CHOICES: tuple[str, ...] = (
+    "😀",
+    "😂",
+    "❤️",
+    "👍",
+    "👎",
+    "😭",
+    "😮",
+    "😡",
+    "🎉",
+    "🔥",
+    "👋",
+    "✨",
+    "📡",
+)
+# Must match the ".emoji-picker { height: ... }" CSS rule below.
+EMOJI_PICKER_HEIGHT = 3
+# What the ".emoji-picker" CSS rule below actually costs in columns:
+# "border: solid ..." is 1 column each side (EMOJI_PICKER_BORDER_CELLS),
+# "padding: 0 2 0 1" is 1 column on the left but 2 on the right
+# (EMOJI_PICKER_PADDING_CELLS) -- see emoji_picker_total_width().
+#
+# The extra right-side cell is a real-hardware fix, not cosmetic: "❤️"
+# (U+2764 HEAVY BLACK HEART + U+FE0F variation selector) is the only
+# choice in EMOJI_PICKER_CHOICES whose BASE codepoint has Unicode East
+# Asian Width "Narrow" -- every other emoji here is "Wide" and renders
+# at a consistent, undisputed 2 terminal columns everywhere. Rich's own
+# cell_len() (used by emoji_picker_content_width() below) resolves the
+# heart+VS16 sequence to 2 columns, matching how most GUI terminals
+# render it, but a terminal that instead honors the base character's
+# raw Narrow property -- observed on real uConsole hardware -- draws it
+# in only 1 column. Since Textual emits a whole picker row as one
+# contiguous run of characters (content, then padding, then the right
+# border), any single glyph rendering narrower than Python assumed
+# shifts every character drawn after it in that same row -- including
+# the picker's own right border -- left by the shortfall, making it
+# look displaced relative to the (pure-ASCII, unambiguous) top/bottom
+# border rows. A real terminal's cursor advances by however many
+# columns IT decides a character occupies; nothing in Python can
+# correct that after the fact. The fix is to always leave 1 spare,
+# unambiguous (plain-space) column between the content and the right
+# border: on a terminal that renders the heart at the expected 2
+# columns, that space is just a harmless extra sliver of padding: on
+# one that renders it at only 1, the same space is what silently
+# absorbs the 1-column shortfall, so the border still lands exactly
+# where it should either way. See
+# test_picker_padding_absorbs_worst_case_ambiguous_width_undercount for
+# the regression that encodes this reasoning directly (not just a
+# width-helper arithmetic check, which alone cannot catch this: the
+# pure Python math above is self-consistent regardless of what a real
+# terminal decides to do with an ambiguous-width character).
+EMOJI_PICKER_BORDER_CELLS = 2
+EMOJI_PICKER_PADDING_CELLS = 3
+
+
+def emoji_picker_content_width() -> int:
+    """Exact rendered terminal-cell width of the picker's emoji row.
+
+    Never len(text): each item is a 1-cell bracket/space, the emoji's
+    own RENDERED cell width (cell_len -- a wide emoji is 2 cells even
+    when, like an intact heart+variation-selector sequence, it is more
+    than one Python character), and a closing 1-cell bracket/space,
+    plus a 1-cell separator between items. Derived from
+    EMOJI_PICKER_CHOICES itself, so the picker never needs a manual
+    width update if the set changes.
+    """
+    per_item_width = sum(1 + cell_len(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES)
+    separator_width = max(0, len(EMOJI_PICKER_CHOICES) - 1)
+    return per_item_width + separator_width
+
+
+def emoji_picker_total_width() -> int:
+    """Content width plus the border/padding the CSS rule actually
+
+    applies -- the picker's bounding box should hug this exactly, with
+    only the CSS's own intentional padding, never a stretched-to-fit
+    container (see item 12 of the follow-up task).
+    """
+    return (
+        emoji_picker_content_width()
+        + EMOJI_PICKER_BORDER_CELLS
+        + EMOJI_PICKER_PADDING_CELLS
+    )
+
+
+class EmojiPicker(Static):
+    """Compact horizontal emoji strip for the CHAT composer (Ctrl+E).
+
+    Never focusable -- like the existing sender-action ViewportMenu,
+    this is an overlay the App's own on_key intercepts LEFT/RIGHT/
+    ENTER/ESC for while it is open; the composer Input keeps real
+    Textual focus throughout (see item 22: "composer remains focused").
+    """
+
+    can_focus = False
+
+    def __init__(self) -> None:
+        super().__init__(classes="emoji-picker", markup=False)
+        self.highlighted_index = 0
+        default_palette = THEME_PALETTES["white"]
+        self._base_color = default_palette.base
+        self._accent_color = default_palette.accent
+
+    def on_mount(self) -> None:
+        self._render_picker()
+
+    def set_palette(self, base: str, accent: str) -> None:
+        self._base_color = base
+        self._accent_color = accent
+        self._render_picker()
+
+    def move_highlight(self, direction: int) -> None:
+        self.highlighted_index = (self.highlighted_index + direction) % len(
+            EMOJI_PICKER_CHOICES
+        )
+        self._render_picker()
+
+    @property
+    def selected_emoji(self) -> str:
+        return EMOJI_PICKER_CHOICES[self.highlighted_index]
+
+    def _render_picker(self) -> None:
+        text = Text()
+        for index, emoji in enumerate(EMOJI_PICKER_CHOICES):
+            if index:
+                text.append(" ", style=self._base_color)
+            selected = index == self.highlighted_index
+            text.append("[" if selected else " ", style=self._base_color)
+            text.append(emoji, style=self._accent_color if selected else self._base_color)
+            text.append("]" if selected else " ", style=self._base_color)
+        self.update(text)
 
 
 @dataclass
@@ -480,6 +692,14 @@ class RadioSettingApplied(Message):
         self.result = result
 
 
+class ClockSyncApplied(Message):
+    """One RadioService.sync_clock() call finished (see _apply_sync_clock)."""
+
+    def __init__(self, result: ClockSyncResult) -> None:
+        super().__init__()
+        self.result = result
+
+
 class LoadOlderControl(Static):
     """Focusable, keyboard-only control for one bounded history page."""
 
@@ -510,6 +730,12 @@ class EndOfChatHistoryMarker(Static):
         )
 
 
+MESSAGE_ACTION_LABELS: dict[str, str] = {
+    "resend": "[ RESEND ]",
+    "delete": "[ DEL ]",
+}
+
+
 class MessageActionControl(Static):
     """A contextual action beneath a message; ready for future action kinds."""
 
@@ -524,7 +750,7 @@ class MessageActionControl(Static):
         self.entry = entry
         self.action = action
         super().__init__(
-            "[ RESEND ]",
+            MESSAGE_ACTION_LABELS[action],
             classes="message-action chat-nav-target",
             markup=False,
         )
@@ -586,8 +812,55 @@ class ChatMessageInput(Input):
     class Left(Message):
         pass
 
+    def on_focus(self, _event: Focus) -> None:
+        self.app._update_footer()
+
     def on_blur(self, _event: Blur) -> None:
         self.post_message(self.Left())
+        # The emoji picker is subordinate to composer focus -- ANY way
+        # this widget loses focus (tab switch, another control taking
+        # focus, etc.) must dismiss it. Re-focusing the composer later
+        # never reopens it on its own; Ctrl+E is required again.
+        picker = getattr(self.app, "_emoji_picker", None)
+        if picker is not None:
+            self.app._close_emoji_picker()
+
+    def on_key(self, event: Key) -> None:
+        """Intercept the emoji picker's keys (and Ctrl+E to open it)
+
+        directly on this widget -- NOT in the App's own on_key. Input
+        already binds "enter" (submit) and "ctrl+e"/"left"/"right"
+        (end-of-line/cursor movement) itself; Textual checks a focused
+        widget's own on_key BEFORE its inherited key bindings, so this
+        is the only place that can reliably preempt those defaults
+        while this widget has focus (see items 18 and 23).
+        """
+        app = self.app
+        picker = getattr(app, "_emoji_picker", None)
+        if picker is not None:
+            if event.key == "left":
+                picker.move_highlight(-1)
+                event.stop()
+            elif event.key == "right":
+                picker.move_highlight(1)
+                event.stop()
+            elif event.key == "enter":
+                emoji = picker.selected_emoji
+                app._close_emoji_picker()
+                app._insert_emoji_at_cursor(emoji)
+                event.stop()
+            elif event.key == "escape":
+                app._close_emoji_picker()
+                event.stop()
+            elif event.key == "up":
+                # Dismiss, then let the SAME keypress continue on to the
+                # App's own "up leaves the composer" handling below --
+                # never swallow UP merely to close the picker.
+                app._close_emoji_picker()
+            return
+        if event.key == "ctrl+e":
+            app._open_emoji_picker()
+            event.stop()
 
 
 class ConnectionPage(VerticalScroll):
@@ -1805,8 +2078,10 @@ class ChatEntryWidget(Vertical):
             markup=False,
         )
         self.selection_marker = Static(" ", classes="chat-selection-marker", markup=False)
-        self.action_control = MessageActionControl(entry)
+        self.action_control = MessageActionControl(entry, action="resend")
         self.action_control.display = False
+        self.delete_control = MessageActionControl(entry, action="delete")
+        self.delete_control.display = False
         classes = "chat-entry new-message" if is_new else "chat-entry"
         if self.favorite:
             classes += " favorite-sender"
@@ -1816,7 +2091,11 @@ class ChatEntryWidget(Vertical):
                 Vertical(header, self.message_label, classes="chat-entry-content"),
                 classes="chat-entry-row",
             ),
-            self.action_control,
+            Horizontal(
+                self.action_control,
+                self.delete_control,
+                classes="message-action-row",
+            ),
             classes=classes,
         )
         self.refresh_delivery_state(1)
@@ -1837,25 +2116,24 @@ class ChatEntryWidget(Vertical):
         self.favorite = favorite and not self.entry.outgoing
         self.set_class(self.favorite, "favorite-sender")
 
-    def refresh_delivery_state(self, dot_count: int) -> None:
+    def refresh_delivery_state(self, animation_frame: int) -> None:
         if self.delivery_label is None:
             return
         internal_state = self.entry.delivery_state or DeliveryState.SENT
-        visible_state = (
-            DeliveryState.SENDING
-            if internal_state in (DeliveryState.SENDING, DeliveryState.SENT)
-            else internal_state
-        )
-        text = visible_state.value
+        visible_state = internal_state
         if visible_state is DeliveryState.SENDING:
-            text += "." * dot_count
+            text = SENDING_ARROW_GLYPH.rjust(animation_frame)
+        else:
+            text = DELIVERY_CHECKMARKS.get(visible_state, visible_state.value)
         self.delivery_label.update(text)
         for name in DeliveryState:
             self.set_class(
                 name is visible_state,
                 f"delivery-{name.value.lower()}",
             )
-        self.action_control.display = can_manual_resend(self.entry)
+        actionable = can_manual_resend(self.entry)
+        self.action_control.display = actionable
+        self.delete_control.display = actionable
 
     def on_focus(self, _event: Focus) -> None:
         self.selection_marker.update(">")
@@ -2060,28 +2338,56 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #style-status, #radio-status {
+    #style-status, #radio-status, #radio-clock-status {
         height: 2;
     }
 
-    #style-status.setting-success, #radio-status.setting-success {
+    #style-status.setting-success, #radio-status.setting-success,
+    #radio-clock-status.setting-success {
         color: $white_accent;
     }
 
     Screen.theme-green #style-status.setting-success,
-    Screen.theme-green #radio-status.setting-success {
+    Screen.theme-green #radio-status.setting-success,
+    Screen.theme-green #radio-clock-status.setting-success {
         color: $green_accent;
     }
 
     Screen.theme-orange #style-status.setting-success,
-    Screen.theme-orange #radio-status.setting-success {
+    Screen.theme-orange #radio-status.setting-success,
+    Screen.theme-orange #radio-clock-status.setting-success {
         color: $orange_accent;
     }
 
-    #connection-error, #send-error, #style-status.setting-error, #radio-status.setting-error {
+    #connection-error, #send-error, #style-status.setting-error,
+    #radio-status.setting-error, #radio-clock-status.setting-error {
         height: auto;
         min-height: 1;
         color: $error;
+    }
+
+    #sync-clock-control {
+        color: $white_accent;
+    }
+
+    Screen.theme-green #sync-clock-control {
+        color: $green_accent;
+    }
+
+    Screen.theme-orange #sync-clock-control {
+        color: $orange_accent;
+    }
+
+    #sync-clock-control:disabled {
+        color: $white_dim;
+    }
+
+    Screen.theme-green #sync-clock-control:disabled {
+        color: $green_dim;
+    }
+
+    Screen.theme-orange #sync-clock-control:disabled {
+        color: $orange_dim;
     }
 
     #send-error.older-message-notice {
@@ -2125,7 +2431,7 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
-    #mesh-status, #mesh-context-status {
+    #mesh-status, #mesh-bottom-row {
         height: 1;
     }
 
@@ -2142,6 +2448,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #mesh-context-status {
+        width: 1fr;
         color: #d8d8d8;
     }
 
@@ -2150,6 +2457,19 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-orange #mesh-context-status {
+        color: #ff8c00;
+    }
+
+    #mesh-last-update {
+        width: auto;
+        color: #d8d8d8;
+    }
+
+    Screen.theme-green #mesh-last-update {
+        color: #39ff14;
+    }
+
+    Screen.theme-orange #mesh-last-update {
         color: #ff8c00;
     }
 
@@ -2251,11 +2571,35 @@ class MeshtasticPassApp(App[None]):
         color: $orange_dim;
     }
 
+    .emoji-picker {
+        layer: popup;
+        position: absolute;
+        background: #101010;
+        border: solid $white_dim;
+        height: 3;
+        /* 1 cell left, 2 cells right -- see EMOJI_PICKER_PADDING_CELLS
+           for why the right side carries an extra safety cell. */
+        padding: 0 2 0 1;
+    }
+
+    Screen.theme-green .emoji-picker {
+        border: solid $green_dim;
+    }
+
+    Screen.theme-orange .emoji-picker {
+        border: solid $orange_dim;
+    }
+
     #load-older, .message-action {
         width: auto;
         height: 1;
         color: #d8d8d8;
         margin-bottom: 1;
+    }
+
+    .message-action-row {
+        width: auto;
+        height: auto;
     }
 
     #end-of-chat-history {
@@ -2361,16 +2705,19 @@ class MeshtasticPassApp(App[None]):
     }
 
     .chat-entry.delivery-sending .chat-entry-delivery,
+    .chat-entry.delivery-sent .chat-entry-delivery,
     .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #39ff14;
     }
 
     Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-green .chat-entry.delivery-sent .chat-entry-delivery,
     Screen.theme-green .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #ff8c00;
     }
 
     Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-orange .chat-entry.delivery-sent .chat-entry-delivery,
     Screen.theme-orange .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #d8d8d8;
     }
@@ -2486,6 +2833,13 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
+        # Local wall-clock moment the last SYNC CLOCK in THIS session
+        # completed successfully -- never the radio's own time (see
+        # SyncClockControl/_apply_sync_clock: AdminMessage has no
+        # get-time RPC to read that back with, see ClockSyncResult).
+        # None until the first successful sync.
+        self._last_clock_sync_at: float | None = None
+        self._clock_sync_in_progress = False
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -2493,7 +2847,7 @@ class MeshtasticPassApp(App[None]):
         self._send_error_message = ""
         self._send_error_dismiss_timer: Timer | None = None
         self._arrival_sequence = 0
-        self._send_dot_count = 1
+        self._send_animation_frame = 1
         self._has_older_history = False
         self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
@@ -2502,6 +2856,7 @@ class MeshtasticPassApp(App[None]):
         self._user_menu_scroll_target: ScrollableContainer | None = None
         self._user_menu_scroll_x: float | None = None
         self._user_menu_scroll_y: float | None = None
+        self._emoji_picker: EmojiPicker | None = None
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -2537,6 +2892,8 @@ class MeshtasticPassApp(App[None]):
                 yield CompassSelector(True)
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
+                yield Static(id="radio-clock-status", markup=False)
+                yield SyncClockControl()
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield ChannelSelector(self._channels, self.current_channel_index)
@@ -2561,7 +2918,16 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="mesh-connection-status", classes="page-title", markup=False)
                 yield Static(id="mesh-status", markup=False)
                 yield MeshTopologyView()
-                yield Static(id="mesh-context-status", markup=False)
+                # Bottom row: focused-node context anchored left (1fr,
+                # truncates gracefully -- see _update_mesh_context_status),
+                # LAST UPDATE anchored right (auto width). Order matters:
+                # the 1fr widget must come first so it absorbs exactly
+                # "container width minus LAST UPDATE's own width", which
+                # is what makes LAST UPDATE land flush against the right
+                # edge with no manual offset math.
+                with Horizontal(id="mesh-bottom-row"):
+                    yield Static(id="mesh-context-status", markup=False)
+                    yield Static(id="mesh-last-update", markup=False)
         yield Static("1-3 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
@@ -2766,6 +3132,7 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
+                    self.query_one(SyncClockControl),
                 )
                 if not getattr(control, "disabled", False)
             ]
@@ -2895,6 +3262,8 @@ class MeshtasticPassApp(App[None]):
     def show_tab(self, tab_id: str) -> None:
         if self.current_tab == "chat" and tab_id != "chat":
             self._mark_new_messages_read()
+            if self._emoji_picker is not None:
+                self._close_emoji_picker()
         self.current_tab = tab_id
         if tab_id == "chat":
             self._mark_unread_messages_viewed()
@@ -3086,6 +3455,90 @@ class MeshtasticPassApp(App[None]):
                     value=spec.from_schema_value(authoritative),
                 )
 
+    @on(SyncClockControl.Activated)
+    def sync_clock_activated(self, _event: SyncClockControl.Activated) -> None:
+        """Begin an explicit SYNC CLOCK -- see RadioService.sync_clock.
+
+        Only ever reached via SyncClockControl.on_key's own Enter
+        handling, itself only reachable while the control isn't
+        `disabled` -- never on connect/reconnect/tab-open/refresh (see
+        item 14/22: SYNC CLOCK is the ONLY thing in this pass that
+        sends anything to the radio, and only on this exact user
+        action).
+        """
+        control = self.query_one(SyncClockControl)
+        status = self.query_one("#radio-clock-status", Static)
+        if self._clock_sync_in_progress or control.disabled:
+            return
+        if self._radio_state is not RadioState.ONLINE:
+            status.remove_class("setting-success")
+            status.add_class("setting-error")
+            status.update("SYNC CLOCK UNAVAILABLE — RADIO NOT CONNECTED")
+            return
+        self._clock_sync_in_progress = True
+        control.disabled = True
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        status.update("SYNCING CLOCK...")
+        self.run_worker(
+            self._apply_sync_clock_from_thread,
+            thread=True,
+            name="sync-clock",
+            exclusive=True,
+        )
+
+    def _apply_sync_clock_from_thread(self) -> None:
+        try:
+            result = self.radio.sync_clock()
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            result = ClockSyncResult(False, 0, None, f"error: {detail}")
+        self.post_message(ClockSyncApplied(result))
+
+    _CLOCK_SYNC_FAILURE_REASONS = {
+        "not_connected": "RADIO NOT CONNECTED",
+        "disconnected": "CONNECTION LOST",
+        "nak": "REJECTED BY RADIO",
+    }
+
+    @on(ClockSyncApplied)
+    def clock_sync_applied(self, event: ClockSyncApplied) -> None:
+        """Every SYNC CLOCK activation reaches exactly one terminal state
+
+        here (see item 21) -- never left stuck at "SYNCING CLOCK...".
+        "timeout" and "unconfirmed" both settle as UNCONFIRMED: neither
+        is negative evidence (a NAK), but AdminMessage has no get-time
+        RPC to positively confirm the write with either (see
+        ClockSyncResult's own docstring) -- this app never claims
+        stronger confirmation than it actually has.
+        """
+        status = self.query_one("#radio-clock-status", Static)
+        self._clock_sync_in_progress = False
+        self._render_radio_settings()
+        if event.result.applied:
+            self._last_clock_sync_at = time()
+            status.remove_class("setting-error")
+            status.add_class("setting-success")
+            status.update(self._clock_status_text())
+        elif event.result.reason in self._CLOCK_SYNC_FAILURE_REASONS:
+            status.remove_class("setting-success")
+            status.add_class("setting-error")
+            reason = self._CLOCK_SYNC_FAILURE_REASONS[event.result.reason]
+            status.update(f"CLOCK SYNC FAILED — {reason}")
+        else:
+            # "timeout" (no ack/nak at all) or "unconfirmed" (a response
+            # arrived but didn't corroborate the write) -- see
+            # RadioService.sync_clock. Neither is negative evidence.
+            status.remove_class("setting-error")
+            status.remove_class("setting-success")
+            status.update("CLOCK SYNC UNCONFIRMED")
+
+    def _clock_status_text(self) -> str:
+        if self._last_clock_sync_at is None:
+            return "TIME UNKNOWN — SYNC TO SET"
+        is_24h = self.query_one(Clock24HSelector).value
+        return f"CLOCK SYNCED — LAST SYNC {_format_time_of_day(self._last_clock_sync_at, is_24h)}"
+
     def _render_radio_settings(self) -> None:
         """Populate RADIO from the SDK's already-synced state (or mark
 
@@ -3107,11 +3560,16 @@ class MeshtasticPassApp(App[None]):
         palette = THEME_PALETTES[self._current_theme]
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
 
+        sync_control = self.query_one(SyncClockControl)
+        supports_clock = bool(getattr(self.radio, "supports_clock_sync", lambda: False)())
+
         if not online:
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
             text = Text()
-            for index, label in enumerate(("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH")):
+            for index, label in enumerate(
+                ("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH", "TIMEZONE")
+            ):
                 if index:
                     text.append("\n")
                 text.append(
@@ -3132,6 +3590,7 @@ class MeshtasticPassApp(App[None]):
                 override.append(" ", style=palette.base)
                 override.append(placeholder, style=palette.dim_base)
                 dropdown.set_status_override(override)
+            sync_control.disabled = True
             return
 
         identity = self.radio.hardware_identity()
@@ -3141,12 +3600,20 @@ class MeshtasticPassApp(App[None]):
             if bluetooth_enabled is None
             else ("ON" if bluetooth_enabled else "OFF")
         )
+        tzdef = self.radio.read_synced_config_field("device", "tzdef")
+        # Read-only display only -- see the item 16 audit: no CLI
+        # reference, firmware source, or protobuf comment in the
+        # installed meshtastic==2.7.11 package confirms tzdef's exact
+        # expected POSIX-TZ syntax, DST behavior, or sign convention,
+        # so editing it is deliberately NOT exposed this pass.
+        tzdef_text = "—" if tzdef is None else ("NOT SET" if tzdef == "" else tzdef)
         text = Text()
         rows = (
             ("HARDWARE", format_hw_model_name(identity.hw_model_name)),
             ("FIRMWARE", identity.firmware_version or "—"),
             ("ROLE", identity.role_name or "—"),
             ("BLUETOOTH", bluetooth_text),
+            ("TIMEZONE", tzdef_text),
         )
         for index, (label, value) in enumerate(rows):
             if index:
@@ -3158,6 +3625,15 @@ class MeshtasticPassApp(App[None]):
             text.append(" ", style=palette.base)
             text.append(value, style=palette.base)
         info_widget.update(text)
+
+        sync_control.disabled = not supports_clock or self._clock_sync_in_progress
+        if not self._clock_sync_in_progress:
+            status = self.query_one("#radio-clock-status", Static)
+            status.remove_class("setting-success")
+            status.remove_class("setting-error")
+            status.update(
+                "TIME UNSUPPORTED" if not supports_clock else self._clock_status_text()
+            )
 
         for dropdown, spec in dropdowns:
             dropdown.set_status_override(None)
@@ -3189,6 +3665,8 @@ class MeshtasticPassApp(App[None]):
                 palette.accent,
                 palette.dim_base,
             )
+        if self._emoji_picker is not None:
+            self._emoji_picker.set_palette(palette.base, palette.accent)
         if len(self.query("#identity-values")):
             self._render_connection_details()
             self._render_identity()
@@ -3240,6 +3718,7 @@ class MeshtasticPassApp(App[None]):
         """
         if self._send_error_message:
             self._show_send_error("")
+        self._update_footer()
 
     def _send_from_thread(
         self,
@@ -3299,25 +3778,40 @@ class MeshtasticPassApp(App[None]):
 
     @on(SendSubmitted)
     def send_was_submitted(self, event: SendSubmitted) -> None:
+        """send_text() returning successfully is a purely LOCAL event --
+
+        the SDK accepted the packet for local submission, nothing more.
+        It must NOT by itself produce SENT (✓): a routing failure (NAK)
+        remains a legitimate, still-open outcome for this exact packet
+        until the first real routing response arrives (see
+        RadioService._parse_send_response/_on_routing_response). The
+        entry stays in SENDING (rendered as the animated arrow, see
+        ChatEntryWidget.refresh_delivery_state) until that first
+        response resolves it to SENT, HEARD, or FAILED.
+
+        SimulatedRadioService's `immediate_state` is the one exception:
+        it exists specifically so tests can force a deterministic
+        outcome without simulating a real ack round-trip.
+        """
         entry = event.entry
-        if event.generation != entry.send_generation:
+        if entry.deleted or event.generation != entry.send_generation:
             return
         entry.packet_id = event.sent.packet_id
         state = (
             entry.delivery_state
             if entry.delivery_state in (DeliveryState.HEARD, DeliveryState.FAILED)
-            else event.sent.immediate_state or DeliveryState.SENT
+            else event.sent.immediate_state or DeliveryState.SENDING
         )
         entry.confirmation_deadline = (
             monotonic() + CHAT_CONFIRMATION_TIMEOUT_SECONDS
-            if state is DeliveryState.SENT
+            if state in (DeliveryState.SENDING, DeliveryState.SENT)
             else None
         )
         self._set_delivery_state(entry, state, packet_id=event.sent.packet_id)
 
     @on(SendFailed)
     def send_failed(self, event: SendFailed) -> None:
-        if event.generation != event.entry.send_generation:
+        if event.entry.deleted or event.generation != event.entry.send_generation:
             return
         self._set_delivery_state(
             event.entry,
@@ -3328,9 +3822,17 @@ class MeshtasticPassApp(App[None]):
 
     @on(DeliveryStatusReceived)
     def delivery_status_received(self, event: DeliveryStatusReceived) -> None:
-        if event.generation != event.entry.send_generation:
+        if event.entry.deleted or event.generation != event.entry.send_generation:
             return
         if event.entry.packet_id not in (None, event.status.packet_id):
+            return
+        # RadioService can now observe more than one routing response for
+        # the same outgoing packet (a later, genuinely stronger
+        # confirmation must not be silently dropped -- see
+        # RadioService._on_routing_response). Once a message has reached
+        # its strongest reachable state (HEARD) or a terminal FAILED, a
+        # duplicate or weaker later update must never overwrite it.
+        if event.entry.delivery_state in (DeliveryState.HEARD, DeliveryState.FAILED):
             return
         self._set_delivery_state(
             event.entry,
@@ -3888,7 +4390,15 @@ class MeshtasticPassApp(App[None]):
             self._update_mesh_context_status()
 
     def _update_mesh_context_status(self) -> None:
-        """Minimal truthful summary line for the currently selected MESH node."""
+        """Minimal truthful summary line for the currently selected MESH node.
+
+        Shares its row with #mesh-last-update, anchored to the right (see
+        the #mesh-bottom-row Horizontal in compose()). This widget's own
+        `width: 1fr` already excludes LAST UPDATE's space from
+        `status_widget.size.width` -- so truncating to exactly that width
+        (grapheme-safe, never a raw slice) is enough to guarantee no
+        overlap, with no need to read LAST UPDATE's text/width directly.
+        """
         widgets = list(self.query("#mesh-context-status"))
         if not widgets:
             return
@@ -3914,22 +4424,26 @@ class MeshtasticPassApp(App[None]):
         # for a genuinely stale/invalid ID, never a relay stage -- the
         # bottom-left context is always either YOU or a real node's full
         # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
-        status_widget.update(
-            format_mesh_context_line(state, now=time()) if state is not None else ""
-        )
+        text = format_mesh_context_line(state, now=time()) if state is not None else ""
+        available = status_widget.size.width
+        if available > 0:
+            text = truncate_to_cells(text, available)
+        status_widget.update(text)
 
     def _advance_delivery_states(self) -> None:
-        self._send_dot_count = self._send_dot_count % 3 + 1
+        self._send_animation_frame = self._send_animation_frame % len(
+            SENDING_ARROW_FRAMES
+        ) + 1
         now = monotonic()
         for entry in self.chat_history:
             if (
-                entry.delivery_state is DeliveryState.SENT
+                entry.delivery_state in (DeliveryState.SENDING, DeliveryState.SENT)
                 and entry.confirmation_deadline is not None
                 and now >= entry.confirmation_deadline
             ):
                 self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
         for widget in self.query(ChatEntryWidget):
-            widget.refresh_delivery_state(self._send_dot_count)
+            widget.refresh_delivery_state(self._send_animation_frame)
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)
@@ -4131,19 +4645,88 @@ class MeshtasticPassApp(App[None]):
                 if widget.entry is event.action_control.entry:
                     widget.focus()
                     break
+        elif event.action_control.action == "delete":
+            self._delete_chat_entry(event.action_control.entry)
+
+    def _delete_chat_entry(self, entry: ChatEntry) -> None:
+        """DEL: permanently remove one LOCAL outgoing entry -- never the
+
+        mesh. A packet already handed to the radio for transmission
+        cannot be pulled back out of the air, so this only ever touches
+        local application state: the UI, self.chat_history (and its
+        backing ChannelChatState -- the same list object, see
+        _state_for), and chat_store's persisted row. Generates zero
+        RF/admin traffic on its own.
+
+        Only ever offered where RESEND already is (can_manual_resend),
+        so `entry` is always a member of the CURRENT channel's
+        self.chat_history, exactly like _reposition_chat_entry assumes
+        for RESEND -- never another channel's message, and a RESEND's
+        own copy is a SEPARATE ChatEntry object (see _rebroadcast,
+        which mutates the SAME entry in place rather than creating a
+        new one), so deleting one can never affect the other.
+
+        entry.deleted is set FIRST, before anything else: it is the
+        actual guard send_was_submitted/send_failed/
+        delivery_status_received check before touching a message again,
+        so a response already sitting in the app's own message queue
+        (posted before this ran, processed after) is still caught, not
+        just responses that arrive later. Retiring the radio-layer
+        correlation (_pending_sends) additionally stops a real
+        RadioService from even invoking that status_handler at all for
+        a NOT-yet-queued late response -- belt and suspenders, since
+        _pending_sends is a RadioService-specific implementation detail
+        that not every radio backend (e.g. SimulatedRadioService) has.
+        """
+        if not can_manual_resend(entry):
+            return
+        entry.deleted = True
+        if entry.packet_id is not None:
+            pending_sends = getattr(self.radio, "_pending_sends", None)
+            if isinstance(pending_sends, dict):
+                pending_sends.pop(entry.packet_id, None)
+        if entry in self.chat_history:
+            self.chat_history.remove(entry)
+        for widget in list(self.query(ChatEntryWidget)):
+            if widget.entry is entry:
+                widget.remove()
+                break
+        if self.chat_store is not None and entry.message_id is not None:
+            try:
+                self.chat_store.delete_message(entry.message_id)
+            except ChatStoreError as error:
+                self._show_send_error(str(error))
+        self.query_one(ChatTranscript).focus()
 
     @on(ChatEntryWidget.UserMenuRequested)
     def open_user_menu(self, event: ChatEntryWidget.UserMenuRequested) -> None:
-        """Open node details/actions without changing transcript layout."""
+        """Open node details/actions without changing transcript layout.
+
+        The NAME row and REPLY's @mention must use the SAME name the
+        user is actually looking at on this message -- entry.author,
+        computed once at receipt time (see
+        app_controller.received_chat_entry: sender_long_name ->
+        sender_short_name -> sender_node_id, never empty) -- not
+        whatever a FRESH NodeDB lookup happens to report right now.
+
+        This matters because the two can genuinely diverge: the live
+        NodeDB record for a node can be overwritten by a LATER, more
+        generic broadcast (e.g. a bare auto-generated "Meshtastic ab59"
+        default before that node re-announces its real chosen name),
+        while this specific message's OWN packet already carried the
+        real name at the time it arrived. A fresh lookup is still used
+        for hops_away/last_heard/is_local, which are legitimately
+        "as of right now" facts a point-in-time snapshot can't provide.
+        """
         entry = event.widget.entry
         if entry.outgoing or not entry.node_id:
             return
-        getter = getattr(self.radio, "get_node_metadata", None)
         metadata = NodeMetadata(
             entry.node_id,
-            entry.sender_name,
+            entry.author,
             entry.sender_short_name,
         )
+        getter = getattr(self.radio, "get_node_metadata", None)
         if callable(getter):
             try:
                 current = getter(entry.node_id)
@@ -4152,8 +4735,8 @@ class MeshtasticPassApp(App[None]):
             if isinstance(current, NodeMetadata):
                 metadata = NodeMetadata(
                     entry.node_id,
-                    current.long_name or metadata.long_name,
-                    current.short_name or metadata.short_name,
+                    metadata.long_name or current.long_name,
+                    metadata.short_name or current.short_name,
                     current.hops_away,
                     current.last_heard,
                     current.is_local,
@@ -4251,29 +4834,31 @@ class MeshtasticPassApp(App[None]):
         self._activate_node_action(metadata.node_id, action)
 
     def _activate_reply(self, metadata: NodeMetadata) -> None:
-        """Insert an @mention for this node at the start of the CHAT
+        """Insert an @mention for this node at the composer's CURRENT
 
-        draft, then hand focus back to the input for continued typing.
-        A text-entry convenience only -- never changes Meshtastic
-        addressing/routing based on the textual @mention.
+        CURSOR POSITION (an empty composer is the trivial case: the
+        mention becomes the whole draft so far), then hand focus back
+        to the input for continued typing. Existing draft text before
+        and after the cursor is always preserved untouched. A text-
+        entry convenience only -- never changes Meshtastic addressing/
+        routing based on the textual @mention. Relies on Textual's own
+        Input.cursor_position/value indexing rather than reimplementing
+        cursor math, so this stays correct for multi-codepoint grapheme
+        clusters already in the draft.
         """
         self._close_user_menu(restore_focus=False)
         mention = f"@{_reply_mention_name(metadata)}"
         chat_input = self.query_one("#chat-input", Input)
         draft = chat_input.value
-        if draft == mention or draft.startswith(f"{mention} "):
-            # Already mentioned at the start of the draft -- preserve it
-            # exactly, never duplicate the mention.
-            new_value = draft
-        elif draft:
-            new_value = f"{mention} {draft}"
-        else:
-            new_value = f"{mention} "
+        cursor = chat_input.cursor_position
+        insertion = f"{mention} "
+        new_value = draft[:cursor] + insertion + draft[cursor:]
+        new_cursor = cursor + len(insertion)
         chat_input.value = new_value
         if self.current_tab != "chat":
             self.show_tab("chat")
         chat_input.focus()
-        chat_input.cursor_position = len(chat_input.value)
+        chat_input.cursor_position = new_cursor
 
     def _activate_node_action(self, node_id: str, action: str) -> None:
         if not node_id or action not in ("favorite", "unfavorite"):
@@ -4323,6 +4908,64 @@ class MeshtasticPassApp(App[None]):
                     animate=False,
                     force=True,
                 )
+
+    def _open_emoji_picker(self) -> None:
+        """Mount the emoji strip near the composer, sized to HUG its own
+
+        content (see emoji_picker_total_width() -- computed from
+        rendered cell widths, never len()), not stretched to the
+        composer's full width. Positioned via the SAME
+        calculate_popup_placement() the sender-action ViewportMenu
+        already uses (see _open_node_menu) -- not hand-rolled
+        arithmetic -- specifically because that function clamps BOTH
+        axes against the real screen region: an earlier version of
+        this method only clamped the WIDTH to the composer's own
+        width, never the X-OFFSET against the screen's right edge,
+        which could still let the picker's right border extend past
+        the visible terminal on a real narrow/XL-font layout even
+        though the width math itself was correct in isolation.
+        Never moves Textual focus off the composer (see item 22):
+        ChatMessageInput.on_key intercepts LEFT/RIGHT/ENTER/ESC
+        directly on the still-focused composer while this is open (see
+        that method's own docstring for why it -- not the App's
+        on_key -- has to be the one to do this).
+        """
+        chat_input = self.query_one("#chat-input", Input)
+        picker = EmojiPicker()
+        self._emoji_picker = picker
+        self.screen.mount(picker)
+        palette = THEME_PALETTES[self._current_theme]
+        picker.set_palette(palette.base, palette.accent)
+        placement = calculate_popup_placement(
+            chat_input.region,
+            self.screen.region,
+            emoji_picker_total_width(),
+            EMOJI_PICKER_HEIGHT,
+        )
+        picker.styles.width = placement.width
+        picker.styles.offset = (placement.x, placement.y)
+
+    def _close_emoji_picker(self) -> None:
+        picker = self._emoji_picker
+        self._emoji_picker = None
+        if picker is not None:
+            picker.remove()
+
+    def _insert_emoji_at_cursor(self, emoji: str) -> None:
+        """Insert at the composer's CURRENT CURSOR POSITION -- draft
+
+        text before and after is always preserved (see item 22).
+        Relies on Textual's own Input.cursor_position/value indexing
+        rather than reimplementing cursor math (see item 25).
+        """
+        chat_input = self.query_one("#chat-input", Input)
+        draft = chat_input.value
+        cursor = chat_input.cursor_position
+        new_value = draft[:cursor] + emoji + draft[cursor:]
+        new_cursor = cursor + len(emoji)
+        chat_input.value = new_value
+        chat_input.focus()
+        chat_input.cursor_position = new_cursor
 
     def _clear_indicator_if_at_bottom(self) -> None:
         if self._is_near_chat_bottom() and self.transcript_new_count:
@@ -4602,7 +5245,7 @@ class MeshtasticPassApp(App[None]):
             self._update_effective_transmission_time(entry)
         if packet_id is not None:
             entry.packet_id = packet_id
-        if state is not DeliveryState.SENT:
+        if state not in (DeliveryState.SENDING, DeliveryState.SENT):
             entry.confirmation_deadline = None
         completed_at = (
             time()
@@ -4627,7 +5270,7 @@ class MeshtasticPassApp(App[None]):
                 self._show_send_error(str(error))
         for widget in self.query(ChatEntryWidget):
             if widget.entry is entry:
-                widget.refresh_delivery_state(self._send_dot_count)
+                widget.refresh_delivery_state(self._send_animation_frame)
                 break
         self._update_footer()
 
@@ -4726,7 +5369,7 @@ class MeshtasticPassApp(App[None]):
 
     def _update_footer(self) -> None:
         if self.current_tab == "chat" and isinstance(self.focused, Input):
-            text = "ENTER send    ESC messages    F4 quit"
+            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
         elif self.current_tab == "chat":
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
@@ -4858,10 +5501,11 @@ class MeshtasticPassApp(App[None]):
         _advance_connection_animation, which calls this on a fixed
         ~0.45s cadence). Once ONLINE (status_text == ""), this leaves
         that widget untouched -- _update_mesh_status_line (called from
-        _refresh_mesh) becomes the writer for the "LAST UPDATE" fallback
-        instead. The two never fight over ownership: this function only
-        ever writes while NOT ONLINE, that one only ever writes while
-        ONLINE.
+        _refresh_mesh) force-hides it instead, unconditionally, since it
+        has no ONLINE-state purpose any more (LAST UPDATE now lives in
+        the separate bottom-right #mesh-last-update widget). The two
+        never fight over ownership: this function only ever writes while
+        NOT ONLINE, that one only ever touches the widget while ONLINE.
         """
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
@@ -4883,15 +5527,17 @@ class MeshtasticPassApp(App[None]):
     def _update_mesh_status_line(
         self, working_set: tuple[MeshNodeState, ...], now: float
     ) -> None:
-        """The ONLINE half of #mesh-connection-status: a PERSISTENT
+        """#mesh-last-update: a PERSISTENT "LAST UPDATE <age>"
 
-        "LAST UPDATE <age>" mesh-freshness indicator, always shown while
-        the radio is ONLINE -- not a stale-only warning. Answers "how
-        long ago did this radio last obtain meaningful information about
-        the mesh", so it keeps aging (1s, 2s, ... 1m, ...) between
-        refreshes with no new data, and only resets when a genuinely
-        fresher timestamp arrives -- never merely because this method
-        itself ran again (see _refresh_mesh's 1Hz periodic call).
+        mesh-freshness indicator, anchored bottom-right (see the
+        #mesh-bottom-row Horizontal in compose()), shown while the radio
+        is ONLINE -- not a stale-only warning. Answers "how long ago did
+        this radio last obtain meaningful information about the mesh",
+        so it keeps aging (1s, 2s, ... 1m, ...) between refreshes with no
+        new data, and only resets when a genuinely fresher timestamp
+        arrives -- never merely because this method itself ran again or
+        LAST UPDATE's own widget moved (see _refresh_mesh's 1Hz periodic
+        call).
 
         The age comes from the single most recent NodeDB last_heard
         among the working set's remote nodes (excluding YOU) -- never
@@ -4901,18 +5547,23 @@ class MeshtasticPassApp(App[None]):
         trustworthy last_heard at all, this is omitted rather than
         showing a made-up age.
 
-        Never touches the widget while the radio isn't ONLINE --
-        _update_chat_connection_state() owns it then, on its own fixed
-        animation cadence, so it can stay byte-for-byte in sync with
-        CHAT's own status line; recomputing here too, on _refresh_mesh's
-        different cadence, previously let the two drift out of phase by
-        a dot. The two never fight over the widget: this function is a
-        no-op while not ONLINE, and _update_chat_connection_state only
-        ever writes non-empty text, which happens only while not ONLINE.
+        Also force-hides #mesh-connection-status (the OLD top-of-view
+        location) every ONLINE cycle: that widget is exclusively owned
+        by _update_chat_connection_state() while NOT ONLINE (see that
+        method's own docstring), so once ONLINE, nothing else would ever
+        clear its stale text/display=True from the last disconnected
+        state -- left alone, it would stay visible and keep reserving
+        its top row forever. Forcing display=False here (never merely
+        "when there's no LAST UPDATE text", unlike the old behavior this
+        replaces) is what lets #mesh-view's own `height: 1fr` reclaim
+        that freed row automatically, with no hardcoded row math.
         """
         if self._radio_state is not RadioState.ONLINE:
             return
-        widgets = list(self.query("#mesh-connection-status"))
+        connection_widgets = list(self.query("#mesh-connection-status"))
+        if connection_widgets:
+            connection_widgets[0].display = False
+        widgets = list(self.query("#mesh-last-update"))
         if not widgets:
             return
         widget = widgets[0]
@@ -4927,7 +5578,6 @@ class MeshtasticPassApp(App[None]):
             if age >= 0:
                 text = f"LAST UPDATE {format_relative_age(age)}"
         widget.update(text)
-        widget.display = bool(text)
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:

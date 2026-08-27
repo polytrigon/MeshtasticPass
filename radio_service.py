@@ -222,6 +222,39 @@ class ConfigWriteResult:
 
 
 @dataclass(frozen=True)
+class ClockSyncResult:
+    """Outcome of one RadioService.sync_clock() call.
+
+    Unlike write_verified_config_field, AdminMessage exposes no
+    get-time-equivalent RPC (confirmed against the installed
+    meshtastic==2.7.11 protobuf schema: no get_time_request/response
+    field exists anywhere on AdminMessage) -- there is no way to
+    independently ask the radio to report its own current clock value
+    back. `applied` is therefore True only when BOTH a clean
+    mesh-routing ACK for the set_time_only admin write was received AND
+    a best-effort secondary signal -- a subsequently observed packet's
+    own rxTime, the RECEIVING device's own locally-stamped Unix
+    timestamp (see RadioService._accept_received_message's identical
+    use of rxTime for radio_rx_at) -- lands within a few seconds of the
+    host epoch requested. When no such packet ever arrives, or its
+    rxTime doesn't corroborate the write, this settles for
+    "unconfirmed" rather than fabricating "applied" from routing-ack
+    evidence alone -- exactly the same standard ConfigWriteResult
+    already holds ordinary config writes to.
+
+    `reason` is "" when applied is True; otherwise one of:
+    "not_connected", "disconnected", "nak", "timeout" (no ack/nak
+    response at all), or "unconfirmed" (a response arrived but did not
+    corroborate the write).
+    """
+
+    applied: bool
+    requested_epoch: int
+    observed_rx_time: int | None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class ReceivedMessage:
     """A decoded text message with no Meshtastic SDK-specific structures.
 
@@ -283,6 +316,14 @@ def validate_send_request(
 class RadioService:
     """Owns the connection between the app and a Meshtastic radio."""
 
+    _MAX_PENDING_SENDS = 200
+    # How close a subsequent packet's own rxTime must land to the host
+    # epoch we asked the radio to adopt (see sync_clock) to count as
+    # corroborating evidence -- generous enough to absorb normal
+    # send/serial/processing latency, never so tight that ordinary
+    # round-trip time alone produces a false "unconfirmed".
+    _CLOCK_SYNC_TOLERANCE_SECONDS = 10
+
     def __init__(self, device_path: str = "/dev/ttyUSB0") -> None:
         self.device_path = device_path
         self._interface: Any | None = None
@@ -291,6 +332,15 @@ class RadioService:
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._direct_observations: dict[str, float] = {}
         self._activity_local_node_id: str | None = None
+        # Tracks in-flight outgoing sends by packet ID, keyed to the
+        # status_handler given to send_text(). See _on_routing_response:
+        # unlike the SDK's own one-shot onResponse callback (which
+        # discards its handler after the FIRST matching packet), this
+        # keeps watching so a genuinely stronger, later-arriving
+        # confirmation (e.g. a DM destination's own ack arriving after
+        # an earlier local/implicit one) can still be observed instead
+        # of silently dropped. Bounded by _MAX_PENDING_SENDS.
+        self._pending_sends: dict[int, Callable[[SendStatus], None]] = {}
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -758,6 +808,83 @@ class RadioService:
 
         return ConfigWriteResult(False, value, None, "timeout")
 
+    def supports_clock_sync(self) -> bool:
+        """Whether the installed SDK/protobuf schema exposes
+
+        AdminMessage.set_time_only -- a schema-driven capability check
+        (see item 20: never inferred from device path or board-name
+        string) that stays accurate even against a different installed
+        meshtastic package version than the one this was audited
+        against (2.7.11). Independent of whether a radio is actually
+        connected right now -- callers combine this with connection
+        state separately, exactly like every other capability check in
+        this class.
+        """
+        from meshtastic.protobuf import admin_pb2
+
+        return "set_time_only" in admin_pb2.AdminMessage.DESCRIPTOR.fields_by_name
+
+    def sync_clock(self) -> ClockSyncResult:
+        """Set the radio's clock from THIS host's current wall clock,
+
+        captured as close as practical to the actual write (see
+        ClockSyncResult's docstring for why "applied" is a materially
+        weaker guarantee here than write_verified_config_field's:
+        AdminMessage has no get-time RPC to read the value back with).
+
+        Bypasses node.setTime()/Node's own convenience wrapper on
+        purpose, for the same reason write_verified_config_field
+        bypasses node.writeConfig(): for the LOCAL node those wire no
+        response callback at all, so nothing would ever see the ack or
+        a later packet's rxTime.
+
+        Never called periodically or automatically -- see app.py's own
+        caller, which only ever runs this from an explicit SYNC CLOCK
+        activation.
+        """
+        interface = self._interface
+        if interface is None:
+            return ClockSyncResult(False, 0, None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            return ClockSyncResult(False, 0, None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2
+
+        target_interface = interface
+        requested_epoch = int(time.time())
+        write_message = admin_pb2.AdminMessage()
+        write_message.set_time_only = requested_epoch
+
+        response_seen = {"any": False, "nak": False, "rx_time": None}
+
+        def on_ack(packet: Any) -> None:
+            response_seen["any"] = True
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                response_seen["nak"] = True
+            rx_time = packet.get("rxTime") if isinstance(packet, dict) else None
+            if isinstance(rx_time, (int, float)):
+                response_seen["rx_time"] = int(rx_time)
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+            interface.waitForAckNak()
+        except Exception:
+            pass
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return ClockSyncResult(False, requested_epoch, None, "disconnected")
+        if response_seen["nak"]:
+            return ClockSyncResult(False, requested_epoch, None, "nak")
+        if not response_seen["any"]:
+            return ClockSyncResult(False, requested_epoch, None, "timeout")
+
+        rx_time = response_seen["rx_time"]
+        if rx_time is not None and abs(rx_time - requested_epoch) <= self._CLOCK_SYNC_TOLERANCE_SECONDS:
+            return ClockSyncResult(True, requested_epoch, rx_time, "")
+        return ClockSyncResult(False, requested_epoch, rx_time, "unconfirmed")
+
     def remove_message_handler(
         self,
         handler: Callable[[ReceivedMessage], None],
@@ -810,6 +937,16 @@ class RadioService:
             raise RadioSendError(f"Could not send text message: {detail}") from error
 
         packet_id = self._optional_int(getattr(sdk_packet, "id", None))
+        if status_handler is not None and packet_id is not None:
+            # The SDK's own one-shot onResponse above only ever sees the
+            # FIRST matching routing response (it pops its handler on
+            # first use) -- keep watching independently via the generic
+            # "meshtastic.receive.routing" topic so a genuinely stronger,
+            # later-arriving confirmation is never silently dropped (see
+            # _on_routing_response).
+            self._pending_sends[packet_id] = status_handler
+            while len(self._pending_sends) > self._MAX_PENDING_SENDS:
+                self._pending_sends.pop(next(iter(self._pending_sends)), None)
         return SentMessage(
             message.text,
             message.channel_index,
@@ -817,8 +954,51 @@ class RadioService:
             packet_id=packet_id,
         )
 
+    def _on_routing_response(
+        self,
+        packet: Any = None,
+        interface: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Watch every ROUTING_APP response for one this service is still
+
+        tracking (see send_text/_pending_sends), independent of the
+        SDK's own one-shot per-send callback. A stale interface (a
+        reconnect already completed) can never resolve a send tracked
+        against the PREVIOUS connection.
+        """
+        if interface is not None and interface is not self._interface:
+            return
+        decoded = packet.get("decoded") if isinstance(packet, dict) else None
+        packet_id = (
+            self._optional_int(decoded.get("requestId"))
+            if isinstance(decoded, dict)
+            else None
+        )
+        if packet_id is None:
+            return
+        handler = self._pending_sends.get(packet_id)
+        if handler is None:
+            return
+        status = self._parse_send_response(packet)
+        if status is None:
+            return
+        handler(status)
+        if status.state in (DeliveryState.HEARD, DeliveryState.FAILED):
+            self._pending_sends.pop(packet_id, None)
+
     def _parse_send_response(self, packet: Any) -> SendStatus | None:
-        """Convert a Meshtastic routing ACK/NAK into application state."""
+        """Convert a Meshtastic routing response into truthful delivery
+
+        evidence. A clean ack whose "from" is our OWN node number is
+        the SDK's own "implicit ack" (see node.py's onAckNak/
+        receivedImplAck) -- real evidence the local radio/routing layer
+        handled the packet, but never proof any other node received it,
+        so it is reported as SENT, not HEARD. Only a clean ack whose
+        "from" names a DIFFERENT node -- a DM destination's own
+        explicit ack, or any other node's routing response genuinely
+        reaching us -- is strong enough to report HEARD.
+        """
         if not isinstance(packet, dict):
             return None
         decoded = packet.get("decoded")
@@ -831,13 +1011,24 @@ class RadioService:
         if reason is None:
             return None
         packet_id = self._optional_int(decoded.get("requestId"))
-        if reason == "NONE":
-            return SendStatus(DeliveryState.HEARD, packet_id)
-        return SendStatus(
-            DeliveryState.FAILED,
-            packet_id,
-            detail=f"Meshtastic routing failure: {reason}",
+        if reason != "NONE":
+            return SendStatus(
+                DeliveryState.FAILED,
+                packet_id,
+                detail=f"Meshtastic routing failure: {reason}",
+            )
+
+        from_number = self._optional_int(packet.get("from"))
+        local_number = self._optional_int(
+            getattr(getattr(self._interface, "myInfo", None), "my_node_num", None)
         )
+        if (
+            from_number is not None
+            and local_number is not None
+            and from_number != local_number
+        ):
+            return SendStatus(DeliveryState.HEARD, packet_id)
+        return SendStatus(DeliveryState.SENT, packet_id)
 
     @staticmethod
     def _normalize_routing_error(routing: dict[str, Any]) -> str | None:
@@ -900,6 +1091,27 @@ class RadioService:
             pub.unsubscribe(
                 self._on_connection_lost,
                 "meshtastic.connection.lost",
+            )
+            raise
+
+        try:
+            # ROUTING_APP has a registered KnownProtocol("routing", ...)
+            # in meshtastic/__init__.py, so its topic is
+            # "meshtastic.receive.routing" -- NOT the generic
+            # "meshtastic.receive.data.ROUTING_APP" pattern that applies
+            # to portnums without one.
+            pub.subscribe(
+                self._on_routing_response,
+                "meshtastic.receive.routing",
+            )
+        except Exception:
+            pub.unsubscribe(
+                self._on_connection_lost,
+                "meshtastic.connection.lost",
+            )
+            pub.unsubscribe(
+                self._on_text_received,
+                "meshtastic.receive.text",
             )
             raise
 
@@ -1051,6 +1263,7 @@ class RadioService:
             subscriptions = (
                 (self._on_connection_lost, "meshtastic.connection.lost"),
                 (self._on_text_received, "meshtastic.receive.text"),
+                (self._on_routing_response, "meshtastic.receive.routing"),
                 (self._on_any_packet_for_debug, "meshtastic.receive"),
             )
             for callback, topic in subscriptions:

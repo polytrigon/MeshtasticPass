@@ -46,6 +46,12 @@ class ChatEntry:
     confirmation_deadline: float | None = None
     send_generation: int = 0
     arrival_order: int = 0
+    # Set once by the DEL action (see app.py's _delete_chat_entry) and
+    # never cleared -- a stale pending-delivery response arriving for
+    # this entry afterward (send_was_submitted/send_failed/
+    # delivery_status_received) must find this True and no-op, never
+    # resurrect or mutate an entry the user already removed.
+    deleted: bool = False
 
     @property
     def message_time(self) -> float | None:

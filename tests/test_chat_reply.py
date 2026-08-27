@@ -101,13 +101,18 @@ class ChatReplyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(chat_input.has_focus)
             self.assertEqual(chat_input.cursor_position, len(chat_input.value))
 
-    async def test_reply_preserves_existing_draft(self) -> None:
+    async def test_reply_at_start_of_existing_draft_preserves_it(self) -> None:
+        """Cursor at position 0 -- the mention is inserted before the
+
+        existing draft, which survives completely untouched after it.
+        """
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             app.show_tab("chat")
             chat_input = app.query_one("#chat-input", Input)
             chat_input.value = "that's really cool"
+            chat_input.cursor_position = 0
 
             message = replace(
                 SIMULATED_MESSAGES[0],
@@ -120,14 +125,21 @@ class ChatReplyTests(unittest.IsolatedAsyncioTestCase):
             await self._select_reply(pilot, app)
 
             self.assertEqual(chat_input.value, "@ALICE that's really cool")
+            self.assertEqual(chat_input.cursor_position, len("@ALICE "))
 
-    async def test_reply_does_not_duplicate_an_existing_mention(self) -> None:
+    async def test_reply_at_cursor_in_middle_of_existing_draft(self) -> None:
+        """The defining case: insertion happens at the CURRENT CURSOR
+
+        POSITION, not merely at the start or end -- text before and
+        after the cursor is both preserved exactly.
+        """
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             app.show_tab("chat")
             chat_input = app.query_one("#chat-input", Input)
-            chat_input.value = "@ALICE that's really cool"
+            chat_input.value = "hello there"
+            chat_input.cursor_position = len("hello ")
 
             message = replace(
                 SIMULATED_MESSAGES[0],
@@ -139,7 +151,35 @@ class ChatReplyTests(unittest.IsolatedAsyncioTestCase):
             await self._open_menu_for(pilot, app, message)
             await self._select_reply(pilot, app)
 
-            self.assertEqual(chat_input.value, "@ALICE that's really cool")
+            self.assertEqual(chat_input.value, "hello @ALICE there")
+            self.assertEqual(chat_input.cursor_position, len("hello @ALICE "))
+
+    async def test_reply_at_cursor_after_an_existing_mention_inserts_again(self) -> None:
+        """Insertion is unconditional on the cursor position -- REPLY
+
+        does not special-case or deduplicate an already-present
+        mention (a cursor-position-based insertion has no single
+        "start of draft" to compare against).
+        """
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "@ALICE that's really cool"
+            chat_input.cursor_position = 0
+
+            message = replace(
+                SIMULATED_MESSAGES[0],
+                packet_id=9005,
+                sender_node_id="!a11ce999",
+                sender_long_name="ALICE",
+                sender_short_name="ALC",
+            )
+            await self._open_menu_for(pilot, app, message)
+            await self._select_reply(pilot, app)
+
+            self.assertEqual(chat_input.value, "@ALICE @ALICE that's really cool")
 
     async def test_reply_falls_back_to_short_name_when_long_name_missing(
         self,
@@ -160,6 +200,41 @@ class ChatReplyTests(unittest.IsolatedAsyncioTestCase):
 
             chat_input = app.query_one("#chat-input", Input)
             self.assertEqual(chat_input.value, "@SHRT ")
+
+    async def test_reply_uses_the_visible_message_name_not_a_diverged_nodedb_lookup(
+        self,
+    ) -> None:
+        """Regression for the real-hardware report: a message visibly
+
+        rendered as "Golf Sierra Portable" produced REPLY mention
+        "@Meshtastic ab59" -- a fresh NodeDB lookup returning a
+        DIFFERENT (more generic/default) name than the one this
+        specific message's own packet carried at receipt time. Node
+        !a11ce001's live simulated NodeDB entry is "Alice Trail"/"ALCE"
+        (see SIMULATED_NODES) -- deliberately different from this
+        message's own carried name, to reproduce the exact divergence.
+        """
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            message = replace(
+                SIMULATED_MESSAGES[0],
+                packet_id=9006,
+                sender_node_id="!a11ce001",
+                sender_long_name="Golf Sierra Portable",
+                sender_short_name="GSP",
+            )
+            await self._open_menu_for(pilot, app, message)
+
+            menu = app.query_one(ViewportMenu)
+            self.assertIn("Golf Sierra Portable", [item.label for item in menu.items])
+            self.assertNotIn("Alice Trail", [item.label for item in menu.items])
+
+            await self._select_reply(pilot, app)
+
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(chat_input.value, "@Golf Sierra Portable ")
 
     async def test_reply_falls_back_to_compact_node_id_when_no_names(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)

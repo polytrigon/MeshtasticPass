@@ -2955,8 +2955,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         """The CONNECTING/RECONNECTING status text disappears once ONLINE
 
-        -- replaced by the persistent "LAST UPDATE <age>" mesh-freshness
-        indicator (see item 3), never left blank, since the default
+        -- the old top-of-view widget is hidden entirely (freeing its row
+        for the grid, see item 5), replaced by the persistent
+        "LAST UPDATE <age>" mesh-freshness indicator now anchored
+        bottom-right, never left blank, since the default
         SimulatedRadioService fixture has real, known NodeDB last_heard
         data as soon as it connects.
         """
@@ -2971,8 +2973,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app._radio_state, RadioState.ONLINE)
 
             status_widget = app.query_one("#mesh-connection-status")
-            self.assertTrue(status_widget.display)
-            text = str(status_widget.render())
+            self.assertFalse(status_widget.display)
+            last_update_widget = app.query_one("#mesh-last-update")
+            text = str(last_update_widget.render())
             self.assertIn("LAST UPDATE", text)
             self.assertNotIn("STATUS", text)
 
@@ -4817,15 +4820,18 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
-    """The shared #mesh-connection-status widget's priority:
+    """#mesh-connection-status (top) vs #mesh-last-update (bottom-right):
 
-    the shared connection-status text while not ONLINE, else a
-    PERSISTENT "LAST UPDATE <age>" mesh-freshness indicator -- always
-    shown while ONLINE, not only when stale -- see
-    app._update_mesh_status_line. The age is a pure function of (most
+    the shared connection-status text lives in the TOP widget while not
+    ONLINE; once ONLINE, that TOP widget is hidden entirely (freeing its
+    row for the grid) and a PERSISTENT "LAST UPDATE <age>" mesh-freshness
+    indicator -- always shown while ONLINE, not only when stale -- takes
+    over the SEPARATE bottom-right widget instead (see item 5,
+    app._update_mesh_status_line). The age is a pure function of (most
     recent working-set remote last_heard, current wall time): it climbs
     between refreshes with no new data and resets only when a genuinely
-    fresher NodeDB timestamp arrives, never merely because a refresh ran.
+    fresher NodeDB timestamp arrives, never merely because a refresh ran
+    or the indicator moved to a new widget.
     """
 
     def setUp(self) -> None:
@@ -4844,6 +4850,11 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
         return MeshtasticPassApp(radio, self.settings)
 
     async def _mesh_status_text(self, app: MeshtasticPassApp) -> str:
+        from textual.widgets import Static
+
+        return str(app.query_one("#mesh-last-update", Static).render())
+
+    async def _mesh_connection_text(self, app: MeshtasticPassApp) -> str:
         from textual.widgets import Static
 
         return str(app.query_one("#mesh-connection-status", Static).render())
@@ -4882,7 +4893,9 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             text = await self._mesh_status_text(app)
             self.assertIn("LAST UPDATE", text)
             self.assertIn("5s", text)
-            self.assertTrue(app.query_one("#mesh-connection-status").display)
+            # The old top-of-view widget no longer consumes a row while
+            # ONLINE -- its space is reclaimed by the grid (see item 5).
+            self.assertFalse(app.query_one("#mesh-connection-status").display)
 
     async def test_last_update_ages_between_refreshes_with_no_new_data(self) -> None:
         """Between two refreshes with the SAME underlying last_heard, the
@@ -4953,10 +4966,12 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("LAST UPDATE 0s", await self._mesh_status_text(app))
 
     async def test_returning_online_restores_last_update(self) -> None:
-        """CONNECTING replaces LAST UPDATE in the same widget location;
+        """CONNECTING shows the shared status in the TOP widget (which
 
-        once ONLINE resumes, LAST UPDATE returns automatically -- no
-        second/duplicate status line is ever created.
+        reclaims the row LAST UPDATE would otherwise occupy at the
+        bottom-right); once ONLINE resumes, LAST UPDATE returns
+        automatically there -- no second/duplicate widget is ever
+        created, and the TOP widget goes back to hidden.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -4968,24 +4983,33 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertFalse(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.CONNECTING)
             await pilot.pause()
-            text = await self._mesh_status_text(app)
+            text = await self._mesh_connection_text(app)
             self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.CONNECTING]}", text)
-            self.assertNotIn("LAST UPDATE", text)
+            self.assertTrue(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.ONLINE, app.radio.info)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertFalse(app.query_one("#mesh-connection-status").display)
             self.assertEqual(len(list(app.query("#mesh-connection-status"))), 1)
+            self.assertEqual(len(list(app.query("#mesh-last-update"))), 1)
 
-    async def test_connecting_status_overrides_stale_last_update(self) -> None:
+    async def test_connecting_status_appears_on_top_without_clearing_last_update(
+        self,
+    ) -> None:
         """While CONNECTING/RECONNECTING, the shared connection-status
 
-        text always wins over "LAST UPDATE" -- see
-        _update_mesh_status_line's priority order.
+        text appears in the TOP widget (see item 5's separate-widgets
+        layout); the bottom-right LAST UPDATE indicator is a distinct
+        widget now, and simply freezes at its last known value rather
+        than being cleared -- reconnecting introduces no new event that
+        touches it (see _update_mesh_status_line's own early-return
+        while not ONLINE).
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -5000,12 +5024,146 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             text = await self._mesh_status_text(app)
             self.assertIn("LAST UPDATE", text)
+            self.assertFalse(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.OFFLINE, message="lost")
             await pilot.pause()
-            text = await self._mesh_status_text(app)
-            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", text)
-            self.assertNotIn("LAST UPDATE", text)
+            top_text = await self._mesh_connection_text(app)
+            self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", top_text)
+            self.assertTrue(app.query_one("#mesh-connection-status").display)
+            # The bottom-right indicator is untouched by the disconnect --
+            # still showing its last computed value, not blanked.
+            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+
+
+class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
+    """Item 5: LAST UPDATE moved to bottom-right, freeing the old
+
+    top-of-view row for the grid, and the bottom row's two widgets
+    (#mesh-context-status left, #mesh-last-update right) must never
+    collide -- see app._update_mesh_context_status/_update_mesh_status_line
+    and the #mesh-bottom-row Horizontal in compose().
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def test_grid_gains_rows_once_top_status_row_is_reclaimed(self) -> None:
+        """At a terminal height chosen so the freed 2 rows cross an odd/
+
+        even boundary in _compute_mesh_grid_dimensions, going ONLINE
+        (hiding #mesh-connection-status) measurably grows the visible
+        grid's own row count -- proving #mesh-view's `height: 1fr`
+        reclaims the space with no hardcoded row math, not merely that
+        the widget's pixel height changed.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 31)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            offline_rows, _, _, _ = view.current_grid_dimensions()
+
+            app._show_connection(RadioState.ONLINE, app.radio.info)
+            app._refresh_mesh()
+            await pilot.pause()
+            online_rows, _, _, _ = view.current_grid_dimensions()
+
+            self.assertGreater(online_rows, offline_rows)
+
+    async def test_context_and_last_update_share_the_bottom_row_at_normal_width(
+        self,
+    ) -> None:
+        """At a normal XL uConsole-like width, a realistic-length
+
+        context line and LAST UPDATE both render in full on the same
+        row, with LAST UPDATE's own text never truncated (it is
+        `width: auto`, always sized to its own content).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            node_id = "!ctxwidth1"
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata(
+                node_id, "Golf Sierra Portable", "GSP", last_heard=time.time() - 5
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh()
+            await pilot.pause()
+            _mesh_select_node(app, node_id)
+            await pilot.pause()
+
+            context_widget = app.query_one("#mesh-context-status")
+            last_update_widget = app.query_one("#mesh-last-update")
+            context_text = str(context_widget.render())
+            last_update_text = str(last_update_widget.render())
+
+            self.assertIn("Golf Sierra Portable", context_text)
+            self.assertNotIn("…", context_text)
+            self.assertTrue(last_update_text.startswith("LAST UPDATE"))
+            self.assertLessEqual(cell_len(context_text), context_widget.size.width)
+
+    async def test_context_truncates_gracefully_at_narrow_width_without_overlap(
+        self,
+    ) -> None:
+        """At a narrow width, an overlong context line truncates
+
+        (grapheme-safe ellipsis, never a raw clip) to fit the space
+        Textual's own 1fr/auto layout actually assigned it -- LAST
+        UPDATE keeps rendering in full, and the two never overlap
+        because each occupies its own laid-out box.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(40, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            node_id = "!ctxwidth2"
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            node = NodeMetadata(
+                node_id,
+                "An Extremely Long Node Long Name That Cannot Possibly Fit",
+                "LONG",
+                last_heard=time.time() - 5,
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            app._refresh_mesh()
+            await pilot.pause()
+            _mesh_select_node(app, node_id)
+            await pilot.pause()
+
+            context_widget = app.query_one("#mesh-context-status")
+            last_update_widget = app.query_one("#mesh-last-update")
+            context_text = str(context_widget.render())
+            last_update_text = str(last_update_widget.render())
+
+            self.assertTrue(context_text.endswith("…"))
+            self.assertLessEqual(cell_len(context_text), context_widget.size.width)
+            self.assertTrue(last_update_text.startswith("LAST UPDATE"))
+            self.assertNotIn("…", last_update_text)
+            bottom_row = app.query_one("#mesh-bottom-row")
+            self.assertLessEqual(
+                cell_len(context_text) + cell_len(last_update_text),
+                bottom_row.size.width,
+            )
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):
