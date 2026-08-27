@@ -4970,7 +4970,7 @@ class MeshUnrelatedNodeObstacleAvoidanceTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
                 {app.radio.info.node_id: (0, 0), "!a1a1a1a1": (8, 4)},
-                theme="white",
+                theme="snow",
                 now=1_800_000_000.0,
             )
             await pilot.pause()
@@ -5001,7 +5001,7 @@ class MeshUnrelatedNodeObstacleAvoidanceTests(unittest.IsolatedAsyncioTestCase):
                     "!a1a1a1a1": (8, 4),
                     "!b0b0b0b0": (4, 4),
                 },
-                theme="white",
+                theme="snow",
                 now=1_800_000_000.0,
             )
             await pilot.pause()
@@ -5073,7 +5073,7 @@ class MeshSelectedRoutePaintPriorityTests(unittest.IsolatedAsyncioTestCase):
             "!aaaaaaaa": (-4, -6),
             "!bbbbbbbb": (4, -2),
         }
-        view.set_nodes(working_set, base_positions, theme="white", now=1_800_000_000.0)
+        view.set_nodes(working_set, base_positions, theme="snow", now=1_800_000_000.0)
         return view
 
     def _connector_cells(self, view: MeshTopologyView):
@@ -5124,10 +5124,10 @@ class MeshSelectedRoutePaintPriorityTests(unittest.IsolatedAsyncioTestCase):
             view = self._set_overlapping_pair(app)
             view.select_node("!aaaaaaaa")
             view.set_nodes(
-                view.working_set, view.base_positions, theme="white", now=1_800_000_000.0
+                view.working_set, view.base_positions, theme="snow", now=1_800_000_000.0
             )
             await pilot.pause()
-            palette = THEME_PALETTES["white"]
+            palette = THEME_PALETTES["snow"]
             raw_cells = self._connector_cells(view)
             positions = [(x, y) for x, y, _glyph, _color in raw_cells]
             duplicated = {p for p in positions if positions.count(p) > 1}
@@ -5150,16 +5150,16 @@ class MeshSelectedRoutePaintPriorityTests(unittest.IsolatedAsyncioTestCase):
             view = self._set_overlapping_pair(app)
             view.select_node("!bbbbbbbb")
             view.set_nodes(
-                view.working_set, view.base_positions, theme="white", now=1_800_000_000.0
+                view.working_set, view.base_positions, theme="snow", now=1_800_000_000.0
             )
             await pilot.pause()
 
             view.select_local()
             view.set_nodes(
-                view.working_set, view.base_positions, theme="white", now=1_800_000_000.0
+                view.working_set, view.base_positions, theme="snow", now=1_800_000_000.0
             )
             await pilot.pause()
-            palette = THEME_PALETTES["white"]
+            palette = THEME_PALETTES["snow"]
             cells = self._connector_cells(view)
             self.assertTrue(
                 all(color == palette.dim_base for _x, _y, _glyph, color in cells)
@@ -5526,7 +5526,7 @@ class ThinScrollBarRenderTests(unittest.TestCase):
             position=5,
             thickness=1,
             vertical=True,
-            back_color=RichColor.parse(THEME_PALETTES["white"].dim_base),
+            back_color=RichColor.parse(THEME_PALETTES["snow"].dim_base),
             bar_color=RichColor.parse("#39ff14"),
         )
         non_newline = [

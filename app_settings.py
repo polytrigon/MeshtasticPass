@@ -26,12 +26,26 @@ VALID_FONT_SIZES = tuple(size for _name, size in FONT_SIZE_CHOICES)
 # a value found in the config file.
 DEFAULT_FONT_SIZE = 18
 COLOR_CHOICES = (
-    ("WHITE", "white"),
-    ("GREEN", "green"),
-    ("ORANGE", "orange"),
+    ("SNOW", "snow"),
+    ("AMBER", "amber"),
 )
 VALID_COLORS = tuple(value for _name, value in COLOR_CHOICES)
-DEFAULT_COLOR = "white"
+DEFAULT_COLOR = "snow"
+# Deterministic migration for the three retired theme names (see the
+# theme-overhaul completion report for the full reasoning): "white" ->
+# "snow" and "orange" -> "amber" both keep their BASE hue. "green" has
+# no base-hue equivalent in the new two-theme palette -- SNOW is the
+# only remaining palette that still contains that exact neon green at
+# all (as its ACCENT, see theme_palette.THEME_PALETTES), so a "green"
+# theme user keeps seeing that same green prominently rather than
+# losing it outright under "orange"/AMBER, which shares nothing with
+# it. Never discards a color preference outright -- every legacy value
+# maps to a valid current one.
+_LEGACY_COLOR_MIGRATION = {
+    "white": "snow",
+    "green": "snow",
+    "orange": "amber",
+}
 DEFAULT_DEVICE_PATH = "/dev/ttyUSB0"
 
 
@@ -101,6 +115,10 @@ class AppSettings:
         if cls.is_valid_font_size(candidate):
             settings.font_size = candidate
         color_candidate = raw.get("color")
+        if isinstance(color_candidate, str):
+            color_candidate = _LEGACY_COLOR_MIGRATION.get(
+                color_candidate, color_candidate
+            )
         if cls.is_valid_color(color_candidate):
             settings.color = color_candidate
         device_candidate = raw.get("device_path")

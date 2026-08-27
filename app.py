@@ -150,6 +150,25 @@ def _format_time_of_day(epoch: float, is_24h: bool) -> str:
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
+# Item 14 root cause: RadioService.sync_clock() ultimately depends on
+# the third-party SDK's OWN blocking primitives -- the synchronous
+# admin-write call, then interface.waitForAckNak() (whose installed
+# meshtastic SDK default, meshtastic.util.Timeout(maxSecs=20), is a
+# THIRD-PARTY implementation detail MeshtasticPass does not control or
+# independently verify). On real hardware the observed "stuck at
+# SYNCING CLOCK... indefinitely" bug traces to this: nothing in
+# MeshtasticPass's own code bounds how long that call chain can take,
+# so a serial-layer stall in the admin-write call itself (before
+# waitForAckNak's own timer even starts) is never caught by anything.
+# This watchdog is MeshtasticPass's OWN upper bound -- protocol-derived
+# from that same SDK 20s figure plus a safety margin for the
+# surrounding admin-write/session-key dispatch, not a random long sleep
+# (item 17) -- guaranteeing the OBSERVABLE UI always reaches a terminal
+# state (see _sync_clock_watchdog_expired) even if the underlying call
+# never returns. It cannot forcibly stop that call -- Python cannot
+# cancel a blocking thread -- so a late, orphaned completion is safely
+# ignored via the generation guard on ClockSyncApplied.
+CLOCK_SYNC_WATCHDOG_SECONDS = 25.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -164,9 +183,16 @@ SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # already theme-driven and untouched by this change. Does not change
 # what causes DeliveryState.FAILED, nor its meaning: a definitive
 # routing failure/NAK.
+# UNCONFIRMED/U+27D0 WHITE DIAMOND WITH CENTRED DOT: same reasoning as
+# the checkmarks/✕ above -- a plain, Narrow-width text glyph, never an
+# emoji-presentation one -- replacing the literal word "UNCONFIRMED" as
+# pure presentation. Means exactly what it always meant: no conclusive
+# positive or negative routing outcome arrived before the confirmation
+# timeout (see can_manual_resend/MANUAL_RESEND_STATES, unchanged).
 DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
     DeliveryState.SENT: "✓",
     DeliveryState.HEARD: "✓✓",
+    DeliveryState.UNCONFIRMED: "⟐",
     DeliveryState.FAILED: "✕",
 }
 # A single narrow glyph (U+2192 RIGHTWARDS ARROW -- plain, non-emoji,
@@ -466,8 +492,15 @@ class SyncClockControl(Static):
         pass
 
     def __init__(self) -> None:
+        # Item 10/11: an inline "CLOCK SYNC   [ SYNC NOW ]" row directly
+        # below 24 HOUR TIME, using the SAME label-column/value-column
+        # width math (CONNECTION_ROW_PREFIX + CONNECTION_LABEL_WIDTH) as
+        # every neighboring RADIO row -- not a standalone full-row
+        # button anymore. Replaces the old standalone "[ SYNC CLOCK ]"
+        # control entirely; there is only ever this one clock-sync
+        # control (item 10: "Do not expose duplicate controls").
         super().__init__(
-            "[ SYNC CLOCK ]",
+            f"{CONNECTION_ROW_PREFIX}{'CLOCK SYNC':<{CONNECTION_LABEL_WIDTH}} [ SYNC NOW ]",
             id="sync-clock-control",
             classes="connection-action-row",
             markup=False,
@@ -477,6 +510,13 @@ class SyncClockControl(Static):
         if event.key == "enter" and not self.disabled:
             self.post_message(self.Activated())
             event.stop()
+
+
+# The value/status column starts exactly where "[ SYNC NOW ]" itself
+# starts on SyncClockControl's own row (see its __init__) -- matching
+# that offset, rather than centering, is what item 12 requires ("The
+# second line should align with the value/action column").
+CLOCK_STATUS_INDENT = " " * (len(CONNECTION_ROW_PREFIX) + CONNECTION_LABEL_WIDTH + 1)
 
 
 class ChannelSelector(KeyboardDropdown):
@@ -593,7 +633,7 @@ class EmojiPicker(Static):
     def __init__(self) -> None:
         super().__init__(classes="emoji-picker", markup=False)
         self.highlighted_index = 0
-        default_palette = THEME_PALETTES["white"]
+        default_palette = THEME_PALETTES["snow"]
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
 
@@ -727,11 +767,19 @@ class RadioSettingApplied(Message):
 
 
 class ClockSyncApplied(Message):
-    """One RadioService.sync_clock() call finished (see _apply_sync_clock)."""
+    """One RadioService.sync_clock() call finished (see _apply_sync_clock).
 
-    def __init__(self, result: ClockSyncResult) -> None:
+    `generation` identifies WHICH _begin_sync_clock() attempt this is --
+    see clock_sync_applied's own guard: a completion whose generation no
+    longer matches the app's current one is stale (the watchdog already
+    resolved it, see CLOCK_SYNC_WATCHDOG_SECONDS) and is safely ignored
+    rather than reverting an already-terminal UI state.
+    """
+
+    def __init__(self, result: ClockSyncResult, generation: int) -> None:
         super().__init__()
         self.result = result
+        self.generation = generation
 
 
 class LoadOlderControl(Static):
@@ -764,14 +812,29 @@ class EndOfChatHistoryMarker(Static):
         )
 
 
+# U+27F2 ANTICLOCKWISE GAPPED CIRCLE ARROW -- a plain, Narrow-width
+# text glyph (never emoji-presentation), replacing the literal word
+# "RESEND". DEL keeps its existing bracketed text; only RESEND becomes
+# a bare glyph (see item 2 of the CHAT-action task).
+RESEND_GLYPH = "⟲"
 MESSAGE_ACTION_LABELS: dict[str, str] = {
-    "resend": "[ RESEND ]",
+    "resend": RESEND_GLYPH,
     "delete": "[ DEL ]",
 }
 
 
 class MessageActionControl(Static):
-    """A contextual action beneath a message; ready for future action kinds."""
+    """A contextual action beneath a message; ready for future action kinds.
+
+    Vertical CHAT navigation only ever stops on the "resend" control
+    (see MeshtasticPassApp._chat_navigation_targets) -- "delete" is
+    reachable only by an explicit horizontal move (see on_key below),
+    never a vertical one, so UP/DOWN can never land on DEL directly.
+    `paired_control` links the two action controls for one message to
+    each other (set once, right after both are constructed -- see
+    ChatEntryWidget.__init__), letting each one move focus to its
+    sibling with no separate lookup/query needed.
+    """
 
     can_focus = True
 
@@ -783,6 +846,7 @@ class MessageActionControl(Static):
     def __init__(self, entry: ChatEntry, action: str = "resend") -> None:
         self.entry = entry
         self.action = action
+        self.paired_control: "MessageActionControl | None" = None
         super().__init__(
             MESSAGE_ACTION_LABELS[action],
             classes="message-action chat-nav-target",
@@ -792,6 +856,18 @@ class MessageActionControl(Static):
     def on_key(self, event: Key) -> None:
         if event.key == "enter":
             self.post_message(self.Activated(self))
+            event.stop()
+        elif event.key == "right" and self.action == "resend":
+            # RIGHT from RESEND -> DEL, one deliberate move away --
+            # never triggered by navigation alone (see item 6). Stops
+            # here so the transcript's own RIGHT ("jump to present and
+            # type") never fires for this specific focus target.
+            if self.paired_control is not None:
+                self.paired_control.focus()
+            event.stop()
+        elif event.key == "left" and self.action == "delete":
+            if self.paired_control is not None:
+                self.paired_control.focus()
             event.stop()
 
 
@@ -1901,7 +1977,7 @@ class MeshTopologyView(Container):
         self._relay_stages = ()
         self._selected_node_id = ""
         self._edge_node_ids = frozenset()
-        self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
+        self.board.query_one(MeshCanvas).render_scene(1, 1, (), "snow")
 
     def select_node(self, node_id: str) -> None:
         """Select a real working-set node by ID; anything else is a no-op.
@@ -2171,6 +2247,8 @@ class ChatEntryWidget(Vertical):
         self.action_control.display = False
         self.delete_control = MessageActionControl(entry, action="delete")
         self.delete_control.display = False
+        self.action_control.paired_control = self.delete_control
+        self.delete_control.paired_control = self.action_control
         classes = "chat-entry new-message" if is_new else "chat-entry"
         if self.favorite:
             classes += " favorite-sender"
@@ -2248,34 +2326,34 @@ class MeshtasticPassApp(App[None]):
 
     TITLE = "MeshtasticPass"
     CSS = f"""
-    $white_dim: {THEME_PALETTES["white"].dim_base};
-    $green_dim: {THEME_PALETTES["green"].dim_base};
-    $orange_dim: {THEME_PALETTES["orange"].dim_base};
-    $white_accent: {THEME_PALETTES["white"].accent};
-    $green_accent: {THEME_PALETTES["green"].accent};
-    $orange_accent: {THEME_PALETTES["orange"].accent};
+    $snow_base: {THEME_PALETTES["snow"].base};
+    $snow_accent: {THEME_PALETTES["snow"].accent};
+    $snow_accent2: {THEME_PALETTES["snow"].accent2};
+    $snow_dim: {THEME_PALETTES["snow"].dim};
+    $snow_confirm: {THEME_PALETTES["snow"].confirm};
+    $amber_base: {THEME_PALETTES["amber"].base};
+    $amber_accent: {THEME_PALETTES["amber"].accent};
+    $amber_accent2: {THEME_PALETTES["amber"].accent2};
+    $amber_dim: {THEME_PALETTES["amber"].dim};
+    $amber_confirm: {THEME_PALETTES["amber"].confirm};
     $error: {ERROR};
     $selection_background: #181818;
     """ + """
     Screen {
         background: #101010;
-        color: #d8d8d8;
+        color: $snow_base;
         layers: base popup;
     }
 
-    Screen.theme-green {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange {
-        color: #ff8c00;
+    Screen.theme-amber {
+        color: $amber_base;
     }
 
     #tab-bar {
         height: 3;
         padding: 1 1 0 1;
         background: #101010;
-        color: $white_dim;
+        color: $snow_dim;
     }
 
     #content {
@@ -2290,17 +2368,17 @@ class MeshtasticPassApp(App[None]):
     #connection {
         overflow-x: hidden;
         scrollbar-size: 1 1;
-        scrollbar-color: #d8d8d8;
-        scrollbar-color-hover: #d8d8d8;
-        scrollbar-color-active: #d8d8d8;
-        scrollbar-background: $white_dim;
-        scrollbar-background-hover: $white_dim;
-        scrollbar-background-active: $white_dim;
+        scrollbar-color: $snow_base;
+        scrollbar-color-hover: $snow_base;
+        scrollbar-color-active: $snow_base;
+        scrollbar-background: $snow_dim;
+        scrollbar-background-hover: $snow_dim;
+        scrollbar-background-active: $snow_dim;
     }
 
     .page-title {
         height: 2;
-        color: #f2f2f2;
+        color: $snow_accent;
         text-style: bold;
     }
 
@@ -2338,7 +2416,11 @@ class MeshtasticPassApp(App[None]):
     .identity-name-unavailable {
         width: auto;
         height: 1;
-        color: $white_dim;
+        color: $snow_dim;
+    }
+
+    Screen.theme-amber .identity-name-unavailable {
+        color: $amber_dim;
     }
 
     #long-name-input, #short-name-input {
@@ -2347,12 +2429,22 @@ class MeshtasticPassApp(App[None]):
         border: none;
         padding: 0;
         background: #101010;
-        color: #d8d8d8;
+        color: $snow_base;
+    }
+
+    Screen.theme-amber #long-name-input,
+    Screen.theme-amber #short-name-input {
+        color: $amber_base;
     }
 
     #long-name-input:disabled, #short-name-input:disabled {
-        color: $white_dim;
+        color: $snow_dim;
         opacity: 1;
+    }
+
+    Screen.theme-amber #long-name-input:disabled,
+    Screen.theme-amber #short-name-input:disabled {
+        color: $amber_dim;
     }
 
     #identity-status {
@@ -2361,31 +2453,33 @@ class MeshtasticPassApp(App[None]):
     }
 
     #identity-status {
-        color: #39ff14;
+        color: $snow_confirm;
+    }
+
+    Screen.theme-amber #identity-status {
+        color: $amber_confirm;
     }
 
     #identity-status.setting-error {
         color: $error;
     }
 
-    Screen.theme-green #long-name-input,
-    Screen.theme-green #short-name-input {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #long-name-input,
-    Screen.theme-orange #short-name-input {
-        color: #ff8c00;
-    }
-
     .keyboard-dropdown {
         height: auto;
         min-height: 2;
-        color: #d8d8d8;
+        color: $snow_base;
+    }
+
+    Screen.theme-amber .keyboard-dropdown {
+        color: $amber_base;
     }
 
     .keyboard-dropdown:focus {
-        color: #f2f2f2;
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber .keyboard-dropdown:focus {
+        color: $amber_accent;
     }
 
     #connection .connection-action-row {
@@ -2401,24 +2495,12 @@ class MeshtasticPassApp(App[None]):
         background: $selection_background;
     }
 
-    Screen.theme-green .keyboard-dropdown,
-    Screen.theme-green #chat-input {
-        color: #39ff14;
+    Screen.theme-amber #chat-input {
+        color: $amber_base;
     }
 
-    Screen.theme-orange .keyboard-dropdown,
-    Screen.theme-orange #chat-input {
-        color: #ff8c00;
-    }
-
-    Screen.theme-green .keyboard-dropdown:focus,
-    Screen.theme-green .page-title {
-        color: #7cff6b;
-    }
-
-    Screen.theme-orange .keyboard-dropdown:focus,
-    Screen.theme-orange .page-title {
-        color: #ffb000;
+    Screen.theme-amber .page-title {
+        color: $amber_accent;
     }
 
     #chat-title {
@@ -2431,21 +2513,28 @@ class MeshtasticPassApp(App[None]):
         height: 2;
     }
 
-    #style-status.setting-success, #radio-status.setting-success,
-    #radio-clock-status.setting-success {
-        color: $white_accent;
+    .setting-success {
+        color: $snow_confirm;
     }
 
-    Screen.theme-green #style-status.setting-success,
-    Screen.theme-green #radio-status.setting-success,
-    Screen.theme-green #radio-clock-status.setting-success {
-        color: $green_accent;
+    Screen.theme-amber .setting-success {
+        color: $amber_confirm;
     }
 
-    Screen.theme-orange #style-status.setting-success,
-    Screen.theme-orange #radio-status.setting-success,
-    Screen.theme-orange #radio-clock-status.setting-success {
-        color: $orange_accent;
+    .setting-syncing {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber .setting-syncing {
+        color: $amber_accent;
+    }
+
+    .setting-unconfirmed {
+        color: $snow_accent2;
+    }
+
+    Screen.theme-amber .setting-unconfirmed {
+        color: $amber_accent2;
     }
 
     #connection-error, #send-error, #style-status.setting-error,
@@ -2456,68 +2545,47 @@ class MeshtasticPassApp(App[None]):
     }
 
     #sync-clock-control {
-        color: $white_accent;
+        color: $snow_accent;
     }
 
-    Screen.theme-green #sync-clock-control {
-        color: $green_accent;
-    }
-
-    Screen.theme-orange #sync-clock-control {
-        color: $orange_accent;
+    Screen.theme-amber #sync-clock-control {
+        color: $amber_accent;
     }
 
     #sync-clock-control:disabled {
-        color: $white_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green #sync-clock-control:disabled {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange #sync-clock-control:disabled {
-        color: $orange_dim;
+    Screen.theme-amber #sync-clock-control:disabled {
+        color: $amber_dim;
     }
 
     #send-error.older-message-notice {
-        color: #39ff14;
+        color: $snow_accent;
     }
 
-    Screen.theme-green #send-error.older-message-notice {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange #send-error.older-message-notice {
-        color: #d8d8d8;
+    Screen.theme-amber #send-error.older-message-notice {
+        color: $amber_accent;
     }
 
     #chat-log {
         height: 1fr;
         scrollbar-size: 1 1;
-        scrollbar-color: #d8d8d8;
-        scrollbar-color-hover: #d8d8d8;
-        scrollbar-color-active: #d8d8d8;
-        scrollbar-background: $white_dim;
-        scrollbar-background-hover: $white_dim;
-        scrollbar-background-active: $white_dim;
+        scrollbar-color: $snow_base;
+        scrollbar-color-hover: $snow_base;
+        scrollbar-color-active: $snow_base;
+        scrollbar-background: $snow_dim;
+        scrollbar-background-hover: $snow_dim;
+        scrollbar-background-active: $snow_dim;
     }
 
-    Screen.theme-green #chat-log, Screen.theme-green #connection {
-        scrollbar-color: #39ff14;
-        scrollbar-color-hover: #39ff14;
-        scrollbar-color-active: #39ff14;
-        scrollbar-background: $green_dim;
-        scrollbar-background-hover: $green_dim;
-        scrollbar-background-active: $green_dim;
-    }
-
-    Screen.theme-orange #chat-log, Screen.theme-orange #connection {
-        scrollbar-color: #ff8c00;
-        scrollbar-color-hover: #ff8c00;
-        scrollbar-color-active: #ff8c00;
-        scrollbar-background: $orange_dim;
-        scrollbar-background-hover: $orange_dim;
-        scrollbar-background-active: $orange_dim;
+    Screen.theme-amber #chat-log, Screen.theme-amber #connection {
+        scrollbar-color: $amber_base;
+        scrollbar-color-hover: $amber_base;
+        scrollbar-color-active: $amber_base;
+        scrollbar-background: $amber_dim;
+        scrollbar-background-hover: $amber_dim;
+        scrollbar-background-active: $amber_dim;
     }
 
     #mesh-status, #mesh-bottom-row {
@@ -2525,41 +2593,29 @@ class MeshtasticPassApp(App[None]):
     }
 
     #mesh-status {
-        color: $white_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green #mesh-status {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange #mesh-status {
-        color: $orange_dim;
+    Screen.theme-amber #mesh-status {
+        color: $amber_dim;
     }
 
     #mesh-context-status {
         width: 1fr;
-        color: #d8d8d8;
+        color: $snow_base;
     }
 
-    Screen.theme-green #mesh-context-status {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #mesh-context-status {
-        color: #ff8c00;
+    Screen.theme-amber #mesh-context-status {
+        color: $amber_base;
     }
 
     #mesh-last-update {
         width: auto;
-        color: #d8d8d8;
+        color: $snow_base;
     }
 
-    Screen.theme-green #mesh-last-update {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #mesh-last-update {
-        color: #ff8c00;
+    Screen.theme-amber #mesh-last-update {
+        color: $amber_base;
     }
 
     #mesh-view {
@@ -2590,100 +2646,75 @@ class MeshtasticPassApp(App[None]):
         content-align: center middle;
     }
 
-    Screen.theme-green .identity-name-unavailable {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange .identity-name-unavailable {
-        color: $orange_dim;
-    }
-
     .viewport-menu {
         layer: popup;
         position: absolute;
         background: #101010;
-        border: solid $white_dim;
+        border: solid $snow_dim;
         padding: 0;
         scrollbar-size: 1 1;
-        scrollbar-color: #d8d8d8;
-        scrollbar-background: $white_dim;
+        scrollbar-color: $snow_base;
+        scrollbar-background: $snow_dim;
     }
 
     .viewport-menu-row {
         height: 1;
         padding: 0 1;
-        color: #d8d8d8;
+        color: $snow_base;
     }
 
     .viewport-menu-row.highlighted {
-        color: #39ff14;
+        color: $snow_accent;
         text-style: bold reverse;
     }
 
     .viewport-menu-row.informational {
-        color: $white_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green .viewport-menu {
-        border: solid $green_dim;
-        scrollbar-color: #39ff14;
-        scrollbar-background: $green_dim;
+    Screen.theme-amber .viewport-menu {
+        border: solid $amber_dim;
+        scrollbar-color: $amber_base;
+        scrollbar-background: $amber_dim;
     }
 
-    Screen.theme-green .viewport-menu-row {
-        color: #39ff14;
+    Screen.theme-amber .viewport-menu-row {
+        color: $amber_base;
     }
 
-    Screen.theme-green .viewport-menu-row.highlighted {
-        color: #ff8c00;
+    Screen.theme-amber .viewport-menu-row.highlighted {
+        color: $amber_accent;
     }
 
-    Screen.theme-green .viewport-menu-row.informational {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange .viewport-menu {
-        border: solid $orange_dim;
-        scrollbar-color: #ff8c00;
-        scrollbar-background: $orange_dim;
-    }
-
-    Screen.theme-orange .viewport-menu-row {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .viewport-menu-row.highlighted {
-        color: #d8d8d8;
-    }
-
-    Screen.theme-orange .viewport-menu-row.informational {
-        color: $orange_dim;
+    Screen.theme-amber .viewport-menu-row.informational {
+        color: $amber_dim;
     }
 
     .emoji-picker {
         layer: popup;
         position: absolute;
         background: #101010;
-        border: solid $white_dim;
+        border: solid $snow_dim;
         height: 3;
         /* 1 cell left, 2 cells right -- see EMOJI_PICKER_PADDING_CELLS
            for why the right side carries an extra safety cell. */
         padding: 0 2 0 1;
     }
 
-    Screen.theme-green .emoji-picker {
-        border: solid $green_dim;
-    }
-
-    Screen.theme-orange .emoji-picker {
-        border: solid $orange_dim;
+    Screen.theme-amber .emoji-picker {
+        border: solid $amber_dim;
     }
 
     #load-older, .message-action {
         width: auto;
         height: 1;
-        color: #d8d8d8;
+        color: $snow_base;
         margin-bottom: 1;
+    }
+
+    Screen.theme-amber #load-older,
+    Screen.theme-amber .message-action {
+        color: $amber_base;
     }
 
     .message-action-row {
@@ -2695,30 +2726,16 @@ class MeshtasticPassApp(App[None]):
         width: 1fr;
         height: 1;
         margin-bottom: 1;
-        color: $white_dim;
+        color: $snow_dim;
         text-align: center;
     }
 
-    Screen.theme-green #end-of-chat-history {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange #end-of-chat-history {
-        color: $orange_dim;
+    Screen.theme-amber #end-of-chat-history {
+        color: $amber_dim;
     }
 
     #load-older:focus, .message-action:focus {
         text-style: reverse;
-    }
-
-    Screen.theme-green #load-older,
-    Screen.theme-green .message-action {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #load-older,
-    Screen.theme-orange .message-action {
-        color: #ff8c00;
     }
 
     .chat-entry {
@@ -2750,77 +2767,63 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    Screen.theme-white .chat-entry.favorite-sender .chat-entry-author {
-        color: #39ff14;
+    .chat-entry.favorite-sender .chat-entry-author {
+        color: $snow_accent;
     }
 
-    Screen.theme-green .chat-entry.favorite-sender .chat-entry-author {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .chat-entry.favorite-sender .chat-entry-author {
-        color: #d8d8d8;
+    Screen.theme-amber .chat-entry.favorite-sender .chat-entry-author {
+        color: $amber_accent;
     }
 
     .chat-entry-separator, .chat-entry-delivery {
         width: auto;
-        color: $white_dim;
+        color: $snow_dim;
     }
 
     .chat-entry-timestamp, .chat-entry-distance {
         width: auto;
-        color: $white_dim;
+        color: $snow_dim;
         text-style: dim;
     }
 
-    Screen.theme-green .chat-entry-timestamp,
-    Screen.theme-green .chat-entry-distance {
-        color: $green_dim;
+    Screen.theme-amber .chat-entry-timestamp,
+    Screen.theme-amber .chat-entry-distance {
+        color: $amber_dim;
     }
 
-    Screen.theme-orange .chat-entry-timestamp,
-    Screen.theme-orange .chat-entry-distance {
-        color: $orange_dim;
+    Screen.theme-amber .chat-entry-separator,
+    Screen.theme-amber .chat-entry-delivery {
+        color: $amber_dim;
     }
 
-    Screen.theme-green .chat-entry-separator,
-    Screen.theme-green .chat-entry-delivery {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange .chat-entry-separator,
-    Screen.theme-orange .chat-entry-delivery {
-        color: $orange_dim;
-    }
-
+    /* Delivery color grammar (item 9/28): -> animated = ACCENT,
+       ✓ SENT = BASE, ✓✓ HEARD = ACCENT, ⟐ UNCONFIRMED = ACCENT2,
+       ✕ FAILED/INTERRUPTED = ERROR. Semantics (DeliveryState) are
+       unchanged -- only which token each visible glyph resolves to. */
     .chat-entry.delivery-sending .chat-entry-delivery,
-    .chat-entry.delivery-sent .chat-entry-delivery,
-    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #39ff14;
-    }
-
-    Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery,
-    Screen.theme-green .chat-entry.delivery-sent .chat-entry-delivery,
-    Screen.theme-green .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery,
-    Screen.theme-orange .chat-entry.delivery-sent .chat-entry-delivery,
-    Screen.theme-orange .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #d8d8d8;
-    }
-
     .chat-entry.delivery-heard .chat-entry-delivery {
-        color: #d8d8d8;
+        color: $snow_accent;
     }
 
-    Screen.theme-green .chat-entry.delivery-heard .chat-entry-delivery {
-        color: #39ff14;
+    Screen.theme-amber .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-amber .chat-entry.delivery-heard .chat-entry-delivery {
+        color: $amber_accent;
     }
 
-    Screen.theme-orange .chat-entry.delivery-heard .chat-entry-delivery {
-        color: #ff8c00;
+    .chat-entry.delivery-sent .chat-entry-delivery {
+        color: $snow_base;
+    }
+
+    Screen.theme-amber .chat-entry.delivery-sent .chat-entry-delivery {
+        color: $amber_base;
+    }
+
+    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: $snow_accent2;
+    }
+
+    Screen.theme-amber .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: $amber_accent2;
     }
 
     .chat-entry.delivery-failed .chat-entry-delivery,
@@ -2832,25 +2835,18 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
-    Screen.theme-white .chat-entry.new-message .chat-entry-author,
-    Screen.theme-white .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-white .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-white .chat-entry.new-message .chat-entry-text {
-        color: #39ff14;
+    .chat-entry.new-message .chat-entry-author,
+    .chat-entry.new-message .chat-entry-timestamp,
+    .chat-entry.new-message .chat-entry-distance,
+    .chat-entry.new-message .chat-entry-text {
+        color: $snow_accent;
     }
 
-    Screen.theme-green .chat-entry.new-message .chat-entry-author,
-    Screen.theme-green .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-green .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-green .chat-entry.new-message .chat-entry-text {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .chat-entry.new-message .chat-entry-author,
-    Screen.theme-orange .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-orange .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-orange .chat-entry.new-message .chat-entry-text {
-        color: #d8d8d8;
+    Screen.theme-amber .chat-entry.new-message .chat-entry-author,
+    Screen.theme-amber .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-amber .chat-entry.new-message .chat-entry-distance,
+    Screen.theme-amber .chat-entry.new-message .chat-entry-text {
+        color: $amber_accent;
     }
 
     #chat-input {
@@ -2858,7 +2854,7 @@ class MeshtasticPassApp(App[None]):
         border: none;
         padding: 0;
         background: #101010;
-        color: #f2f2f2;
+        color: $snow_base;
     }
 
     #chat-input:focus {
@@ -2867,33 +2863,28 @@ class MeshtasticPassApp(App[None]):
 
     #chat-new-below {
         height: 1;
-        color: #ffb000;
+        color: $snow_accent;
         text-align: right;
+    }
+
+    Screen.theme-amber #chat-new-below {
+        color: $amber_accent;
     }
 
     #footer {
         height: 2;
         padding: 0 1;
-        border-top: solid $white_dim;
-        color: $white_dim;
+        border-top: solid $snow_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green #tab-bar,
-    Screen.theme-green #footer {
-        color: $green_dim;
+    Screen.theme-amber #tab-bar,
+    Screen.theme-amber #footer {
+        color: $amber_dim;
     }
 
-    Screen.theme-orange #tab-bar,
-    Screen.theme-orange #footer {
-        color: $orange_dim;
-    }
-
-    Screen.theme-green #footer {
-        border-top: solid $green_dim;
-    }
-
-    Screen.theme-orange #footer {
-        border-top: solid $orange_dim;
+    Screen.theme-amber #footer {
+        border-top: solid $amber_dim;
     }
     """
 
@@ -2929,6 +2920,14 @@ class MeshtasticPassApp(App[None]):
         # None until the first successful sync.
         self._last_clock_sync_at: float | None = None
         self._clock_sync_in_progress = False
+        # Identifies the CURRENT _begin_sync_clock() attempt -- see
+        # ClockSyncApplied/CLOCK_SYNC_WATCHDOG_SECONDS: a completion or
+        # watchdog firing for a stale (superseded/already-resolved)
+        # generation is ignored, so a late orphaned completion from a
+        # genuinely stuck underlying call can never revert an
+        # already-terminal UI state back to "syncing".
+        self._clock_sync_generation = 0
+        self._sync_clock_watchdog_timer: Timer | None = None
         # Whether AUTO SYNC has already run once for the CURRENT
         # connection lifecycle (see _maybe_auto_sync_clock/item 17) --
         # reset only when _show_connection sees a genuine non-ONLINE ->
@@ -2987,9 +2986,9 @@ class MeshtasticPassApp(App[None]):
                 yield CompassSelector(True)
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
+                yield SyncClockControl()
                 yield Static(id="radio-clock-status", markup=False)
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
-                yield SyncClockControl()
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield ChannelSelector(self._channels, self.current_channel_index)
@@ -3228,8 +3227,8 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
-                    self.query_one(AutoSyncSelector),
                     self.query_one(SyncClockControl),
+                    self.query_one(AutoSyncSelector),
                 )
                 if not getattr(control, "disabled", False)
             ]
@@ -3286,6 +3285,7 @@ class MeshtasticPassApp(App[None]):
             lambda: self._save_long_name_from_thread(long_name),
             thread=True,
             name="save-radio-long-name",
+            group="save-radio-long-name",
             exclusive=True,
         )
 
@@ -3325,6 +3325,7 @@ class MeshtasticPassApp(App[None]):
             lambda: self._save_short_name_from_thread(short_name),
             thread=True,
             name="save-radio-short-name",
+            group="save-radio-short-name",
             exclusive=True,
         )
 
@@ -3416,11 +3417,9 @@ class MeshtasticPassApp(App[None]):
         if event.setting_name == "clock_auto_sync":
             self.settings.set_clock_auto_sync(bool(event.value))
             self.settings.save()
-            clock_status = self.query_one("#radio-clock-status", Static)
-            clock_status.remove_class("setting-error")
-            clock_status.add_class("setting-success")
-            clock_status.update(
-                "AUTO SYNC ENABLED" if event.value else "AUTO SYNC DISABLED"
+            self._set_clock_status(
+                "AUTO SYNC ENABLED" if event.value else "AUTO SYNC DISABLED",
+                "setting-success",
             )
             return
 
@@ -3508,6 +3507,7 @@ class MeshtasticPassApp(App[None]):
             ),
             thread=True,
             name="apply-radio-setting",
+            group="apply-radio-setting",
             exclusive=True,
         )
 
@@ -3574,26 +3574,67 @@ class MeshtasticPassApp(App[None]):
         """
         self._begin_sync_clock()
 
+    _CLOCK_STATUS_CLASSES = (
+        "setting-success",
+        "setting-error",
+        "setting-syncing",
+        "setting-unconfirmed",
+    )
+
+    def _set_clock_status(self, text: str, css_class: str | None) -> None:
+        """The one place #radio-clock-status is ever written -- keeps
+
+        the value-column indent (item 12) and the semantic color class
+        (item 13/29) in sync at every call site instead of repeating
+        both by hand. `css_class` is one of setting-success (CONFIRM),
+        setting-error (ERROR), setting-syncing (ACCENT), setting-
+        unconfirmed (ACCENT2), or None for plain BASE-colored
+        informational text.
+        """
+        status = self.query_one("#radio-clock-status", Static)
+        for name in self._CLOCK_STATUS_CLASSES:
+            status.remove_class(name)
+        if css_class is not None:
+            status.add_class(css_class)
+        status.update(f"{CLOCK_STATUS_INDENT}{text}")
+
     def _begin_sync_clock(self) -> None:
         control = self.query_one(SyncClockControl)
-        status = self.query_one("#radio-clock-status", Static)
         if self._clock_sync_in_progress or control.disabled:
+            # Item 18: a repeated activation while already syncing must
+            # never enqueue a second admin write -- silently ignored,
+            # exactly like every other guarded action in this class.
             return
         if self._radio_state is not RadioState.ONLINE:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
-            status.update("SYNC CLOCK UNAVAILABLE — RADIO NOT CONNECTED")
+            self._set_clock_status(
+                "SYNC CLOCK UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+            )
             return
+        self._clock_sync_generation += 1
+        generation = self._clock_sync_generation
         self._clock_sync_in_progress = True
         control.disabled = True
-        status.remove_class("setting-success")
-        status.remove_class("setting-error")
-        status.update("SYNCING CLOCK...")
+        self._set_clock_status("SYNCING CLOCK...", "setting-syncing")
+        # Item 18 (worker hygiene): a dedicated group, not the implicit
+        # shared "default" one -- see CLOCK_SYNC_WATCHDOG_SECONDS'
+        # own docstring. Without this, an UNRELATED exclusive RADIO
+        # worker (saving a name, applying a different setting) starting
+        # while a sync is in flight would cancel this worker's Textual-
+        # level bookkeeping via exclusive=True's group-wide cancellation,
+        # even though the two operations have nothing to do with each
+        # other.
         self.run_worker(
-            self._apply_sync_clock_from_thread,
+            lambda: self._apply_sync_clock_from_thread(generation),
             thread=True,
             name="sync-clock",
+            group="sync-clock",
             exclusive=True,
+        )
+        if self._sync_clock_watchdog_timer is not None:
+            self._sync_clock_watchdog_timer.stop()
+        self._sync_clock_watchdog_timer = self.set_timer(
+            CLOCK_SYNC_WATCHDOG_SECONDS,
+            lambda: self._sync_clock_watchdog_expired(generation),
         )
 
     def _maybe_auto_sync_clock(self) -> None:
@@ -3623,19 +3664,48 @@ class MeshtasticPassApp(App[None]):
         self._clock_auto_sync_done_this_connection = True
         self._begin_sync_clock()
 
-    def _apply_sync_clock_from_thread(self) -> None:
+    def _apply_sync_clock_from_thread(self, generation: int) -> None:
         try:
             result = self.radio.sync_clock()
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
             result = ClockSyncResult(False, 0, None, f"error: {detail}")
-        self.post_message(ClockSyncApplied(result))
+        self.post_message(ClockSyncApplied(result, generation))
 
     _CLOCK_SYNC_FAILURE_REASONS = {
         "not_connected": "RADIO NOT CONNECTED",
         "disconnected": "CONNECTION LOST",
         "nak": "REJECTED BY RADIO",
     }
+
+    def _sync_clock_watchdog_expired(self, generation: int) -> None:
+        """Item 14/17's actual fix: guarantees SYNCING CLOCK... is always
+
+        transient, independent of whatever the underlying SDK call is
+        doing (see CLOCK_SYNC_WATCHDOG_SECONDS). A no-op if this
+        generation already resolved normally through clock_sync_applied
+        (the common case) or was already superseded by a newer sync
+        attempt. When it genuinely fires, there is no ACK, no NAK, and
+        no corroborating rxTime -- exactly the existing "timeout"
+        evidence standard (see clock_sync_applied), never negative
+        evidence, so this settles the SAME way that case already does:
+        CLOCK SYNC UNCONFIRMED, control re-enabled, never left stuck.
+
+        Also advances _clock_sync_generation itself: this forced
+        resolution is its own attempt boundary, so if the original
+        (abandoned) call eventually completes late, ClockSyncApplied's
+        own generation check sees it as stale even when no NEWER sync
+        has since started -- otherwise that orphaned completion would
+        still match the unchanged generation and incorrectly overwrite
+        this already-terminal UNCONFIRMED state.
+        """
+        self._sync_clock_watchdog_timer = None
+        if generation != self._clock_sync_generation or not self._clock_sync_in_progress:
+            return
+        self._clock_sync_generation += 1
+        self._clock_sync_in_progress = False
+        self._render_radio_settings()
+        self._set_clock_status("CLOCK SYNC UNCONFIRMED", "setting-unconfirmed")
 
     @on(ClockSyncApplied)
     def clock_sync_applied(self, event: ClockSyncApplied) -> None:
@@ -3647,27 +3717,30 @@ class MeshtasticPassApp(App[None]):
         RPC to positively confirm the write with either (see
         ClockSyncResult's own docstring) -- this app never claims
         stronger confirmation than it actually has.
+
+        A stale generation (see ClockSyncApplied's own docstring) means
+        the watchdog already resolved this attempt, or a newer one has
+        since started -- either way, this late completion must never
+        overwrite an already-terminal (or already-different) UI state.
         """
-        status = self.query_one("#radio-clock-status", Static)
+        if event.generation != self._clock_sync_generation:
+            return
+        if self._sync_clock_watchdog_timer is not None:
+            self._sync_clock_watchdog_timer.stop()
+            self._sync_clock_watchdog_timer = None
         self._clock_sync_in_progress = False
         self._render_radio_settings()
         if event.result.applied:
             self._last_clock_sync_at = time()
-            status.remove_class("setting-error")
-            status.add_class("setting-success")
-            status.update(self._clock_status_text())
+            self._set_clock_status(self._clock_status_text(), "setting-success")
         elif event.result.reason in self._CLOCK_SYNC_FAILURE_REASONS:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
             reason = self._CLOCK_SYNC_FAILURE_REASONS[event.result.reason]
-            status.update(f"CLOCK SYNC FAILED — {reason}")
+            self._set_clock_status(f"CLOCK SYNC FAILED — {reason}", "setting-error")
         else:
             # "timeout" (no ack/nak at all) or "unconfirmed" (a response
             # arrived but didn't corroborate the write) -- see
             # RadioService.sync_clock. Neither is negative evidence.
-            status.remove_class("setting-error")
-            status.remove_class("setting-success")
-            status.update("CLOCK SYNC UNCONFIRMED")
+            self._set_clock_status("CLOCK SYNC UNCONFIRMED", "setting-unconfirmed")
 
     def _clock_status_text(self) -> str:
         if self._last_clock_sync_at is None:
@@ -3764,12 +3837,15 @@ class MeshtasticPassApp(App[None]):
 
         sync_control.disabled = not supports_clock or self._clock_sync_in_progress
         if not self._clock_sync_in_progress:
-            status = self.query_one("#radio-clock-status", Static)
-            status.remove_class("setting-success")
-            status.remove_class("setting-error")
-            status.update(
-                "TIME UNSUPPORTED" if not supports_clock else self._clock_status_text()
-            )
+            if not supports_clock:
+                self._set_clock_status("TIME UNSUPPORTED", None)
+            elif self._last_clock_sync_at is not None:
+                # CLOCK SYNCED persists in CONFIRM across passive
+                # refreshes (e.g. a reconnect) too, not only the instant
+                # clock_sync_applied itself runs (item 29/35).
+                self._set_clock_status(self._clock_status_text(), "setting-success")
+            else:
+                self._set_clock_status(self._clock_status_text(), None)
 
         for dropdown, spec in dropdowns:
             dropdown.set_status_override(None)
@@ -4612,13 +4688,31 @@ class MeshtasticPassApp(App[None]):
         )
 
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
+        """Vertical CHAT stops: every message is exactly ONE stop.
+
+        An actionable (FAILED/UNCONFIRMED) message's stop is its
+        RESEND control (⟲) -- the message's own ChatEntryWidget is
+        excluded so the message doesn't ALSO appear as a separate
+        stop, and DEL is excluded unconditionally (see item 5: "only
+        ⟲ participates in normal vertical message traversal"). An
+        ordinary message keeps its ChatEntryWidget as the stop, same
+        as always.
+        """
         targets: list[Static | ChatEntryWidget] = []
         transcript = self.query_one(ChatTranscript)
         for widget in transcript.walk_children():
-            if isinstance(
-                widget,
-                (LoadOlderControl, ChatEntryWidget, MessageActionControl),
-            ) and widget.display:
+            if isinstance(widget, MessageActionControl):
+                if widget.display and widget.action == "resend":
+                    targets.append(widget)
+                continue
+            if (
+                isinstance(widget, (LoadOlderControl, ChatEntryWidget))
+                and widget.display
+                and not (
+                    isinstance(widget, ChatEntryWidget)
+                    and can_manual_resend(widget.entry)
+                )
+            ):
                 targets.append(widget)
         return targets
 
@@ -4823,6 +4917,23 @@ class MeshtasticPassApp(App[None]):
         """
         if not can_manual_resend(entry):
             return
+        # Item 8: focus must never point at a destroyed widget, and
+        # should prefer landing on whatever remaining target now
+        # occupies DEL's own vertical slot (the next-older message, or
+        # the composer if this was the last one) over a generic
+        # "reset to the transcript" fallback. Captured BEFORE removal:
+        # DEL's own slot is the deleted message's RESEND control's
+        # position (delete_control is never itself a vertical target
+        # -- see _chat_navigation_targets), one past it.
+        targets_before = self._chat_navigation_targets()
+        focus_index = next(
+            (
+                index
+                for index, target in enumerate(targets_before)
+                if isinstance(target, MessageActionControl) and target.entry is entry
+            ),
+            None,
+        )
         entry.deleted = True
         if entry.packet_id is not None:
             pending_sends = getattr(self.radio, "_pending_sends", None)
@@ -4839,6 +4950,15 @@ class MeshtasticPassApp(App[None]):
                 self.chat_store.delete_message(entry.message_id)
             except ChatStoreError as error:
                 self._show_send_error(str(error))
+        if focus_index is not None:
+            remaining = self._chat_navigation_targets()
+            if remaining:
+                target = remaining[min(focus_index, len(remaining) - 1)]
+                target.focus()
+                target.scroll_visible(animate=False)
+                return
+            self._focus_chat_composer()
+            return
         self.query_one(ChatTranscript).focus()
 
     @on(ChatEntryWidget.UserMenuRequested)

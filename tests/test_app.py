@@ -25,6 +25,7 @@ from app import (
     AutoSyncSelector,
     ChannelSelector,
     Clock24HSelector,
+    ClockSyncApplied,
     CompassSelector,
     ConnectionPage,
     ChatTranscript,
@@ -311,11 +312,11 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
             entry = await self._send_and_get_entry(app, pilot)
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
 
-            app._apply_color_theme("green")
+            app._apply_color_theme("amber")
             await pilot.pause()
             self.assertEqual(
                 widget.delivery_label.visual_style.foreground.hex6,
-                THEME_PALETTES["green"].accent.upper(),
+                THEME_PALETTES["amber"].accent.upper(),
             )
 
     async def test_h_resend_uses_the_same_arrow_semantics(self) -> None:
@@ -327,9 +328,13 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
             app._set_delivery_state(entry, DeliveryState.FAILED)
             await pilot.pause()
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            widget.focus()
+            # The message's one vertical stop IS its RESEND control now
+            # (item 5) -- focus it directly rather than the message
+            # widget itself, which is no longer a navigable target
+            # while actionable.
+            widget.action_control.focus()
 
-            await pilot.press("down", "enter")
+            await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
                 if entry.packet_id is not None:
@@ -832,9 +837,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(Clock24HSelector))
             await pilot.press("down")
-            self.assertIs(app.focused, app.query_one(AutoSyncSelector))
-            await pilot.press("down")
             self.assertIs(app.focused, app.query_one(SyncClockControl))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(AutoSyncSelector))
 
     async def test_sync_clock_applies_and_shows_last_sync_time(self) -> None:
         radio = SimulatedRadioService(
@@ -1101,6 +1106,263 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(radio.sync_clock.call_count, 2)
+
+    # ---- RADIO clock UI layout (items 10-13) -----------------------------
+
+    async def test_clock_sync_row_is_inline_below_24_hour_time_no_duplicate(
+        self,
+    ) -> None:
+        """CLOCK SYNC renders as one inline "label   [ SYNC NOW ]" row
+
+        directly below 24 HOUR TIME (item 11), using the same label-
+        column/value-column width math as every neighboring RADIO row
+        (item 12) -- and the old standalone "[ SYNC CLOCK ]" wording is
+        gone entirely (item 10: no duplicate controls).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            control = app.query_one(SyncClockControl)
+            rendered = str(control.render())
+            self.assertNotIn("SYNC CLOCK", rendered)
+            self.assertIn("CLOCK SYNC", rendered)
+            self.assertIn("[ SYNC NOW ]", rendered)
+            # Value column starts at the same offset every other
+            # label-driven RADIO row uses.
+            self.assertEqual(rendered.index("["), 15)
+
+            connection_children = list(app.query_one("#connection").children)
+
+            def index_of(widget_type) -> int:
+                return next(
+                    i
+                    for i, child in enumerate(connection_children)
+                    if isinstance(child, widget_type)
+                )
+
+            clock_index = index_of(Clock24HSelector)
+            sync_index = index_of(SyncClockControl)
+            self.assertEqual(sync_index, clock_index + 1)
+
+            status = app.query_one("#radio-clock-status", Static)
+            status_index = connection_children.index(status)
+            auto_sync_index = index_of(AutoSyncSelector)
+            self.assertEqual(status_index, sync_index + 1)
+            self.assertEqual(auto_sync_index, status_index + 1)
+
+    async def test_clock_status_line_aligns_to_value_column_not_centered(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            rendered = str(status.render())
+            control_rendered = str(app.query_one(SyncClockControl).render())
+            self.assertEqual(
+                len(rendered) - len(rendered.lstrip(" ")),
+                control_rendered.index("["),
+            )
+
+    async def test_clock_status_colors_use_semantic_tokens(self) -> None:
+        """Item 13/29: SYNCING=ACCENT, SYNCED=CONFIRM,
+
+        UNCONFIRMED=ACCENT2, FAILED=ERROR -- never a hardcoded literal.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            palette = THEME_PALETTES[app._current_theme]
+
+            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(status.has_class("setting-syncing"))
+            self.assertEqual(
+                status.visual_style.foreground.hex6, palette.accent.upper()
+            )
+
+            app._sync_clock_watchdog_expired(app._clock_sync_generation)
+            await pilot.pause()
+            self.assertTrue(status.has_class("setting-unconfirmed"))
+            self.assertEqual(
+                status.visual_style.foreground.hex6, palette.accent2.upper()
+            )
+
+            radio.sync_clock = Mock(
+                return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+            )
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "CLOCK SYNCED" in str(status.render()):
+                    break
+            self.assertTrue(status.has_class("setting-success"))
+            self.assertEqual(
+                status.visual_style.foreground.hex6, palette.confirm.upper()
+            )
+
+            radio.sync_clock = Mock(
+                return_value=ClockSyncResult(False, 1_700_000_000, None, "nak")
+            )
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "FAILED" in str(status.render()):
+                    break
+            self.assertTrue(status.has_class("setting-error"))
+            self.assertEqual(status.visual_style.foreground.hex6, "#FF1744")
+
+    # ---- Stuck SYNCING CLOCK... watchdog (item 14/15/17) ------------------
+
+    async def test_stuck_sync_reaches_unconfirmed_via_watchdog_without_real_wait(
+        self,
+    ) -> None:
+        """The root-cause fix: even if RadioService.sync_clock() never
+
+        returns at all, the UI must still reach a terminal state --
+        SYNCING CLOCK... is never permanent (item 15). Directly invokes
+        the watchdog callback (same convention as
+        _auto_dismiss_send_error) instead of waiting the real
+        CLOCK_SYNC_WATCHDOG_SECONDS duration (item 17).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
+            control = app.query_one(SyncClockControl)
+            status = app.query_one("#radio-clock-status", Static)
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("SYNCING", str(status.render()))
+            self.assertTrue(control.disabled)
+            self.assertTrue(app._clock_sync_in_progress)
+
+            app._sync_clock_watchdog_expired(app._clock_sync_generation)
+            await pilot.pause()
+
+            self.assertNotIn("SYNCING", str(status.render()))
+            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+            self.assertFalse(app._clock_sync_in_progress)
+            self.assertFalse(control.disabled)  # SYNC NOW usable again
+
+    async def test_watchdog_is_a_noop_once_already_resolved_normally(self) -> None:
+        """A watchdog scheduled for a sync that already completed on its
+
+        own must never re-trigger or corrupt the now-settled UI state.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "CLOCK SYNCED" in str(status.render()):
+                    break
+            resolved_generation = app._clock_sync_generation
+
+            app._sync_clock_watchdog_expired(resolved_generation)
+            await pilot.pause()
+
+            self.assertIn("CLOCK SYNCED", str(status.render()))
+            self.assertTrue(status.has_class("setting-success"))
+
+    async def test_late_orphaned_completion_after_watchdog_is_ignored(self) -> None:
+        """A genuinely-stuck sync_clock() call that eventually completes
+
+        AFTER the watchdog already resolved it to UNCONFIRMED must not
+        revert the UI, and must not corrupt a NEWER sync attempt either
+        -- the stale generation is dropped silently.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
+            status = app.query_one("#radio-clock-status", Static)
+            control = app.query_one(SyncClockControl)
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            stale_generation = app._clock_sync_generation
+
+            app._sync_clock_watchdog_expired(stale_generation)
+            await pilot.pause()
+            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+
+            # The original (now-orphaned) attempt finally "completes" --
+            # its stale-generation ClockSyncApplied must be ignored.
+            app.post_message(
+                ClockSyncApplied(
+                    ClockSyncResult(True, 1_700_000_000, 1_700_000_000, ""),
+                    stale_generation,
+                )
+            )
+            await pilot.pause()
+            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+            self.assertFalse(app._clock_sync_in_progress)
+
+    async def test_repeated_sync_now_activation_sends_only_one_write(self) -> None:
+        """Item 18: while already syncing, SYNC NOW must not enqueue a
+
+        second admin write -- disabled/ignored safely.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
+            control = app.query_one(SyncClockControl)
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+            app._sync_clock_watchdog_expired(app._clock_sync_generation)
+            await pilot.pause()
+            self.assertFalse(control.disabled)
+
+            radio.sync_clock = Mock(
+                return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+            )
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
 
     async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
         radio = SimulatedRadioService(
@@ -1627,8 +1889,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             font_selector = app.query_one(FontSizeSelector)
             color_selector = app.query_one(ColorSelector)
             self.assertTrue(font_selector.has_focus)
-            self.assertEqual(color_selector.color, "white")
-            self.assertTrue(app.screen.has_class("theme-white"))
+            self.assertEqual(color_selector.color, "snow")
+            self.assertTrue(app.screen.has_class("theme-snow"))
 
             await pilot.press("down")
             self.assertTrue(color_selector.has_focus)
@@ -1637,15 +1899,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
-            self.assertEqual(color_selector.color, "green")
-            self.assertEqual(self.settings.color, "green")
-            self.assertTrue(app.screen.has_class("theme-green"))
-            self.assertFalse(app.screen.has_class("theme-white"))
+            self.assertEqual(color_selector.color, "amber")
+            self.assertEqual(self.settings.color, "amber")
+            self.assertTrue(app.screen.has_class("theme-amber"))
+            self.assertFalse(app.screen.has_class("theme-snow"))
 
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
-            self.assertEqual(color_selector.color, "orange")
-            self.assertTrue(app.screen.has_class("theme-orange"))
+            # Only SNOW/AMBER exist -- one more DOWN wraps back around.
+            self.assertEqual(color_selector.color, "snow")
+            self.assertTrue(app.screen.has_class("theme-snow"))
 
             await pilot.press("up", "enter", "down", "enter")
             await pilot.pause()
@@ -1653,12 +1916,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             # A fresh install's default is XL (item 4), one DOWN from
             # which is XXL.
             self.assertEqual(font_selector.font_size, 22)
-            self.assertEqual(color_selector.color, "orange")
+            self.assertEqual(color_selector.color, "snow")
 
         reloaded = AppSettings.load(config_path=self.settings.config_path)
-        self.assertEqual(reloaded.color, "orange")
+        self.assertEqual(reloaded.color, "snow")
 
-    async def test_style_status_inherits_white_green_and_orange(self) -> None:
+    async def test_style_status_inherits_snow_and_amber(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -1678,9 +1941,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIn("FONT SIZE SAVED", str(status.render()))
                 self.assertTrue(status.has_class("setting-success"))
+                # setting-success now resolves to CONFIRM, not ACCENT
+                # (item 35: SAVED/APPLIED feedback is success feedback).
                 self.assertEqual(
                     status.visual_style.foreground.hex6,
-                    palette.accent,
+                    palette.confirm,
                 )
 
                 color.value = theme
@@ -1706,7 +1971,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("COLOR SAVED", str(status.render()))
                 self.assertEqual(
                     status.visual_style.foreground.hex6,
-                    palette.accent,
+                    palette.confirm,
                 )
 
             original_save = self.settings.save
@@ -1721,6 +1986,89 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(status.has_class("setting-error"))
             self.assertFalse(status.has_class("setting-success"))
             self.assertEqual(status.visual_style.foreground.hex6, ERROR)
+
+    async def test_only_snow_and_amber_are_selectable(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            color = app.query_one(ColorSelector)
+            self.assertEqual(
+                [option.value for option in color.options], ["snow", "amber"]
+            )
+
+    async def test_theme_switch_generates_zero_rf_or_admin_traffic(self) -> None:
+        """Item 44: changing COLOR must never write to the radio."""
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock()
+            radio.set_long_name = Mock()
+            radio.set_short_name = Mock()
+            radio.write_verified_config_field = Mock()
+
+            for theme in ("amber", "snow", "amber"):
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                color = app.query_one(ColorSelector)
+                await app.dropdown_selected(
+                    KeyboardDropdown.Selected(color, theme)
+                )
+                await pilot.pause()
+
+            radio.sync_clock.assert_not_called()
+            radio.set_long_name.assert_not_called()
+            radio.set_short_name.assert_not_called()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
+    async def test_theme_switch_updates_chat_mesh_radio_and_config_live(self) -> None:
+        """Item 16/31: switching themes must recolor already-rendered
+
+        CHAT, MESH, RADIO, and CONFIG/CONNECTION widgets immediately --
+        no app restart, no re-navigation required.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+            chat_widget = list(app.query(ChatEntryWidget))[-1]
+            author = chat_widget.query_one(".chat-entry-author", Static)
+
+            app.show_tab("mesh")
+            await pilot.pause()
+
+            app.show_tab("connection")
+            color = app.query_one(ColorSelector)
+            font = app.query_one(FontSizeSelector)
+            radio_dropdown = app.query_one(Clock24HSelector)
+
+            for theme in ("amber", "snow"):
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                palette = THEME_PALETTES[theme]
+
+                self.assertEqual(color._base_color, palette.base)
+                self.assertEqual(font._base_color, palette.base)
+                self.assertEqual(radio_dropdown._base_color, palette.base)
+
+                app.show_tab("chat")
+                await pilot.pause()
+                self.assertEqual(
+                    author.visual_style.foreground.hex6, palette.base.upper()
+                )
+                app.show_tab("connection")
+                await pilot.pause()
 
     async def test_chat_unread_counter_tracks_only_hidden_incoming_messages(self) -> None:
         radio = SimulatedRadioService(
@@ -1967,7 +2315,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, color)
             self.assertGreater(page.scroll_y, 0)
             await pilot.press("enter", "down", "enter")
-            self.assertEqual(color.color, "green")
+            self.assertEqual(color.color, "amber")
 
             page.scroll_to(y=0, animate=False)
             await pilot.pause()
@@ -1994,7 +2342,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             position=5,
             thickness=1,
             vertical=True,
-            back_color=Color.parse(THEME_PALETTES["white"].dim_base),
+            back_color=Color.parse(THEME_PALETTES["snow"].dim_base),
             bar_color=Color.parse("#39ff14"),
         )
         thumb_segments = [
@@ -2021,7 +2369,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(
                 segment.style.color.name
-                == THEME_PALETTES["white"].dim_base.lower()
+                == THEME_PALETTES["snow"].dim_base.lower()
                 for segment in track_segments
             )
         )
@@ -2176,7 +2524,15 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             footer = str(app.query_one("#footer", Static).render())
             self.assertNotIn("composer", footer.lower())
 
-    async def test_chat_down_uses_final_resend_and_del_before_composer(self) -> None:
+    async def test_chat_right_reaches_del_and_down_from_resend_reaches_composer(
+        self,
+    ) -> None:
+        """The actionable message is ONE vertical stop, anchored on
+
+        RESEND (item 5) -- DEL is reachable only via an explicit RIGHT
+        from there, never a vertical target itself (item 6), so DOWN
+        from RESEND goes straight to the composer.
+        """
         app = MeshtasticPassApp(
             SimulatedRadioService(
                 connect_delay=0,
@@ -2194,23 +2550,97 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             chat_input = app.query_one("#chat-input", Input)
             chat_input.value = "draft"
 
-            # Seed focus directly on the message (neutral+DOWN now goes
-            # straight to the composer -- see item 6) so this keeps
-            # testing the intra-message walk itself: the message's own
-            # RESEND then DEL MessageActionControls before the composer.
             await pilot.press("escape")
             app._chat_navigation_targets()[0].focus()
             await pilot.pause()
-            self.assertIsInstance(app.focused, ChatEntryWidget)
-            await pilot.press("down")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "resend")
+            await pilot.press("right")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "delete")
+            await pilot.press("left")
             self.assertIsInstance(app.focused, MessageActionControl)
             self.assertEqual(app.focused.action, "resend")
             await pilot.press("down")
-            self.assertIsInstance(app.focused, MessageActionControl)
-            self.assertEqual(app.focused.action, "delete")
-            await pilot.press("down")
             self.assertIs(app.focused, chat_input)
             self.assertEqual(chat_input.value, "draft")
+
+    async def test_repeated_up_traverses_consecutive_actionable_messages_by_resend(
+        self,
+    ) -> None:
+        """Item 5: composer -> newest ⟲ -> previous ⟲ -> previous normal
+
+        message. Never composer -> DEL -> ⟲ -> DEL -> ⟲.
+        """
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            app._accept_received_message(
+                self._plain_incoming_message("!a1", "Alice", "ALCE", "hello", 91001)
+            )
+            first_failed = app._start_outgoing("first failure")
+            app._set_delivery_state(first_failed, DeliveryState.FAILED)
+            second_failed = app._start_outgoing("second failure")
+            app._set_delivery_state(second_failed, DeliveryState.FAILED)
+            await pilot.pause()
+
+            await pilot.press("escape")
+            app.query_one("#chat-input", Input).focus()
+            await pilot.press("up")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "resend")
+            self.assertIs(app.focused.entry, second_failed)
+
+            await pilot.press("up")
+            self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "resend")
+            self.assertIs(app.focused.entry, first_failed)
+
+            await pilot.press("up")
+            self.assertIsInstance(app.focused, ChatEntryWidget)
+            self.assertEqual(app.focused.entry.text, "hello")
+
+    async def test_navigation_alone_never_triggers_resend_or_delete(self) -> None:
+        """UP/DOWN/LEFT/RIGHT only ever move focus -- ENTER is the only
+
+        key that activates a control (item 6: "No action is triggered
+        by navigation alone").
+        """
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            entry = app._start_outgoing("do not touch me")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            app._rebroadcast = Mock()
+
+            await pilot.press("escape")
+            app.query_one("#chat-input", Input).focus()
+            await pilot.press("up")
+            self.assertEqual(app.focused.action, "resend")
+            await pilot.press("right")
+            self.assertEqual(app.focused.action, "delete")
+            await pilot.press("left")
+            self.assertEqual(app.focused.action, "resend")
+            await pilot.press("down")
+            await pilot.press("up")
+
+            app._rebroadcast.assert_not_called()
+            self.assertTrue(can_manual_resend(entry))
+            self.assertEqual(entry.delivery_state, DeliveryState.FAILED)
+            self.assertTrue(
+                any(w.entry is entry for w in app.query(ChatEntryWidget))
+            )
 
     async def test_chat_middle_right_and_empty_navigation_do_not_trap_focus(self) -> None:
         app = MeshtasticPassApp(
@@ -2375,12 +2805,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(unread_widget.has_class("new-message"))
             self.assertEqual(app.unread_count, 0)
 
-            expected_highlight_colors = {
-                "white": "#39FF14",
-                "green": "#FF8C00",
-                "orange": "#D8D8D8",
-            }
-            for theme, expected in expected_highlight_colors.items():
+            for theme in ("snow", "amber"):
+                expected = THEME_PALETTES[theme].accent.upper()
                 app._apply_color_theme(theme)
                 await pilot.pause()
                 for part in (
@@ -2406,16 +2832,17 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app.show_tab("chat")
             await pilot.pause()
             self.assertFalse(unread_widget.has_class("new-message"))
-            self.assertEqual(unread_author.visual_style.foreground.hex6, "#FF8C00")
+            amber_base = THEME_PALETTES["amber"].base.upper()
+            self.assertEqual(unread_author.visual_style.foreground.hex6, amber_base)
             self.assertEqual(
                 unread_timestamp.visual_style.foreground.hex6,
-                THEME_PALETTES["orange"].dim_base,
+                THEME_PALETTES["amber"].dim_base,
             )
             self.assertEqual(
                 unread_distance.visual_style.foreground.hex6,
-                THEME_PALETTES["orange"].dim_base,
+                THEME_PALETTES["amber"].dim_base,
             )
-            self.assertEqual(unread_body.visual_style.foreground.hex6, "#FF8C00")
+            self.assertEqual(unread_body.visual_style.foreground.hex6, amber_base)
 
             app._accept_received_message(incoming)
             visible_widget = list(app.query(ChatEntryWidget))[-1]
@@ -2450,12 +2877,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(entry.delivery_state, DeliveryState.SENT)
             self.assertIn(DeliveryState.SENT, DeliveryState)
 
-            palettes = {
-                "white": ("#39FF14", "#D8D8D8"),
-                "green": ("#FF8C00", "#39FF14"),
-                "orange": ("#D8D8D8", "#FF8C00"),
-            }
-            for theme, (accent, base) in palettes.items():
+            # Item 9/28: -> SENDING=ACCENT, ✓ SENT=BASE, ✓✓ HEARD=ACCENT,
+            # ⟐ UNCONFIRMED=ACCENT2, ✕ FAILED=ERROR.
+            for theme in ("snow", "amber"):
+                palette = THEME_PALETTES[theme]
                 app._apply_color_theme(theme)
 
                 entry.delivery_state = DeliveryState.SENDING
@@ -2465,7 +2890,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     str(widget.delivery_label.render()),
                     ("→", " →"),
                 )
-                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
+                self.assertEqual(
+                    widget.delivery_label.visual_style.foreground.hex6,
+                    palette.accent.upper(),
+                )
 
                 entry.delivery_state = DeliveryState.SENT
                 widget.refresh_delivery_state(2)
@@ -2473,22 +2901,31 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(str(widget.delivery_label.render()), "✓")
                 self.assertFalse(widget.has_class("delivery-sending"))
                 self.assertTrue(widget.has_class("delivery-sent"))
-                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
+                self.assertEqual(
+                    widget.delivery_label.visual_style.foreground.hex6,
+                    palette.base.upper(),
+                )
 
                 entry.delivery_state = DeliveryState.HEARD
                 widget.refresh_delivery_state(1)
                 await pilot.pause()
                 self.assertEqual(str(widget.delivery_label.render()), "✓✓")
-                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, base)
+                self.assertEqual(
+                    widget.delivery_label.visual_style.foreground.hex6,
+                    palette.accent.upper(),
+                )
 
                 entry.delivery_state = DeliveryState.UNCONFIRMED
                 widget.refresh_delivery_state(1)
                 await pilot.pause()
                 self.assertEqual(
                     str(widget.delivery_label.render()),
-                    "UNCONFIRMED",
+                    "⟐",
                 )
-                self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
+                self.assertEqual(
+                    widget.delivery_label.visual_style.foreground.hex6,
+                    palette.accent2.upper(),
+                )
 
                 entry.delivery_state = DeliveryState.FAILED
                 widget.refresh_delivery_state(1)
@@ -2527,7 +2964,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 (DeliveryState.SENT, 1, "✓"),
                 (DeliveryState.HEARD, 1, "✓✓"),
                 (DeliveryState.FAILED, 1, "✕"),
-                (DeliveryState.UNCONFIRMED, 1, "UNCONFIRMED"),
+                (DeliveryState.UNCONFIRMED, 1, "⟐"),
             )
             widths = []
             for state, animation_frame, expected in transitions:
@@ -2544,7 +2981,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(widths[2], widths[1])
             self.assertGreater(widths[3], widths[2])
             self.assertLess(widths[4], widths[3])  # ✕ (1 cell) is narrower than ✓✓ (2 cells)
-            self.assertGreater(widths[5], widths[4])
+            self.assertEqual(widths[5], widths[4])  # ⟐ is also a 1-cell glyph, like ✕
 
     async def test_terminal_cursor_guard_runs_for_app_lifecycle(self) -> None:
         radio = SimulatedRadioService(
@@ -2581,7 +3018,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             app.show_tab("chat")
-            app._apply_color_theme("green")
+            app._apply_color_theme("amber")
 
             # Call the actual RadioService pubsub callback on the app thread.
             # The UI bridge must work from either SDK callback context.
@@ -2605,14 +3042,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("DELAYED", str(widget.timestamp_label.render()))
             radio.interface.sendText.assert_not_called()
             for part in parts:
-                self.assertEqual(part.visual_style.foreground.hex6, "#FF8C00")
+                self.assertEqual(
+                    part.visual_style.foreground.hex6,
+                    THEME_PALETTES["amber"].accent.upper(),
+                )
 
-            expected_new_colors = {
-                "white": "#39FF14",
-                "green": "#FF8C00",
-                "orange": "#D8D8D8",
-            }
-            for theme, expected in expected_new_colors.items():
+            for theme in ("snow", "amber"):
+                expected = THEME_PALETTES[theme].accent.upper()
                 app._apply_color_theme(theme)
                 await pilot.pause()
                 for part in parts:
@@ -3160,9 +3596,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 w for w in app.query(ChatEntryWidget) if w.entry is entry
             )
             self.assertTrue(can_manual_resend(entry))
-            widget.focus()
+            widget.action_control.focus()
             radio.send_text = Mock(side_effect=lambda *args, **kwargs: sleep(3))
-            await pilot.press("down", "enter")
+            await pilot.press("enter")
             await pilot.pause()
 
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
@@ -3289,7 +3725,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(entry.delivery_state, DeliveryState.SENT)
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
             rendered = str(widget.delivery_label.render())
-            self.assertIn("UNCONFIRMED", rendered)
+            self.assertIn("⟐", rendered)
             self.assertNotIn("SENDING", rendered)
             self.assertTrue(can_manual_resend(entry))
             self.assertTrue(widget.action_control.display)
@@ -3310,7 +3746,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 w for w in second_app.query(ChatEntryWidget) if w.entry is reloaded
             )
             rendered = str(widget.delivery_label.render())
-            self.assertIn("UNCONFIRMED", rendered)
+            self.assertIn("⟐", rendered)
             self.assertNotIn("SENDING", rendered)
             self.assertEqual(second_radio.sent_messages, ())
 
@@ -3351,8 +3787,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
             self.assertIs(widget.entry, entry)
 
-            widget.focus()
-            await pilot.press("down", "enter")
+            widget.action_control.focus()
+            await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
                 if entry.delivery_state is DeliveryState.SENT:
@@ -3375,7 +3811,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
             self.assertIs(widget.entry, entry)
-            self.assertIn("UNCONFIRMED", str(widget.delivery_label.render()))
+            self.assertIn("⟐", str(widget.delivery_label.render()))
             self.assertNotIn("✓", str(widget.delivery_label.render()))
 
             raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
@@ -3416,8 +3852,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     widget = next(
                         w for w in app.query(ChatEntryWidget) if w.entry is entry
                     )
-                    widget.focus()
-                    await pilot.press("down", "enter")
+                    widget.action_control.focus()
+                    await pilot.press("enter")
                     for _ in range(10):
                         await pilot.pause()
                         if entry.delivery_state is expected_state:
@@ -3522,9 +3958,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             original_index = app.chat_history.index(entry)
 
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            widget.focus()
+            widget.action_control.focus()
             radio.send_text = Mock(side_effect=lambda *args, **kwargs: sleep(3))
-            await pilot.press("down", "enter")
+            await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
             self.assertEqual(entry.send_generation, 2)
@@ -3608,8 +4044,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             )
 
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            widget.focus()
-            await pilot.press("down", "enter")
+            widget.action_control.focus()
+            await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
                 if entry.delivery_state is DeliveryState.SENT:
@@ -3701,8 +4137,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            widget.focus()
-            await pilot.press("down", "enter")
+            widget.action_control.focus()
+            await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
                 if entry.delivery_state is DeliveryState.SENT:
@@ -3756,8 +4192,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            widget.focus()
-            await pilot.press("down", "enter")
+            widget.action_control.focus()
+            await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
                 if entry.delivery_state is DeliveryState.SENT:
@@ -3827,12 +4263,18 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
 
+            # Selection/focus continuity here is about the MESSAGE
+            # widget itself (see the docstring), independent of the
+            # keyboard-navigation model -- focus the widget directly
+            # and trigger the SAME resend implementation the RESEND
+            # control's Enter handler calls, rather than simulating
+            # DOWN/RIGHT keypresses that would move focus off it.
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
             widget.focus()
             await pilot.pause()
             self.assertTrue(widget.has_focus)
 
-            await pilot.press("down", "enter")
+            app._rebroadcast(entry)
             for _ in range(10):
                 await pilot.pause()
                 if entry.delivery_state is DeliveryState.SENT:
@@ -3870,9 +4312,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._set_delivery_state(entry, DeliveryState.FAILED)
             await pilot.pause()
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            widget.focus()
+            widget.action_control.focus()
             radio.send_text = Mock(side_effect=lambda *args, **kwargs: sleep(3))
-            await pilot.press("down", "enter")
+            await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
 
@@ -4623,7 +5065,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._span_hex(chat_spans[-1]), palette.accent.upper())
 
     async def test_connection_status_color_tracks_theme_switches(self) -> None:
-        """Switching WHITE/GREEN/ORANGE while a temporary status is showing
+        """Switching SNOW/AMBER while a temporary status is showing
 
         must immediately remap to that theme's own BASE+ACCENT at the
         component level -- never leave a previous theme's color stuck
@@ -4635,7 +5077,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             app._show_connection(RadioState.CONNECTING)
             await pilot.pause()
-            for theme in ("white", "green", "orange"):
+            for theme in ("snow", "amber"):
                 app._apply_color_theme(theme)
                 await pilot.pause()
                 palette = THEME_PALETTES[theme]
@@ -4657,7 +5099,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            for theme in ("white", "green", "orange"):
+            for theme in ("snow", "amber"):
                 app._apply_color_theme(theme)
                 palette = THEME_PALETTES[theme]
                 for state, expected in (
@@ -5218,8 +5660,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(immediate.delivery_state, DeliveryState.UNCONFIRMED)
 
             widget = list(app.query(ChatEntryWidget))[-1]
-            widget.focus()
-            await pilot.press("down", "enter")
+            widget.action_control.focus()
+            await pilot.press("enter")
             for _ in range(5):
                 await pilot.pause()
                 if immediate.delivery_state is DeliveryState.SENT:

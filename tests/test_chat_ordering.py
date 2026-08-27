@@ -14,6 +14,7 @@ from app import ChatEntryWidget, ChatTranscript, LoadOlderControl, MeshtasticPas
 from app_settings import AppSettings
 from chat_store import ChatStore
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
+from theme_palette import THEME_PALETTES
 from viewport_menu import ViewportMenu
 
 
@@ -81,11 +82,8 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
             status = app.query_one("#send-error", Static)
             self.assertEqual(str(status.render()), "2 OLDER MESSAGES RECEIVED")
             self.assertTrue(status.has_class("older-message-notice"))
-            for theme, accent in (
-                ("white", "#39FF14"),
-                ("green", "#FF8C00"),
-                ("orange", "#D8D8D8"),
-            ):
+            for theme in ("snow", "amber"):
+                accent = THEME_PALETTES[theme].accent.upper()
                 app._apply_color_theme(theme)
                 await pilot.pause()
                 self.assertEqual(status.visual_style.foreground.hex6, accent)
@@ -357,12 +355,12 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(status.render()), "2 OLDER MESSAGES RECEIVED")
             self.assertEqual(
                 widgets[0].timestamp_label.visual_style.foreground.hex6,
-                "#565656",
+                THEME_PALETTES["snow"].dim_base,
             )
             self.assertEqual(
                 widgets[0].query_one(".chat-entry-author", Static)
                 .visual_style.foreground.hex6,
-                "#D8D8D8",
+                THEME_PALETTES["snow"].base.upper(),
             )
 
             widgets[1].focus()

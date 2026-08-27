@@ -218,7 +218,12 @@ class ChatArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, chat_input)
             self.assertEqual(chat_input.value, "meet at the ridge")
 
-    async def test_composer_up_uses_final_del_and_empty_chat_noops(self) -> None:
+    async def test_composer_up_uses_final_resend_and_empty_chat_noops(self) -> None:
+        """UP from the composer must land on the newest actionable
+
+        message's RESEND control (⟲), never DEL directly (item 5) --
+        DEL is reachable only by an explicit RIGHT from there (item 6).
+        """
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 22)) as pilot:
             app.show_tab("chat")
@@ -235,7 +240,11 @@ class ChatArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             chat_input.value = "draft"
             await pilot.press("up")
             self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "resend")
+            await pilot.press("right")
             self.assertEqual(app.focused.action, "delete")
+            await pilot.press("left")
+            self.assertEqual(app.focused.action, "resend")
             await pilot.press("down")
             self.assertIs(app.focused, chat_input)
             self.assertEqual(chat_input.value, "draft")

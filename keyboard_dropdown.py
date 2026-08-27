@@ -59,7 +59,7 @@ class KeyboardDropdown(Static):
         self.is_open = False
         self._status_override: Text | None = None
         self._highlighted_index = self._selected_index()
-        default_palette = THEME_PALETTES["white"]
+        default_palette = THEME_PALETTES["snow"]
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
         self._subdued_color = default_palette.dim_base
