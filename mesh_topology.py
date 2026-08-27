@@ -120,6 +120,8 @@ def build_relay_stages(
     hop_counts: Mapping[str, int],
     row_count: int,
     column_count: int,
+    row_scale: int = 1,
+    column_scale: int = 1,
 ) -> tuple[tuple[RelayStage, ...], dict[str, tuple[int, int]]]:
     """Generate anonymous relay-stage placeholders for every real CLIENT
 
@@ -139,12 +141,43 @@ def build_relay_stages(
     client's already-fixed grid cell, rounded to the nearest integer
     grid step -- geography sets the rough direction the chain extends
     in, never its exact route. Collisions with real nodes, YOU, or
-    another client's stages are resolved with the same bounded
-    ring-search-then-full-grid-scan fallback place_within_bounds uses
-    (_reserve_bounded_cell), so a stage is never silently dropped as
-    long as the fixed grid has any free cell left. Clients are processed
-    in deterministic node_id order so placement never depends on
+    another client's stages are resolved by _reserve_relay_stage_cell,
+    which -- unlike the generic nearest-any-free-cell search
+    place_within_bounds uses (_reserve_bounded_cell) -- additionally
+    refuses to place a stage such that the segment connecting it to
+    the PREVIOUS stage (or, for the last stage, also the segment onward
+    to the real endpoint) would touch any cell already used by an
+    earlier real node, an earlier relay stage of ANY client, or an
+    earlier segment of THIS SAME client's own chain. A stage may still
+    be nudged sideways by a collision (the route may bend), but never
+    onto a cell that would make the rendered connector retrace or fork
+    off of itself (the route may not branch) -- see
+    _reserve_relay_stage_cell's own docstring for why that self-overlap
+    corrupts the rendered connector, not just this function's own
+    output. Only crossings with ANOTHER client's own chain are left
+    alone (see item 9 of the responsive-viewport/relay-chain task:
+    overlapping line geometry between two DIFFERENT endpoints' routes
+    is expected and never merges their identity) -- only a node's own
+    FINAL position (in `real_positions`/relay `positions`, already in
+    `occupied`) blocks a later client's placement, never an earlier
+    client's interior line cells. A stage is never silently dropped as
+    long as the fixed grid has any free cell left at all. Clients are
+    processed in deterministic node_id order, and each client's own
+    stages in ascending hop order, so placement never depends on
     working-set iteration/arrival order.
+
+    `row_scale`/`column_scale` (default 1, i.e. pure logical-grid
+    steps) let the overlap check above account for the actual pixel
+    spacing the caller will render with (see app.py's
+    DOT_GRID_SPACING_X/Y) -- REQUIRED for correctness whenever that
+    spacing differs per axis: two LOGICALLY adjacent cells with no
+    interior step between them can still have real interior PIXEL
+    cells once scaled unevenly per axis (4 wide, 2 tall here), and a
+    DIFFERENT segment's own interior pixel cells can land exactly on
+    one of those -- invisible to a check done in logical-grid units
+    alone. The RETURNED stage positions themselves are always plain
+    logical (row, column) grid steps regardless of scale; only the
+    internal collision-avoidance math sees the scaled coordinates.
     """
     you_position = real_positions.get(you_id)
     if you_position is None:
@@ -157,6 +190,11 @@ def build_relay_stages(
         client_position = real_positions.get(client_id)
         if count <= 0 or client_position is None:
             continue
+        previous_position = you_position
+        blocked_pixel_cells = {
+            _scaled_pixel(position, row_scale=row_scale, column_scale=column_scale)
+            for position in occupied
+        }
         for step in range(1, count + 1):
             fraction = step / (count + 1)
             row = round(
@@ -165,17 +203,42 @@ def build_relay_stages(
             column = round(
                 you_position[1] + (client_position[1] - you_position[1]) * fraction
             )
-            row, column = _reserve_bounded_cell(
+            # The last stage's onward segment to the real (already
+            # fixed) endpoint is the one connector segment
+            # build_relay_stages never gets another chance to validate
+            # -- app.py draws it directly from this stage's final
+            # position -- so it is checked here too, at placement time,
+            # for exactly this one stage.
+            next_fixed_point = client_position if step == count else None
+            row, column = _reserve_relay_stage_cell(
                 _clamp(row, 1, row_count),
                 _clamp(column, 1, column_count),
                 occupied,
                 row_count=row_count,
                 column_count=column_count,
+                previous_position=previous_position,
+                blocked_pixel_cells=blocked_pixel_cells,
+                next_fixed_point=next_fixed_point,
+                row_scale=row_scale,
+                column_scale=column_scale,
             )
-            occupied.add((row, column))
+            candidate = (row, column)
+            occupied.add(candidate)
+            blocked_pixel_cells.add(
+                _scaled_pixel(candidate, row_scale=row_scale, column_scale=column_scale)
+            )
+            blocked_pixel_cells |= _segment_pixel_cells(
+                previous_position, candidate, row_scale=row_scale, column_scale=column_scale
+            )
+            if next_fixed_point is not None:
+                blocked_pixel_cells |= _segment_pixel_cells(
+                    candidate, next_fixed_point,
+                    row_scale=row_scale, column_scale=column_scale,
+                )
             node_id = f"relay:{client_id}:{step}"
             stages.append(RelayStage(node_id, client_id, step))
-            positions[node_id] = (row, column)
+            positions[node_id] = candidate
+            previous_position = candidate
     return tuple(stages), positions
 
 
@@ -729,6 +792,154 @@ def _reserve_bounded_cell(
             if (candidate_row, candidate_column) not in occupied:
                 return (candidate_row, candidate_column)
     return (row, column)  # pragma: no cover - unreachable, grid full
+
+
+def _scaled_pixel(
+    position: tuple[int, int], *, row_scale: int, column_scale: int
+) -> tuple[int, int]:
+    """Scale a LOGICAL (row, column) grid step into the same (x, y)
+
+    convention _mesh_grid_pixel uses for rendering (column -> x, row ->
+    y) -- minus its constant "-1" offset, which is irrelevant here
+    since only RELATIVE spacing/overlap between cells matters for
+    collision detection, never an absolute screen position.
+    """
+    row, column = position
+    return (column * column_scale, row * row_scale)
+
+
+def _segment_pixel_cells(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    row_scale: int,
+    column_scale: int,
+) -> set[tuple[int, int]]:
+    """The interior cells route_connector would actually draw between
+
+    two LOGICAL grid points once scaled to pixel spacing (start/end
+    themselves excluded, exactly as route_connector excludes its own
+    endpoints) -- used only to detect whether a CANDIDATE relay-stage
+    placement's connecting segment would retrace ground an earlier
+    part of the same chain, or another node entirely, already
+    occupies.
+
+    Scaling BEFORE routing (rather than checking in raw logical-grid
+    units) matters whenever the two axes scale unevenly (see
+    DOT_GRID_SPACING_X/Y, 4 wide vs 2 tall): two grid steps that are
+    directly adjacent in LOGICAL space (no interior step between them
+    at all) can still have several real interior PIXEL cells once
+    scaled -- cells a check done in logical-grid units alone would
+    never see, even though a DIFFERENT segment's own interior pixel
+    cells can land exactly on one of them once actually rendered.
+    """
+    start_pixel = _scaled_pixel(start, row_scale=row_scale, column_scale=column_scale)
+    end_pixel = _scaled_pixel(end, row_scale=row_scale, column_scale=column_scale)
+    return {
+        (x, y)
+        for x, y, _glyph in route_connector(*start_pixel, *end_pixel)
+    }
+
+
+def _reserve_relay_stage_cell(
+    row: int,
+    column: int,
+    occupied: set[tuple[int, int]],
+    *,
+    row_count: int,
+    column_count: int,
+    previous_position: tuple[int, int],
+    blocked_pixel_cells: set[tuple[int, int]],
+    next_fixed_point: tuple[int, int] | None,
+    row_scale: int,
+    column_scale: int,
+) -> tuple[int, int]:
+    """Claim (row, column) for the next relay stage in an ordered chain,
+
+    or the nearest cell that is both free AND whose connecting
+    segment(s), once scaled to actual pixel spacing, touch no cell in
+    `blocked_pixel_cells` -- never a placement that would make this
+    stage's own route retrace an earlier real node, an earlier relay
+    stage, or an earlier segment of the SAME chain.
+
+    This is the fix for a real-hardware report where a 3-hop
+    endpoint's third relay stage, displaced sideways by an ordinary
+    collision, read as a displaced, orphan-looking side branch instead
+    of a continuous chain. The actual mechanism: route_chain draws
+    each segment independently, and two segments' cells at the same
+    pixel coordinate resolve by last-drawn-wins (see
+    MeshTopologyView.set_nodes' connector loop) -- so a stage placed
+    such that its segment crosses back over an earlier segment's cells
+    silently overwrites part of that earlier segment's own connecting
+    line, even though every stage's final position, owner, and index
+    were individually correct. `blocked_pixel_cells` is the caller's
+    accumulated, already-scaled set of every cell already used by this
+    SAME client's earlier segments (see build_relay_stages) plus every
+    already-placed real node and relay stage -- checking against their
+    union catches both a stage retracing its own chain's earlier path
+    AND a segment merely passing through an unrelated node's cell as
+    an elbow waypoint (which a human reader sees as an extra,
+    unrelated line converging on that node -- just as branch-like as a
+    true fork, even though the exact coordinate is normally occluded
+    by that node's own glyph).
+
+    `next_fixed_point`, when given (only for a client's LAST stage),
+    additionally requires the onward segment from the candidate to
+    that already-fixed real endpoint to avoid `blocked_pixel_cells`
+    too -- the one connector segment this function is never asked to
+    validate again afterward (app.py draws it directly from this
+    stage's final position). A stage may still be nudged sideways by
+    an ordinary collision (the route may bend); it may not land
+    anywhere that would make its own segment(s) revisit already-drawn
+    ground (the route may not branch).
+
+    Falls back to the ordinary any-free-cell search
+    (_reserve_bounded_cell) only if literally no cell in the entire
+    grid satisfies every constraint -- exactly as rare, and handled
+    exactly as deterministically (a stage is never silently dropped),
+    as that function's own full-grid-scan fallback; this is the one
+    case where the resulting chain may still visually retrace itself,
+    since every alternative would too.
+    """
+
+    def satisfies(candidate: tuple[int, int]) -> bool:
+        if candidate in occupied:
+            return False
+        if (
+            _segment_pixel_cells(
+                previous_position, candidate,
+                row_scale=row_scale, column_scale=column_scale,
+            )
+            & blocked_pixel_cells
+        ):
+            return False
+        if next_fixed_point is not None and (
+            _segment_pixel_cells(
+                candidate, next_fixed_point,
+                row_scale=row_scale, column_scale=column_scale,
+            )
+            & blocked_pixel_cells
+        ):
+            return False
+        return True
+
+    if satisfies((row, column)):
+        return row, column
+    radius = 1
+    max_span = row_count + column_count
+    while radius <= max_span:
+        for delta_row, delta_column in _square_ring(radius):
+            candidate = (row + delta_row, column + delta_column)
+            if (
+                1 <= candidate[0] <= row_count
+                and 1 <= candidate[1] <= column_count
+                and satisfies(candidate)
+            ):
+                return candidate
+        radius += 1
+    return _reserve_bounded_cell(
+        row, column, occupied, row_count=row_count, column_count=column_count
+    )
 
 
 def _direction_bucket(bearing: float) -> str:

@@ -1139,6 +1139,14 @@ class MeshTopologyView(Container):
             hop_counts=active_hop_counts,
             row_count=MESH_LOGICAL_GRID_ROWS,
             column_count=MESH_LOGICAL_GRID_COLUMNS,
+            # The real per-axis pixel spacing this view actually renders
+            # with -- required for build_relay_stages' own self-overlap
+            # avoidance to correctly predict what will land on screen
+            # (DOT_GRID_SPACING_X/Y are uneven per axis; see
+            # mesh_topology.build_relay_stages' own docstring for why
+            # that unevenness matters here).
+            row_scale=DOT_GRID_SPACING_Y,
+            column_scale=DOT_GRID_SPACING_X,
         )
         self._relay_stages = relay_stages
         self._base_positions = {**real_positions, **relay_positions}
@@ -1345,8 +1353,25 @@ class MeshTopologyView(Container):
                     if self._selected_node_id in chain_ids
                     else palette.dim_base
                 )
+                route_cells = route_chain(chain_points)
+                if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
+                    # build_relay_stages already guarantees an ordered,
+                    # non-self-overlapping chain in LOGICAL space (see
+                    # its own docstring), but project_to_viewport clips
+                    # each node's position independently, with no
+                    # awareness of chain order -- a chain whose stages
+                    # get clipped onto DIFFERENT edge cells can still
+                    # end up geometrically out of order once translated
+                    # to screen coordinates. Rather than let that render
+                    # as a branch, fall back to a direct YOU-to-endpoint
+                    # line for the connector's PATH only -- the relay
+                    # dots themselves stay rendered at their own clipped
+                    # positions (see the glyph-placement loop above),
+                    # never fabricated or hidden, only the connecting
+                    # LINE no longer visits them.
+                    route_cells = route_chain((centers[you_id], centers[remote_id]))
                 connector_cells.extend(
-                    (x, y, glyph, color) for x, y, glyph in route_chain(chain_points)
+                    (x, y, glyph, color) for x, y, glyph in route_cells
                 )
         self.board.query_one(MeshCanvas).render_scene(
             board_width, board_height, tuple(connector_cells), theme

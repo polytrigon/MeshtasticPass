@@ -1068,6 +1068,271 @@ class RelayStageGeometryTests(unittest.TestCase):
         self.assertEqual((entry.x, entry.y), (0, -3))
 
 
+class RelayChainOrderedRouteTests(unittest.TestCase):
+    """Pure tests for the ordered-relay-chain regression: a real
+
+    hardware report where a 3-hop endpoint's third relay stage,
+    displaced sideways by collision avoidance, visually read as an
+    orphan side-branch rather than a continuous route (see
+    build_relay_stages/_reserve_relay_stage_cell's docstrings for the
+    root cause -- a stage placed geometrically BEHIND its predecessor
+    forces route_chain's later segments to retrace an earlier
+    segment's own cells, which last-drawn-wins overwrite erases).
+    """
+
+    def _assert_continuous_no_self_overlap(
+        self, you_position, ordered_stage_positions, endpoint_position
+    ):
+        """The chain's rendered cells contain no duplicate coordinate --
+
+        the direct, decisive proxy for "no branch": a genuine branch or
+        an overwrite-erased segment can only arise from two different
+        segments of the SAME chain drawing to the identical cell (see
+        MeshCanvas/_render_mesh_canvas's last-drawn-wins overlay).
+
+        Converted through _mesh_grid_pixel first -- exactly as
+        MeshTopologyView.set_nodes does before calling route_chain --
+        since adjacent LOGICAL (row, column) steps are NOT adjacent
+        pixel cells (see DOT_GRID_SPACING_X/Y); testing on raw logical
+        coordinates would report false overlaps route_chain's real
+        caller never actually produces.
+        """
+        chain_points = tuple(
+            _mesh_grid_pixel(row, column)
+            for row, column in (you_position, *ordered_stage_positions, endpoint_position)
+        )
+        cells = route_chain(chain_points)
+        coordinates = [(x, y) for x, y, _glyph in cells]
+        self.assertEqual(
+            len(coordinates),
+            len(set(coordinates)),
+            f"chain segments overlap/self-cross: {chain_points}",
+        )
+        return cells
+
+    def test_reserve_relay_stage_cell_refuses_a_route_through_another_node(
+        self,
+    ) -> None:
+        """Direct proof of the fix: given a blocked ideal cell where the
+
+        ordinary nearest-any-free-cell search (_reserve_bounded_cell)
+        picks a cell whose OWN onward segment to the real endpoint
+        would pass directly through another real node's cell as an
+        elbow waypoint (not merely its final position touching that
+        node), the new resolver refuses that candidate and lands on
+        one whose onward segment stays clear of it -- checked with the
+        real per-axis pixel spacing (DOT_GRID_SPACING_X/Y), since this
+        exact class of overlap is only visible once scaled (see
+        _segment_pixel_cells' own docstring).
+        """
+        you_position = (5, 11)
+        r1_position = (4, 11)
+        r2_position = (3, 11)
+        endpoint_position = (1, 11)
+        blocker = (2, 11)  # R3's own naive interpolated cell
+        row_scale, column_scale = DOT_GRID_SPACING_Y, DOT_GRID_SPACING_X
+        occupied = {you_position, r1_position, r2_position, endpoint_position, blocker}
+        blocked_pixel_cells = {
+            mesh_topology_module._scaled_pixel(
+                cell, row_scale=row_scale, column_scale=column_scale
+            )
+            for cell in occupied
+        }
+
+        old_choice = mesh_topology_module._reserve_bounded_cell(
+            2, 11, set(occupied), row_count=8, column_count=21
+        )
+        offending_segment = mesh_topology_module._segment_pixel_cells(
+            old_choice, endpoint_position, row_scale=row_scale, column_scale=column_scale
+        )
+        self.assertTrue(
+            offending_segment & blocked_pixel_cells,
+            "fixture must reproduce the old resolver's onward segment "
+            "to the endpoint passing through an occupied cell",
+        )
+
+        new_choice = mesh_topology_module._reserve_relay_stage_cell(
+            2, 11, set(occupied), row_count=8, column_count=21,
+            previous_position=r2_position,
+            blocked_pixel_cells=blocked_pixel_cells,
+            next_fixed_point=endpoint_position,
+            row_scale=row_scale, column_scale=column_scale,
+        )
+        self.assertNotEqual(new_choice, old_choice)
+        self.assertFalse(
+            mesh_topology_module._segment_pixel_cells(
+                new_choice, endpoint_position,
+                row_scale=row_scale, column_scale=column_scale,
+            )
+            & blocked_pixel_cells
+        )
+
+    def test_three_hop_hardware_regression_stays_one_ordered_chain(self) -> None:
+        """Case 6: the exact real-hardware reproduction -- a 3-hop
+
+        endpoint whose third relay stage's own ideal (naively
+        interpolated) cell is already occupied by an unrelated real
+        node, forcing collision avoidance to displace it -- exactly
+        "one relay is displaced one cell over", the real-hardware
+        report's own description. The rendered route must still be one
+        continuous, non-self-overlapping chain through R1, then R2,
+        then the actually-displaced R3, then the endpoint -- never a
+        branch.
+        """
+        you_position = (5, 11)
+        endpoint_position = (1, 11)
+        real_positions = {
+            "you": you_position,
+            "endpoint": endpoint_position,
+            "blocker": (2, 11),  # R3's own naive interpolated cell
+        }
+        stages, positions = build_relay_stages(
+            real_positions, you_id="you", hop_counts={"endpoint": 3},
+            row_count=8, column_count=21,
+            row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+        )
+        self.assertEqual(len(stages), 3)
+        ordered = sorted(stages, key=lambda stage: stage.index)
+        self.assertEqual([stage.index for stage in ordered], [1, 2, 3])
+        ordered_positions = [positions[stage.node_id] for stage in ordered]
+
+        # R3 was genuinely displaced from its naive interpolated cell.
+        self.assertNotEqual(ordered_positions[2], (2, 11))
+        self.assertEqual(len(ordered_positions), len(set(ordered_positions)))
+
+        self._assert_continuous_no_self_overlap(
+            you_position, ordered_positions, endpoint_position
+        )
+
+    def test_n_hop_continuity_for_one_two_three_five(self) -> None:
+        """Case 7: for N in (1, 2, 3, 5), the rendered route is one
+
+        continuous YOU -> R1 -> ... -> RN -> endpoint chain with no
+        skipped, reordered, or duplicated relay -- checked with EVERY
+        stage's own naive interpolated cell already occupied by an
+        unrelated real node, forcing every single stage to actually be
+        displaced, not merely the trivial no-collision case.
+        """
+        you_position = (5, 11)
+        endpoint_position = (1, 11)
+        for hop_count in (1, 2, 3, 5):
+            with self.subTest(hop_count=hop_count):
+                ideal_cells = []
+                for step in range(1, hop_count + 1):
+                    fraction = step / (hop_count + 1)
+                    ideal_cells.append(
+                        (
+                            round(
+                                you_position[0]
+                                + (endpoint_position[0] - you_position[0]) * fraction
+                            ),
+                            round(
+                                you_position[1]
+                                + (endpoint_position[1] - you_position[1]) * fraction
+                            ),
+                        )
+                    )
+                real_positions = {
+                    "you": you_position,
+                    "endpoint": endpoint_position,
+                    **{f"b{index}": cell for index, cell in enumerate(ideal_cells)},
+                }
+                stages, positions = build_relay_stages(
+                    real_positions, you_id="you",
+                    hop_counts={"endpoint": hop_count},
+                    row_count=8, column_count=21,
+                    row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+                )
+                self.assertEqual(len(stages), hop_count)
+                ordered = sorted(stages, key=lambda stage: stage.index)
+                self.assertEqual(
+                    [stage.index for stage in ordered], list(range(1, hop_count + 1))
+                )
+                ordered_positions = [positions[stage.node_id] for stage in ordered]
+                self.assertEqual(len(ordered_positions), len(set(ordered_positions)))
+                # Every stage was genuinely displaced from its ideal cell.
+                for position, ideal in zip(ordered_positions, ideal_cells):
+                    self.assertNotEqual(position, ideal)
+                self._assert_continuous_no_self_overlap(
+                    you_position, ordered_positions, endpoint_position
+                )
+
+    def test_no_branch_for_a_single_endpoints_own_chain(self) -> None:
+        """Case 8: a single endpoint's own connector component is one
+
+        simple path -- verified directly on the rendered cell list
+        (see _assert_continuous_no_self_overlap) across several
+        different displacement geometries, not merely the count/order
+        already checked above.
+        """
+        you_position = (5, 11)
+        endpoint_position = (8, 11)
+        for blocked in (
+            {(6, 11)},
+            {(6, 11), (7, 11)},
+            {(6, 11), (6, 10), (6, 12), (7, 11)},
+        ):
+            with self.subTest(blocked=blocked):
+                real_positions = {
+                    "you": you_position,
+                    "endpoint": endpoint_position,
+                    **{f"b{i}": cell for i, cell in enumerate(blocked)},
+                }
+                stages, positions = build_relay_stages(
+                    real_positions, you_id="you", hop_counts={"endpoint": 3},
+                    row_count=8, column_count=21,
+                    row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+                )
+                ordered = sorted(stages, key=lambda stage: stage.index)
+                ordered_positions = [positions[stage.node_id] for stage in ordered]
+                self._assert_continuous_no_self_overlap(
+                    you_position, ordered_positions, endpoint_position
+                )
+
+    def test_multiple_endpoints_keep_independent_ordered_chains(self) -> None:
+        """Case 9: two active endpoints whose routes pass near each
+
+        other -- each endpoint's own relay stages stay owned by it, in
+        its own order, and one endpoint's collision handling can never
+        detach or reorder a stage belonging to the other.
+        """
+        you_position = (5, 11)
+        real_positions = {
+            "you": you_position,
+            "alice": (1, 9),
+            "bob": (1, 13),
+        }
+        stages, positions = build_relay_stages(
+            real_positions, you_id="you",
+            hop_counts={"alice": 3, "bob": 3},
+            row_count=8, column_count=21,
+            row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+        )
+        self.assertEqual(len(stages), 6)
+        alice_stages = sorted(
+            (s for s in stages if s.source_node_id == "alice"),
+            key=lambda stage: stage.index,
+        )
+        bob_stages = sorted(
+            (s for s in stages if s.source_node_id == "bob"),
+            key=lambda stage: stage.index,
+        )
+        self.assertEqual([s.index for s in alice_stages], [1, 2, 3])
+        self.assertEqual([s.index for s in bob_stages], [1, 2, 3])
+        alice_ids = {s.node_id for s in alice_stages}
+        bob_ids = {s.node_id for s in bob_stages}
+        self.assertEqual(alice_ids & bob_ids, set())
+
+        alice_positions = [positions[s.node_id] for s in alice_stages]
+        bob_positions = [positions[s.node_id] for s in bob_stages]
+        self.assertEqual(len(alice_positions), len(set(alice_positions)))
+        self.assertEqual(len(bob_positions), len(set(bob_positions)))
+        # Each chain individually stays monotonic and self-consistent
+        # even though both routes pass through the same neighborhood.
+        self._assert_continuous_no_self_overlap(you_position, alice_positions, real_positions["alice"])
+        self._assert_continuous_no_self_overlap(you_position, bob_positions, real_positions["bob"])
+
+
 class RouteChainTests(unittest.TestCase):
     """Pure tests for the multi-segment connector-chain helper."""
 
@@ -5221,6 +5486,56 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(signature)
             width, height, connectors, _theme = signature
             self.assertGreater(len(connectors), 0)
+            for x, y, _glyph, _color in connectors:
+                self.assertTrue(0 <= x < width)
+                self.assertTrue(0 <= y < height)
+
+    async def test_multi_hop_off_screen_endpoint_keeps_one_ordered_chain(
+        self,
+    ) -> None:
+        """Case 12: a genuinely off-screen endpoint with a real, nonzero
+
+        hop count -- the ordered-chain invariant (item 6/7 of the
+        relay-chain correctness task) must hold on the VISIBLE, clipped
+        connector exactly as it does fully on-screen: no duplicate
+        rendered cell (see RelayChainOrderedRouteTests'
+        _assert_continuous_no_self_overlap for why that is the direct
+        proxy for "no branch"), the endpoint gets the edge indicator
+        (never a relay stage), and relay count still matches the
+        client's own reported hop count regardless of clipping.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far_multi_hop = NodeMetadata(
+                "!faroff03", "Far Multi Hop", "FMH3", 3,
+                last_heard=now - 5, position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_multi_hop): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("!faroff03", view.edge_node_ids)
+            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(
+                {stage.node_id for stage in view.relay_stages} & view.edge_node_ids,
+                set(),
+                "anonymous relay stages must never themselves become edge indicators",
+            )
+
+            canvas = view.board.query_one(MeshCanvas)
+            width, height, connectors, _theme = canvas._signature
+            coordinates = [(x, y) for x, y, _glyph, _color in connectors]
+            self.assertEqual(
+                len(coordinates),
+                len(set(coordinates)),
+                "the visible, clipped connector must still be one "
+                "continuous chain -- no branch introduced by clipping",
+            )
             for x, y, _glyph, _color in connectors:
                 self.assertTrue(0 <= x < width)
                 self.assertTrue(0 <= y < height)
