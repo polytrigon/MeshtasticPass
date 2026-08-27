@@ -7,6 +7,7 @@ import argparse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from time import monotonic, time
+from typing import Any, Callable
 
 from rich.cells import cell_len
 from rich.color import Color
@@ -67,10 +68,15 @@ from mesh_topology import (
     route_chain,
 )
 from node_activity import is_node_active
+from radio_capabilities import format_hw_model_name
 from radio_service import (
     ChannelInfo,
+    ConfigWriteResult,
     DeliveryState,
+    DISPLAY_UNITS_IMPERIAL,
+    DISPLAY_UNITS_METRIC,
     LONG_NAME_MAX_UTF8_BYTES,
+    SCREEN_ON_SECS_ALWAYS_ON,
     SHORT_NAME_MAX_UTF8_BYTES,
     RadioEvent,
     RadioIdentityError,
@@ -241,11 +247,138 @@ class DeviceSelector(KeyboardDropdown):
         )
 
 
+SCREEN_TIMEOUT_CHOICES = (
+    ("15 SEC", 15),
+    ("30 SEC", 30),
+    ("1 MIN", 60),
+    ("2 MIN", 120),
+    ("5 MIN", 300),
+    ("10 MIN", 600),
+    ("ALWAYS ON", SCREEN_ON_SECS_ALWAYS_ON),
+)
+
+UNITS_DISPLAY_CHOICES = (
+    ("METRIC", DISPLAY_UNITS_METRIC),
+    ("IMPERIAL", DISPLAY_UNITS_IMPERIAL),
+)
+
+COMPASS_CHOICES = (
+    ("NORTH UP", True),
+    ("HEADING UP", False),
+)
+
+FLIP_SCREEN_CHOICES = (
+    ("OFF", False),
+    ("ON", True),
+)
+
+CLOCK_24H_CHOICES = (
+    ("ON", True),
+    ("OFF", False),
+)
+
+
+@dataclass(frozen=True)
+class RadioSettingSpec:
+    """Maps one RADIO-section dropdown to its localConfig field.
+
+    `to_schema_value`/`from_schema_value` exist ONLY for clock_24h,
+    whose user-facing "24 HOUR TIME" label is the logical NEGATION of
+    the schema's own use_12h_clock field -- every other row's dropdown
+    value already IS the schema value, so the default identity mapping
+    applies unchanged.
+    """
+
+    section: str
+    field: str
+    to_schema_value: Callable[[Any], Any] = lambda value: value
+    from_schema_value: Callable[[Any], Any] = lambda value: value
+
+
+RADIO_SETTINGS: dict[str, RadioSettingSpec] = {
+    "screen_timeout": RadioSettingSpec("display", "screen_on_secs"),
+    "units": RadioSettingSpec("display", "units"),
+    "compass": RadioSettingSpec("display", "compass_north_top"),
+    "flip_screen": RadioSettingSpec("display", "flip_screen"),
+    "clock_24h": RadioSettingSpec(
+        "display",
+        "use_12h_clock",
+        to_schema_value=lambda is_24h: not is_24h,
+        from_schema_value=lambda use_12h_clock: not use_12h_clock,
+    ),
+}
+
+
+class ScreenTimeoutSelector(KeyboardDropdown):
+    def __init__(self, screen_on_secs: int) -> None:
+        super().__init__(
+            "screen_timeout",
+            "SCREEN TIMEOUT",
+            (DropdownOption(name, value) for name, value in SCREEN_TIMEOUT_CHOICES),
+            screen_on_secs,
+            widget_id="radio-screen-timeout-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class UnitsSelector(KeyboardDropdown):
+    def __init__(self, units: int) -> None:
+        super().__init__(
+            "units",
+            "UNITS",
+            (DropdownOption(name, value) for name, value in UNITS_DISPLAY_CHOICES),
+            units,
+            widget_id="radio-units-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class CompassSelector(KeyboardDropdown):
+    def __init__(self, compass_north_top: bool) -> None:
+        super().__init__(
+            "compass",
+            "COMPASS",
+            (DropdownOption(name, value) for name, value in COMPASS_CHOICES),
+            compass_north_top,
+            widget_id="radio-compass-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class FlipScreenSelector(KeyboardDropdown):
+    def __init__(self, flip_screen: bool) -> None:
+        super().__init__(
+            "flip_screen",
+            "FLIP SCREEN",
+            (DropdownOption(name, value) for name, value in FLIP_SCREEN_CHOICES),
+            flip_screen,
+            widget_id="radio-flip-screen-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class Clock24HSelector(KeyboardDropdown):
+    def __init__(self, is_24h: bool) -> None:
+        super().__init__(
+            "clock_24h",
+            "24 HOUR TIME",
+            (DropdownOption(name, value) for name, value in CLOCK_24H_CHOICES),
+            is_24h,
+            widget_id="radio-clock-24h-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
 class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
             "channel_index",
-            "CHAT ·",
+            "",
             (DropdownOption(channel.name, channel.index) for channel in channels),
             value,
             widget_id="chat-title",
@@ -325,6 +458,26 @@ class IdentitySaveFailed(Message):
     def __init__(self, detail: str) -> None:
         super().__init__()
         self.detail = detail
+
+
+class RadioSettingApplied(Message):
+    """A RADIO-section verified config write finished (success or not).
+
+    Carries the dropdown itself (never mutated off the UI thread --
+    only referenced, then acted on here once this message is handled)
+    so the handler can show/revert that exact row without re-querying.
+    """
+
+    def __init__(
+        self,
+        dropdown: "KeyboardDropdown",
+        setting_name: str,
+        result: ConfigWriteResult,
+    ) -> None:
+        super().__init__()
+        self.dropdown = dropdown
+        self.setting_name = setting_name
+        self.result = result
 
 
 class LoadOlderControl(Static):
@@ -1784,13 +1937,13 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #connection-status, #connection-details, #identity-values {
+    #connection-status, #connection-details, #identity-values, #radio-info {
         height: auto;
         min-height: 1;
         overflow-x: hidden;
     }
 
-    #style-title {
+    #style-title, #radio-title {
         margin-top: 1;
     }
 
@@ -1907,23 +2060,25 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #style-status {
+    #style-status, #radio-status {
         height: 2;
     }
 
-    #style-status.setting-success {
+    #style-status.setting-success, #radio-status.setting-success {
         color: $white_accent;
     }
 
-    Screen.theme-green #style-status.setting-success {
+    Screen.theme-green #style-status.setting-success,
+    Screen.theme-green #radio-status.setting-success {
         color: $green_accent;
     }
 
-    Screen.theme-orange #style-status.setting-success {
+    Screen.theme-orange #style-status.setting-success,
+    Screen.theme-orange #radio-status.setting-success {
         color: $orange_accent;
     }
 
-    #connection-error, #send-error, #style-status.setting-error {
+    #connection-error, #send-error, #style-status.setting-error, #radio-status.setting-error {
         height: auto;
         min-height: 1;
         color: $error;
@@ -2375,6 +2530,14 @@ class MeshtasticPassApp(App[None]):
                 yield FontSizeSelector(self.settings.font_size)
                 yield ColorSelector(self.settings.color)
                 yield Static(id="style-status")
+                yield Static("RADIO", id="radio-title", classes="page-title")
+                yield Static(id="radio-info", markup=False)
+                yield ScreenTimeoutSelector(300)
+                yield UnitsSelector(DISPLAY_UNITS_METRIC)
+                yield CompassSelector(True)
+                yield FlipScreenSelector(False)
+                yield Clock24HSelector(True)
+                yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield ChannelSelector(self._channels, self.current_channel_index)
                 yield ChatTranscript(id="chat-log")
@@ -2598,6 +2761,11 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(ShortNameControl),
                     self.query_one(FontSizeSelector),
                     self.query_one(ColorSelector),
+                    self.query_one(ScreenTimeoutSelector),
+                    self.query_one(UnitsSelector),
+                    self.query_one(CompassSelector),
+                    self.query_one(FlipScreenSelector),
+                    self.query_one(Clock24HSelector),
                 )
                 if not getattr(control, "disabled", False)
             ]
@@ -2776,6 +2944,9 @@ class MeshtasticPassApp(App[None]):
         if event.setting_name == "device_path":
             await self._switch_device(str(event.value))
             return
+        if event.setting_name in RADIO_SETTINGS:
+            self._apply_radio_setting(event.dropdown, event.setting_name, event.value)
+            return
 
         status = self.query_one("#style-status", Static)
         try:
@@ -2831,6 +3002,181 @@ class MeshtasticPassApp(App[None]):
             value=getattr(self.radio, "device_path", self.settings.device_path),
         )
 
+    def _apply_radio_setting(
+        self,
+        dropdown: KeyboardDropdown,
+        setting_name: str,
+        dropdown_value: Any,
+    ) -> None:
+        """Begin a verified RADIO-section config write -- see
+
+        RadioService.write_verified_config_field for what "verified"
+        means. Shows APPLYING... immediately; radio_setting_applied()
+        shows APPLIED/reverts the row once the worker thread's result
+        arrives. Never claims APPLIED merely because this call returned.
+        """
+        spec = RADIO_SETTINGS[setting_name]
+        status = self.query_one("#radio-status", Static)
+        if self._radio_state is not RadioState.ONLINE:
+            status.remove_class("setting-success")
+            status.add_class("setting-error")
+            status.update(f"{dropdown.label} UNAVAILABLE — RADIO NOT CONNECTED")
+            return
+        status.remove_class("setting-error")
+        status.remove_class("setting-success")
+        status.update(f"APPLYING {dropdown.label}...")
+        schema_value = spec.to_schema_value(dropdown_value)
+        self.run_worker(
+            lambda: self._apply_radio_setting_from_thread(
+                dropdown, spec, setting_name, schema_value
+            ),
+            thread=True,
+            name="apply-radio-setting",
+            exclusive=True,
+        )
+
+    def _apply_radio_setting_from_thread(
+        self,
+        dropdown: KeyboardDropdown,
+        spec: RadioSettingSpec,
+        setting_name: str,
+        schema_value: Any,
+    ) -> None:
+        try:
+            result = self.radio.write_verified_config_field(spec.section, spec.field, schema_value)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            result = ConfigWriteResult(False, schema_value, None, f"error: {detail}")
+        self.post_message(RadioSettingApplied(dropdown, setting_name, result))
+
+    _RADIO_FAILURE_REASONS = {
+        "not_connected": "RADIO NOT CONNECTED",
+        "disconnected": "CONNECTION LOST",
+        "nak": "REJECTED BY RADIO",
+        "timeout": "TIMED OUT",
+        "mismatch": "READBACK MISMATCH",
+    }
+
+    @on(RadioSettingApplied)
+    def radio_setting_applied(self, event: RadioSettingApplied) -> None:
+        status = self.query_one("#radio-status", Static)
+        spec = RADIO_SETTINGS[event.setting_name]
+        if event.result.applied:
+            status.remove_class("setting-error")
+            status.add_class("setting-success")
+            status.update(f"{event.dropdown.label} APPLIED")
+            event.dropdown.set_options(
+                event.dropdown.options,
+                value=spec.from_schema_value(event.result.readback_value),
+            )
+        else:
+            status.remove_class("setting-success")
+            status.add_class("setting-error")
+            reason = self._RADIO_FAILURE_REASONS.get(
+                event.result.reason, event.result.reason.upper()
+            )
+            status.update(f"{event.dropdown.label} NOT APPLIED — {reason}")
+            # Return the row to the authoritative radio value rather than
+            # leaving the user's rejected selection displayed as if it
+            # had taken effect.
+            authoritative = self.radio.read_synced_config_field(spec.section, spec.field)
+            if authoritative is not None:
+                event.dropdown.set_options(
+                    event.dropdown.options,
+                    value=spec.from_schema_value(authoritative),
+                )
+
+    def _render_radio_settings(self) -> None:
+        """Populate RADIO from the SDK's already-synced state (or mark
+
+        it unavailable) -- called by _show_connection on every
+        connect/reconnect/disconnect, exactly like _render_identity.
+        Never issues a fresh config request itself (see item 17 of the
+        RADIO-section task): a fresh read only ever happens inside
+        write_verified_config_field, to verify a write this session
+        just made.
+        """
+        info_widget = self.query_one("#radio-info", Static)
+        dropdowns: tuple[tuple[KeyboardDropdown, RadioSettingSpec], ...] = (
+            (self.query_one(ScreenTimeoutSelector), RADIO_SETTINGS["screen_timeout"]),
+            (self.query_one(UnitsSelector), RADIO_SETTINGS["units"]),
+            (self.query_one(CompassSelector), RADIO_SETTINGS["compass"]),
+            (self.query_one(FlipScreenSelector), RADIO_SETTINGS["flip_screen"]),
+            (self.query_one(Clock24HSelector), RADIO_SETTINGS["clock_24h"]),
+        )
+        palette = THEME_PALETTES[self._current_theme]
+        online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
+
+        if not online:
+            connecting = self._radio_state is RadioState.CONNECTING
+            placeholder = "..." if connecting else "—"
+            text = Text()
+            for index, label in enumerate(("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH")):
+                if index:
+                    text.append("\n")
+                text.append(
+                    f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
+                    style=palette.base,
+                )
+                text.append(" ", style=palette.base)
+                text.append(placeholder, style=palette.dim_base)
+            info_widget.update(text)
+            unavailable = Text()
+            unavailable.append(placeholder, style=palette.dim_base)
+            for dropdown, _spec in dropdowns:
+                override = Text()
+                override.append(
+                    f"{CONNECTION_ROW_PREFIX}{dropdown.label:<{CONNECTION_LABEL_WIDTH}}",
+                    style=palette.base,
+                )
+                override.append(" ", style=palette.base)
+                override.append(placeholder, style=palette.dim_base)
+                dropdown.set_status_override(override)
+            return
+
+        identity = self.radio.hardware_identity()
+        bluetooth_enabled = self.radio.read_synced_config_field("bluetooth", "enabled")
+        bluetooth_text = (
+            "—"
+            if bluetooth_enabled is None
+            else ("ON" if bluetooth_enabled else "OFF")
+        )
+        text = Text()
+        rows = (
+            ("HARDWARE", format_hw_model_name(identity.hw_model_name)),
+            ("FIRMWARE", identity.firmware_version or "—"),
+            ("ROLE", identity.role_name or "—"),
+            ("BLUETOOTH", bluetooth_text),
+        )
+        for index, (label, value) in enumerate(rows):
+            if index:
+                text.append("\n")
+            text.append(
+                f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
+                style=palette.base,
+            )
+            text.append(" ", style=palette.base)
+            text.append(value, style=palette.base)
+        info_widget.update(text)
+
+        for dropdown, spec in dropdowns:
+            dropdown.set_status_override(None)
+            schema_value = self.radio.read_synced_config_field(spec.section, spec.field)
+            if schema_value is None:
+                override = Text()
+                override.append(
+                    f"{CONNECTION_ROW_PREFIX}{dropdown.label:<{CONNECTION_LABEL_WIDTH}}",
+                    style=palette.base,
+                )
+                override.append(" ", style=palette.base)
+                override.append("UNSUPPORTED", style=palette.dim_base)
+                dropdown.set_status_override(override)
+                continue
+            dropdown.set_options(
+                dropdown.options,
+                value=spec.from_schema_value(schema_value),
+            )
+
     def _apply_color_theme(self, color: str) -> None:
         self._current_theme = color
         for name, _value in COLOR_CHOICES:
@@ -2846,6 +3192,7 @@ class MeshtasticPassApp(App[None]):
         if len(self.query("#identity-values")):
             self._render_connection_details()
             self._render_identity()
+            self._render_radio_settings()
         if len(self.query("#mesh-view")):
             self._refresh_mesh()
         # set_palette() above only refreshes a KeyboardDropdown's BASE
@@ -4433,6 +4780,7 @@ class MeshtasticPassApp(App[None]):
         identity_status.update("")
         self._render_connection_details()
         self._render_identity(force_value=True)
+        self._render_radio_settings()
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()

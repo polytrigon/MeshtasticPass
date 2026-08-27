@@ -22,19 +22,24 @@ from app import (
     ANIMATED_STATUS,
     TAB_NAMES,
     ChannelSelector,
+    Clock24HSelector,
+    CompassSelector,
     ConnectionPage,
     ChatTranscript,
     ChatEntryWidget,
     ColorSelector,
     DeviceSelector,
     EndOfChatHistoryMarker,
+    FlipScreenSelector,
     FontSizeSelector,
     LoadOlderControl,
     LongNameControl,
     ShortNameControl,
     MessageActionControl,
     MeshtasticPassApp,
+    ScreenTimeoutSelector,
     ThinScrollBarRender,
+    UnitsSelector,
     can_manual_resend,
 )
 from app_controller import received_chat_entry
@@ -43,7 +48,9 @@ from chat_store import ChatStore
 from geo import format_distance_miles
 from keyboard_dropdown import KeyboardDropdown
 from radio_service import (
+    ConfigWriteResult,
     DeliveryState,
+    DISPLAY_UNITS_IMPERIAL,
     ReceivedMessage,
     RadioEvent,
     RadioInfo,
@@ -336,6 +343,158 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             "fontname=Monospace 22",
             self.settings.profile_path.read_text(encoding="utf-8"),
         )
+
+    async def test_radio_section_renders_hardware_and_settings_when_connected(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            info_text = str(app.query_one("#radio-info", Static).render())
+            self.assertIn("HARDWARE     HELTEC V3", info_text)
+            self.assertIn("FIRMWARE     sim-1.0.0", info_text)
+            self.assertIn("ROLE         CLIENT", info_text)
+            self.assertIn("BLUETOOTH    ON", info_text)
+
+            self.assertIn("5 MIN", str(app.query_one(ScreenTimeoutSelector).render()))
+            self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
+            self.assertIn("NORTH UP", str(app.query_one(CompassSelector).render()))
+            self.assertIn("OFF", str(app.query_one(FlipScreenSelector).render()))
+            self.assertIn("ON", str(app.query_one(Clock24HSelector).render()))
+
+            for control in (
+                app.query_one(ScreenTimeoutSelector),
+                app.query_one(UnitsSelector),
+                app.query_one(CompassSelector),
+                app.query_one(FlipScreenSelector),
+                app.query_one(Clock24HSelector),
+            ):
+                self.assertFalse(control.disabled)
+
+    async def test_radio_section_disabled_while_disconnected(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=10,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 45)):
+            info_text = str(app.query_one("#radio-info", Static).render())
+            self.assertIn("HARDWARE     ...", info_text)
+            self.assertNotIn("HELTEC", info_text)
+
+            for control in (
+                app.query_one(ScreenTimeoutSelector),
+                app.query_one(UnitsSelector),
+                app.query_one(CompassSelector),
+                app.query_one(FlipScreenSelector),
+                app.query_one(Clock24HSelector),
+            ):
+                self.assertTrue(control.disabled)
+                self.assertIn("...", str(control.render()))
+
+    async def test_changing_screen_timeout_uses_verified_write_and_shows_applied(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            selector = app.query_one(ScreenTimeoutSelector)
+            status = app.query_one("#radio-status", Static)
+            selector.focus()
+            # 15 SEC -> 30 SEC -> 1 MIN -> 2 MIN -> 5 MIN (current) -- one
+            # "down" from 5 MIN reaches 10 MIN.
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "APPLIED" in str(status.render()):
+                    break
+            self.assertIn("SCREEN TIMEOUT APPLIED", str(status.render()))
+            self.assertIn("10 MIN", str(selector.render()))
+            self.assertEqual(
+                radio.read_synced_config_field("display", "screen_on_secs"), 600
+            )
+
+    async def test_failed_verification_returns_ui_to_authoritative_value(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            selector = app.query_one(UnitsSelector)
+            status = app.query_one("#radio-status", Static)
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, DISPLAY_UNITS_IMPERIAL, None, "mismatch")
+            )
+            selector.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT APPLIED" in str(status.render()):
+                    break
+            self.assertIn("UNITS NOT APPLIED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            # Reverted to the authoritative (unchanged) radio value, not
+            # left showing the rejected selection.
+            self.assertIn("METRIC", str(selector.render()))
+
+    async def test_unsupported_radio_field_does_not_crash(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            real_read = radio.read_synced_config_field
+            radio.read_synced_config_field = lambda section, field: (
+                None if (section, field) == ("display", "flip_screen") else real_read(section, field)
+            )
+            app._render_radio_settings()
+            await pilot.pause()
+            self.assertIn(
+                "UNSUPPORTED", str(app.query_one(FlipScreenSelector).render())
+            )
+            self.assertTrue(app.query_one(FlipScreenSelector).disabled)
+            # Everything else is unaffected.
+            self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
+
+    async def test_radio_dropdowns_reachable_by_keyboard_navigation(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(ColorSelector).focus()
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(ScreenTimeoutSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(UnitsSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(CompassSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(FlipScreenSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(Clock24HSelector))
 
     async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
         radio = SimulatedRadioService(
@@ -1281,7 +1440,40 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(content.region.right, transcript.region.right)
             self.assertGreater(widget.region.height, 2)
 
-    async def test_middle_dot_heading_no_end_control_and_f4_quit_last(self) -> None:
+    async def test_chat_header_omits_redundant_chat_prefix(self) -> None:
+        """The CHAT tab is already visibly CHAT (see the tab bar) --
+
+        the in-view heading must show only the channel/modem label,
+        never a redundant leading "CHAT" word/separator.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertNotIn("CHAT", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+
+            # Switching channels (the underlying behavior this control
+            # exists for) is completely unaffected by the label removal.
+            selector = app.query_one(ChannelSelector)
+            selector.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if app.current_channel_index == 1:
+                    break
+            self.assertEqual(app.current_channel_index, 1)
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertNotIn("CHAT", heading)
+            self.assertIn("[ Hiking ▾ ]", heading)
+
+    async def test_chat_heading_no_end_control_and_f4_quit_last(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -1294,7 +1486,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("ACTIVE", heading)
             with self.assertRaises(NoMatches):
                 app.query_one("#end-of-chat")
@@ -1476,7 +1669,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("ACTIVE", heading)
 
             app._accept_received_message(SIMULATED_MESSAGES[0])
@@ -1502,7 +1696,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             timestamp = widget.query_one(".chat-entry-timestamp", Static)
             distance = widget.query_one(".chat-entry-distance", Static)
 
-            self.assertIn("CHAT · [ LongFast ▾ ]", str(heading.render()))
+            self.assertIn("[ LongFast ▾ ]", str(heading.render()))
+            self.assertNotIn("CHAT", str(heading.render()))
             self.assertNotIn("—", str(heading.render()))
             self.assertIs(author.parent, timestamp.parent)
             self.assertIs(author.parent, distance.parent)
@@ -3593,7 +3788,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(chat_input.disabled)
             self.assertEqual(chat_input.value, "Meet at 8?")
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT ·", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
             self.assertNotIn("STATUS", heading)
             status = str(app.query_one("#send-error", Static).render())
             self.assertNotIn("RECONNECTING", status)
@@ -3691,7 +3886,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(app._radio_state, RadioState.ONLINE)
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("STATUS", heading)
 
             radio.simulate_disconnect()
@@ -3711,7 +3907,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(app._radio_state, RadioState.ONLINE)
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("STATUS", heading)
 
     async def test_switching_tabs_during_connecting_shows_identical_status(

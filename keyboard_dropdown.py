@@ -215,9 +215,14 @@ class KeyboardDropdown(Static):
         label = f"{self.prefix}{self.label}"
         if self.label_width is not None:
             label = f"{label:<{self.label_width}}"
+        if label:
             heading = f"{marker} {label} [ {self.selected_label} ▾ ]"
         else:
-            heading = f"{marker} {label} [ {self.selected_label} ▾ ]"
+            # An empty label (e.g. ChannelSelector, which drops the
+            # redundant "CHAT" text -- the tab itself already shows
+            # that) must not leave a dangling double space where the
+            # label would have been.
+            heading = f"{marker} [ {self.selected_label} ▾ ]"
         if self.suffix:
             heading += f" {self.suffix}"
         text = Text(heading, style=self._base_color)
