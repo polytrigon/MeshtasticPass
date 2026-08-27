@@ -123,7 +123,7 @@ and LOAD OLDER do not. A Favorite sender keeps its Favorite author accent after
 the message's NEW-only styling is removed.
 
 The selected channel heading uses the format
-`CHAT · [ configured channel ▾ ] · ACTIVE N`. ACTIVE is a passive count of
+`[ configured channel ▾ ] · ACTIVE N`. ACTIVE is a passive count of
 unique *other* nodes whose freshest trustworthy node-database `lastHeard` or
 packet directly observed by MeshtasticPass is less than five minutes old.
 Exactly five minutes old is inactive. Missing, malformed, future, and otherwise

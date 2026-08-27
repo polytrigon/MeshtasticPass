@@ -378,7 +378,7 @@ class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
             "channel_index",
-            "CHAT ·",
+            "",
             (DropdownOption(channel.name, channel.index) for channel in channels),
             value,
             widget_id="chat-title",

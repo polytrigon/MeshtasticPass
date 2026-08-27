@@ -1440,7 +1440,40 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(content.region.right, transcript.region.right)
             self.assertGreater(widget.region.height, 2)
 
-    async def test_middle_dot_heading_no_end_control_and_f4_quit_last(self) -> None:
+    async def test_chat_header_omits_redundant_chat_prefix(self) -> None:
+        """The CHAT tab is already visibly CHAT (see the tab bar) --
+
+        the in-view heading must show only the channel/modem label,
+        never a redundant leading "CHAT" word/separator.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertNotIn("CHAT", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+
+            # Switching channels (the underlying behavior this control
+            # exists for) is completely unaffected by the label removal.
+            selector = app.query_one(ChannelSelector)
+            selector.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if app.current_channel_index == 1:
+                    break
+            self.assertEqual(app.current_channel_index, 1)
+            heading = str(app.query_one("#chat-title", Static).render())
+            self.assertNotIn("CHAT", heading)
+            self.assertIn("[ Hiking ▾ ]", heading)
+
+    async def test_chat_heading_no_end_control_and_f4_quit_last(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -1453,7 +1486,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("ACTIVE", heading)
             with self.assertRaises(NoMatches):
                 app.query_one("#end-of-chat")
@@ -1635,7 +1669,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("ACTIVE", heading)
 
             app._accept_received_message(SIMULATED_MESSAGES[0])
@@ -1661,7 +1696,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             timestamp = widget.query_one(".chat-entry-timestamp", Static)
             distance = widget.query_one(".chat-entry-distance", Static)
 
-            self.assertIn("CHAT · [ LongFast ▾ ]", str(heading.render()))
+            self.assertIn("[ LongFast ▾ ]", str(heading.render()))
+            self.assertNotIn("CHAT", str(heading.render()))
             self.assertNotIn("—", str(heading.render()))
             self.assertIs(author.parent, timestamp.parent)
             self.assertIs(author.parent, distance.parent)
@@ -3752,7 +3788,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(chat_input.disabled)
             self.assertEqual(chat_input.value, "Meet at 8?")
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT ·", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
             self.assertNotIn("STATUS", heading)
             status = str(app.query_one("#send-error", Static).render())
             self.assertNotIn("RECONNECTING", status)
@@ -3850,7 +3886,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(app._radio_state, RadioState.ONLINE)
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("STATUS", heading)
 
             radio.simulate_disconnect()
@@ -3870,7 +3907,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(app._radio_state, RadioState.ONLINE)
             heading = str(app.query_one("#chat-title", Static).render())
-            self.assertIn("CHAT · [ LongFast ▾ ]", heading)
+            self.assertIn("[ LongFast ▾ ]", heading)
+            self.assertNotIn("CHAT", heading)
             self.assertNotIn("STATUS", heading)
 
     async def test_switching_tabs_during_connecting_shows_identical_status(
