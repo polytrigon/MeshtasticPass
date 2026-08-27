@@ -142,6 +142,14 @@ DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
     DeliveryState.SENT: "✓",
     DeliveryState.HEARD: "✓✓",
 }
+# A single narrow glyph (U+2192 RIGHTWARDS ARROW -- plain, non-emoji,
+# never double-width) animated by right-justifying it to a growing
+# field width each frame: "→", " →", "  →", "   →", then loop. Reads as
+# "in flight / still being resolved", never as success -- unlike the
+# checkmarks above, SENDING covers every outgoing message for which a
+# NAK is still a legitimate possible outcome (see send_was_submitted).
+SENDING_ARROW_GLYPH = "→"
+SENDING_ARROW_FRAMES = (1, 2, 3, 4)
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
@@ -397,23 +405,61 @@ class ChannelSelector(KeyboardDropdown):
         )
 
 
-# Deliberately just 10 basic, widely-supported emoji -- see item 20 of
-# the CHAT delivery/menu/emoji task. Centralized here for easy future
-# expansion; nothing else in this module hardcodes this list.
+# The first-pass emoji set -- see the CHAT delivery/menu/emoji task.
+# Centralized here for easy future expansion; nothing else in this
+# module hardcodes this list or its length.
 EMOJI_PICKER_CHOICES: tuple[str, ...] = (
     "😀",
     "😂",
     "❤️",
     "👍",
     "👎",
-    "😢",
+    "😭",
     "😮",
     "😡",
     "🎉",
     "🔥",
+    "👋",
+    "✨",
+    "📡",
 )
 # Must match the ".emoji-picker { height: ... }" CSS rule below.
 EMOJI_PICKER_HEIGHT = 3
+# What the ".emoji-picker" CSS rule below actually costs in columns:
+# "border: solid ..." is 1 column each side, "padding: 0 1" is 1
+# column each side -- see emoji_picker_total_width().
+EMOJI_PICKER_BORDER_CELLS = 2
+EMOJI_PICKER_PADDING_CELLS = 2
+
+
+def emoji_picker_content_width() -> int:
+    """Exact rendered terminal-cell width of the picker's emoji row.
+
+    Never len(text): each item is a 1-cell bracket/space, the emoji's
+    own RENDERED cell width (cell_len -- a wide emoji is 2 cells even
+    when, like an intact heart+variation-selector sequence, it is more
+    than one Python character), and a closing 1-cell bracket/space,
+    plus a 1-cell separator between items. Derived from
+    EMOJI_PICKER_CHOICES itself, so the picker never needs a manual
+    width update if the set changes.
+    """
+    per_item_width = sum(1 + cell_len(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES)
+    separator_width = max(0, len(EMOJI_PICKER_CHOICES) - 1)
+    return per_item_width + separator_width
+
+
+def emoji_picker_total_width() -> int:
+    """Content width plus the border/padding the CSS rule actually
+
+    applies -- the picker's bounding box should hug this exactly, with
+    only the CSS's own intentional padding, never a stretched-to-fit
+    container (see item 12 of the follow-up task).
+    """
+    return (
+        emoji_picker_content_width()
+        + EMOJI_PICKER_BORDER_CELLS
+        + EMOJI_PICKER_PADDING_CELLS
+    )
 
 
 class EmojiPicker(Static):
@@ -663,6 +709,9 @@ class ChatMessageInput(Input):
 
     class Left(Message):
         pass
+
+    def on_focus(self, _event: Focus) -> None:
+        self.app._update_footer()
 
     def on_blur(self, _event: Blur) -> None:
         self.post_message(self.Left())
@@ -1947,14 +1996,15 @@ class ChatEntryWidget(Vertical):
         self.favorite = favorite and not self.entry.outgoing
         self.set_class(self.favorite, "favorite-sender")
 
-    def refresh_delivery_state(self, dot_count: int) -> None:
+    def refresh_delivery_state(self, animation_frame: int) -> None:
         if self.delivery_label is None:
             return
         internal_state = self.entry.delivery_state or DeliveryState.SENT
         visible_state = internal_state
-        text = DELIVERY_CHECKMARKS.get(visible_state, visible_state.value)
         if visible_state is DeliveryState.SENDING:
-            text += "." * dot_count
+            text = SENDING_ARROW_GLYPH.rjust(animation_frame)
+        else:
+            text = DELIVERY_CHECKMARKS.get(visible_state, visible_state.value)
         self.delivery_label.update(text)
         for name in DeliveryState:
             self.set_class(
@@ -2619,7 +2669,7 @@ class MeshtasticPassApp(App[None]):
         self._send_error_message = ""
         self._send_error_dismiss_timer: Timer | None = None
         self._arrival_sequence = 0
-        self._send_dot_count = 1
+        self._send_animation_frame = 1
         self._has_older_history = False
         self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
@@ -3371,6 +3421,7 @@ class MeshtasticPassApp(App[None]):
         """
         if self._send_error_message:
             self._show_send_error("")
+        self._update_footer()
 
     def _send_from_thread(
         self,
@@ -3430,6 +3481,21 @@ class MeshtasticPassApp(App[None]):
 
     @on(SendSubmitted)
     def send_was_submitted(self, event: SendSubmitted) -> None:
+        """send_text() returning successfully is a purely LOCAL event --
+
+        the SDK accepted the packet for local submission, nothing more.
+        It must NOT by itself produce SENT (✓): a routing failure (NAK)
+        remains a legitimate, still-open outcome for this exact packet
+        until the first real routing response arrives (see
+        RadioService._parse_send_response/_on_routing_response). The
+        entry stays in SENDING (rendered as the animated arrow, see
+        ChatEntryWidget.refresh_delivery_state) until that first
+        response resolves it to SENT, HEARD, or FAILED.
+
+        SimulatedRadioService's `immediate_state` is the one exception:
+        it exists specifically so tests can force a deterministic
+        outcome without simulating a real ack round-trip.
+        """
         entry = event.entry
         if event.generation != entry.send_generation:
             return
@@ -3437,11 +3503,11 @@ class MeshtasticPassApp(App[None]):
         state = (
             entry.delivery_state
             if entry.delivery_state in (DeliveryState.HEARD, DeliveryState.FAILED)
-            else event.sent.immediate_state or DeliveryState.SENT
+            else event.sent.immediate_state or DeliveryState.SENDING
         )
         entry.confirmation_deadline = (
             monotonic() + CHAT_CONFIRMATION_TIMEOUT_SECONDS
-            if state is DeliveryState.SENT
+            if state in (DeliveryState.SENDING, DeliveryState.SENT)
             else None
         )
         self._set_delivery_state(entry, state, packet_id=event.sent.packet_id)
@@ -4058,17 +4124,19 @@ class MeshtasticPassApp(App[None]):
         )
 
     def _advance_delivery_states(self) -> None:
-        self._send_dot_count = self._send_dot_count % 3 + 1
+        self._send_animation_frame = self._send_animation_frame % len(
+            SENDING_ARROW_FRAMES
+        ) + 1
         now = monotonic()
         for entry in self.chat_history:
             if (
-                entry.delivery_state is DeliveryState.SENT
+                entry.delivery_state in (DeliveryState.SENDING, DeliveryState.SENT)
                 and entry.confirmation_deadline is not None
                 and now >= entry.confirmation_deadline
             ):
                 self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
         for widget in self.query(ChatEntryWidget):
-            widget.refresh_delivery_state(self._send_dot_count)
+            widget.refresh_delivery_state(self._send_animation_frame)
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)
@@ -4466,10 +4534,14 @@ class MeshtasticPassApp(App[None]):
                 )
 
     def _open_emoji_picker(self) -> None:
-        """Mount the emoji strip directly above the composer -- see
+        """Mount the emoji strip directly above the composer, sized to
 
-        item 19: spans the composer's own width, one emoji row tall
-        plus its border, never a large modal. Never moves Textual focus
+        HUG its own content (see emoji_picker_total_width() -- computed
+        from rendered cell widths, never len()), not stretched to the
+        composer's full width. Clamped to the composer's own available
+        width so a narrow viewport can never overflow the screen; the
+        normal case (enough room) is content-hugging with only the
+        CSS's own intentional border/padding. Never moves Textual focus
         off the composer (see item 22): ChatMessageInput.on_key
         intercepts LEFT/RIGHT/ENTER/ESC directly on the still-focused
         composer while this is open (see that method's own docstring
@@ -4483,7 +4555,7 @@ class MeshtasticPassApp(App[None]):
         palette = THEME_PALETTES[self._current_theme]
         picker.set_palette(palette.base, palette.accent)
         region = chat_input.region
-        picker.styles.width = max(region.width, len(EMOJI_PICKER_CHOICES) * 3)
+        picker.styles.width = min(emoji_picker_total_width(), max(region.width, 1))
         picker.styles.offset = (region.x, region.y - EMOJI_PICKER_HEIGHT)
 
     def _close_emoji_picker(self) -> None:
@@ -4786,7 +4858,7 @@ class MeshtasticPassApp(App[None]):
             self._update_effective_transmission_time(entry)
         if packet_id is not None:
             entry.packet_id = packet_id
-        if state is not DeliveryState.SENT:
+        if state not in (DeliveryState.SENDING, DeliveryState.SENT):
             entry.confirmation_deadline = None
         completed_at = (
             time()
@@ -4811,7 +4883,7 @@ class MeshtasticPassApp(App[None]):
                 self._show_send_error(str(error))
         for widget in self.query(ChatEntryWidget):
             if widget.entry is entry:
-                widget.refresh_delivery_state(self._send_dot_count)
+                widget.refresh_delivery_state(self._send_animation_frame)
                 break
         self._update_footer()
 
@@ -4910,7 +4982,7 @@ class MeshtasticPassApp(App[None]):
 
     def _update_footer(self) -> None:
         if self.current_tab == "chat" and isinstance(self.focused, Input):
-            text = "ENTER send    ESC messages    F4 quit"
+            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
         elif self.current_tab == "chat":
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
         else:
