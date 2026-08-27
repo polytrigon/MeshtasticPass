@@ -13,7 +13,7 @@ from mesh_state import (
     format_mesh_context_line,
     normalize_mesh_node_id,
 )
-from node_activity import ACTIVE_WINDOW_SECONDS
+from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
 from radio_service import NodeMetadata
 
 
@@ -354,7 +354,7 @@ class FormatMeshContextLineTests(unittest.TestCase):
         figure.
         """
         state = client_state(
-            NodeMetadata("!bob", "Bob Basecamp", "BOB", 1, NOW),
+            NodeMetadata("!bob", "Bob Basecamp", "BOB", 1),
             last_interaction_at=NOW - 30 * 60,
         )
         self.assertEqual(
@@ -364,7 +364,7 @@ class FormatMeshContextLineTests(unittest.TestCase):
 
     def test_client_with_known_distance_format(self) -> None:
         state = MeshNodeState(
-            node=NodeMetadata("!bob", "Bob Basecamp", "BOB", 1, NOW),
+            node=NodeMetadata("!bob", "Bob Basecamp", "BOB", 1),
             is_client=True,
             is_relay=False,
             last_interaction_at=NOW - 30 * 60,
@@ -377,7 +377,7 @@ class FormatMeshContextLineTests(unittest.TestCase):
 
     def test_client_and_relay_format(self) -> None:
         state = MeshNodeState(
-            node=NodeMetadata("!alice", "Alice Trail", "ALC", 0, NOW),
+            node=NodeMetadata("!alice", "Alice Trail", "ALC", 0),
             is_client=True,
             is_relay=True,
             last_interaction_at=NOW - 30 * 60,
@@ -394,7 +394,7 @@ class FormatMeshContextLineTests(unittest.TestCase):
         never rendered as a fabricated "?"/"UNKNOWN"/"NONE".
         """
         state = MeshNodeState(
-            node=NodeMetadata("!r", "Relay Only", None, 2, NOW),
+            node=NodeMetadata("!r", "Relay Only", None, 2),
             is_client=False,
             is_relay=True,
             last_interaction_at=NOW - 60,
@@ -456,8 +456,12 @@ class FormatMeshContextLineTests(unittest.TestCase):
         self.assertNotIn("0 HOPS", format_mesh_context_line(state, now=NOW))
 
     def test_unknown_interaction_time_renders_question_mark(self) -> None:
+        """Both CHAT interaction time and NodeDB last_heard missing --
+
+        LAST SEEN falls back to "?" truthfully, never a fabricated age.
+        """
         state = MeshNodeState(
-            node=NodeMetadata("!x", "X", None, 1, NOW),
+            node=NodeMetadata("!x", "X", None, 1),
             is_client=True,
             is_relay=False,
             last_interaction_at=None,
@@ -479,6 +483,103 @@ class FormatMeshContextLineTests(unittest.TestCase):
             node=you_with_position, is_client=False, is_relay=False, last_interaction_at=None
         )
         self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
+
+
+class LastSeenConsistencyTests(unittest.TestCase):
+    """A displayed node's LAST SEEN must never show "?" when the SAME
+
+    refresh's is_node_active() determination (and therefore MESH(N),
+    FILLED glyph, BASE styling, and active topology) came from a valid
+    NodeDB last_heard -- see format_mesh_context_line's LAST SEEN
+    computation, which must consider last_heard, not CHAT interaction
+    time alone.
+    """
+
+    def test_active_nodedb_only_node_shows_concrete_last_seen(self) -> None:
+        """Case A/C: a NodeDB-only node (no CHAT history at all) that
+
+        is_node_active() would call ACTIVE must show a concrete LAST
+        SEEN age from that same last_heard, never "?".
+        """
+        node = NodeMetadata("!heard0001", "Hairy 9874", "SHN", 3, last_heard=NOW - 120)
+        state = MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertTrue(is_node_active(node.last_heard, NOW))
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertEqual(line, "Hairy 9874 / SHN / ? / 3 HOPS / 2m / ? mi")
+        self.assertNotIn("/ ? /  mi", line)
+        segments = line.split(" / ")
+        self.assertEqual(segments[4], "2m")
+
+    def test_stale_nodedb_only_node_shows_concrete_older_last_seen(self) -> None:
+        """Case B: a stale NodeDB-only node still shows the truthful,
+
+        older age of its last_heard -- not active, but not "?" either.
+        """
+        stale_heard = NOW - ACTIVE_WINDOW_SECONDS - 3 * 60
+        node = NodeMetadata("!stale0001", "Stale Node", "STL", 1, last_heard=stale_heard)
+        state = MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertFalse(is_node_active(node.last_heard, NOW))
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertIn("8m", line)
+        self.assertNotIn("?", line.split(" / ")[4])
+
+    def test_missing_last_heard_and_chat_history_stays_question_mark(self) -> None:
+        """Case D: a genuinely missing timestamp must continue to render
+
+        "?" -- never a fabricated age just because SOME other node in
+        the working set has one.
+        """
+        node = NodeMetadata("!nodata001", "No Data", "ND", 1, last_heard=None)
+        state = MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertEqual(line.split(" / ")[4], "?")
+
+    def test_chat_history_does_not_substitute_when_last_heard_is_fresher(self) -> None:
+        """LAST SEEN reflects whichever signal is genuinely more recent --
+
+        an old CHAT interaction never masks a fresher NodeDB last_heard.
+        """
+        node = NodeMetadata("!fresh0001", "Fresher", "FR", 1, last_heard=NOW - 10)
+        state = MeshNodeState(
+            node=node, is_client=True, is_relay=False, last_interaction_at=NOW - 5000
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertEqual(line.split(" / ")[4], "10s")
+
+    def test_last_heard_does_not_substitute_when_chat_is_fresher(self) -> None:
+        """Symmetric case: a fresher CHAT interaction is reflected too,
+
+        not masked by an older NodeDB last_heard.
+        """
+        node = NodeMetadata("!fresh0002", "ChatFresh", "CF", 1, last_heard=NOW - 5000)
+        state = MeshNodeState(
+            node=node, is_client=True, is_relay=False, last_interaction_at=NOW - 20
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertEqual(line.split(" / ")[4], "20s")
+
+    def test_wall_time_advancing_ages_last_seen_without_new_data(self) -> None:
+        """Case E: the SAME underlying last_heard, evaluated at a later
+
+        `now`, must show a proportionally larger age -- a pure function
+        of (timestamp, now), not something that resets on repaint.
+        """
+        node = NodeMetadata("!aging0001", "Ager", "AG", 1, last_heard=NOW - 5)
+        state = MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW).split(" / ")[4], "5s"
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW + 30).split(" / ")[4], "35s"
+        )
 
 
 if __name__ == "__main__":

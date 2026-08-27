@@ -27,11 +27,13 @@ from app import (
     DOT_GRID_GLYPH,
     DOT_GRID_SPACING_X,
     DOT_GRID_SPACING_Y,
-    MESH_GRID_CENTER_COLUMN,
-    MESH_GRID_CENTER_ROW,
     MESH_BOARD_LABEL_MAX_CELLS,
-    MESH_GRID_COLUMNS,
-    MESH_GRID_ROWS,
+    MESH_GRID_MIN_COLUMNS,
+    MESH_GRID_MIN_ROWS,
+    MESH_LOGICAL_GRID_CENTER_COLUMN,
+    MESH_LOGICAL_GRID_CENTER_ROW,
+    MESH_LOGICAL_GRID_COLUMNS,
+    MESH_LOGICAL_GRID_ROWS,
     MESH_SELECTED_GLYPH_WIDTH,
     MeshCanvas,
     MeshNodeLabelWidget,
@@ -40,6 +42,7 @@ from app import (
     MeshTopologyView,
     MeshtasticPassApp,
     ThinScrollBarRender,
+    _compute_mesh_grid_dimensions,
     _mesh_directional_target,
     _mesh_grid_pixel,
     _mesh_hop_counts,
@@ -71,6 +74,7 @@ from mesh_topology import (
     compact_node_label,
     directional_target,
     place_within_bounds,
+    project_to_viewport,
     route_chain,
     route_connector,
 )
@@ -863,15 +867,35 @@ class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
 
     def test_translate_shifts_every_node_by_the_identical_delta(self) -> None:
         base = {"!you": (5, 11), "!a": (4, 10), "!b": (6, 9)}
-        translated = _mesh_translated_positions(base, "!a")
+        translated = _mesh_translated_positions(
+            base, "!a", center_row=5, center_column=11
+        )
         self.assertEqual(translated["!a"], (5, 11))
         row_delta, column_delta = 5 - 4, 11 - 10
         self.assertEqual(translated["!you"], (5 + row_delta, 11 + column_delta))
         self.assertEqual(translated["!b"], (6 + row_delta, 9 + column_delta))
 
+    def test_translate_recenters_on_whatever_center_the_viewport_gives(self) -> None:
+        """The center is the CURRENT viewport's own center (see
+
+        MeshTopologyView.current_grid_dimensions), never a fixed
+        constant -- a smaller/larger visible grid recenters the
+        selected node on a different cell without changing anything
+        else about the translation.
+        """
+        base = {"!you": (5, 11), "!a": (4, 10)}
+        translated = _mesh_translated_positions(
+            base, "!a", center_row=3, center_column=4
+        )
+        self.assertEqual(translated["!a"], (3, 4))
+        self.assertEqual(translated["!you"], (3 + 1, 4 + 1))
+
     def test_translate_with_unresolvable_selection_is_a_no_op(self) -> None:
         base = {"!you": (5, 11)}
-        self.assertEqual(_mesh_translated_positions(base, "!missing"), base)
+        self.assertEqual(
+            _mesh_translated_positions(base, "!missing", center_row=5, center_column=11),
+            base,
+        )
 
     def test_directional_target_picks_the_nearest_candidate(self) -> None:
         """No hardcoded node IDs: the same general nearest-candidate rule
@@ -1042,6 +1066,271 @@ class RelayStageGeometryTests(unittest.TestCase):
         )
         entry = next(item for item in boosted if item.node.node_id == "!n")
         self.assertEqual((entry.x, entry.y), (0, -3))
+
+
+class RelayChainOrderedRouteTests(unittest.TestCase):
+    """Pure tests for the ordered-relay-chain regression: a real
+
+    hardware report where a 3-hop endpoint's third relay stage,
+    displaced sideways by collision avoidance, visually read as an
+    orphan side-branch rather than a continuous route (see
+    build_relay_stages/_reserve_relay_stage_cell's docstrings for the
+    root cause -- a stage placed geometrically BEHIND its predecessor
+    forces route_chain's later segments to retrace an earlier
+    segment's own cells, which last-drawn-wins overwrite erases).
+    """
+
+    def _assert_continuous_no_self_overlap(
+        self, you_position, ordered_stage_positions, endpoint_position
+    ):
+        """The chain's rendered cells contain no duplicate coordinate --
+
+        the direct, decisive proxy for "no branch": a genuine branch or
+        an overwrite-erased segment can only arise from two different
+        segments of the SAME chain drawing to the identical cell (see
+        MeshCanvas/_render_mesh_canvas's last-drawn-wins overlay).
+
+        Converted through _mesh_grid_pixel first -- exactly as
+        MeshTopologyView.set_nodes does before calling route_chain --
+        since adjacent LOGICAL (row, column) steps are NOT adjacent
+        pixel cells (see DOT_GRID_SPACING_X/Y); testing on raw logical
+        coordinates would report false overlaps route_chain's real
+        caller never actually produces.
+        """
+        chain_points = tuple(
+            _mesh_grid_pixel(row, column)
+            for row, column in (you_position, *ordered_stage_positions, endpoint_position)
+        )
+        cells = route_chain(chain_points)
+        coordinates = [(x, y) for x, y, _glyph in cells]
+        self.assertEqual(
+            len(coordinates),
+            len(set(coordinates)),
+            f"chain segments overlap/self-cross: {chain_points}",
+        )
+        return cells
+
+    def test_reserve_relay_stage_cell_refuses_a_route_through_another_node(
+        self,
+    ) -> None:
+        """Direct proof of the fix: given a blocked ideal cell where the
+
+        ordinary nearest-any-free-cell search (_reserve_bounded_cell)
+        picks a cell whose OWN onward segment to the real endpoint
+        would pass directly through another real node's cell as an
+        elbow waypoint (not merely its final position touching that
+        node), the new resolver refuses that candidate and lands on
+        one whose onward segment stays clear of it -- checked with the
+        real per-axis pixel spacing (DOT_GRID_SPACING_X/Y), since this
+        exact class of overlap is only visible once scaled (see
+        _segment_pixel_cells' own docstring).
+        """
+        you_position = (5, 11)
+        r1_position = (4, 11)
+        r2_position = (3, 11)
+        endpoint_position = (1, 11)
+        blocker = (2, 11)  # R3's own naive interpolated cell
+        row_scale, column_scale = DOT_GRID_SPACING_Y, DOT_GRID_SPACING_X
+        occupied = {you_position, r1_position, r2_position, endpoint_position, blocker}
+        blocked_pixel_cells = {
+            mesh_topology_module._scaled_pixel(
+                cell, row_scale=row_scale, column_scale=column_scale
+            )
+            for cell in occupied
+        }
+
+        old_choice = mesh_topology_module._reserve_bounded_cell(
+            2, 11, set(occupied), row_count=8, column_count=21
+        )
+        offending_segment = mesh_topology_module._segment_pixel_cells(
+            old_choice, endpoint_position, row_scale=row_scale, column_scale=column_scale
+        )
+        self.assertTrue(
+            offending_segment & blocked_pixel_cells,
+            "fixture must reproduce the old resolver's onward segment "
+            "to the endpoint passing through an occupied cell",
+        )
+
+        new_choice = mesh_topology_module._reserve_relay_stage_cell(
+            2, 11, set(occupied), row_count=8, column_count=21,
+            previous_position=r2_position,
+            blocked_pixel_cells=blocked_pixel_cells,
+            next_fixed_point=endpoint_position,
+            row_scale=row_scale, column_scale=column_scale,
+        )
+        self.assertNotEqual(new_choice, old_choice)
+        self.assertFalse(
+            mesh_topology_module._segment_pixel_cells(
+                new_choice, endpoint_position,
+                row_scale=row_scale, column_scale=column_scale,
+            )
+            & blocked_pixel_cells
+        )
+
+    def test_three_hop_hardware_regression_stays_one_ordered_chain(self) -> None:
+        """Case 6: the exact real-hardware reproduction -- a 3-hop
+
+        endpoint whose third relay stage's own ideal (naively
+        interpolated) cell is already occupied by an unrelated real
+        node, forcing collision avoidance to displace it -- exactly
+        "one relay is displaced one cell over", the real-hardware
+        report's own description. The rendered route must still be one
+        continuous, non-self-overlapping chain through R1, then R2,
+        then the actually-displaced R3, then the endpoint -- never a
+        branch.
+        """
+        you_position = (5, 11)
+        endpoint_position = (1, 11)
+        real_positions = {
+            "you": you_position,
+            "endpoint": endpoint_position,
+            "blocker": (2, 11),  # R3's own naive interpolated cell
+        }
+        stages, positions = build_relay_stages(
+            real_positions, you_id="you", hop_counts={"endpoint": 3},
+            row_count=8, column_count=21,
+            row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+        )
+        self.assertEqual(len(stages), 3)
+        ordered = sorted(stages, key=lambda stage: stage.index)
+        self.assertEqual([stage.index for stage in ordered], [1, 2, 3])
+        ordered_positions = [positions[stage.node_id] for stage in ordered]
+
+        # R3 was genuinely displaced from its naive interpolated cell.
+        self.assertNotEqual(ordered_positions[2], (2, 11))
+        self.assertEqual(len(ordered_positions), len(set(ordered_positions)))
+
+        self._assert_continuous_no_self_overlap(
+            you_position, ordered_positions, endpoint_position
+        )
+
+    def test_n_hop_continuity_for_one_two_three_five(self) -> None:
+        """Case 7: for N in (1, 2, 3, 5), the rendered route is one
+
+        continuous YOU -> R1 -> ... -> RN -> endpoint chain with no
+        skipped, reordered, or duplicated relay -- checked with EVERY
+        stage's own naive interpolated cell already occupied by an
+        unrelated real node, forcing every single stage to actually be
+        displaced, not merely the trivial no-collision case.
+        """
+        you_position = (5, 11)
+        endpoint_position = (1, 11)
+        for hop_count in (1, 2, 3, 5):
+            with self.subTest(hop_count=hop_count):
+                ideal_cells = []
+                for step in range(1, hop_count + 1):
+                    fraction = step / (hop_count + 1)
+                    ideal_cells.append(
+                        (
+                            round(
+                                you_position[0]
+                                + (endpoint_position[0] - you_position[0]) * fraction
+                            ),
+                            round(
+                                you_position[1]
+                                + (endpoint_position[1] - you_position[1]) * fraction
+                            ),
+                        )
+                    )
+                real_positions = {
+                    "you": you_position,
+                    "endpoint": endpoint_position,
+                    **{f"b{index}": cell for index, cell in enumerate(ideal_cells)},
+                }
+                stages, positions = build_relay_stages(
+                    real_positions, you_id="you",
+                    hop_counts={"endpoint": hop_count},
+                    row_count=8, column_count=21,
+                    row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+                )
+                self.assertEqual(len(stages), hop_count)
+                ordered = sorted(stages, key=lambda stage: stage.index)
+                self.assertEqual(
+                    [stage.index for stage in ordered], list(range(1, hop_count + 1))
+                )
+                ordered_positions = [positions[stage.node_id] for stage in ordered]
+                self.assertEqual(len(ordered_positions), len(set(ordered_positions)))
+                # Every stage was genuinely displaced from its ideal cell.
+                for position, ideal in zip(ordered_positions, ideal_cells):
+                    self.assertNotEqual(position, ideal)
+                self._assert_continuous_no_self_overlap(
+                    you_position, ordered_positions, endpoint_position
+                )
+
+    def test_no_branch_for_a_single_endpoints_own_chain(self) -> None:
+        """Case 8: a single endpoint's own connector component is one
+
+        simple path -- verified directly on the rendered cell list
+        (see _assert_continuous_no_self_overlap) across several
+        different displacement geometries, not merely the count/order
+        already checked above.
+        """
+        you_position = (5, 11)
+        endpoint_position = (8, 11)
+        for blocked in (
+            {(6, 11)},
+            {(6, 11), (7, 11)},
+            {(6, 11), (6, 10), (6, 12), (7, 11)},
+        ):
+            with self.subTest(blocked=blocked):
+                real_positions = {
+                    "you": you_position,
+                    "endpoint": endpoint_position,
+                    **{f"b{i}": cell for i, cell in enumerate(blocked)},
+                }
+                stages, positions = build_relay_stages(
+                    real_positions, you_id="you", hop_counts={"endpoint": 3},
+                    row_count=8, column_count=21,
+                    row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+                )
+                ordered = sorted(stages, key=lambda stage: stage.index)
+                ordered_positions = [positions[stage.node_id] for stage in ordered]
+                self._assert_continuous_no_self_overlap(
+                    you_position, ordered_positions, endpoint_position
+                )
+
+    def test_multiple_endpoints_keep_independent_ordered_chains(self) -> None:
+        """Case 9: two active endpoints whose routes pass near each
+
+        other -- each endpoint's own relay stages stay owned by it, in
+        its own order, and one endpoint's collision handling can never
+        detach or reorder a stage belonging to the other.
+        """
+        you_position = (5, 11)
+        real_positions = {
+            "you": you_position,
+            "alice": (1, 9),
+            "bob": (1, 13),
+        }
+        stages, positions = build_relay_stages(
+            real_positions, you_id="you",
+            hop_counts={"alice": 3, "bob": 3},
+            row_count=8, column_count=21,
+            row_scale=DOT_GRID_SPACING_Y, column_scale=DOT_GRID_SPACING_X,
+        )
+        self.assertEqual(len(stages), 6)
+        alice_stages = sorted(
+            (s for s in stages if s.source_node_id == "alice"),
+            key=lambda stage: stage.index,
+        )
+        bob_stages = sorted(
+            (s for s in stages if s.source_node_id == "bob"),
+            key=lambda stage: stage.index,
+        )
+        self.assertEqual([s.index for s in alice_stages], [1, 2, 3])
+        self.assertEqual([s.index for s in bob_stages], [1, 2, 3])
+        alice_ids = {s.node_id for s in alice_stages}
+        bob_ids = {s.node_id for s in bob_stages}
+        self.assertEqual(alice_ids & bob_ids, set())
+
+        alice_positions = [positions[s.node_id] for s in alice_stages]
+        bob_positions = [positions[s.node_id] for s in bob_stages]
+        self.assertEqual(len(alice_positions), len(set(alice_positions)))
+        self.assertEqual(len(bob_positions), len(set(bob_positions)))
+        # Each chain individually stays monotonic and self-consistent
+        # even though both routes pass through the same neighborhood.
+        self._assert_continuous_no_self_overlap(you_position, alice_positions, real_positions["alice"])
+        self._assert_continuous_no_self_overlap(you_position, bob_positions, real_positions["bob"])
 
 
 class RouteChainTests(unittest.TestCase):
@@ -1824,13 +2113,16 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         self.assertNotEqual(status, "YOU")
                     # The mesh recentered: the selected node's own base
-                    # position is now the center anchor.
+                    # position is now the CURRENT viewport's own center
+                    # anchor (see MeshTopologyView.current_grid_dimensions).
+                    _, _, center_row, center_column = view.current_grid_dimensions()
                     positions = _mesh_translated_positions(
-                        view.base_positions, view.selected_node_id
+                        view.base_positions,
+                        view.selected_node_id,
+                        center_row=center_row,
+                        center_column=center_column,
                     )
-                    self.assertEqual(
-                        positions[expected_id], (MESH_GRID_CENTER_ROW, MESH_GRID_CENTER_COLUMN)
-                    )
+                    self.assertEqual(positions[expected_id], (center_row, center_column))
                     # Relative geometry between every node is unchanged --
                     # recentering is a pure translation, not a reshuffle.
                     for node_id in (you_id, north_id, south_id, east_id, west_id):
@@ -4251,6 +4543,279 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(view.base_positions["!al1velv1"], alice_before)
 
 
+class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
+    """Active real nodes must always have a connector toward YOU, even
+
+    with an unknown hop count -- the amount of known route detail
+    determines relay visualization, never whether a connection is drawn
+    at all. See app.py's connector-generation loop in
+    MeshTopologyView.set_nodes(), which previously skipped a node
+    entirely whenever hops_away was None.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    def _connector_cells(self, view: MeshTopologyView):
+        canvas = view.board.query_one(MeshCanvas)
+        signature = canvas._signature
+        return signature[2] if signature is not None else ()
+
+    async def test_active_unknown_hops_gets_direct_connector_no_relays(self) -> None:
+        """Case A: active, hopsAway=None -> counted, filled, BASE, a
+
+        direct connector to YOU, and zero anonymous relay stages.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            unknown_hops = NodeMetadata(
+                "!unkn0001", "Unknown Hops", "UNK", None,
+                last_heard=now - 5, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, unknown_hops): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.relay_stages, ())
+            self.assertGreater(len(self._connector_cells(view)), 0)
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!unkn0001")
+            self.assertEqual(str(widget.render()).strip(), CIRCLE_SOLID_LARGE)
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.base)
+            )
+
+    async def test_active_zero_hops_gets_direct_connector_no_relays(self) -> None:
+        """Case B: active, hopsAway=0 -> direct connector, zero relays."""
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            zero_hops = NodeMetadata(
+                "!zero0001", "Zero Hops", "ZER", 0,
+                last_heard=now - 5, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, zero_hops): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.relay_stages, ())
+            self.assertGreater(len(self._connector_cells(view)), 0)
+
+    async def test_active_one_hop_gets_exactly_one_relay(self) -> None:
+        """Case C."""
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            one_hop = NodeMetadata(
+                "!one00001", "One Hop", "ONE", 1,
+                last_heard=now - 5, position=north_of_local(5),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, one_hop): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 1)
+            self.assertGreater(len(self._connector_cells(view)), 0)
+
+    async def test_active_three_hops_gets_exactly_three_relays(self) -> None:
+        """Case D."""
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            three_hops = NodeMetadata(
+                "!three001", "Three Hops", "THR", 3,
+                last_heard=now - 5, position=north_of_local(9),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, three_hops): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(len(view.relay_stages), 3)
+            self.assertGreater(len(self._connector_cells(view)), 0)
+
+    async def test_stale_known_hops_stays_visible_without_active_connector(
+        self,
+    ) -> None:
+        """Case E: a stale node with a known hop count remains visible
+
+        and selectable, stroked/DIM_BASE, with no active connector or
+        relay chain of its own.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            stale = NodeMetadata(
+                "!stale002", "Stale Known", "STK", 2,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.relay_stages, ())
+            self.assertEqual(len(self._connector_cells(view)), 0)
+            self.assertIn("!stale002", {w.node_id for w in app.query(MeshNodeWidget)})
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!stale002")
+
+    async def test_real_device_snapshot_three_active_unknown_hops(self) -> None:
+        """Case F: several stale nodes plus exactly 3 active nodes, all
+
+        3 active nodes with UNKNOWN hops -- MESH(3), exactly 3 filled
+        active endpoints, all 3 with direct abstract connections, zero
+        fabricated relay circles anywhere on the board.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            stale_last_heard = now - ACTIVE_WINDOW_SECONDS - 100
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            active_ids = {"!act1ve01", "!act1ve02", "!act1ve03"}
+            nodes = [
+                local,
+                NodeMetadata(
+                    "!act1ve01", "A1", "A1", None, last_heard=now - 5,
+                    position=north_of_local(3),
+                ),
+                NodeMetadata(
+                    "!act1ve02", "A2", "A2", None, last_heard=now - 5,
+                    position=east_of_local(3),
+                ),
+                NodeMetadata(
+                    "!act1ve03", "A3", "A3", None, last_heard=now - 5,
+                    position=south_of_local(3),
+                ),
+                NodeMetadata(
+                    "!sta1e001", "S1", "S1", 2, last_heard=stale_last_heard,
+                    position=west_of_local(3),
+                ),
+                NodeMetadata(
+                    "!sta1e002", "S2", "S2", None, last_heard=stale_last_heard,
+                    position=west_of_local(6),
+                ),
+            ]
+            app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            self.assertIn("MESH(3)", str(app.query_one("#tab-bar").render()))
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.relay_stages, ())
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
+            palette = THEME_PALETTES[app._current_theme]
+            for node_id in active_ids:
+                widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+                self.assertEqual(str(widget.render()).strip(), CIRCLE_SOLID_LARGE)
+            self.assertGreater(len(self._connector_cells(view)), 0)
+
+    async def test_unknown_hops_node_stale_to_active_gains_connector_in_place(
+        self,
+    ) -> None:
+        """Case G: endpoint position stays fixed; it fills and its
+
+        connector appears on the exact refresh it becomes active.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            stale = NodeMetadata(
+                "!transit1", "Transit", "TR", None,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            position_before = view.base_positions["!transit1"]
+            self.assertEqual(len(self._connector_cells(view)), 0)
+
+            active = NodeMetadata(
+                "!transit1", "Transit", "TR", None,
+                last_heard=now - 5, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, active): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(view.base_positions["!transit1"], position_before)
+            self.assertGreater(len(self._connector_cells(view)), 0)
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!transit1")
+            self.assertEqual(str(widget.render()).strip(), CIRCLE_SOLID_LARGE)
+
+    async def test_unknown_hops_node_active_to_stale_loses_connector_in_place(
+        self,
+    ) -> None:
+        """Case H: the reverse transition -- endpoint stays fixed, dims,
+
+        and its connector disappears.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            now = 1_700_000_000.0
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            active = NodeMetadata(
+                "!transit2", "Transit2", "TR2", None,
+                last_heard=now - 5, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, active): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            position_before = view.base_positions["!transit2"]
+            self.assertGreater(len(self._connector_cells(view)), 0)
+
+            stale = NodeMetadata(
+                "!transit2", "Transit2", "TR2", None,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(view.base_positions["!transit2"], position_before)
+            self.assertEqual(len(self._connector_cells(view)), 0)
+            palette = THEME_PALETTES[app._current_theme]
+            widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!transit2")
+            self.assertEqual(str(widget.render()).strip(), CIRCLE_STROKED_LARGE)
+            self.assertEqual(
+                widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+
 class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
     """The shared #mesh-connection-status widget's priority:
 
@@ -4465,3 +5030,666 @@ class ThinScrollBarRenderTests(unittest.TestCase):
         self.assertTrue(
             all(segment.text == CHAT_SCROLLBAR_THUMB_GLYPH for segment in non_newline)
         )
+
+
+class MeshResponsiveGridDimensionsTests(unittest.TestCase):
+    """Pure tests for _compute_mesh_grid_dimensions -- the responsive
+
+    viewport's sole source of visible grid size, computed from the
+    MESH view's own actual rendered size, never a hardcoded per-font-
+    size table (see item 1/25 of the responsive-viewport task).
+    """
+
+    def test_xl_sized_viewport_uses_approximately_the_old_visual_extent(self) -> None:
+        """Case A: a typical XL-ish viewport (the previous fixed 8x21
+
+        board's own pixel footprint) computes to roughly that same
+        extent -- never requiring the EXACT historical numbers, only a
+        comparable, legitimately-derived odd size.
+        """
+        rows, columns, _, _ = _compute_mesh_grid_dimensions(
+            MESH_LOGICAL_GRID_COLUMNS * DOT_GRID_SPACING_X,
+            MESH_LOGICAL_GRID_ROWS * DOT_GRID_SPACING_Y,
+        )
+        self.assertAlmostEqual(rows, MESH_LOGICAL_GRID_ROWS, delta=2)
+        self.assertAlmostEqual(columns, MESH_LOGICAL_GRID_COLUMNS, delta=2)
+
+    def test_small_sized_viewport_produces_more_rows_and_columns_than_xl(self) -> None:
+        """Case B: a larger available terminal area (more character
+
+        cells fit -- what a SMALL font setting produces in the real
+        deployment) yields strictly more visible grid rows/columns than
+        a smaller one (an XL-sized one), never fewer.
+        """
+        xl_rows, xl_columns, _, _ = _compute_mesh_grid_dimensions(84, 16)
+        small_rows, small_columns, _, _ = _compute_mesh_grid_dimensions(220, 60)
+        self.assertGreater(small_rows, xl_rows)
+        self.assertGreater(small_columns, xl_columns)
+
+    def test_grid_never_exceeds_the_available_viewport_area(self) -> None:
+        """Case C: the computed grid, converted back to terminal cells,
+
+        never exceeds the actual available width/height it was derived
+        from.
+        """
+        for view_width, view_height in ((84, 16), (220, 60), (40, 8), (1000, 300)):
+            with self.subTest(view_width=view_width, view_height=view_height):
+                rows, columns, _, _ = _compute_mesh_grid_dimensions(
+                    view_width, view_height
+                )
+                self.assertLessEqual(columns * DOT_GRID_SPACING_X, max(view_width, columns * DOT_GRID_SPACING_X))
+                # The MIN floors exist precisely so a tiny/zero viewport
+                # (before layout, or pathologically small) never yields
+                # a degenerate size -- those floors may legitimately
+                # exceed a tiny input, but never a normal-sized one.
+                if view_width >= MESH_GRID_MIN_COLUMNS * DOT_GRID_SPACING_X:
+                    self.assertLessEqual(columns * DOT_GRID_SPACING_X, view_width)
+                if view_height >= (MESH_GRID_MIN_ROWS + 1) * DOT_GRID_SPACING_Y:
+                    self.assertLessEqual(rows * DOT_GRID_SPACING_Y, view_height)
+
+    def test_grid_reserves_one_row_of_label_headroom(self) -> None:
+        """Case D: the row count is derived from one fewer usable row
+
+        than the raw viewport height implies -- reserved so a node's
+        label (rendered one row above its glyph) never has to render
+        outside the MESH view's own top edge.
+        """
+        rows, _, _, _ = _compute_mesh_grid_dimensions(84, 20)
+        raw_rows = 20 // DOT_GRID_SPACING_Y
+        self.assertLessEqual(rows, raw_rows - 1)
+
+    def test_dimensions_are_odd_with_an_exact_center(self) -> None:
+        """Case E: dimensions are always odd, so center_row/center_column
+
+        are always an exact, unambiguous integer cell -- never a
+        rounded-off "between two cells" position.
+        """
+        for view_width, view_height in ((84, 16), (91, 23), (220, 61), (57, 33)):
+            with self.subTest(view_width=view_width, view_height=view_height):
+                rows, columns, center_row, center_column = _compute_mesh_grid_dimensions(
+                    view_width, view_height
+                )
+                self.assertEqual(rows % 2, 1)
+                self.assertEqual(columns % 2, 1)
+                self.assertEqual(center_row, rows // 2 + 1)
+                self.assertEqual(center_column, columns // 2 + 1)
+                self.assertTrue(1 <= center_row <= rows)
+                self.assertTrue(1 <= center_column <= columns)
+
+    def test_repeated_calls_with_unchanged_geometry_are_identical(self) -> None:
+        """Case F: a pure function of its two inputs -- calling it
+
+        repeatedly with the same viewport size always yields the exact
+        same dimensions, never drifting from repaint to repaint.
+        """
+        first = _compute_mesh_grid_dimensions(97, 27)
+        for _ in range(5):
+            self.assertEqual(_compute_mesh_grid_dimensions(97, 27), first)
+
+    def test_activity_and_theme_never_feed_into_grid_dimensions(self) -> None:
+        """Case G: _compute_mesh_grid_dimensions takes only a width and
+
+        a height -- there is no parameter, global, or code path by
+        which node activity, selection, or theme could ever change its
+        result for the same viewport size.
+        """
+        import inspect
+
+        signature = inspect.signature(_compute_mesh_grid_dimensions)
+        self.assertEqual(list(signature.parameters), ["view_width", "view_height"])
+
+
+class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
+    """Live app tests for the off-screen edge-indicator viewport (items
+
+    4-9, 26-28 of the responsive-viewport task): a real node whose
+    translated logical position falls outside the small simulated
+    viewport renders as an edge indicator, arrow navigation reaches it
+    as a valid target, and selecting it recenters the viewport so it
+    becomes a normal visible, labeled node.
+
+    Positions are injected directly via MeshTopologyView.set_nodes()
+    with a hand-crafted base_positions dict, deliberately bypassing
+    _refresh_mesh's GPS-bearing/assign_grid_slots/place_within_bounds
+    pipeline -- that placement logic already has its own dedicated
+    coverage elsewhere in this file; this class tests the NEW viewport-
+    clipping/edge-indicator concern in isolation from it, against a
+    small simulated terminal window standing in for an XL-sized
+    viewport (see item 23/26: XL == fewer visible terminal cells).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    @staticmethod
+    def _state(node_id: str, name: str, *, is_local: bool = False) -> MeshNodeState:
+        node = NodeMetadata(
+            node_id, name, name[:4].upper(), is_local=is_local, last_heard=1_700_000_000.0
+        )
+        return MeshNodeState(node=node, is_client=False, is_relay=False, last_interaction_at=None)
+
+    def _fixture(self, you_id: str):
+        """YOU near the logical center; DAVID close by; ALICE due
+
+        north, BOB south-west, and CHARLIE south-east, all pushed to
+        the FAR edge of the fixed 8x21 logical grid -- see
+        MESH_LOGICAL_GRID_ROWS/COLUMNS.
+        """
+        working_set = (
+            self._state(you_id, "You", is_local=True),
+            self._state("!david004", "David"),
+            self._state("!alice001", "Alice"),
+            self._state("!bob002", "Bob"),
+            self._state("!charlie003", "Charlie"),
+        )
+        base_positions = {
+            you_id: (
+                MESH_LOGICAL_GRID_CENTER_ROW,
+                MESH_LOGICAL_GRID_CENTER_COLUMN,
+            ),
+            # Due east, not northwest, of YOU -- so "up" navigation
+            # unambiguously targets ALICE alone (see
+            # test_arrow_navigation_reaches_and_recenters_on_an_off_
+            # screen_node), never a closer diagonal candidate.
+            "!david004": (
+                MESH_LOGICAL_GRID_CENTER_ROW,
+                MESH_LOGICAL_GRID_CENTER_COLUMN + 1,
+            ),
+            "!alice001": (1, MESH_LOGICAL_GRID_CENTER_COLUMN),
+            "!bob002": (MESH_LOGICAL_GRID_ROWS, 3),
+            "!charlie003": (MESH_LOGICAL_GRID_ROWS, MESH_LOGICAL_GRID_COLUMNS - 2),
+        }
+        return working_set, base_positions
+
+    async def test_distant_nodes_render_as_directional_edge_indicators(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.select_node(you_id)
+            view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
+            await pilot.pause()
+
+            row_count, column_count, center_row, center_column = (
+                view.current_grid_dimensions()
+            )
+            self.assertLess(row_count, MESH_LOGICAL_GRID_ROWS)
+
+            # DAVID renders normally: a real label exists for him.
+            self.assertTrue(
+                any(w.node_id == "!david004" for w in app.query(MeshNodeLabelWidget))
+            )
+            self.assertNotIn("!david004", view.edge_node_ids)
+
+            # ALICE/BOB/CHARLIE are genuinely off-screen edge indicators.
+            self.assertEqual(
+                view.edge_node_ids, {"!alice001", "!bob002", "!charlie003"}
+            )
+            for edge_id in ("!alice001", "!bob002", "!charlie003"):
+                self.assertFalse(
+                    any(w.node_id == edge_id for w in app.query(MeshNodeLabelWidget)),
+                    f"{edge_id} must not have a normal label while off-screen",
+                )
+                # Still a real, ordinary glyph -- same semantic dot
+                # treatment as any other real node (see
+                # _mesh_node_color); no new "off-screen" color.
+                self.assertTrue(
+                    any(w.node_id == edge_id for w in app.query(MeshNodeWidget))
+                )
+
+            # Directional relationship preserved: ALICE clamps to the
+            # top row on YOU's own column; BOB to the bottom-left
+            # corner; CHARLIE to the bottom-right corner.
+            positions = _mesh_translated_positions(
+                view.base_positions, you_id, center_row=center_row, center_column=center_column
+            )
+            viewport_positions, edge_ids = project_to_viewport(
+                positions, row_count=row_count, column_count=column_count
+            )
+            self.assertEqual(edge_ids & set(base_positions), view.edge_node_ids)
+            self.assertEqual(viewport_positions["!alice001"][0], 1)
+            self.assertEqual(viewport_positions["!alice001"][1], center_column)
+            self.assertEqual(viewport_positions["!bob002"], (row_count, 1))
+            self.assertEqual(viewport_positions["!charlie003"], (row_count, column_count))
+
+    async def test_arrow_navigation_reaches_and_recenters_on_an_off_screen_node(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.select_node(you_id)
+            view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
+            await pilot.pause()
+            self.assertIn("!alice001", view.edge_node_ids)
+
+            await pilot.press("up")
+            await pilot.pause()
+
+            # ALICE becomes selected purely from directional navigation
+            # against the STABLE logical positions -- never from
+            # whatever was merely visible on screen.
+            self.assertEqual(view.selected_node_id, "!alice001")
+            # The viewport recentered: ALICE is no longer an edge
+            # indicator, and now has a normal label.
+            self.assertNotIn("!alice001", view.edge_node_ids)
+            self.assertTrue(
+                any(w.node_id == "!alice001" for w in app.query(MeshNodeLabelWidget))
+            )
+            # The underlying logical/base positions never changed --
+            # recentering is a pure viewport transform, not a
+            # topology re-derivation (see item 10/11).
+            self.assertEqual(view.base_positions[you_id], base_positions[you_id])
+            self.assertEqual(view.base_positions["!alice001"], base_positions["!alice001"])
+
+            # YOU (previously the center) may now legitimately be
+            # off-screen or on the boundary now that ALICE is centered
+            # -- navigating back to YOU must still work deterministically.
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, you_id)
+            self.assertNotIn(you_id, view.edge_node_ids)
+
+    async def test_previously_visible_node_becomes_edge_indicator_after_recenter(
+        self,
+    ) -> None:
+        """Selecting a distant node can push a PREVIOUSLY visible node
+
+        (e.g. YOU, or another near neighbor) far enough from the new
+        center that it becomes an edge indicator in turn -- the
+        translation is symmetric, not YOU-privileged.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            # select_node() only accepts an ID already in the working
+            # set -- populate it (defaulting selection to YOU) before
+            # selecting ALICE, exactly as the production
+            # _mesh_select_node/_move_mesh_focus call sequence does.
+            view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
+            view.select_node("!alice001")
+            view.set_nodes(working_set, view.base_positions, theme=app._current_theme, now=1_700_000_000.0)
+            await pilot.pause()
+
+            # Recentered on ALICE (far north of YOU): YOU, BOB, and
+            # CHARLIE -- all far south of ALICE now -- are edge
+            # indicators; ALICE herself renders normally.
+            self.assertNotIn("!alice001", view.edge_node_ids)
+            self.assertIn(you_id, view.edge_node_ids | {you_id})
+
+    async def test_multiple_off_screen_nodes_on_the_same_edge_do_not_collide(
+        self,
+    ) -> None:
+        """Case 27: two distinct real nodes that would otherwise clamp
+
+        to the identical boundary cell are deterministically spread
+        along that edge instead of stacking invisibly on one cell.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set = (
+                self._state(you_id, "You", is_local=True),
+                self._state("!north001", "North One"),
+                self._state("!north002", "North Two"),
+            )
+            base_positions = {
+                you_id: (MESH_LOGICAL_GRID_CENTER_ROW, MESH_LOGICAL_GRID_CENTER_COLUMN),
+                "!north001": (1, MESH_LOGICAL_GRID_CENTER_COLUMN),
+                "!north002": (1, MESH_LOGICAL_GRID_CENTER_COLUMN),
+            }
+            view = app.query_one(MeshTopologyView)
+            view.select_node(you_id)
+            view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
+            await pilot.pause()
+
+            self.assertEqual(view.edge_node_ids, {"!north001", "!north002"})
+            row_count, column_count, center_row, center_column = (
+                view.current_grid_dimensions()
+            )
+            positions = _mesh_translated_positions(
+                view.base_positions, you_id, center_row=center_row, center_column=center_column
+            )
+            viewport_positions, _ = project_to_viewport(
+                positions, row_count=row_count, column_count=column_count
+            )
+            self.assertNotEqual(
+                viewport_positions["!north001"], viewport_positions["!north002"]
+            )
+            # Deterministic across repeated calls with the same input.
+            again, _ = project_to_viewport(
+                positions, row_count=row_count, column_count=column_count
+            )
+            self.assertEqual(viewport_positions, again)
+            self.assertEqual(
+                sum(1 for w in app.query(MeshNodeWidget) if w.node_id in ("!north001", "!north002")),
+                2,
+            )
+
+    async def test_no_duplicate_node_ids_and_relays_never_become_edge_targets(
+        self,
+    ) -> None:
+        """Case 27/16: an anonymous relay stage is never included in
+
+        edge_node_ids (it is not a navigable identity at all), and no
+        real node ever appears as more than one mounted widget.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far_client = NodeMetadata(
+                "!far0001", "Far Client", "FARC", 3,
+                last_heard=now - 5, position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_client): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+            self.assertGreater(len(relay_ids), 0)
+            self.assertEqual(relay_ids & view.edge_node_ids, set())
+
+            all_glyph_ids = [w.node_id for w in app.query(MeshNodeWidget)] + [
+                w.node_id for w in app.query(MeshRelayWidget)
+            ]
+            self.assertEqual(len(all_glyph_ids), len(set(all_glyph_ids)))
+
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertNotIn(view.selected_node_id, relay_ids)
+
+    async def test_mesh_count_is_independent_of_edge_visibility(self) -> None:
+        """Case 21: MESH(N) counts active real remote nodes by the
+
+        existing authoritative predicate alone -- being rendered as an
+        edge indicator (off-screen) never removes a node from that
+        count.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far_active = NodeMetadata(
+                "!faract2", "Far Active Two", "FAC2", None,
+                last_heard=now - 5, position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_active): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("!faract2", view.edge_node_ids)
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
+
+    async def test_connector_clips_at_viewport_boundary_without_fake_endpoints(
+        self,
+    ) -> None:
+        """Case 28: an active client far enough off-screen still gets a
+
+        connector, drawn to its clamped edge position -- never a
+        fabricated relay or a fabricated endpoint merely because the
+        true connector would otherwise extend off the visible grid.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far_active = NodeMetadata(
+                "!faract1", "Far Active", "FACT", None,
+                last_heard=now - 5, position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_active): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("!faract1", view.edge_node_ids)
+            self.assertEqual(view.relay_stages, ())
+
+            canvas = view.board.query_one(MeshCanvas)
+            signature = canvas._signature
+            self.assertIsNotNone(signature)
+            width, height, connectors, _theme = signature
+            self.assertGreater(len(connectors), 0)
+            for x, y, _glyph, _color in connectors:
+                self.assertTrue(0 <= x < width)
+                self.assertTrue(0 <= y < height)
+
+    async def test_multi_hop_off_screen_endpoint_keeps_one_ordered_chain(
+        self,
+    ) -> None:
+        """Case 12: a genuinely off-screen endpoint with a real, nonzero
+
+        hop count -- the ordered-chain invariant (item 6/7 of the
+        relay-chain correctness task) must hold on the VISIBLE, clipped
+        connector exactly as it does fully on-screen: no duplicate
+        rendered cell (see RelayChainOrderedRouteTests'
+        _assert_continuous_no_self_overlap for why that is the direct
+        proxy for "no branch"), the endpoint gets the edge indicator
+        (never a relay stage), and relay count still matches the
+        client's own reported hop count regardless of clipping.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far_multi_hop = NodeMetadata(
+                "!faroff03", "Far Multi Hop", "FMH3", 3,
+                last_heard=now - 5, position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_multi_hop): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("!faroff03", view.edge_node_ids)
+            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(
+                {stage.node_id for stage in view.relay_stages} & view.edge_node_ids,
+                set(),
+                "anonymous relay stages must never themselves become edge indicators",
+            )
+
+            canvas = view.board.query_one(MeshCanvas)
+            width, height, connectors, _theme = canvas._signature
+            coordinates = [(x, y) for x, y, _glyph, _color in connectors]
+            self.assertEqual(
+                len(coordinates),
+                len(set(coordinates)),
+                "the visible, clipped connector must still be one "
+                "continuous chain -- no branch introduced by clipping",
+            )
+            for x, y, _glyph, _color in connectors:
+                self.assertTrue(0 <= x < width)
+                self.assertTrue(0 <= y < height)
+
+
+class ProjectToViewportTests(unittest.TestCase):
+    """Pure tests for mesh_topology.project_to_viewport -- the direct-
+
+    preserving clip that turns a translated logical position into
+    either an unchanged in-viewport cell or a boundary-clamped edge
+    indicator (see items 4/14 of the responsive-viewport task).
+    """
+
+    def test_in_bounds_positions_are_unchanged(self) -> None:
+        viewport, edge_ids = project_to_viewport(
+            {"a": (2, 2), "b": (3, 3)}, row_count=5, column_count=5
+        )
+        self.assertEqual(viewport, {"a": (2, 2), "b": (3, 3)})
+        self.assertEqual(edge_ids, frozenset())
+
+    def test_cardinal_edge_projection_preserves_the_shared_axis(self) -> None:
+        viewport, edge_ids = project_to_viewport(
+            {"you": (3, 3), "alice": (-10, 3)}, row_count=5, column_count=5
+        )
+        self.assertEqual(viewport["alice"], (1, 3))
+        self.assertEqual(edge_ids, frozenset({"alice"}))
+
+    def test_corner_projection_preserves_diagonal_relationship(self) -> None:
+        """Case 14: a node beyond BOTH axes clamps to the matching
+
+        corner (here, north-east), never collapsing onto one of only
+        four cardinal edge cells regardless of its real direction.
+        """
+        for position, expected_corner in (
+            ((-10, 20), (1, 5)),  # north-east
+            ((-10, -20), (1, 1)),  # north-west
+            ((20, 20), (5, 5)),  # south-east
+            ((20, -20), (5, 1)),  # south-west
+        ):
+            with self.subTest(position=position):
+                viewport, edge_ids = project_to_viewport(
+                    {"you": (3, 3), "far": position}, row_count=5, column_count=5
+                )
+                self.assertEqual(viewport["far"], expected_corner)
+                self.assertEqual(edge_ids, frozenset({"far"}))
+
+    def test_in_bounds_node_is_never_displaced_by_an_edge_collision(self) -> None:
+        viewport, edge_ids = project_to_viewport(
+            {"you": (3, 3), "near": (1, 3), "far": (-10, 3)},
+            row_count=5,
+            column_count=5,
+        )
+        self.assertEqual(viewport["near"], (1, 3))
+        self.assertNotEqual(viewport["far"], (1, 3))
+        self.assertEqual(edge_ids, frozenset({"far"}))
+
+    def test_colliding_edge_nodes_are_spread_deterministically(self) -> None:
+        viewport, edge_ids = project_to_viewport(
+            {"you": (3, 3), "a": (-10, 3), "b": (-11, 3)},
+            row_count=5,
+            column_count=5,
+        )
+        self.assertEqual(edge_ids, frozenset({"a", "b"}))
+        self.assertNotEqual(viewport["a"], viewport["b"])
+        again, _ = project_to_viewport(
+            {"you": (3, 3), "a": (-10, 3), "b": (-11, 3)},
+            row_count=5,
+            column_count=5,
+        )
+        self.assertEqual(viewport, again)
+
+    def test_selected_node_at_exact_center_is_never_an_edge(self) -> None:
+        """The translated selected node always lands exactly at
+
+        (center_row, center_column), which is trivially in-bounds --
+        so it can never itself become an edge indicator (see item 7:
+        the currently selected node is always fully visible).
+        """
+        viewport, edge_ids = project_to_viewport(
+            {"you": (3, 3)}, row_count=5, column_count=5
+        )
+        self.assertEqual(viewport["you"], (3, 3))
+        self.assertEqual(edge_ids, frozenset())
+
+
+class MeshResponsiveResizeAndFocusPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """Live resize tests (items 22-24): a real terminal-size change
+
+    (standing in for a font-size change taking effect, since a live
+    process cannot actually change its own font mid-session -- see
+    item 23) must recompute the visible grid and reveal/hide edge
+    indicators accordingly, while never disturbing the current
+    selection, the underlying logical topology, or MESH(N).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def test_growing_the_terminal_reveals_more_grid_and_keeps_selection(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await pilot.pause()
+            await pilot.press("3")
+            await pilot.pause()
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far_north = NodeMetadata(
+                "!far0north", "Far North", "FARN", None,
+                last_heard=now - 5, position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_north): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            small_rows, small_columns, _, _ = view.current_grid_dimensions()
+            self.assertIn("!far0north", view.edge_node_ids)
+            self.assertEqual(view.selected_node_id, you_id)
+
+            await pilot.resize_terminal(220, 60)
+            await pilot.pause()
+
+            big_rows, big_columns, _, _ = view.current_grid_dimensions()
+            self.assertGreater(big_rows, small_rows)
+            self.assertGreater(big_columns, small_columns)
+            # Selection persisted through the resize -- never silently
+            # reassigned merely because the layout changed (item 22).
+            self.assertEqual(view.selected_node_id, you_id)
+            # MESH(N)/activity are untouched by a pure layout event.
+            self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
+            # The underlying logical position is exactly what it was --
+            # only the viewport changed, never the topology itself.
+            self.assertEqual(
+                view.base_positions[you_id],
+                (MESH_LOGICAL_GRID_CENTER_ROW, MESH_LOGICAL_GRID_CENTER_COLUMN),
+            )
+
+            await pilot.resize_terminal(60, 14)
+            await pilot.pause()
+            shrunk_rows, shrunk_columns, _, _ = view.current_grid_dimensions()
+            self.assertEqual((shrunk_rows, shrunk_columns), (small_rows, small_columns))
+            self.assertEqual(view.selected_node_id, you_id)

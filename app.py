@@ -63,6 +63,7 @@ from mesh_topology import (
     compact_node_label,
     directional_target,
     place_within_bounds,
+    project_to_viewport,
     route_chain,
 )
 from node_activity import is_node_active
@@ -446,28 +447,67 @@ class ConnectionPage(VerticalScroll):
 CIRCLE_SOLID_LARGE = "●"
 CIRCLE_STROKED_LARGE = "○"
 
-# --- MESH: real passive-data visualization on a fixed grid -----------------
+# --- MESH: real passive-data visualization on a responsive viewport --------
 #
-# A fixed 21-column x 8-row board driven entirely by real, passively
+# A viewport into a logical topology that may be LARGER than the
+# currently visible terminal grid, driven entirely by real, passively
 # observed Meshtastic data -- no LoRa traffic is ever generated to
 # populate or refresh it (see _refresh_mesh). Real nodes are placed by
 # coarse compass direction/distance ranking when GPS is available
 # (never exact, proportional geography), spread to use more of the
-# fixed grid's available room, and a real CLIENT's truthful nonzero hop
-# count renders as that many anonymous relay-stage placeholders along
-# its path to YOU (see mesh_topology.RelayStage) -- visual/topology
-# decoration only, never selectable, focusable, or a navigation
-# candidate. Intentionally out of scope: Favorites, dynamic node-count
-# growth beyond the bounded working set, and scrolling (the working set
-# is bounded precisely so the whole board always fits one viewport).
-# See mesh_state.py for the working-set/role/staleness/distance model
-# and mesh_topology.py for the pure grid geometry (assign_grid_slots(),
-# place_within_bounds(), directional_target(), build_relay_stages(),
-# route_chain()) reused here.
-MESH_GRID_ROWS = 8
-MESH_GRID_COLUMNS = 21
-MESH_GRID_CENTER_ROW = 5
-MESH_GRID_CENTER_COLUMN = 11
+# visible grid's available room, and a real CLIENT's truthful nonzero
+# hop count renders as that many anonymous relay-stage placeholders
+# along its path to YOU (see mesh_topology.RelayStage) -- visual/
+# topology decoration only, never selectable, focusable, or a
+# navigation candidate. The visible grid's own row/column count is
+# computed fresh from the MESH view's actual rendered size every
+# refresh (see _compute_mesh_grid_dimensions), never a hardcoded
+# per-font-size table -- a node whose logical position falls outside
+# that grid renders as an edge indicator instead of being force-fit
+# inside it (see mesh_topology.project_to_viewport). Intentionally out
+# of scope: Favorites, dynamic node-count growth beyond the bounded
+# working set, and free-form scrolling (navigation is always node-to-
+# node via the arrow keys, never a scrollable viewport). See
+# mesh_state.py for the working-set/role/staleness/distance model and
+# mesh_topology.py for the pure grid geometry (assign_grid_slots(),
+# place_within_bounds(), project_to_viewport(), directional_target(),
+# build_relay_stages(), route_chain()) reused here.
+MESH_GRID_MIN_ROWS = 5
+MESH_GRID_MIN_COLUMNS = 9
+# A node's label renders one terminal row ABOVE its glyph (see
+# set_nodes) -- reserving this one row of headroom at the top of the
+# computed grid keeps a glyph from ever being placed so close to
+# #mesh-view's own top edge that its label would render outside this
+# container entirely.
+MESH_GRID_LABEL_MARGIN_ROWS = 1
+# The LOGICAL topology's own bounded extent (assign_grid_slots()'s
+# `max_radius`/min_radius_by_id-boosted grid steps, mapped onto real
+# row/column coordinates by place_within_bounds() in _refresh_mesh) --
+# a FIXED coordinate space, entirely independent of the current
+# VIEWPORT's own row/column count (see
+# MeshTopologyView.current_grid_dimensions/on_resize, which never
+# touch these). A live viewport resize can only ever clip/reveal more
+# or less of this SAME stable layout afterward (see
+# mesh_topology.project_to_viewport) -- never re-derive it from a
+# different origin (see item 11/12 of the responsive-viewport task).
+#
+# Deliberately NOT dramatically larger than a typical viewport:
+# place_within_bounds() actively STRETCHES the lone farthest node on
+# each half-axis to use all available room up to this bound (see its
+# own docstring) -- an enormous bound here would stretch even a single
+# nearby remote node far out into empty space for no rendering
+# benefit, making nearly everything an edge indicator regardless of
+# viewport size. Kept at the same size that comfortably filled the
+# previous fixed 8x21 board -- still genuinely independent of the
+# viewport (a SMALL-font viewport, computed larger, can now reveal
+# this entire logical extent at once with room to spare; an XL-sized
+# one, computed smaller, or a client legitimately boosted farther out
+# by a large truthful hop count, can genuinely exceed it and need edge
+# indicators -- see item 26's tests).
+MESH_LOGICAL_GRID_ROWS = 8
+MESH_LOGICAL_GRID_COLUMNS = 21
+MESH_LOGICAL_GRID_CENTER_ROW = 5
+MESH_LOGICAL_GRID_CENTER_COLUMN = 11
 # Selected-node "visually larger" treatment: a 3-cell-wide composite
 # (small dot + role glyph + small dot) replacing the ordinary 1-cell
 # glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
@@ -530,21 +570,31 @@ def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
 
 
 def _mesh_translated_positions(
-    base_positions: Mapping[str, tuple[int, int]], selected_node_id: str
+    base_positions: Mapping[str, tuple[int, int]],
+    selected_node_id: str,
+    *,
+    center_row: int,
+    center_column: int,
 ) -> dict[str, tuple[int, int]]:
     """Translate the whole current layout so the selected node sits at the
 
-    center grid position. This is a pure whole-mesh translation: every
-    node shifts by the same row/column delta, so relative geometry
-    between nodes never changes -- it is never an independent per-node
-    recomputation, and it never touches `base_positions` (the working
-    set's fixed geographic/fallback layout) itself.
+    given center grid position (the CURRENT viewport's own center --
+    see MeshTopologyView.current_grid_dimensions, computed fresh from
+    the view's actual rendered size, never a fixed constant). This is a
+    pure whole-mesh translation: every node shifts by the same row/
+    column delta, so relative geometry between nodes never changes --
+    it is never an independent per-node recomputation, and it never
+    touches `base_positions` (the working set's fixed geographic/
+    fallback layout, itself independent of the viewport entirely) --
+    only a later clip into the visible grid (see
+    mesh_topology.project_to_viewport) can move a node off this exact
+    translated position, never this function.
     """
     selected = base_positions.get(selected_node_id)
     if selected is None:
         return dict(base_positions)
-    row_delta = MESH_GRID_CENTER_ROW - selected[0]
-    column_delta = MESH_GRID_CENTER_COLUMN - selected[1]
+    row_delta = center_row - selected[0]
+    column_delta = center_column - selected[1]
     return {
         node_id: (row + row_delta, column + column_delta)
         for node_id, (row, column) in base_positions.items()
@@ -580,8 +630,8 @@ def _mesh_directional_target(
             PositionedNode(node=NodeMetadata(node_id), x=column, y=row, region="UNKNOWN")
             for node_id, (row, column) in base_positions.items()
         ),
-        width=MESH_GRID_COLUMNS,
-        height=MESH_GRID_ROWS,
+        width=MESH_LOGICAL_GRID_COLUMNS,
+        height=MESH_LOGICAL_GRID_ROWS,
     )
     target = directional_target(current_node_id, layout, direction)  # type: ignore[arg-type]
     return target.node.node_id if target is not None else None
@@ -764,13 +814,54 @@ def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
 
 
 DOT_GRID_GLYPH = "·"
-# The fixed MESH grid must fit entirely inside the MESH viewport on the
-# supported uConsole/test terminal size (~90 columns) with no scrolling.
 # 4x2 keeps a 2:1 x:y ratio (so the grid reads as roughly square against
-# typical terminal cell proportions); at the current 9x21 grid that renders
-# an 84x18 board, with margin inside that viewport.
+# typical terminal cell proportions) between one logical grid step and
+# its rendered terminal-cell size -- this ratio itself never changes
+# with font size or viewport size (see item 3 of the responsive-
+# viewport task: glyphs are never scaled to fill space; the GRID gains
+# or loses cells instead).
 DOT_GRID_SPACING_X = 4
 DOT_GRID_SPACING_Y = 2
+
+
+def _compute_mesh_grid_dimensions(
+    view_width: int, view_height: int
+) -> tuple[int, int, int, int]:
+    """Derive (rows, columns, center_row, center_column) for the
+
+    visible MESH grid from the MESH viewport's OWN actual rendered
+    size -- never a hardcoded per-font-size table (see
+    MeshTopologyView.current_grid_dimensions, this function's only
+    caller). #mesh-view already flexes to fill whatever space remains
+    once the top connection/status line and the bottom selected-node
+    context line (both separate sibling widgets outside this
+    container -- see MeshtasticPassApp.compose) take their own rows,
+    so `view_width`/`view_height` -- that container's own self.size --
+    already IS "the available MESH content area", with no further
+    reservation needed for those two specifically.
+
+    MESH_GRID_LABEL_MARGIN_ROWS is reserved from the row count for
+    label headroom (see set_nodes). Dimensions are forced ODD so there
+    is always an exact, unambiguous center cell for YOU to occupy when
+    the viewport is YOU-centered, floored at MESH_GRID_MIN_ROWS/
+    MESH_GRID_MIN_COLUMNS so a not-yet-laid-out or pathologically small
+    container never produces a degenerate 0- or 1-cell grid. A pure
+    function of its two inputs: unchanged geometry always yields
+    identical dimensions, and nothing about node activity, selection,
+    or connectors ever feeds into it.
+    """
+    columns = max(MESH_GRID_MIN_COLUMNS, view_width // DOT_GRID_SPACING_X)
+    if columns % 2 == 0:
+        columns -= 1
+    usable_rows = (
+        max(1, view_height // DOT_GRID_SPACING_Y) - MESH_GRID_LABEL_MARGIN_ROWS
+    )
+    rows = max(MESH_GRID_MIN_ROWS, usable_rows)
+    if rows % 2 == 0:
+        rows -= 1
+    center_row = rows // 2 + 1
+    center_column = columns // 2 + 1
+    return rows, columns, center_row, center_column
 
 
 def _render_mesh_canvas(
@@ -845,14 +936,18 @@ class MeshCanvas(Static):
 
 
 class MeshTopologyView(Container):
-    """A fixed 8x21 grid MESH board driven by a real, bounded MESH working set.
+    """A responsive VIEWPORT into a MESH working set that may be larger
 
-    No scrolling, no scrollbars -- the working set is bounded precisely
-    so the whole board always fits this one fixed viewport (see
-    mesh_state.build_mesh_working_set). Node identity, positions
+    than the currently visible terminal grid (see
+    current_grid_dimensions/mesh_topology.project_to_viewport). No
+    scrolling, no scrollbars -- navigation is always node-to-node via
+    the arrow keys (see MeshtasticPassApp._move_mesh_focus); a node
+    whose translated position falls outside the visible grid renders
+    as an edge indicator instead. Node identity, positions
     (base_positions, from mesh_topology.assign_grid_slots() +
-    place_within_bounds()), and roles all come from the current working
-    set passed to set_nodes(); this view only lays out and renders them.
+    place_within_bounds() -- STABLE, viewport-independent logical
+    coordinates) and roles all come from the current working set passed
+    to set_nodes(); this view only lays out, clips, and renders them.
     """
 
     can_focus = True
@@ -866,6 +961,8 @@ class MeshTopologyView(Container):
         self._working_set: tuple[MeshNodeState, ...] = ()
         self._base_positions: dict[str, tuple[int, int]] = {}
         self._relay_stages: tuple[RelayStage, ...] = ()
+        self._edge_node_ids: frozenset[str] = frozenset()
+        self._last_now: float = 0.0
 
     @property
     def board(self) -> Container:
@@ -881,10 +978,13 @@ class MeshTopologyView(Container):
 
     @property
     def base_positions(self) -> dict[str, tuple[int, int]]:
-        """Real-node AND anonymous-relay-stage logical (row, column)
+        """Real-node AND anonymous-relay-stage STABLE logical (row,
 
-        positions, merged -- rendering and connector routing need both
-        kinds of coordinate together. This is NOT the arrow-navigation
+        column) positions, merged -- the fixed layout produced by
+        assign_grid_slots()/place_within_bounds()/build_relay_stages(),
+        entirely independent of the current viewport/selection (see
+        mesh_topology.project_to_viewport, applied only at render time
+        in set_nodes -- never here). This is NOT the arrow-navigation
         candidate set: a RelayStage's ID is included here (its glyph
         must be positioned and translated exactly like a real node's)
         but is never itself navigable -- see
@@ -898,6 +998,60 @@ class MeshTopologyView(Container):
     @property
     def relay_stages(self) -> tuple[RelayStage, ...]:
         return self._relay_stages
+
+    @property
+    def edge_node_ids(self) -> frozenset[str]:
+        """Real working-set node IDs currently rendered as an edge
+
+        indicator rather than normally -- i.e. their translated
+        position fell outside the visible viewport this render and was
+        clipped onto its boundary (see mesh_topology.
+        project_to_viewport). Never includes anonymous relay-stage IDs:
+        those are excluded from this set even when their own position
+        was likewise clipped, since a relay stage is never a selectable
+        "edge" concept, just clipped visual topology (see set_nodes).
+        """
+        return self._edge_node_ids & {state.node.node_id for state in self._working_set}
+
+    def current_grid_dimensions(self) -> tuple[int, int, int, int]:
+        """(rows, columns, center_row, center_column) for the visible
+
+        grid, computed fresh from this container's OWN actual rendered
+        size (see _compute_mesh_grid_dimensions) -- never a hardcoded
+        per-font-size table. Calling this repeatedly with no layout
+        change in between always returns the identical result: it is a
+        pure function of self.size, never of activity, selection, or
+        connectors.
+        """
+        return _compute_mesh_grid_dimensions(self.size.width, self.size.height)
+
+    def on_resize(self) -> None:
+        """The MESH viewport's available terminal-cell area just
+
+        changed (a real terminal resize, or -- in the real deployment
+        -- reopening after a font-size change reconfigured how many
+        cells fit; see item 24 of the responsive-viewport task) --
+        relayout immediately against the new size rather than waiting
+        for the next unrelated refresh.
+
+        Re-renders the SAME already-known working set/positions against
+        the new size, reusing the exact "now" set_nodes was last called
+        with (`_last_now`) rather than sampling a fresh, unsynchronized
+        time() here: a resize is a pure LAYOUT event and must only ever
+        change screen coordinates, never re-derive activity/counts from
+        a different "now" than the rest of the current refresh cycle
+        used (see _refresh_mesh's own "computed exactly ONCE per cycle"
+        principle -- this must not become a second, independent source
+        of "now"). A no-op before the working set has ever been
+        populated (nothing to relayout yet, and no "now" to reuse).
+        """
+        if self._working_set:
+            self.set_nodes(
+                self._working_set,
+                self._base_positions,
+                theme=self.app._current_theme,
+                now=self._last_now,
+            )
 
     def set_nodes(
         self,
@@ -915,10 +1069,21 @@ class MeshTopologyView(Container):
         nodes that actually entered/left the working set -- unchanged
         nodes keep their existing widget, so unchanged data never
         reshuffles or remounts anything.
+
+        The visible grid's own dimensions are recomputed fresh from
+        this container's actual current size every call (see
+        current_grid_dimensions) -- a resize (real terminal resize, or
+        a later call after a font-size-driven relaunch) is picked up
+        automatically the next time this runs, with no separate
+        per-font-size table anywhere.
         """
+        self._last_now = now
         board = self.board
-        board_width = MESH_GRID_COLUMNS * DOT_GRID_SPACING_X
-        board_height = MESH_GRID_ROWS * DOT_GRID_SPACING_Y
+        row_count, column_count, center_row, center_column = (
+            self.current_grid_dimensions()
+        )
+        board_width = column_count * DOT_GRID_SPACING_X
+        board_height = row_count * DOT_GRID_SPACING_Y
         board.styles.width = board_width
         board.styles.height = board_height
         # Horizontally center the whole board as one rigid block inside the
@@ -961,12 +1126,27 @@ class MeshTopologyView(Container):
         # rendered connectors, and "what else does my radio remember"
         # via dim, disconnected real nodes.
         active_hop_counts = _mesh_active_hop_counts(working_set, now=now)
+        # Relay-stage interpolation happens in the STABLE logical
+        # coordinate space (MESH_LOGICAL_GRID_*), never the current
+        # viewport's dynamic row/column count -- a relay chain's
+        # placement must not shift merely because the visible grid grew
+        # or shrank (see item 12 of the responsive-viewport task); only
+        # the later viewport-projection step below may move it on
+        # screen.
         relay_stages, relay_positions = build_relay_stages(
             real_positions,
             you_id=you_id or "",
             hop_counts=active_hop_counts,
-            row_count=MESH_GRID_ROWS,
-            column_count=MESH_GRID_COLUMNS,
+            row_count=MESH_LOGICAL_GRID_ROWS,
+            column_count=MESH_LOGICAL_GRID_COLUMNS,
+            # The real per-axis pixel spacing this view actually renders
+            # with -- required for build_relay_stages' own self-overlap
+            # avoidance to correctly predict what will land on screen
+            # (DOT_GRID_SPACING_X/Y are uneven per axis; see
+            # mesh_topology.build_relay_stages' own docstring for why
+            # that unevenness matters here).
+            row_scale=DOT_GRID_SPACING_Y,
+            column_scale=DOT_GRID_SPACING_X,
         )
         self._relay_stages = relay_stages
         self._base_positions = {**real_positions, **relay_positions}
@@ -980,6 +1160,25 @@ class MeshTopologyView(Container):
                 working_set[0].node.node_id if working_set else ""
             )
 
+        # A real working-set node whose translated position falls
+        # outside the current viewport renders as an edge indicator:
+        # its glyph still gets the ordinary real-node treatment (see
+        # MeshNodeWidget.refresh_visual -- FILLED/BASE or STROKED/
+        # DIM_BASE per the same is_node_active predicate as always,
+        # never a new "off-screen" color), but it gets no label -- a
+        # normal label always implies a normal in-viewport node.
+        positions = _mesh_translated_positions(
+            self._base_positions,
+            self._selected_node_id,
+            center_row=center_row,
+            center_column=center_column,
+        )
+        viewport_positions, edge_ids = project_to_viewport(
+            positions, row_count=row_count, column_count=column_count
+        )
+        self._edge_node_ids = edge_ids
+        labelable_ids = current_ids - edge_ids
+
         states_by_id = {state.node.node_id: state for state in working_set}
         stages_by_id = {stage.node_id: stage for stage in relay_stages}
         # Widget.remove() only schedules removal -- it does not take effect
@@ -990,7 +1189,7 @@ class MeshTopologyView(Container):
             if widget.node_id not in current_ids:
                 widget.remove()
         for widget in list(self.query(MeshNodeLabelWidget)):
-            if widget.node_id not in current_ids:
+            if widget.node_id not in labelable_ids:
                 widget.remove()
         for widget in list(self.query(MeshRelayWidget)):
             if widget.node_id not in relay_ids:
@@ -1003,7 +1202,7 @@ class MeshTopologyView(Container):
         existing_label_ids = {
             widget.node_id
             for widget in self.query(MeshNodeLabelWidget)
-            if widget.node_id in current_ids
+            if widget.node_id in labelable_ids
         }
         existing_relay_ids = {
             widget.node_id
@@ -1017,7 +1216,7 @@ class MeshTopologyView(Container):
         ]
         new_labels = [
             MeshNodeLabelWidget(states_by_id[node_id])
-            for node_id in states_by_id
+            for node_id in labelable_ids
             if node_id not in existing_label_ids
         ]
         # Anonymous relay-stage placeholders are never labeled -- no
@@ -1039,7 +1238,7 @@ class MeshTopologyView(Container):
         label_widgets = [
             widget
             for widget in self.query(MeshNodeLabelWidget)
-            if widget.node_id in current_ids
+            if widget.node_id in labelable_ids
         ]
         relay_widgets = [
             widget for widget in self.query(MeshRelayWidget) if widget.node_id in relay_ids
@@ -1051,9 +1250,6 @@ class MeshTopologyView(Container):
         for widget in relay_widgets:
             widget.stage = stages_by_id[widget.node_id]
 
-        positions = _mesh_translated_positions(
-            self._base_positions, self._selected_node_id
-        )
         centers: dict[str, tuple[int, int]] = {}
         # The glyph is the sole coordinate authority: it is always a 1x1
         # (or, selected, 3x1) widget centered exactly on (grid_x, grid_y),
@@ -1061,7 +1257,7 @@ class MeshTopologyView(Container):
         # `centers` (used for connector endpoints below) only ever
         # reflects glyph coordinates.
         for widget in glyph_widgets:
-            row, column = positions[widget.node_id]
+            row, column = viewport_positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
             selected = widget.node_id == self._selected_node_id
             # Selected nodes render a 3-cell-wide composite (see
@@ -1080,7 +1276,7 @@ class MeshTopologyView(Container):
         # enlarged selected composite -- a relay stage is never selected
         # (see MeshRelayWidget), so it is always exactly 1 cell wide.
         for widget in relay_widgets:
-            row, column = positions[widget.node_id]
+            row, column = viewport_positions[widget.node_id]
             grid_x, grid_y = _mesh_grid_pixel(row, column)
             widget.styles.width = 1
             widget.styles.height = 1
@@ -1105,19 +1301,25 @@ class MeshTopologyView(Container):
 
         # Connector semantics: a YOU-to-node path means "we currently
         # believe this node is active in the mesh" -- CLIENT history
-        # alone is not enough, and neither is a merely-known hop count;
-        # see _mesh_active_hop_counts. A stale node keeps its last-known
-        # position but no path back to YOU: it answers "what else does
-        # my radio remember", not "what's active right now". It is drawn
-        # through exactly that client's own anonymous relay stages
-        # (hops_away of them, in order -- see RelayStage/
-        # build_relay_stages), representing observed path DEPTH, never
-        # discovered relay identity: "Alice is 3 relay stages away",
-        # never "these are three identified radios". A `? HOPS` client
-        # gets no path at all -- any line, direct or through relay
-        # stages, would imply a specific, unverified hop depth, which is
-        # never fabricated (see the MESH spec's "UNKNOWN HOPS" / "? HOPS
-        # CONNECTORS" sections).
+        # alone is not enough; see _mesh_active_hop_counts. A stale node
+        # keeps its last-known position but no path back to YOU: it
+        # answers "what else does my radio remember", not "what's active
+        # right now". The amount of known route detail determines relay
+        # visualization, never whether a connection exists at all: a
+        # known nonzero hop count draws through exactly that many
+        # anonymous relay stages (see RelayStage/build_relay_stages),
+        # representing observed path DEPTH, never discovered relay
+        # identity ("Alice is 3 relay stages away", never "these are
+        # three identified radios"); a known zero hop count, or an
+        # UNKNOWN hop count, draws a direct line with zero relay stages
+        # -- "we know this real node is currently participating, but we
+        # do not know its intermediate route" is not the same claim as
+        # "draw an isolated active dot with no connection at all", and
+        # treating it that way previously left active nodes with unknown
+        # hops rendered with no connector whatsoever. The selected-node
+        # context line's own "? HOPS" still reports the hop count
+        # honestly (see format_mesh_context_line) -- this only concerns
+        # whether a connector renders, never fabricates a hop count.
         palette = THEME_PALETTES[theme]
         stages_by_client: dict[str, list[RelayStage]] = {}
         for stage in relay_stages:
@@ -1129,11 +1331,9 @@ class MeshTopologyView(Container):
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
-                hops = state.node.hops_away
                 if (
                     state.node.is_local
                     or remote_id not in centers
-                    or hops is None
                     or not is_node_active(state.node.last_heard, now)
                 ):
                     continue
@@ -1153,8 +1353,25 @@ class MeshTopologyView(Container):
                     if self._selected_node_id in chain_ids
                     else palette.dim_base
                 )
+                route_cells = route_chain(chain_points)
+                if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
+                    # build_relay_stages already guarantees an ordered,
+                    # non-self-overlapping chain in LOGICAL space (see
+                    # its own docstring), but project_to_viewport clips
+                    # each node's position independently, with no
+                    # awareness of chain order -- a chain whose stages
+                    # get clipped onto DIFFERENT edge cells can still
+                    # end up geometrically out of order once translated
+                    # to screen coordinates. Rather than let that render
+                    # as a branch, fall back to a direct YOU-to-endpoint
+                    # line for the connector's PATH only -- the relay
+                    # dots themselves stay rendered at their own clipped
+                    # positions (see the glyph-placement loop above),
+                    # never fabricated or hidden, only the connecting
+                    # LINE no longer visits them.
+                    route_cells = route_chain((centers[you_id], centers[remote_id]))
                 connector_cells.extend(
-                    (x, y, glyph, color) for x, y, glyph in route_chain(chain_points)
+                    (x, y, glyph, color) for x, y, glyph in route_cells
                 )
         self.board.query_one(MeshCanvas).render_scene(
             board_width, board_height, tuple(connector_cells), theme
@@ -1168,6 +1385,7 @@ class MeshTopologyView(Container):
         self._base_positions = {}
         self._relay_stages = ()
         self._selected_node_id = ""
+        self._edge_node_ids = frozenset()
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
 
     def select_node(self, node_id: str) -> None:
@@ -2172,7 +2390,7 @@ class MeshtasticPassApp(App[None]):
                 yield Static("Coming in a future milestone.")
             with Vertical(id="mesh", classes="tab-page"):
                 # Shown/hidden and populated by _update_chat_connection_state()
-                # with the exact same _connection_status_text() CHAT's
+                # with the exact same _connection_status_rich_text() CHAT's
                 # heading uses -- never MESH-specific terminology. Not the
                 # removed permanent "> MESH · ACTIVE N" heading: this
                 # exists ONLY while a connection state needs to be
@@ -3251,7 +3469,7 @@ class MeshtasticPassApp(App[None]):
             # Stale topology intentionally stays visible while
             # connecting/reconnecting -- the shared top-of-view
             # connection status (see _update_chat_connection_state/
-            # _connection_status_text) already communicates "not live
+            # _connection_status_rich_text) already communicates "not live
             # right now"; clearing or rebuilding the board here would be
             # a needless reshuffle of useful stale data over a
             # connection-status change alone. Never MESH-specific
@@ -3281,12 +3499,17 @@ class MeshtasticPassApp(App[None]):
             max_radius=DEFAULT_MAX_GRID_RADIUS,
             min_radius_by_id=min_radius_by_id,
         )
+        # Placed in the STABLE logical coordinate space, entirely
+        # independent of the current viewport's own row/column count
+        # (see MESH_LOGICAL_GRID_ROWS) -- MeshTopologyView.set_nodes is
+        # the only place that later translates/clips this same layout
+        # into whatever is currently visible.
         base_positions = place_within_bounds(
             slots,
-            center_row=MESH_GRID_CENTER_ROW,
-            center_column=MESH_GRID_CENTER_COLUMN,
-            row_count=MESH_GRID_ROWS,
-            column_count=MESH_GRID_COLUMNS,
+            center_row=MESH_LOGICAL_GRID_CENTER_ROW,
+            center_column=MESH_LOGICAL_GRID_CENTER_COLUMN,
+            row_count=MESH_LOGICAL_GRID_ROWS,
+            column_count=MESH_LOGICAL_GRID_COLUMNS,
         )
         view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
         self._update_mesh_context_status()
@@ -3403,10 +3626,18 @@ class MeshtasticPassApp(App[None]):
         to navigate at all (`if not targets`, also unchanged) -- e.g. a
         freshly opened, empty CHAT, satisfying "DOWN begins composing"
         (see show_tab's CHAT branch) without disturbing the ordinary
-        walk-through-messages-then-reach-composer flow a non-empty
-        transcript still uses. UP (direction < 0) from the neutral
-        post-tab-entry/post-Escape state lands on the newest visible
-        message, exactly as it always has.
+        walk-through-messages-then-reach-composer flow once focus is
+        already on a specific message.
+
+        The NEUTRAL state -- focus is on the transcript itself or
+        anything else not among `targets`, e.g. right after opening
+        CHAT or pressing Escape (see show_tab/on_key) -- is treated as
+        "positioned at the latest message" for BOTH directions, not
+        merely for UP: DOWN goes straight to the composer, the same as
+        if one more message existed past the newest and DOWN had
+        stepped past it, with no need to first walk forward through
+        every older message. UP still lands on the newest visible
+        message itself, exactly as it always has.
         """
         targets = self._chat_navigation_targets()
         if not targets:
@@ -3421,7 +3652,10 @@ class MeshtasticPassApp(App[None]):
                 return
             target = targets[max(0, min(len(targets) - 1, next_index))]
         except ValueError:
-            target = targets[-1] if direction < 0 else targets[0]
+            if direction > 0:
+                self._focus_chat_composer()
+                return
+            target = targets[-1]
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
@@ -4002,7 +4236,23 @@ class MeshtasticPassApp(App[None]):
         packet_id: int | None = None,
         detail: str = "",
     ) -> None:
+        previous_state = entry.delivery_state
         entry.delivery_state = state
+        # A manual resend (send_generation > 1) that actually,
+        # successfully re-enters the mesh moves the message to its new
+        # chronological position -- see _update_effective_transmission_
+        # time. Gated on the OLD state being SENDING specifically so
+        # this fires exactly once per resend generation, at the
+        # SENDING -> SENT/HEARD transition only: a later SENT -> HEARD
+        # acknowledgement (previous_state is already SENT here, not
+        # SENDING) never re-triggers it, and an ordinary first attempt
+        # (send_generation == 1) is never affected at all.
+        if (
+            entry.send_generation > 1
+            and previous_state is DeliveryState.SENDING
+            and state in (DeliveryState.SENT, DeliveryState.HEARD)
+        ):
+            self._update_effective_transmission_time(entry)
         if packet_id is not None:
             entry.packet_id = packet_id
         if state is not DeliveryState.SENT:
@@ -4033,6 +4283,74 @@ class MeshtasticPassApp(App[None]):
                 widget.refresh_delivery_state(self._send_dot_count)
                 break
         self._update_footer()
+
+    def _update_effective_transmission_time(self, entry: ChatEntry) -> None:
+        """Move `entry` to reflect WHEN it actually, successfully
+
+        retransmitted -- not when the user originally composed it (see
+        item 3, MANUAL RESEND SHOULD UPDATE CHAT CHRONOLOGY). Only
+        `local_sent_at` (ChatEntry.message_time/order_key's source for
+        an outgoing entry, and the persisted column of the same name)
+        changes; the message keeps its identity, message_id, and every
+        send_attempt row exactly as before -- nothing is deleted,
+        recreated, or duplicated. `created_at` (persisted separately,
+        never touched here) still truthfully answers "when was this
+        message first composed", regardless of how many attempts it
+        took to actually land.
+
+        `age_reference` is updated too so the DISPLAYED elapsed age
+        reflects the same new moment. It is never itself persisted (see
+        ChatEntry.age_reference / stored_chat_entry) -- a fresh restart
+        recomputes it correctly from the persisted local_sent_at alone,
+        so this in-memory update only matters for the current session.
+        """
+        wall_now = time()
+        entry.local_sent_at = wall_now
+        entry.age_reference = monotonic()
+        if self.chat_store is not None and entry.message_id is not None:
+            try:
+                self.chat_store.update_message_chronology(entry.message_id, wall_now)
+            except ChatStoreError as error:
+                self._show_send_error(str(error))
+        self._reposition_chat_entry(entry)
+
+    def _reposition_chat_entry(self, entry: ChatEntry) -> None:
+        """Move `entry` (and its mounted widget, if any) to the list
+
+        position its current order_key now implies, without destroying
+        or recreating the widget -- so any live selection/focus on it
+        (see Widget.move_child) survives the move exactly. Manual resend
+        is only ever offered on an already-visible, currently-mounted
+        message (see can_manual_resend/_rebroadcast's callers), so
+        `entry` is always a member of the CURRENT channel's
+        self.chat_history when this runs.
+        """
+        if entry not in self.chat_history:
+            return
+        self.chat_history.remove(entry)
+        new_index = self._insert_entry_in_order(self.chat_history, entry)
+        if self.current_tab != "chat":
+            return
+        widget = next(
+            (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
+            None,
+        )
+        if widget is None:
+            return
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        following = self._following_chat_widget(new_index)
+        if following is widget:
+            return
+        if following is not None:
+            transcript.move_child(widget, before=following)
+            return
+        others = [
+            candidate
+            for candidate in transcript.query(ChatEntryWidget)
+            if candidate is not widget
+        ]
+        if others:
+            transcript.move_child(widget, after=others[-1])
 
     def _rebroadcast(self, entry: ChatEntry) -> None:
         if not can_manual_resend(entry):
@@ -4119,28 +4437,6 @@ class MeshtasticPassApp(App[None]):
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
 
-    def _connection_status_text(self) -> str:
-        """The single authoritative connection-status line CHAT and MESH
-
-        show at the top of their view while the radio isn't ONLINE.
-
-        Built from the EXACT SAME ANIMATED_STATUS mapping and
-        _status_dot_count animation counter CONNECTION/CONFIG's own
-        status row already uses (see _render_connection_details) --
-        never a tab-specific reinterpretation. This is why CHAT could
-        previously show "RECONNECTING..." while CONNECTION/CONFIG showed
-        "CONNECTING...": CHAT's old _render_chat_status() hardcoded its
-        own literal string instead of reading this shared value. There
-        is no separate RECONNECTING state in RadioState -- a dropped
-        connection re-enters RadioState.CONNECTING exactly like the
-        first attempt (see radio_service.connection_events()), so both
-        report identically here too. Returns "" when ONLINE (nothing to
-        show; callers should hide/restore their normal presentation).
-        """
-        if self._radio_state is RadioState.ONLINE:
-            return ""
-        return f"STATUS {ANIMATED_STATUS[self._radio_state]}" + "." * self._status_dot_count
-
     def _connection_status_color(self) -> str:
         """The semantic color for the current non-ONLINE radio state --
 
@@ -4149,18 +4445,52 @@ class MeshtasticPassApp(App[None]):
         duplicating the ternary): ERROR for RadioState.ERROR, ACCENT for
         every other non-ONLINE state (CONNECTING, OFFLINE). CHAT (see
         _update_chat_connection_state) and MESH (same function, which
-        writes #mesh-connection-status) both reuse this exact value for
-        _connection_status_text(), so all three surfaces always agree on
-        what a given radio state visually means -- one authoritative
-        color decision, never three independent ones. Uses the current
-        theme's own semantic tokens (never a hardcoded literal color),
-        so it stays correct across WHITE/GREEN/ORANGE. Meaningless while
-        ONLINE; callers only use this alongside non-empty status text,
-        which _connection_status_text() only ever produces when not
-        ONLINE.
+        writes #mesh-connection-status) both reuse this exact value via
+        _connection_status_rich_text(), so all three surfaces always
+        agree on what a given radio state visually means -- one
+        authoritative color decision, never three independent ones.
+        Uses the current theme's own semantic tokens (never a hardcoded
+        literal color), so it stays correct across WHITE/GREEN/ORANGE.
+        Meaningless while ONLINE; callers only use this alongside
+        non-empty status text, which _connection_status_rich_text()
+        only ever produces when not ONLINE.
         """
         palette = THEME_PALETTES[self._current_theme]
         return palette.error if self._radio_state is RadioState.ERROR else palette.accent
+
+    def _connection_status_rich_text(self) -> Text | None:
+        """The single authoritative connection-status line CHAT and MESH
+
+        show at the top of their view while the radio isn't ONLINE, styled
+        component-level: the "STATUS" word in BASE, the animated state
+        word (CONNECTING..., OFFLINE -- RETRYING..., ...) in its own
+        semantic color from _connection_status_color() -- the same
+        label-in-BASE/value-in-its-own-style grammar
+        _render_connection_details() already uses for CONNECTION/
+        CONFIG's own status row, reused verbatim here so CHAT's heading
+        and MESH's status line always agree with it at the SPAN level,
+        not merely "some color somewhere in the string" (see
+        _update_chat_connection_state, this function's only caller).
+        Built from the EXACT SAME ANIMATED_STATUS mapping and
+        _status_dot_count animation counter CONNECTION/CONFIG's own
+        status row already uses -- never a tab-specific reinterpretation.
+        There is no separate RECONNECTING state in RadioState -- a
+        dropped connection re-enters RadioState.CONNECTING exactly like
+        the first attempt (see radio_service.connection_events()), so
+        both report identically here too. Returns None when ONLINE
+        (nothing to show; callers should hide/restore their normal
+        presentation).
+        """
+        if self._radio_state is RadioState.ONLINE:
+            return None
+        palette = THEME_PALETTES[self._current_theme]
+        text = Text()
+        text.append("STATUS ", style=palette.base)
+        text.append(
+            ANIMATED_STATUS[self._radio_state] + "." * self._status_dot_count,
+            style=self._connection_status_color(),
+        )
+        return text
 
     def _update_chat_connection_state(self) -> None:
         """Keep CHAT's connection-status presentation in sync with the
@@ -4185,9 +4515,6 @@ class MeshtasticPassApp(App[None]):
         ever writes while NOT ONLINE, that one only ever writes while
         ONLINE.
         """
-        status_text = self._connection_status_text()
-        status_color = self._connection_status_color() if status_text else None
-
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
             chat_inputs[0].disabled = self._radio_state is not RadioState.ONLINE
@@ -4195,13 +4522,14 @@ class MeshtasticPassApp(App[None]):
 
         selectors = list(self.query(ChannelSelector))
         if selectors:
-            selectors[0].set_status_override(status_text or None, color=status_color)
+            selectors[0].set_status_override(self._connection_status_rich_text())
 
-        if status_text:
+        status_rich_text = self._connection_status_rich_text()
+        if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:
                 widget = mesh_status_widgets[0]
-                widget.update(Text(status_text, style=status_color))
+                widget.update(status_rich_text)
                 widget.display = True
 
     def _update_mesh_status_line(
@@ -4387,7 +4715,7 @@ class MeshtasticPassApp(App[None]):
         """Send-error / older-message notice only -- connection status
 
         lives solely in CHAT's top heading now (see
-        _update_chat_connection_state/_connection_status_text), never
+        _update_chat_connection_state/_connection_status_rich_text), never
         duplicated here. Message entry is disabled while not ONLINE
         (see _update_chat_connection_state), so this renders whatever
         it normally would regardless of connection state -- there is
