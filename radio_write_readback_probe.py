@@ -18,13 +18,21 @@ THE CORE QUESTION THIS PROBE ANSWERS: does reading
 prove the RADIO applied the change, or does it only prove the LOCAL
 Python object was mutated? To answer this honestly, every "read" in
 this script poisons the local field with an unmistakable sentinel
-value first, explicitly asks the radio to resend that config section
-(`localNode.requestConfig(...)`), and then polls until the SDK's own
-generic FromRadio-handling code (see mesh_interface.py's
-_handleFromRadio, which CopyFrom()s a fresh config packet into this
-exact same object whenever one arrives) overwrites the sentinel -- or
-times out. Only a value that is NOT the sentinel we just poisoned it
-with counts as evidence of a genuinely fresh radio-side response.
+value first, then sends its own `AdminMessage.get_config_request` for
+DISPLAY_CONFIG with an EXPLICIT response callback wired -- bypassing
+`localNode.requestConfig()`'s convenience wrapper, which passes
+`onResponse=None` for the LOCAL node specifically. That default is not
+a caching quirk: it means NOTHING in the SDK ever parses the radio's
+`getConfigResponse` reply or copies it into `localConfig` for a local
+node's own config requests, even though the reply packet is fully
+visible on the generic "meshtastic.receive" topic. A fresh value is
+only accepted once a `getConfigResponse` packet's own raw protobuf
+(`AdminMessage.get_config_response.WhichOneof("payload_variant")`)
+names the "display" section -- never from packet arrival alone
+(other sections/ACKs arrive on the same topic) and never from a bare
+poll of the local cache (which this callback also updates via the
+SDK's own `Node.onResponseRequestSettings`, cross-checked but not
+trusted as the primary signal).
 
 Every packet the SDK decodes during the experiment (routing ACK/NAK,
 admin responses, anything else) is also logged via the same generic
@@ -113,6 +121,36 @@ class PacketObserver:
         return [describe_packet(packet) for packet in self.packets[start_index:]]
 
 
+def _get_config_response_section(admin: Any) -> str | None:
+    """Which LocalConfig section (e.g. "display") a getConfigResponse
+
+    names, read directly from the packet's own raw AdminMessage
+    protobuf via the Config message's `payload_variant` oneof -- never
+    from the decoded dict's key order, and never from any side effect
+    on local_node's cache. Returns None for anything that is not a
+    getConfigResponse (routing ACK/NAK, other admin replies, etc.).
+    """
+    if not isinstance(admin, dict):
+        return None
+    raw = admin.get("raw")
+    if raw is None or not raw.HasField("get_config_response"):
+        return None
+    return raw.get_config_response.WhichOneof("payload_variant")
+
+
+def _get_config_response_field(admin: Any, section: str, field: str) -> Any:
+    """The value of `section.field` inside a getConfigResponse's raw
+
+    protobuf payload -- e.g. section="display", field="screen_on_secs".
+    Returns None if `admin` does not carry a getConfigResponse for
+    that section.
+    """
+    if _get_config_response_section(admin) != section:
+        return None
+    section_message = getattr(admin["raw"].get_config_response, section)
+    return getattr(section_message, field)
+
+
 def describe_packet(packet: Any) -> str:
     """Human-readable one-liner for one decoded SDK packet -- routing
 
@@ -133,7 +171,14 @@ def describe_packet(packet: Any) -> str:
         return f"from={from_id} ROUTING_APP errorReason={reason} requestId={decoded.get('requestId')}"
     if portnum == "ADMIN_APP":
         admin = decoded.get("admin")
-        keys = list(admin.keys()) if isinstance(admin, dict) else []
+        section = _get_config_response_section(admin)
+        if section is not None:
+            detail = f"getConfigResponse section={section}"
+            if section == SECTION_NAME:
+                value = _get_config_response_field(admin, SECTION_NAME, FIELD_NAME)
+                detail += f" {FIELD_NAME}={value}"
+            return f"from={from_id} ADMIN_APP {detail}"
+        keys = [key for key in admin.keys() if key != "raw"] if isinstance(admin, dict) else []
         return f"from={from_id} ADMIN_APP fields={keys}"
     return f"from={from_id} portnum={portnum} channel={packet.get('channel', 0)}"
 
@@ -146,33 +191,73 @@ def fresh_read(
 ) -> tuple[int | None, bool]:
     """Poison the local cache, request a fresh config read from the
 
-    radio, and poll until the poisoned value is overwritten by
-    genuinely new data or `timeout` elapses.
+    radio, and wait for a getConfigResponse whose OWN raw protobuf
+    content names the "display" section -- never for packet arrival
+    alone (other admin traffic uses the same topic) and never by
+    polling the local cache for a bare change.
+
+    Bypasses localNode.requestConfig()'s convenience wrapper on
+    purpose: for the LOCAL node it hard-codes onResponse=None, so nothing
+    would ever parse the reply. This calls _sendAdmin directly with an
+    explicit callback that (a) invokes the SDK's own
+    Node.onResponseRequestSettings, so localConfig genuinely gets the
+    same CopyFrom a remote-node request would receive, and (b)
+    independently extracts the section/value straight from the
+    packet's raw protobuf, which is the actual pass/fail signal.
 
     Returns (value_or_None, timed_out). `value_or_None` is None only
-    when timed_out is True -- there is otherwise always a concrete
-    (possibly still-sentinel-adjacent, but in practice always
-    radio-sourced) integer to report.
+    when timed_out is True.
     """
+    from meshtastic.protobuf import admin_pb2
+
     section = getattr(local_node.localConfig, SECTION_NAME)
     setattr(section, FIELD_NAME, SENTINEL_VALUE)
-    field_descriptor = local_node.localConfig.DESCRIPTOR.fields_by_name[SECTION_NAME]
+
+    admin_request = admin_pb2.AdminMessage()
+    admin_request.get_config_request = admin_pb2.AdminMessage.ConfigType.Value(
+        f"{SECTION_NAME.upper()}_CONFIG"
+    )
+
+    found: dict[str, int] = {}
+
+    def on_response(packet: Any) -> None:
+        # Reuse the SDK's own extraction/CopyFrom logic (normally only
+        # wired for remote-node requests) so localConfig is updated
+        # through the real mechanism, not a hand-rolled duplicate of it.
+        local_node.onResponseRequestSettings(packet)
+        decoded = packet.get("decoded") if isinstance(packet, dict) else None
+        admin = decoded.get("admin") if isinstance(decoded, dict) else None
+        if _get_config_response_section(admin) == SECTION_NAME:
+            found["value"] = _get_config_response_field(admin, SECTION_NAME, FIELD_NAME)
 
     before_count = len(observer.packets)
-    local_node.requestConfig(field_descriptor)
+    local_node._sendAdmin(admin_request, onResponse=on_response)
 
     start = time.monotonic()
     while time.monotonic() - start < timeout:
-        current = getattr(getattr(local_node.localConfig, SECTION_NAME), FIELD_NAME)
-        if current != SENTINEL_VALUE:
+        if "value" in found:
+            value = found["value"]
             elapsed = time.monotonic() - start
-            log(f"fresh radio-side config packet observed after {elapsed:.2f}s")
+            log(
+                f"received radio-originated getConfigResponse for "
+                f"section={SECTION_NAME} after {elapsed:.2f}s: {FIELD_NAME}={value}"
+            )
+            cached = getattr(getattr(local_node.localConfig, SECTION_NAME), FIELD_NAME)
+            if cached != value:
+                log(
+                    f"WARNING: localConfig cache ({cached}) does not match the "
+                    f"packet-extracted value ({value}) -- treating the packet, "
+                    f"not the cache, as authoritative"
+                )
             for line in observer.describe_since(before_count):
                 log(f"  packet during readback wait: {line}")
-            return current, False
-        time.sleep(0.2)
+            return value, False
+        time.sleep(0.05)
 
-    log(f"TIMED OUT waiting {timeout:g}s for a fresh config packet")
+    log(
+        f"TIMED OUT waiting {timeout:g}s for a getConfigResponse naming "
+        f"section={SECTION_NAME}"
+    )
     for line in observer.describe_since(before_count):
         log(f"  packet during readback wait: {line}")
     return None, True
