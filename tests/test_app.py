@@ -2565,6 +2565,65 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, chat_input)
             self.assertEqual(chat_input.value, "draft")
 
+    async def test_resend_label_is_bracketed_like_del(self) -> None:
+        """RESEND uses the SAME bracketed action-control grammar as
+
+        DEL -- "[ ⟲ ]", never the bare glyph alone.
+        """
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            entry = app._start_outgoing("bracket check")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+
+            resend_label = str(widget.action_control.render())
+            self.assertEqual(resend_label, "[ ⟲ ]")
+            self.assertNotEqual(resend_label, "⟲")
+            self.assertEqual(str(widget.delete_control.render()), "[ DEL ]")
+
+    async def test_failed_row_renders_x_resend_and_del(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            entry = app._start_outgoing("failed row")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+
+            self.assertEqual(str(widget.delivery_label.render()), "✕")
+            self.assertEqual(str(widget.action_control.render()), "[ ⟲ ]")
+            self.assertEqual(str(widget.delete_control.render()), "[ DEL ]")
+
+    async def test_unconfirmed_row_renders_diamond_resend_and_del(self) -> None:
+        app = MeshtasticPassApp(
+            SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
+            ),
+            self.settings,
+        )
+        async with app.run_test(size=(80, 22)) as pilot:
+            app.show_tab("chat")
+            entry = app._start_outgoing("unconfirmed row")
+            app._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
+            await pilot.pause()
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+
+            self.assertEqual(str(widget.delivery_label.render()), "⟐")
+            self.assertEqual(str(widget.action_control.render()), "[ ⟲ ]")
+            self.assertEqual(str(widget.delete_control.render()), "[ DEL ]")
+
     async def test_repeated_up_traverses_consecutive_actionable_messages_by_resend(
         self,
     ) -> None:

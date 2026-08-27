@@ -814,11 +814,11 @@ class EndOfChatHistoryMarker(Static):
 
 # U+27F2 ANTICLOCKWISE GAPPED CIRCLE ARROW -- a plain, Narrow-width
 # text glyph (never emoji-presentation), replacing the literal word
-# "RESEND". DEL keeps its existing bracketed text; only RESEND becomes
-# a bare glyph (see item 2 of the CHAT-action task).
+# "RESEND". Bracketed exactly like DEL's own "[ DEL ]" -- the same
+# action-control grammar for both, "[ ⟲ ]" -- not a bare glyph.
 RESEND_GLYPH = "⟲"
 MESSAGE_ACTION_LABELS: dict[str, str] = {
-    "resend": RESEND_GLYPH,
+    "resend": f"[ {RESEND_GLYPH} ]",
     "delete": "[ DEL ]",
 }
 
