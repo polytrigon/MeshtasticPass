@@ -283,6 +283,8 @@ def validate_send_request(
 class RadioService:
     """Owns the connection between the app and a Meshtastic radio."""
 
+    _MAX_PENDING_SENDS = 200
+
     def __init__(self, device_path: str = "/dev/ttyUSB0") -> None:
         self.device_path = device_path
         self._interface: Any | None = None
@@ -291,6 +293,15 @@ class RadioService:
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._direct_observations: dict[str, float] = {}
         self._activity_local_node_id: str | None = None
+        # Tracks in-flight outgoing sends by packet ID, keyed to the
+        # status_handler given to send_text(). See _on_routing_response:
+        # unlike the SDK's own one-shot onResponse callback (which
+        # discards its handler after the FIRST matching packet), this
+        # keeps watching so a genuinely stronger, later-arriving
+        # confirmation (e.g. a DM destination's own ack arriving after
+        # an earlier local/implicit one) can still be observed instead
+        # of silently dropped. Bounded by _MAX_PENDING_SENDS.
+        self._pending_sends: dict[int, Callable[[SendStatus], None]] = {}
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -810,6 +821,16 @@ class RadioService:
             raise RadioSendError(f"Could not send text message: {detail}") from error
 
         packet_id = self._optional_int(getattr(sdk_packet, "id", None))
+        if status_handler is not None and packet_id is not None:
+            # The SDK's own one-shot onResponse above only ever sees the
+            # FIRST matching routing response (it pops its handler on
+            # first use) -- keep watching independently via the generic
+            # "meshtastic.receive.routing" topic so a genuinely stronger,
+            # later-arriving confirmation is never silently dropped (see
+            # _on_routing_response).
+            self._pending_sends[packet_id] = status_handler
+            while len(self._pending_sends) > self._MAX_PENDING_SENDS:
+                self._pending_sends.pop(next(iter(self._pending_sends)), None)
         return SentMessage(
             message.text,
             message.channel_index,
@@ -817,8 +838,51 @@ class RadioService:
             packet_id=packet_id,
         )
 
+    def _on_routing_response(
+        self,
+        packet: Any = None,
+        interface: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Watch every ROUTING_APP response for one this service is still
+
+        tracking (see send_text/_pending_sends), independent of the
+        SDK's own one-shot per-send callback. A stale interface (a
+        reconnect already completed) can never resolve a send tracked
+        against the PREVIOUS connection.
+        """
+        if interface is not None and interface is not self._interface:
+            return
+        decoded = packet.get("decoded") if isinstance(packet, dict) else None
+        packet_id = (
+            self._optional_int(decoded.get("requestId"))
+            if isinstance(decoded, dict)
+            else None
+        )
+        if packet_id is None:
+            return
+        handler = self._pending_sends.get(packet_id)
+        if handler is None:
+            return
+        status = self._parse_send_response(packet)
+        if status is None:
+            return
+        handler(status)
+        if status.state in (DeliveryState.HEARD, DeliveryState.FAILED):
+            self._pending_sends.pop(packet_id, None)
+
     def _parse_send_response(self, packet: Any) -> SendStatus | None:
-        """Convert a Meshtastic routing ACK/NAK into application state."""
+        """Convert a Meshtastic routing response into truthful delivery
+
+        evidence. A clean ack whose "from" is our OWN node number is
+        the SDK's own "implicit ack" (see node.py's onAckNak/
+        receivedImplAck) -- real evidence the local radio/routing layer
+        handled the packet, but never proof any other node received it,
+        so it is reported as SENT, not HEARD. Only a clean ack whose
+        "from" names a DIFFERENT node -- a DM destination's own
+        explicit ack, or any other node's routing response genuinely
+        reaching us -- is strong enough to report HEARD.
+        """
         if not isinstance(packet, dict):
             return None
         decoded = packet.get("decoded")
@@ -831,13 +895,24 @@ class RadioService:
         if reason is None:
             return None
         packet_id = self._optional_int(decoded.get("requestId"))
-        if reason == "NONE":
-            return SendStatus(DeliveryState.HEARD, packet_id)
-        return SendStatus(
-            DeliveryState.FAILED,
-            packet_id,
-            detail=f"Meshtastic routing failure: {reason}",
+        if reason != "NONE":
+            return SendStatus(
+                DeliveryState.FAILED,
+                packet_id,
+                detail=f"Meshtastic routing failure: {reason}",
+            )
+
+        from_number = self._optional_int(packet.get("from"))
+        local_number = self._optional_int(
+            getattr(getattr(self._interface, "myInfo", None), "my_node_num", None)
         )
+        if (
+            from_number is not None
+            and local_number is not None
+            and from_number != local_number
+        ):
+            return SendStatus(DeliveryState.HEARD, packet_id)
+        return SendStatus(DeliveryState.SENT, packet_id)
 
     @staticmethod
     def _normalize_routing_error(routing: dict[str, Any]) -> str | None:
@@ -900,6 +975,27 @@ class RadioService:
             pub.unsubscribe(
                 self._on_connection_lost,
                 "meshtastic.connection.lost",
+            )
+            raise
+
+        try:
+            # ROUTING_APP has a registered KnownProtocol("routing", ...)
+            # in meshtastic/__init__.py, so its topic is
+            # "meshtastic.receive.routing" -- NOT the generic
+            # "meshtastic.receive.data.ROUTING_APP" pattern that applies
+            # to portnums without one.
+            pub.subscribe(
+                self._on_routing_response,
+                "meshtastic.receive.routing",
+            )
+        except Exception:
+            pub.unsubscribe(
+                self._on_connection_lost,
+                "meshtastic.connection.lost",
+            )
+            pub.unsubscribe(
+                self._on_text_received,
+                "meshtastic.receive.text",
             )
             raise
 
@@ -1051,6 +1147,7 @@ class RadioService:
             subscriptions = (
                 (self._on_connection_lost, "meshtastic.connection.lost"),
                 (self._on_text_received, "meshtastic.receive.text"),
+                (self._on_routing_response, "meshtastic.receive.routing"),
                 (self._on_any_packet_for_debug, "meshtastic.receive"),
             )
             for callback, topic in subscriptions:

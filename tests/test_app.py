@@ -1860,18 +1860,15 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 entry.delivery_state = DeliveryState.SENT
                 widget.refresh_delivery_state(2)
                 await pilot.pause()
-                self.assertIn(
-                    str(widget.delivery_label.render()),
-                    ("SENDING.", "SENDING..", "SENDING..."),
-                )
-                self.assertTrue(widget.has_class("delivery-sending"))
-                self.assertFalse(widget.has_class("delivery-sent"))
+                self.assertEqual(str(widget.delivery_label.render()), "✓")
+                self.assertFalse(widget.has_class("delivery-sending"))
+                self.assertTrue(widget.has_class("delivery-sent"))
                 self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
 
                 entry.delivery_state = DeliveryState.HEARD
                 widget.refresh_delivery_state(1)
                 await pilot.pause()
-                self.assertEqual(str(widget.delivery_label.render()), "HEARD")
+                self.assertEqual(str(widget.delivery_label.render()), "✓✓")
                 self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, base)
 
                 entry.delivery_state = DeliveryState.UNCONFIRMED
@@ -1895,10 +1892,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             entry.delivery_state = DeliveryState.SENT
             widget.refresh_delivery_state(1)
             app._advance_delivery_states()
-            self.assertIn(
-                str(widget.delivery_label.render()),
-                ("SENDING.", "SENDING..", "SENDING..."),
-            )
+            self.assertEqual(str(widget.delivery_label.render()), "✓")
             self.assertIsNone(widget.distance_label)
 
     async def test_delivery_label_reflows_between_visible_states(self) -> None:
@@ -1919,7 +1913,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
             transitions = (
                 (DeliveryState.SENDING, 3, "SENDING..."),
-                (DeliveryState.HEARD, 1, "HEARD"),
+                (DeliveryState.SENT, 1, "✓"),
+                (DeliveryState.HEARD, 1, "✓✓"),
                 (DeliveryState.FAILED, 1, "FAILED"),
                 (DeliveryState.UNCONFIRMED, 1, "UNCONFIRMED"),
             )
@@ -1938,6 +1933,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(widths[1], widths[0])
             self.assertGreater(widths[2], widths[1])
             self.assertGreater(widths[3], widths[2])
+            self.assertGreater(widths[4], widths[3])
 
     async def test_terminal_cursor_guard_runs_for_app_lifecycle(self) -> None:
         radio = SimulatedRadioService(
@@ -2720,12 +2716,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         send_was_submitted/_set_delivery_state, so widget.entry is
         entry holds the whole way through.
 
-        SENT is deliberately rendered identically to SENDING by
-        ChatEntryWidget.refresh_delivery_state() (an intentional
-        "still awaiting confirmation" display, unrelated to this bug)
-        -- so the widget correctly still reads "SENDING..." immediately
-        after reaching SENT. What must also hold, with zero restart,
-        is that once the confirmation window elapses,
+        SENT renders as the checkmark (✓) -- the strongest truthful
+        evidence of a successful local send without stronger remote
+        confirmation (see RadioService._parse_send_response). What must
+        also hold, with zero restart, is that once the confirmation window elapses,
         _advance_delivery_states() promotes it to UNCONFIRMED and the
         store/entry/widget move together again.
         """
@@ -2762,7 +2756,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
             raw.close()
             self.assertEqual(row["delivery_state"], "SENT")
-            self.assertIn("SENDING", str(widget.delivery_label.render()))
+            self.assertEqual(str(widget.delivery_label.render()), "✓")
 
             entry.confirmation_deadline = monotonic() - 1
             app._advance_delivery_states()
@@ -2771,7 +2765,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
             self.assertIs(widget.entry, entry)
             self.assertIn("UNCONFIRMED", str(widget.delivery_label.render()))
-            self.assertNotIn("SENDING", str(widget.delivery_label.render()))
+            self.assertNotIn("✓", str(widget.delivery_label.render()))
 
             raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
             raw.row_factory = sqlite3.Row
@@ -2788,8 +2782,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         no restart/tab-switch/history-reload required.
         """
         cases = (
-            (SimulatedSendOutcome.SENT, DeliveryState.SENT, "SENDING"),
-            (SimulatedSendOutcome.HEARD, DeliveryState.HEARD, "HEARD"),
+            (SimulatedSendOutcome.SENT, DeliveryState.SENT, "✓"),
+            (SimulatedSendOutcome.HEARD, DeliveryState.HEARD, "✓✓"),
         )
         for outcome, expected_state, expected_text in cases:
             with self.subTest(outcome=outcome):

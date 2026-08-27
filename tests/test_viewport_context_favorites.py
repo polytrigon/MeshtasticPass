@@ -235,6 +235,47 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
         reloaded = AppSettings.load(config_path=self.settings.config_path)
         self.assertTrue(reloaded.is_favorite("!a11ce001"))
 
+    async def test_duplicate_display_names_remain_distinct_favorites(self) -> None:
+        """FAVORITE is keyed to stable node ID, never display name -- two
+
+        different nodes both calling themselves ALICE must never share
+        or cross-contaminate favorite state.
+        """
+        radio = self.radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(70, 18)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            first_alice = replace(
+                SIMULATED_MESSAGES[0],
+                sender_node_id="!a11ce001",
+                sender_long_name="ALICE",
+                packet_id=700001,
+            )
+            second_alice = replace(
+                SIMULATED_MESSAGES[0],
+                sender_node_id="!a11ce002",
+                sender_long_name="ALICE",
+                packet_id=700002,
+            )
+            app._accept_received_message(first_alice)
+            app._accept_received_message(second_alice)
+            first_widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry.node_id == "!a11ce001"
+            )
+            second_widget = next(
+                w for w in app.query(ChatEntryWidget) if w.entry.node_id == "!a11ce002"
+            )
+
+            first_widget.focus()
+            await pilot.press("enter", "enter")
+            await pilot.pause()
+
+            self.assertTrue(self.settings.is_favorite("!a11ce001"))
+            self.assertFalse(self.settings.is_favorite("!a11ce002"))
+            self.assertTrue(first_widget.has_class("favorite-sender"))
+            self.assertFalse(second_widget.has_class("favorite-sender"))
+
     async def test_unfavorite_updates_all_mounted_entries(self) -> None:
         self.settings.set_favorite("!a11ce001", True)
         self.settings.save()

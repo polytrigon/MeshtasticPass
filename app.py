@@ -131,6 +131,17 @@ CONNECTION_ROW_PREFIX = "  "
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
+# U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
+# emoji-presentation glyph, so it never unexpectedly renders double-
+# width). SENT/checkmark meaning: the strongest truthful evidence of a
+# successful local send WITHOUT stronger remote confirmation (see
+# RadioService._parse_send_response). HEARD/double-checkmark meaning:
+# a genuinely different node's own routing response reached us -- see
+# the same method's "from" comparison.
+DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
+    DeliveryState.SENT: "✓",
+    DeliveryState.HEARD: "✓✓",
+}
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
@@ -386,6 +397,73 @@ class ChannelSelector(KeyboardDropdown):
         )
 
 
+# Deliberately just 10 basic, widely-supported emoji -- see item 20 of
+# the CHAT delivery/menu/emoji task. Centralized here for easy future
+# expansion; nothing else in this module hardcodes this list.
+EMOJI_PICKER_CHOICES: tuple[str, ...] = (
+    "😀",
+    "😂",
+    "❤️",
+    "👍",
+    "👎",
+    "😢",
+    "😮",
+    "😡",
+    "🎉",
+    "🔥",
+)
+# Must match the ".emoji-picker { height: ... }" CSS rule below.
+EMOJI_PICKER_HEIGHT = 3
+
+
+class EmojiPicker(Static):
+    """Compact horizontal emoji strip for the CHAT composer (Ctrl+E).
+
+    Never focusable -- like the existing sender-action ViewportMenu,
+    this is an overlay the App's own on_key intercepts LEFT/RIGHT/
+    ENTER/ESC for while it is open; the composer Input keeps real
+    Textual focus throughout (see item 22: "composer remains focused").
+    """
+
+    can_focus = False
+
+    def __init__(self) -> None:
+        super().__init__(classes="emoji-picker", markup=False)
+        self.highlighted_index = 0
+        default_palette = THEME_PALETTES["white"]
+        self._base_color = default_palette.base
+        self._accent_color = default_palette.accent
+
+    def on_mount(self) -> None:
+        self._render_picker()
+
+    def set_palette(self, base: str, accent: str) -> None:
+        self._base_color = base
+        self._accent_color = accent
+        self._render_picker()
+
+    def move_highlight(self, direction: int) -> None:
+        self.highlighted_index = (self.highlighted_index + direction) % len(
+            EMOJI_PICKER_CHOICES
+        )
+        self._render_picker()
+
+    @property
+    def selected_emoji(self) -> str:
+        return EMOJI_PICKER_CHOICES[self.highlighted_index]
+
+    def _render_picker(self) -> None:
+        text = Text()
+        for index, emoji in enumerate(EMOJI_PICKER_CHOICES):
+            if index:
+                text.append(" ", style=self._base_color)
+            selected = index == self.highlighted_index
+            text.append("[" if selected else " ", style=self._base_color)
+            text.append(emoji, style=self._accent_color if selected else self._base_color)
+            text.append("]" if selected else " ", style=self._base_color)
+        self.update(text)
+
+
 @dataclass
 class ChannelChatState:
     entries: list[ChatEntry] = field(default_factory=list)
@@ -588,6 +666,38 @@ class ChatMessageInput(Input):
 
     def on_blur(self, _event: Blur) -> None:
         self.post_message(self.Left())
+
+    def on_key(self, event: Key) -> None:
+        """Intercept the emoji picker's keys (and Ctrl+E to open it)
+
+        directly on this widget -- NOT in the App's own on_key. Input
+        already binds "enter" (submit) and "ctrl+e"/"left"/"right"
+        (end-of-line/cursor movement) itself; Textual checks a focused
+        widget's own on_key BEFORE its inherited key bindings, so this
+        is the only place that can reliably preempt those defaults
+        while this widget has focus (see items 18 and 23).
+        """
+        app = self.app
+        picker = getattr(app, "_emoji_picker", None)
+        if picker is not None:
+            if event.key == "left":
+                picker.move_highlight(-1)
+                event.stop()
+            elif event.key == "right":
+                picker.move_highlight(1)
+                event.stop()
+            elif event.key == "enter":
+                emoji = picker.selected_emoji
+                app._close_emoji_picker()
+                app._insert_emoji_at_cursor(emoji)
+                event.stop()
+            elif event.key == "escape":
+                app._close_emoji_picker()
+                event.stop()
+            return
+        if event.key == "ctrl+e":
+            app._open_emoji_picker()
+            event.stop()
 
 
 class ConnectionPage(VerticalScroll):
@@ -1841,12 +1951,8 @@ class ChatEntryWidget(Vertical):
         if self.delivery_label is None:
             return
         internal_state = self.entry.delivery_state or DeliveryState.SENT
-        visible_state = (
-            DeliveryState.SENDING
-            if internal_state in (DeliveryState.SENDING, DeliveryState.SENT)
-            else internal_state
-        )
-        text = visible_state.value
+        visible_state = internal_state
+        text = DELIVERY_CHECKMARKS.get(visible_state, visible_state.value)
         if visible_state is DeliveryState.SENDING:
             text += "." * dot_count
         self.delivery_label.update(text)
@@ -2251,6 +2357,23 @@ class MeshtasticPassApp(App[None]):
         color: $orange_dim;
     }
 
+    .emoji-picker {
+        layer: popup;
+        position: absolute;
+        background: #101010;
+        border: solid $white_dim;
+        height: 3;
+        padding: 0 1;
+    }
+
+    Screen.theme-green .emoji-picker {
+        border: solid $green_dim;
+    }
+
+    Screen.theme-orange .emoji-picker {
+        border: solid $orange_dim;
+    }
+
     #load-older, .message-action {
         width: auto;
         height: 1;
@@ -2361,16 +2484,19 @@ class MeshtasticPassApp(App[None]):
     }
 
     .chat-entry.delivery-sending .chat-entry-delivery,
+    .chat-entry.delivery-sent .chat-entry-delivery,
     .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #39ff14;
     }
 
     Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-green .chat-entry.delivery-sent .chat-entry-delivery,
     Screen.theme-green .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #ff8c00;
     }
 
     Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-orange .chat-entry.delivery-sent .chat-entry-delivery,
     Screen.theme-orange .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: #d8d8d8;
     }
@@ -2502,6 +2628,7 @@ class MeshtasticPassApp(App[None]):
         self._user_menu_scroll_target: ScrollableContainer | None = None
         self._user_menu_scroll_x: float | None = None
         self._user_menu_scroll_y: float | None = None
+        self._emoji_picker: EmojiPicker | None = None
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -2895,6 +3022,8 @@ class MeshtasticPassApp(App[None]):
     def show_tab(self, tab_id: str) -> None:
         if self.current_tab == "chat" and tab_id != "chat":
             self._mark_new_messages_read()
+            if self._emoji_picker is not None:
+                self._close_emoji_picker()
         self.current_tab = tab_id
         if tab_id == "chat":
             self._mark_unread_messages_viewed()
@@ -3189,6 +3318,8 @@ class MeshtasticPassApp(App[None]):
                 palette.accent,
                 palette.dim_base,
             )
+        if self._emoji_picker is not None:
+            self._emoji_picker.set_palette(palette.base, palette.accent)
         if len(self.query("#identity-values")):
             self._render_connection_details()
             self._render_identity()
@@ -3331,6 +3462,14 @@ class MeshtasticPassApp(App[None]):
         if event.generation != event.entry.send_generation:
             return
         if event.entry.packet_id not in (None, event.status.packet_id):
+            return
+        # RadioService can now observe more than one routing response for
+        # the same outgoing packet (a later, genuinely stronger
+        # confirmation must not be silently dropped -- see
+        # RadioService._on_routing_response). Once a message has reached
+        # its strongest reachable state (HEARD) or a terminal FAILED, a
+        # duplicate or weaker later update must never overwrite it.
+        if event.entry.delivery_state in (DeliveryState.HEARD, DeliveryState.FAILED):
             return
         self._set_delivery_state(
             event.entry,
@@ -4251,29 +4390,31 @@ class MeshtasticPassApp(App[None]):
         self._activate_node_action(metadata.node_id, action)
 
     def _activate_reply(self, metadata: NodeMetadata) -> None:
-        """Insert an @mention for this node at the start of the CHAT
+        """Insert an @mention for this node at the composer's CURRENT
 
-        draft, then hand focus back to the input for continued typing.
-        A text-entry convenience only -- never changes Meshtastic
-        addressing/routing based on the textual @mention.
+        CURSOR POSITION (an empty composer is the trivial case: the
+        mention becomes the whole draft so far), then hand focus back
+        to the input for continued typing. Existing draft text before
+        and after the cursor is always preserved untouched. A text-
+        entry convenience only -- never changes Meshtastic addressing/
+        routing based on the textual @mention. Relies on Textual's own
+        Input.cursor_position/value indexing rather than reimplementing
+        cursor math, so this stays correct for multi-codepoint grapheme
+        clusters already in the draft.
         """
         self._close_user_menu(restore_focus=False)
         mention = f"@{_reply_mention_name(metadata)}"
         chat_input = self.query_one("#chat-input", Input)
         draft = chat_input.value
-        if draft == mention or draft.startswith(f"{mention} "):
-            # Already mentioned at the start of the draft -- preserve it
-            # exactly, never duplicate the mention.
-            new_value = draft
-        elif draft:
-            new_value = f"{mention} {draft}"
-        else:
-            new_value = f"{mention} "
+        cursor = chat_input.cursor_position
+        insertion = f"{mention} "
+        new_value = draft[:cursor] + insertion + draft[cursor:]
+        new_cursor = cursor + len(insertion)
         chat_input.value = new_value
         if self.current_tab != "chat":
             self.show_tab("chat")
         chat_input.focus()
-        chat_input.cursor_position = len(chat_input.value)
+        chat_input.cursor_position = new_cursor
 
     def _activate_node_action(self, node_id: str, action: str) -> None:
         if not node_id or action not in ("favorite", "unfavorite"):
@@ -4323,6 +4464,49 @@ class MeshtasticPassApp(App[None]):
                     animate=False,
                     force=True,
                 )
+
+    def _open_emoji_picker(self) -> None:
+        """Mount the emoji strip directly above the composer -- see
+
+        item 19: spans the composer's own width, one emoji row tall
+        plus its border, never a large modal. Never moves Textual focus
+        off the composer (see item 22): ChatMessageInput.on_key
+        intercepts LEFT/RIGHT/ENTER/ESC directly on the still-focused
+        composer while this is open (see that method's own docstring
+        for why it -- not the App's on_key -- has to be the one to do
+        this).
+        """
+        chat_input = self.query_one("#chat-input", Input)
+        picker = EmojiPicker()
+        self._emoji_picker = picker
+        self.screen.mount(picker)
+        palette = THEME_PALETTES[self._current_theme]
+        picker.set_palette(palette.base, palette.accent)
+        region = chat_input.region
+        picker.styles.width = max(region.width, len(EMOJI_PICKER_CHOICES) * 3)
+        picker.styles.offset = (region.x, region.y - EMOJI_PICKER_HEIGHT)
+
+    def _close_emoji_picker(self) -> None:
+        picker = self._emoji_picker
+        self._emoji_picker = None
+        if picker is not None:
+            picker.remove()
+
+    def _insert_emoji_at_cursor(self, emoji: str) -> None:
+        """Insert at the composer's CURRENT CURSOR POSITION -- draft
+
+        text before and after is always preserved (see item 22).
+        Relies on Textual's own Input.cursor_position/value indexing
+        rather than reimplementing cursor math (see item 25).
+        """
+        chat_input = self.query_one("#chat-input", Input)
+        draft = chat_input.value
+        cursor = chat_input.cursor_position
+        new_value = draft[:cursor] + emoji + draft[cursor:]
+        new_cursor = cursor + len(emoji)
+        chat_input.value = new_value
+        chat_input.focus()
+        chat_input.cursor_position = new_cursor
 
     def _clear_indicator_if_at_bottom(self) -> None:
         if self._is_near_chat_bottom() and self.transcript_new_count:
