@@ -356,6 +356,29 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(radio.sent_texts, ["unresolved delivery"])
 
+    async def test_arrow_animation_has_exactly_two_positions(self) -> None:
+        """The real animation cycle (_advance_delivery_states, driven by
+
+        the existing 0.45s delivery timer -- no new timer added) must
+        only ever produce "→" and " →", never a longer-padded frame.
+        """
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = await self._send_and_get_entry(app, pilot)
+            widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+
+            seen = set()
+            for _ in range(6):
+                app._advance_delivery_states()
+                seen.add(str(widget.delivery_label.render()))
+            self.assertEqual(seen, {"→", " →"})
+            self.assertEqual(
+                widget.delivery_label.visual_style.foreground.hex6,
+                THEME_PALETTES[app._current_theme].accent.upper(),
+            )
+
 
 class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -2157,7 +2180,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIn(
                     str(widget.delivery_label.render()),
-                    ("→", " →", "  →", "   →"),
+                    ("→", " →"),
                 )
                 self.assertEqual(widget.delivery_label.visual_style.foreground.hex6, accent)
 
@@ -2217,7 +2240,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
             transitions = (
                 (DeliveryState.SENDING, 1, "→"),
-                (DeliveryState.SENDING, 4, "   →"),
+                (DeliveryState.SENDING, 2, " →"),
                 (DeliveryState.SENT, 1, "✓"),
                 (DeliveryState.HEARD, 1, "✓✓"),
                 (DeliveryState.FAILED, 1, "FAILED"),

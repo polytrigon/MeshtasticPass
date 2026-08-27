@@ -46,7 +46,7 @@ from chat_store import (
     ChatStoreError,
 )
 from geo import format_distance_miles
-from grapheme_text import install_flag_pair_protection
+from grapheme_text import install_flag_pair_protection, truncate_to_cells
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshNodeState,
@@ -96,7 +96,7 @@ from relative_time import format_relative_age
 from simulated_radio_service import SimulatedRadioService, SimulatedSendOutcome
 from terminal_cursor import TerminalCursor
 from theme_palette import ERROR, THEME_PALETTES
-from viewport_menu import PopupItem, ViewportMenu
+from viewport_menu import PopupItem, ViewportMenu, calculate_popup_placement
 
 
 # Patches Rich's grapheme splitter (used by Static/Content's word-wrap
@@ -149,7 +149,7 @@ DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
 # checkmarks above, SENDING covers every outgoing message for which a
 # NAK is still a legitimate possible outcome (see send_was_submitted).
 SENDING_ARROW_GLYPH = "→"
-SENDING_ARROW_FRAMES = (1, 2, 3, 4)
+SENDING_ARROW_FRAMES = (1, 2)
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
@@ -715,6 +715,13 @@ class ChatMessageInput(Input):
 
     def on_blur(self, _event: Blur) -> None:
         self.post_message(self.Left())
+        # The emoji picker is subordinate to composer focus -- ANY way
+        # this widget loses focus (tab switch, another control taking
+        # focus, etc.) must dismiss it. Re-focusing the composer later
+        # never reopens it on its own; Ctrl+E is required again.
+        picker = getattr(self.app, "_emoji_picker", None)
+        if picker is not None:
+            self.app._close_emoji_picker()
 
     def on_key(self, event: Key) -> None:
         """Intercept the emoji picker's keys (and Ctrl+E to open it)
@@ -743,6 +750,11 @@ class ChatMessageInput(Input):
             elif event.key == "escape":
                 app._close_emoji_picker()
                 event.stop()
+            elif event.key == "up":
+                # Dismiss, then let the SAME keypress continue on to the
+                # App's own "up leaves the composer" handling below --
+                # never swallow UP merely to close the picker.
+                app._close_emoji_picker()
             return
         if event.key == "ctrl+e":
             app._open_emoji_picker()
@@ -2281,7 +2293,7 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $orange_dim;
     }
 
-    #mesh-status, #mesh-context-status {
+    #mesh-status, #mesh-bottom-row {
         height: 1;
     }
 
@@ -2298,6 +2310,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #mesh-context-status {
+        width: 1fr;
         color: #d8d8d8;
     }
 
@@ -2306,6 +2319,19 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-orange #mesh-context-status {
+        color: #ff8c00;
+    }
+
+    #mesh-last-update {
+        width: auto;
+        color: #d8d8d8;
+    }
+
+    Screen.theme-green #mesh-last-update {
+        color: #39ff14;
+    }
+
+    Screen.theme-orange #mesh-last-update {
         color: #ff8c00;
     }
 
@@ -2738,7 +2764,16 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="mesh-connection-status", classes="page-title", markup=False)
                 yield Static(id="mesh-status", markup=False)
                 yield MeshTopologyView()
-                yield Static(id="mesh-context-status", markup=False)
+                # Bottom row: focused-node context anchored left (1fr,
+                # truncates gracefully -- see _update_mesh_context_status),
+                # LAST UPDATE anchored right (auto width). Order matters:
+                # the 1fr widget must come first so it absorbs exactly
+                # "container width minus LAST UPDATE's own width", which
+                # is what makes LAST UPDATE land flush against the right
+                # edge with no manual offset math.
+                with Horizontal(id="mesh-bottom-row"):
+                    yield Static(id="mesh-context-status", markup=False)
+                    yield Static(id="mesh-last-update", markup=False)
         yield Static("1-3 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
@@ -4093,7 +4128,15 @@ class MeshtasticPassApp(App[None]):
             self._update_mesh_context_status()
 
     def _update_mesh_context_status(self) -> None:
-        """Minimal truthful summary line for the currently selected MESH node."""
+        """Minimal truthful summary line for the currently selected MESH node.
+
+        Shares its row with #mesh-last-update, anchored to the right (see
+        the #mesh-bottom-row Horizontal in compose()). This widget's own
+        `width: 1fr` already excludes LAST UPDATE's space from
+        `status_widget.size.width` -- so truncating to exactly that width
+        (grapheme-safe, never a raw slice) is enough to guarantee no
+        overlap, with no need to read LAST UPDATE's text/width directly.
+        """
         widgets = list(self.query("#mesh-context-status"))
         if not widgets:
             return
@@ -4119,9 +4162,11 @@ class MeshtasticPassApp(App[None]):
         # for a genuinely stale/invalid ID, never a relay stage -- the
         # bottom-left context is always either YOU or a real node's full
         # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
-        status_widget.update(
-            format_mesh_context_line(state, now=time()) if state is not None else ""
-        )
+        text = format_mesh_context_line(state, now=time()) if state is not None else ""
+        available = status_widget.size.width
+        if available > 0:
+            text = truncate_to_cells(text, available)
+        status_widget.update(text)
 
     def _advance_delivery_states(self) -> None:
         self._send_animation_frame = self._send_animation_frame % len(
@@ -4341,16 +4386,33 @@ class MeshtasticPassApp(App[None]):
 
     @on(ChatEntryWidget.UserMenuRequested)
     def open_user_menu(self, event: ChatEntryWidget.UserMenuRequested) -> None:
-        """Open node details/actions without changing transcript layout."""
+        """Open node details/actions without changing transcript layout.
+
+        The NAME row and REPLY's @mention must use the SAME name the
+        user is actually looking at on this message -- entry.author,
+        computed once at receipt time (see
+        app_controller.received_chat_entry: sender_long_name ->
+        sender_short_name -> sender_node_id, never empty) -- not
+        whatever a FRESH NodeDB lookup happens to report right now.
+
+        This matters because the two can genuinely diverge: the live
+        NodeDB record for a node can be overwritten by a LATER, more
+        generic broadcast (e.g. a bare auto-generated "Meshtastic ab59"
+        default before that node re-announces its real chosen name),
+        while this specific message's OWN packet already carried the
+        real name at the time it arrived. A fresh lookup is still used
+        for hops_away/last_heard/is_local, which are legitimately
+        "as of right now" facts a point-in-time snapshot can't provide.
+        """
         entry = event.widget.entry
         if entry.outgoing or not entry.node_id:
             return
-        getter = getattr(self.radio, "get_node_metadata", None)
         metadata = NodeMetadata(
             entry.node_id,
-            entry.sender_name,
+            entry.author,
             entry.sender_short_name,
         )
+        getter = getattr(self.radio, "get_node_metadata", None)
         if callable(getter):
             try:
                 current = getter(entry.node_id)
@@ -4359,8 +4421,8 @@ class MeshtasticPassApp(App[None]):
             if isinstance(current, NodeMetadata):
                 metadata = NodeMetadata(
                     entry.node_id,
-                    current.long_name or metadata.long_name,
-                    current.short_name or metadata.short_name,
+                    metadata.long_name or current.long_name,
+                    metadata.short_name or current.short_name,
                     current.hops_away,
                     current.last_heard,
                     current.is_local,
@@ -4534,19 +4596,25 @@ class MeshtasticPassApp(App[None]):
                 )
 
     def _open_emoji_picker(self) -> None:
-        """Mount the emoji strip directly above the composer, sized to
+        """Mount the emoji strip near the composer, sized to HUG its own
 
-        HUG its own content (see emoji_picker_total_width() -- computed
-        from rendered cell widths, never len()), not stretched to the
-        composer's full width. Clamped to the composer's own available
-        width so a narrow viewport can never overflow the screen; the
-        normal case (enough room) is content-hugging with only the
-        CSS's own intentional border/padding. Never moves Textual focus
-        off the composer (see item 22): ChatMessageInput.on_key
-        intercepts LEFT/RIGHT/ENTER/ESC directly on the still-focused
-        composer while this is open (see that method's own docstring
-        for why it -- not the App's on_key -- has to be the one to do
-        this).
+        content (see emoji_picker_total_width() -- computed from
+        rendered cell widths, never len()), not stretched to the
+        composer's full width. Positioned via the SAME
+        calculate_popup_placement() the sender-action ViewportMenu
+        already uses (see _open_node_menu) -- not hand-rolled
+        arithmetic -- specifically because that function clamps BOTH
+        axes against the real screen region: an earlier version of
+        this method only clamped the WIDTH to the composer's own
+        width, never the X-OFFSET against the screen's right edge,
+        which could still let the picker's right border extend past
+        the visible terminal on a real narrow/XL-font layout even
+        though the width math itself was correct in isolation.
+        Never moves Textual focus off the composer (see item 22):
+        ChatMessageInput.on_key intercepts LEFT/RIGHT/ENTER/ESC
+        directly on the still-focused composer while this is open (see
+        that method's own docstring for why it -- not the App's
+        on_key -- has to be the one to do this).
         """
         chat_input = self.query_one("#chat-input", Input)
         picker = EmojiPicker()
@@ -4554,9 +4622,14 @@ class MeshtasticPassApp(App[None]):
         self.screen.mount(picker)
         palette = THEME_PALETTES[self._current_theme]
         picker.set_palette(palette.base, palette.accent)
-        region = chat_input.region
-        picker.styles.width = min(emoji_picker_total_width(), max(region.width, 1))
-        picker.styles.offset = (region.x, region.y - EMOJI_PICKER_HEIGHT)
+        placement = calculate_popup_placement(
+            chat_input.region,
+            self.screen.region,
+            emoji_picker_total_width(),
+            EMOJI_PICKER_HEIGHT,
+        )
+        picker.styles.width = placement.width
+        picker.styles.offset = (placement.x, placement.y)
 
     def _close_emoji_picker(self) -> None:
         picker = self._emoji_picker
@@ -5114,10 +5187,11 @@ class MeshtasticPassApp(App[None]):
         _advance_connection_animation, which calls this on a fixed
         ~0.45s cadence). Once ONLINE (status_text == ""), this leaves
         that widget untouched -- _update_mesh_status_line (called from
-        _refresh_mesh) becomes the writer for the "LAST UPDATE" fallback
-        instead. The two never fight over ownership: this function only
-        ever writes while NOT ONLINE, that one only ever writes while
-        ONLINE.
+        _refresh_mesh) force-hides it instead, unconditionally, since it
+        has no ONLINE-state purpose any more (LAST UPDATE now lives in
+        the separate bottom-right #mesh-last-update widget). The two
+        never fight over ownership: this function only ever writes while
+        NOT ONLINE, that one only ever touches the widget while ONLINE.
         """
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
@@ -5139,15 +5213,17 @@ class MeshtasticPassApp(App[None]):
     def _update_mesh_status_line(
         self, working_set: tuple[MeshNodeState, ...], now: float
     ) -> None:
-        """The ONLINE half of #mesh-connection-status: a PERSISTENT
+        """#mesh-last-update: a PERSISTENT "LAST UPDATE <age>"
 
-        "LAST UPDATE <age>" mesh-freshness indicator, always shown while
-        the radio is ONLINE -- not a stale-only warning. Answers "how
-        long ago did this radio last obtain meaningful information about
-        the mesh", so it keeps aging (1s, 2s, ... 1m, ...) between
-        refreshes with no new data, and only resets when a genuinely
-        fresher timestamp arrives -- never merely because this method
-        itself ran again (see _refresh_mesh's 1Hz periodic call).
+        mesh-freshness indicator, anchored bottom-right (see the
+        #mesh-bottom-row Horizontal in compose()), shown while the radio
+        is ONLINE -- not a stale-only warning. Answers "how long ago did
+        this radio last obtain meaningful information about the mesh",
+        so it keeps aging (1s, 2s, ... 1m, ...) between refreshes with no
+        new data, and only resets when a genuinely fresher timestamp
+        arrives -- never merely because this method itself ran again or
+        LAST UPDATE's own widget moved (see _refresh_mesh's 1Hz periodic
+        call).
 
         The age comes from the single most recent NodeDB last_heard
         among the working set's remote nodes (excluding YOU) -- never
@@ -5157,18 +5233,23 @@ class MeshtasticPassApp(App[None]):
         trustworthy last_heard at all, this is omitted rather than
         showing a made-up age.
 
-        Never touches the widget while the radio isn't ONLINE --
-        _update_chat_connection_state() owns it then, on its own fixed
-        animation cadence, so it can stay byte-for-byte in sync with
-        CHAT's own status line; recomputing here too, on _refresh_mesh's
-        different cadence, previously let the two drift out of phase by
-        a dot. The two never fight over the widget: this function is a
-        no-op while not ONLINE, and _update_chat_connection_state only
-        ever writes non-empty text, which happens only while not ONLINE.
+        Also force-hides #mesh-connection-status (the OLD top-of-view
+        location) every ONLINE cycle: that widget is exclusively owned
+        by _update_chat_connection_state() while NOT ONLINE (see that
+        method's own docstring), so once ONLINE, nothing else would ever
+        clear its stale text/display=True from the last disconnected
+        state -- left alone, it would stay visible and keep reserving
+        its top row forever. Forcing display=False here (never merely
+        "when there's no LAST UPDATE text", unlike the old behavior this
+        replaces) is what lets #mesh-view's own `height: 1fr` reclaim
+        that freed row automatically, with no hardcoded row math.
         """
         if self._radio_state is not RadioState.ONLINE:
             return
-        widgets = list(self.query("#mesh-connection-status"))
+        connection_widgets = list(self.query("#mesh-connection-status"))
+        if connection_widgets:
+            connection_widgets[0].display = False
+        widgets = list(self.query("#mesh-last-update"))
         if not widgets:
             return
         widget = widgets[0]
@@ -5183,7 +5264,6 @@ class MeshtasticPassApp(App[None]):
             if age >= 0:
                 text = f"LAST UPDATE {format_relative_age(age)}"
         widget.update(text)
-        widget.display = bool(text)
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:

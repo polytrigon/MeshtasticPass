@@ -212,6 +212,118 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chat_input.cursor_position, len("hello "))
             self.assertTrue(chat_input.has_focus)
 
+    async def test_up_dismisses_picker_then_leaves_composer_normally(self) -> None:
+        """UP must not be swallowed merely to close the picker -- the
+
+        SAME keypress both dismisses it AND performs the normal "UP
+        leaves the composer for CHAT message navigation" behavior.
+        """
+        app = self.make_app()
+        async with app.run_test(size=(90, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "hello there"
+            chat_input.cursor_position = len("hello ")
+            chat_input.focus()
+            await pilot.press("ctrl+e")
+            self.assertIsNotNone(app._emoji_picker)
+
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertIsNone(app._emoji_picker)
+            self.assertFalse(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "hello there")
+            self.assertEqual(chat_input.cursor_position, len("hello "))
+
+    async def test_up_dismisses_picker_even_when_composer_keeps_focus(self) -> None:
+        """With an EMPTY chat history, _move_chat_focus(-1) is a no-op
+
+        (nothing to navigate to) and the composer never loses focus, so
+        ChatMessageInput.on_blur never fires. This is the one case that
+        proves ChatMessageInput.on_key's own explicit UP-handling is
+        actually load-bearing, not merely redundant with blur-based
+        dismissal.
+        """
+        app = self.make_app()
+        async with app.run_test(size=(90, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "draft"
+            chat_input.focus()
+            await pilot.press("ctrl+e")
+            self.assertIsNotNone(app._emoji_picker)
+
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertIsNone(app._emoji_picker)
+            self.assertTrue(chat_input.has_focus)
+            self.assertEqual(chat_input.value, "draft")
+
+    async def test_tab_switch_dismisses_picker_without_mutating_draft(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(90, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "hello there"
+            chat_input.cursor_position = len("hello ")
+            chat_input.focus()
+            await pilot.press("ctrl+e")
+            self.assertIsNotNone(app._emoji_picker)
+
+            app.show_tab("connection")
+            await pilot.pause()
+
+            self.assertIsNone(app._emoji_picker)
+            self.assertEqual(chat_input.value, "hello there")
+
+    async def test_generic_composer_blur_dismisses_picker(self) -> None:
+        """ANY normal focus transfer away from the composer -- not just
+
+        ESC/UP/tab-switch specifically -- must dismiss the picker (see
+        ChatMessageInput.on_blur).
+        """
+        app = self.make_app()
+        async with app.run_test(size=(90, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = "draft"
+            chat_input.focus()
+            await pilot.press("ctrl+e")
+            self.assertIsNotNone(app._emoji_picker)
+
+            app.query_one("#chat-log", ChatTranscript).focus()
+            await pilot.pause()
+
+            self.assertIsNone(app._emoji_picker)
+            self.assertEqual(chat_input.value, "draft")
+
+    async def test_reopening_composer_does_not_reopen_picker(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(90, 24)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
+            await pilot.press("ctrl+e")
+            self.assertIsNotNone(app._emoji_picker)
+
+            app.query_one("#chat-log", ChatTranscript).focus()
+            await pilot.pause()
+            self.assertIsNone(app._emoji_picker)
+
+            chat_input.focus()
+            await pilot.pause()
+
+            self.assertIsNone(app._emoji_picker)
+
     async def test_heart_emoji_sequence_stays_intact_and_editable(self) -> None:
         """❤️ is a multi-codepoint sequence (heart + variation selector) --
 
@@ -291,6 +403,49 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(picker.region.width, emoji_picker_total_width())
             self.assertLess(picker.region.width, chat_input.region.width)
 
+    async def test_picker_right_border_geometry_at_xl(self) -> None:
+        """A real widget/render-geometry regression, not only the pure
+
+        emoji_picker_total_width() unit test: reads Textual's ACTUAL
+        computed gutter (border + padding) and content_region for the
+        mounted widget, and proves the outer region's right edge sits
+        EXACTLY at content_region.right + the right gutter -- no
+        one-cell drift, no phantom trailing column, regardless of what
+        the pure width helper claims in isolation. Also proves the
+        content area Textual actually allocated matches
+        emoji_picker_content_width() exactly, so a future CSS change to
+        border/padding without updating EMOJI_PICKER_BORDER_CELLS/
+        EMOJI_PICKER_PADDING_CELLS would be caught here.
+        """
+        app = self.make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app.query_one("#chat-input", Input).focus()
+            await pilot.press("ctrl+e")
+            picker = app._emoji_picker
+            await pilot.pause()
+
+            gutter = picker.styles.gutter
+            content_region = picker.content_region
+
+            # The CSS's actual border+padding, read from Textual itself --
+            # not assumed from the EMOJI_PICKER_BORDER_CELLS/PADDING_CELLS
+            # constants.
+            self.assertEqual(gutter.left + gutter.right, 4)
+            self.assertEqual(content_region.width, emoji_picker_content_width())
+
+            # The fundamental invariant: outer width = content width +
+            # both gutters, exactly -- no drift in either direction.
+            self.assertEqual(
+                picker.region.width, content_region.width + gutter.left + gutter.right
+            )
+            # The right border terminates immediately after the content
+            # area plus its own padding -- never leaving a phantom blank
+            # column, never clipping the last emoji.
+            self.assertEqual(picker.region.right, content_region.right + gutter.right)
+            self.assertEqual(picker.region.x + gutter.left, content_region.x)
+
     async def test_picker_content_width_uses_rendered_cell_width_not_len(self) -> None:
         """❤️ is 5 Python characters (heart, U+FE0F variation selector
 
@@ -353,8 +508,15 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             picker = app._emoji_picker
             await pilot.pause()
 
-            self.assertLessEqual(picker.region.width, chat_input.region.width)
+            # Clamped against the real screen viewport (the same proven
+            # calculate_popup_placement() the sender-action menu already
+            # uses) -- never against the narrower composer width alone,
+            # which is what actually matters: the picker must never
+            # overflow off-screen, even if that means it ends up wider
+            # than the composer itself in a very narrow layout.
+            self.assertLessEqual(picker.region.width, app.screen.region.width)
             self.assertGreater(picker.region.width, 0)
+            self.assertGreaterEqual(picker.region.x, app.screen.region.x)
             self.assertLessEqual(picker.region.right, app.screen.region.right)
 
     async def test_reply_then_emoji_workflow(self) -> None:
