@@ -426,10 +426,41 @@ EMOJI_PICKER_CHOICES: tuple[str, ...] = (
 # Must match the ".emoji-picker { height: ... }" CSS rule below.
 EMOJI_PICKER_HEIGHT = 3
 # What the ".emoji-picker" CSS rule below actually costs in columns:
-# "border: solid ..." is 1 column each side, "padding: 0 1" is 1
-# column each side -- see emoji_picker_total_width().
+# "border: solid ..." is 1 column each side (EMOJI_PICKER_BORDER_CELLS),
+# "padding: 0 2 0 1" is 1 column on the left but 2 on the right
+# (EMOJI_PICKER_PADDING_CELLS) -- see emoji_picker_total_width().
+#
+# The extra right-side cell is a real-hardware fix, not cosmetic: "❤️"
+# (U+2764 HEAVY BLACK HEART + U+FE0F variation selector) is the only
+# choice in EMOJI_PICKER_CHOICES whose BASE codepoint has Unicode East
+# Asian Width "Narrow" -- every other emoji here is "Wide" and renders
+# at a consistent, undisputed 2 terminal columns everywhere. Rich's own
+# cell_len() (used by emoji_picker_content_width() below) resolves the
+# heart+VS16 sequence to 2 columns, matching how most GUI terminals
+# render it, but a terminal that instead honors the base character's
+# raw Narrow property -- observed on real uConsole hardware -- draws it
+# in only 1 column. Since Textual emits a whole picker row as one
+# contiguous run of characters (content, then padding, then the right
+# border), any single glyph rendering narrower than Python assumed
+# shifts every character drawn after it in that same row -- including
+# the picker's own right border -- left by the shortfall, making it
+# look displaced relative to the (pure-ASCII, unambiguous) top/bottom
+# border rows. A real terminal's cursor advances by however many
+# columns IT decides a character occupies; nothing in Python can
+# correct that after the fact. The fix is to always leave 1 spare,
+# unambiguous (plain-space) column between the content and the right
+# border: on a terminal that renders the heart at the expected 2
+# columns, that space is just a harmless extra sliver of padding: on
+# one that renders it at only 1, the same space is what silently
+# absorbs the 1-column shortfall, so the border still lands exactly
+# where it should either way. See
+# test_picker_padding_absorbs_worst_case_ambiguous_width_undercount for
+# the regression that encodes this reasoning directly (not just a
+# width-helper arithmetic check, which alone cannot catch this: the
+# pure Python math above is self-consistent regardless of what a real
+# terminal decides to do with an ambiguous-width character).
 EMOJI_PICKER_BORDER_CELLS = 2
-EMOJI_PICKER_PADDING_CELLS = 2
+EMOJI_PICKER_PADDING_CELLS = 3
 
 
 def emoji_picker_content_width() -> int:
@@ -2439,7 +2470,9 @@ class MeshtasticPassApp(App[None]):
         background: #101010;
         border: solid $white_dim;
         height: 3;
-        padding: 0 1;
+        /* 1 cell left, 2 cells right -- see EMOJI_PICKER_PADDING_CELLS
+           for why the right side carries an extra safety cell. */
+        padding: 0 2 0 1;
     }
 
     Screen.theme-green .emoji-picker {

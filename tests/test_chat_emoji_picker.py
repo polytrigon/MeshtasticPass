@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+import unicodedata
 import unittest
 
 from textual.widgets import Input, Static
@@ -431,8 +432,12 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
 
             # The CSS's actual border+padding, read from Textual itself --
             # not assumed from the EMOJI_PICKER_BORDER_CELLS/PADDING_CELLS
-            # constants.
-            self.assertEqual(gutter.left + gutter.right, 4)
+            # constants. Right is deliberately 1 cell wider than left (see
+            # EMOJI_PICKER_PADDING_CELLS): a spare, unambiguous column that
+            # absorbs a real terminal rendering an ambiguous-width emoji
+            # (like the heart) narrower than Python assumes.
+            self.assertEqual(gutter.left, 2)
+            self.assertEqual(gutter.right, 3)
             self.assertEqual(content_region.width, emoji_picker_content_width())
 
             # The fundamental invariant: outer width = content width +
@@ -445,6 +450,59 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             # column, never clipping the last emoji.
             self.assertEqual(picker.region.right, content_region.right + gutter.right)
             self.assertEqual(picker.region.x + gutter.left, content_region.x)
+
+    def test_picker_padding_absorbs_worst_case_ambiguous_width_undercount(self) -> None:
+        """The real-hardware regression from PR #39: the right border was
+
+        still visibly misaligned on an actual uConsole even after the
+        calculate_popup_placement() screen-edge-clamp fix and even
+        though test_picker_right_border_geometry_at_xl (a real widget-
+        geometry read, not just the pure width helper) already passed.
+        Neither of those catches the true root cause: "❤️"'s BASE
+        codepoint (U+2764) has Unicode East Asian Width "Narrow" --
+        unlike every other EMOJI_PICKER_CHOICES entry, which is "Wide"
+        -- so a terminal that honors that raw property (rather than
+        overriding to a wide emoji-presentation glyph the way this
+        Python environment's own Rich cell_len() does) renders it in
+        only 1 column, not the 2 emoji_picker_content_width() assumes.
+        Since a picker row is emitted as one contiguous run of
+        characters, that 1-column shortfall silently shifts everything
+        drawn afterward in the SAME row -- including the picker's own
+        right border -- left by exactly that much, relative to the
+        pure-ASCII, unambiguous top/bottom border rows.
+
+        This is computed independently from Unicode's own East Asian
+        Width data, never from cell_len() (the exact function the
+        insufficient earlier test relied on for both the width helper
+        AND the geometry check), so it fails for the real defect even
+        though every cell_len()-based number stays internally
+        consistent.
+        """
+
+        def worst_case_width(emoji: str) -> int:
+            base_width = unicodedata.east_asian_width(emoji[0])
+            return cell_len(emoji) if base_width in ("W", "F") else 1
+
+        optimistic_total = emoji_picker_content_width()
+        worst_case_total = sum(
+            1 + worst_case_width(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES
+        ) + max(0, len(EMOJI_PICKER_CHOICES) - 1)
+        worst_case_shortfall = optimistic_total - worst_case_total
+
+        # Sanity check on the premise itself: EMOJI_PICKER_CHOICES must
+        # still contain a genuinely ambiguous-width glyph for this
+        # regression to mean anything. If this ever fails because ❤️
+        # was removed/replaced, the padding safety margin below may no
+        # longer be needed -- that's a real finding, not a bug in the
+        # test.
+        self.assertGreater(worst_case_shortfall, 0)
+
+        # The baseline (symmetric, 1 cell each side) padding is 2; any
+        # amount beyond that is pure safety margin and must fully cover
+        # the worst case, on the RIGHT side specifically (a shortfall
+        # earlier in the row only ever pushes things further right,
+        # never left, so only the right edge is at risk).
+        self.assertGreaterEqual(EMOJI_PICKER_PADDING_CELLS - 2, worst_case_shortfall)
 
     async def test_picker_content_width_uses_rendered_cell_width_not_len(self) -> None:
         """❤️ is 5 Python characters (heart, U+FE0F variation selector
