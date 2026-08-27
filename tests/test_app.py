@@ -21,6 +21,8 @@ from textual.widgets import Input, Static
 
 from app import (
     ANIMATED_STATUS,
+    CONNECTION_LABEL_WIDTH,
+    CONNECTION_ROW_PREFIX,
     TAB_NAMES,
     AutoSyncSelector,
     ChannelSelector,
@@ -43,6 +45,8 @@ from app import (
     ScreenTimeoutSelector,
     SyncClockControl,
     ThinScrollBarRender,
+    TimezoneSelector,
+    TIMEZONE_CHOICES,
     UnitsSelector,
     can_manual_resend,
 )
@@ -206,7 +210,7 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-            self.assertIn("→", str(widget.delivery_label.render()))
+            self.assertIn("▷", str(widget.delivery_label.render()))
 
     async def test_b_remains_arrow_while_failure_still_legitimately_possible(
         self,
@@ -341,7 +345,7 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
                     break
 
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
-            self.assertIn("→", str(widget.delivery_label.render()))
+            self.assertIn("▷", str(widget.delivery_label.render()))
 
             radio.fire_status(entry.packet_id, SendStatus(DeliveryState.SENT, entry.packet_id))
             for _ in range(10):
@@ -368,7 +372,7 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
         """The real animation cycle (_advance_delivery_states, driven by
 
         the existing 0.45s delivery timer -- no new timer added) must
-        only ever produce "→" and " →", never a longer-padded frame.
+        only ever produce "▷" and " ▷", never a longer-padded frame.
         """
         radio = ControllableSendRadioService()
         app = MeshtasticPassApp(radio, self.settings)
@@ -381,7 +385,7 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(6):
                 app._advance_delivery_states()
                 seen.add(str(widget.delivery_label.render()))
-            self.assertEqual(seen, {"→", " →"})
+            self.assertEqual(seen, {"▷", " ▷"})
             self.assertEqual(
                 widget.delivery_label.visual_style.foreground.hex6,
                 THEME_PALETTES[app._current_theme].accent.upper(),
@@ -694,8 +698,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("FIRMWARE     sim-1.0.0", info_text)
             self.assertIn("ROLE         CLIENT", info_text)
             self.assertIn("BLUETOOTH    ON", info_text)
-            self.assertIn("TIMEZONE     NOT SET", info_text)
+            self.assertNotIn("TIMEZONE", info_text)
 
+            self.assertIn("[ NOT SET ▾ ]", str(app.query_one(TimezoneSelector).render()))
             self.assertIn("5 MIN", str(app.query_one(ScreenTimeoutSelector).render()))
             self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
             self.assertIn("NORTH UP", str(app.query_one(CompassSelector).render()))
@@ -703,6 +708,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ON", str(app.query_one(Clock24HSelector).render()))
 
             for control in (
+                app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
                 app.query_one(UnitsSelector),
                 app.query_one(CompassSelector),
@@ -711,9 +717,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 app.query_one(SyncClockControl),
             ):
                 self.assertFalse(control.disabled)
-            self.assertIn(
-                "TIME UNKNOWN", str(app.query_one("#radio-clock-status", Static).render())
-            )
+            # Idle state: CLOCK SYNC shows no second line at all (see
+            # "RADIO -- SIMPLIFY CLOCK SYNC UX" item 1) -- the row
+            # collapses instead of reserving a permanent "TIME UNKNOWN"
+            # message.
+            status = app.query_one("#radio-clock-status", Static)
+            self.assertFalse(status.display)
+            self.assertEqual(str(status.render()), "")
 
     async def test_radio_section_disabled_while_disconnected(self) -> None:
         radio = SimulatedRadioService(
@@ -729,6 +739,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("HELTEC", info_text)
 
             for control in (
+                app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
                 app.query_one(UnitsSelector),
                 app.query_one(CompassSelector),
@@ -815,6 +826,182 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             # Everything else is unaffected.
             self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
 
+    # ---- TIMEZONE (device.tzdef) -------------------------------------
+
+    async def test_timezone_shows_not_set_when_tzdef_is_empty(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertIn(
+                "[ NOT SET ▾ ]", str(app.query_one(TimezoneSelector).render())
+            )
+
+    async def test_timezone_shows_eastern_for_the_exact_verified_tzdef(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio._config_sections["device"]["tzdef"] = "EST5EDT,M3.2.0,M11.1.0"
+            radio.refresh_config_snapshot()
+            app._render_radio_settings()
+            await pilot.pause()
+            self.assertIn(
+                "[ EASTERN ▾ ]", str(app.query_one(TimezoneSelector).render())
+            )
+
+    async def test_timezone_shows_custom_for_an_unknown_nonempty_tzdef(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio._config_sections["device"]["tzdef"] = "WEIRD1,M1.1.1,M2.2.2"
+            radio.refresh_config_snapshot()
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(TimezoneSelector)
+            self.assertIn("[ CUSTOM ▾ ]", str(dropdown.render()))
+            self.assertNotIn("WEIRD1", str(dropdown.render()))
+
+            # CUSTOM is preserved across further passive refreshes --
+            # never silently overwritten.
+            app._render_radio_settings()
+            await pilot.pause()
+            self.assertIn("[ CUSTOM ▾ ]", str(dropdown.render()))
+            self.assertEqual(
+                radio.read_synced_config_field("device", "tzdef"), "WEIRD1,M1.1.1,M2.2.2"
+            )
+
+    async def test_timezone_eastern_writes_the_exact_verified_string(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(TimezoneSelector)
+            status = app.query_one("#timezone-status", Static)
+            dropdown.focus()
+            # NOT SET -> UTC -> EASTERN.
+            await pilot.press("enter", "down", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "SAVED" in str(status.render()):
+                    break
+            self.assertIn("TIMEZONE SAVED", str(status.render()))
+            self.assertTrue(status.has_class("setting-success"))
+            self.assertEqual(
+                radio.read_synced_config_field("device", "tzdef"),
+                "EST5EDT,M3.2.0,M11.1.0",
+            )
+            self.assertIn("[ EASTERN ▾ ]", str(dropdown.render()))
+
+            app._dismiss_timezone_status()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "")
+
+    async def test_timezone_failed_write_reverts_to_authoritative_value(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(TimezoneSelector)
+            status = app.query_one("#timezone-status", Static)
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, "GMT0", None, "mismatch")
+            )
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT SAVED" in str(status.render()):
+                    break
+            self.assertIn("TIMEZONE NOT SAVED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+            self.assertIn("[ NOT SET ▾ ]", str(dropdown.render()))
+
+    async def test_timezone_unsupported_schema_disables_dropdown_safely(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            del radio._config_sections["device"]["tzdef"]
+            radio.refresh_config_snapshot()
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(TimezoneSelector)
+            self.assertIn("UNSUPPORTED", str(dropdown.render()))
+            self.assertTrue(dropdown.disabled)
+
+    async def test_timezone_write_never_syncs_the_clock(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(TimezoneSelector)
+            status = app.query_one("#timezone-status", Static)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "SAVED" in str(status.render()):
+                    break
+            radio.sync_clock.assert_not_called()
+
+    async def test_timezone_confirmed_write_updates_the_cached_snapshot(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.config_snapshot()
+            dropdown = app.query_one(TimezoneSelector)
+            status = app.query_one("#timezone-status", Static)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "SAVED" in str(status.render()):
+                    break
+            after = radio.config_snapshot()
+            self.assertIsNot(after, before)
+            device = next(s for s in after.local_config if s.section == "device")
+            self.assertEqual(device.fields["tzdef"], "GMT0")
+
+    async def test_opening_config_sends_zero_timezone_requests(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            app.query_one(TimezoneSelector).focus()
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
     async def test_radio_dropdowns_reachable_by_keyboard_navigation(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
@@ -826,6 +1013,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
             app.query_one(ColorSelector).focus()
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(TimezoneSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(ScreenTimeoutSelector))
             await pilot.press("down")
@@ -841,33 +1030,55 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(AutoSyncSelector))
 
-    async def test_sync_clock_applies_and_shows_last_sync_time(self) -> None:
+    async def test_sync_clock_shows_syncing_then_idle_with_no_terminal_text(
+        self,
+    ) -> None:
+        """"RADIO -- SIMPLIFY CLOCK SYNC UX" item 1/2: a clean manual
+
+        sync shows SYNCING TIME immediately, sends exactly one
+        set_time_only, and returns to a bare [ SYNC NOW ] with NO
+        CLOCK SYNCED/CLOCK SYNC UNCONFIRMED text once the fixed
+        feedback window elapses -- fired directly rather than waiting
+        the real CLOCK_SYNC_FEEDBACK_SECONDS duration (the established
+        convention -- see _auto_dismiss_send_error's own tests).
+        """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
         )
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
             self.assertIsNone(app._last_clock_sync_at)
             status = app.query_one("#radio-clock-status", Static)
-            self.assertIn("TIME UNKNOWN", str(status.render()))
+            control = app.query_one(SyncClockControl)
+            self.assertEqual(str(status.render()), "")
 
-            app.query_one(SyncClockControl).focus()
+            control.focus()
             await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "CLOCK SYNCED" in str(status.render()):
-                    break
-            self.assertIn("CLOCK SYNCED", str(status.render()))
-            self.assertIsNotNone(app._last_clock_sync_at)
-            self.assertFalse(app.query_one(SyncClockControl).disabled)
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+            self.assertIn("SYNCING TIME", str(status.render()))
+            self.assertTrue(status.has_class("setting-syncing"))
+            self.assertNotIn("[ SYNC NOW ]", str(control.render()))
+            self.assertTrue(control.disabled)
+            self.assertIsNotNone(app._last_clock_sync_at)  # set as soon as applied
+
+            app._clock_sync_feedback_expired(app._clock_sync_generation)
+            await pilot.pause()
+
+            self.assertEqual(str(status.render()), "")
+            self.assertNotIn("CLOCK SYNCED", str(status.render()))
+            self.assertIn("[ SYNC NOW ]", str(control.render()))
+            self.assertFalse(control.disabled)
 
     async def test_sync_clock_only_sends_on_explicit_activation(self) -> None:
         """Connect, reconnect, tab switches, and a plain settings refresh
 
         must never call RadioService.sync_clock on their own -- only
-        the user explicitly activating SyncClockControl may (see item
-        14/22).
+        the user explicitly activating SyncClockControl may.
         """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
@@ -897,28 +1108,48 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(radio.sync_clock.call_count, 1)
 
-    async def test_sync_clock_unconfirmed_reaches_terminal_state(self) -> None:
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        radio.sync_clock = Mock(
-            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            status = app.query_one("#radio-clock-status", Static)
-            control = app.query_one(SyncClockControl)
-            control.focus()
-            await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "SYNCING" not in str(status.render()):
-                    break
-            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
-            self.assertFalse(control.disabled)  # never left stuck
+    async def test_sync_clock_uncertain_outcomes_never_surface_unconfirmed(
+        self,
+    ) -> None:
+        """Item 4: "timeout" and "unconfirmed" are no longer shown as
 
-    async def test_sync_clock_nak_shows_failed_reason(self) -> None:
+        CLOCK SYNC UNCONFIRMED -- neither is negative evidence, so the
+        feedback window just elapses silently back to idle, exactly
+        like a clean success.
+        """
+        for reason in ("timeout", "unconfirmed"):
+            with self.subTest(reason=reason):
+                radio = SimulatedRadioService(
+                    connect_delay=0, message_interval=0, scripted_messages=()
+                )
+                radio.sync_clock = Mock(
+                    return_value=ClockSyncResult(False, 1_700_000_000, None, reason)
+                )
+                app = MeshtasticPassApp(radio, self.settings)
+                async with app.run_test(size=(100, 45)) as pilot:
+                    await pilot.pause()
+                    status = app.query_one("#radio-clock-status", Static)
+                    control = app.query_one(SyncClockControl)
+                    control.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertIn("SYNCING TIME", str(status.render()))
+
+                    app._clock_sync_feedback_expired(app._clock_sync_generation)
+                    await pilot.pause()
+                    self.assertNotIn("UNCONFIRMED", str(status.render()))
+                    self.assertEqual(str(status.render()), "")
+                    self.assertFalse(control.disabled)
+
+    async def test_sync_clock_nak_interrupts_the_window_with_a_compact_error(
+        self,
+    ) -> None:
+        """Item 3: a definitive, known failure (NAK) is real negative
+
+        evidence -- it interrupts the feedback window EARLY with a
+        compact error, rather than waiting for the fixed window to
+        elapse.
+        """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
         )
@@ -929,7 +1160,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
             status = app.query_one("#radio-clock-status", Static)
-            app.query_one(SyncClockControl).focus()
+            control = app.query_one(SyncClockControl)
+            control.focus()
             await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
@@ -937,6 +1169,38 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertIn("CLOCK SYNC FAILED", str(status.render()))
             self.assertIn("REJECTED BY RADIO", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+            # The error itself reuses the same feedback-window auto-
+            # dismiss (item 3) and then restores SYNC NOW.
+            app._clock_sync_feedback_expired(app._clock_sync_generation)
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "")
+            self.assertIn("[ SYNC NOW ]", str(control.render()))
+            self.assertFalse(control.disabled)
+
+    async def test_sync_clock_not_connected_shows_immediate_compact_error(
+        self,
+    ) -> None:
+        """A race: the connection drops between the keypress being
+
+        queued and _begin_sync_clock actually running -- SyncClockControl
+        is still enabled (it was last rendered while ONLINE), so this
+        exercises the "not ONLINE" guard directly instead of relying on
+        the widget's own disabled state.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.OFFLINE
+            app._begin_sync_clock()
+            await pilot.pause()
+            status = app.query_one("#radio-clock-status", Static)
+            self.assertIn("CLOCK SYNC FAILED", str(status.render()))
+            self.assertIn("RADIO NOT CONNECTED", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
 
     async def test_unsupported_clock_sync_shows_unsupported_and_disables_control(
         self,
@@ -1017,6 +1281,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             for control in (
                 app.query_one(FontSizeSelector),
                 app.query_one(ColorSelector),
+                app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
             ):
                 control.focus()
@@ -1274,21 +1539,27 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
         )
+        radio.sync_clock = Mock(side_effect=lambda: sleep(3))
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
             status = app.query_one("#radio-clock-status", Static)
             rendered = str(status.render())
+            self.assertIn("SYNCING TIME", rendered)
             control_rendered = str(app.query_one(SyncClockControl).render())
             self.assertEqual(
                 len(rendered) - len(rendered.lstrip(" ")),
-                control_rendered.index("["),
+                CONNECTION_LABEL_WIDTH + len(CONNECTION_ROW_PREFIX) + 1,
             )
+            self.assertNotIn("[", control_rendered)
 
     async def test_clock_status_colors_use_semantic_tokens(self) -> None:
-        """Item 13/29: SYNCING=ACCENT, SYNCED=CONFIRM,
+        """SYNCING=ACCENT, FAILED=ERROR -- never a hardcoded literal, and
 
-        UNCONFIRMED=ACCENT2, FAILED=ERROR -- never a hardcoded literal.
+        never the retired UNCONFIRMED/SYNCED semantic states.
         """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
@@ -1308,32 +1579,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 status.visual_style.foreground.hex6, palette.accent.upper()
             )
 
-            app._sync_clock_watchdog_expired(app._clock_sync_generation)
-            await pilot.pause()
-            self.assertTrue(status.has_class("setting-unconfirmed"))
-            self.assertEqual(
-                status.visual_style.foreground.hex6, palette.accent2.upper()
+            app.post_message(
+                ClockSyncApplied(
+                    ClockSyncResult(False, 1_700_000_000, None, "nak"),
+                    app._clock_sync_generation,
+                )
             )
-
-            radio.sync_clock = Mock(
-                return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
-            )
-            app.query_one(SyncClockControl).focus()
-            await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "CLOCK SYNCED" in str(status.render()):
-                    break
-            self.assertTrue(status.has_class("setting-success"))
-            self.assertEqual(
-                status.visual_style.foreground.hex6, palette.confirm.upper()
-            )
-
-            radio.sync_clock = Mock(
-                return_value=ClockSyncResult(False, 1_700_000_000, None, "nak")
-            )
-            app.query_one(SyncClockControl).focus()
-            await pilot.press("enter")
             for _ in range(10):
                 await pilot.pause()
                 if "FAILED" in str(status.render()):
@@ -1341,113 +1592,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(status.has_class("setting-error"))
             self.assertEqual(status.visual_style.foreground.hex6, "#FF1744")
 
-    # ---- Stuck SYNCING CLOCK... watchdog (item 14/15/17) ------------------
-
-    async def test_stuck_sync_reaches_unconfirmed_via_watchdog_without_real_wait(
-        self,
-    ) -> None:
-        """The root-cause fix: even if RadioService.sync_clock() never
-
-        returns at all, the UI must still reach a terminal state --
-        SYNCING CLOCK... is never permanent (item 15). Directly invokes
-        the watchdog callback (same convention as
-        _auto_dismiss_send_error) instead of waiting the real
-        CLOCK_SYNC_WATCHDOG_SECONDS duration (item 17).
-        """
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
-            control = app.query_one(SyncClockControl)
-            status = app.query_one("#radio-clock-status", Static)
-            control.focus()
-            await pilot.press("enter")
-            await pilot.pause()
-            self.assertIn("SYNCING", str(status.render()))
-            self.assertTrue(control.disabled)
-            self.assertTrue(app._clock_sync_in_progress)
-
-            app._sync_clock_watchdog_expired(app._clock_sync_generation)
-            await pilot.pause()
-
-            self.assertNotIn("SYNCING", str(status.render()))
-            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
-            self.assertFalse(app._clock_sync_in_progress)
-            self.assertFalse(control.disabled)  # SYNC NOW usable again
-
-    async def test_watchdog_is_a_noop_once_already_resolved_normally(self) -> None:
-        """A watchdog scheduled for a sync that already completed on its
-
-        own must never re-trigger or corrupt the now-settled UI state.
-        """
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        radio.sync_clock = Mock(
-            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            status = app.query_one("#radio-clock-status", Static)
-            app.query_one(SyncClockControl).focus()
-            await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "CLOCK SYNCED" in str(status.render()):
-                    break
-            resolved_generation = app._clock_sync_generation
-
-            app._sync_clock_watchdog_expired(resolved_generation)
-            await pilot.pause()
-
-            self.assertIn("CLOCK SYNCED", str(status.render()))
-            self.assertTrue(status.has_class("setting-success"))
-
-    async def test_late_orphaned_completion_after_watchdog_is_ignored(self) -> None:
-        """A genuinely-stuck sync_clock() call that eventually completes
-
-        AFTER the watchdog already resolved it to UNCONFIRMED must not
-        revert the UI, and must not corrupt a NEWER sync attempt either
-        -- the stale generation is dropped silently.
-        """
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
-            status = app.query_one("#radio-clock-status", Static)
-            control = app.query_one(SyncClockControl)
-            control.focus()
-            await pilot.press("enter")
-            await pilot.pause()
-            stale_generation = app._clock_sync_generation
-
-            app._sync_clock_watchdog_expired(stale_generation)
-            await pilot.pause()
-            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
-
-            # The original (now-orphaned) attempt finally "completes" --
-            # its stale-generation ClockSyncApplied must be ignored.
-            app.post_message(
-                ClockSyncApplied(
-                    ClockSyncResult(True, 1_700_000_000, 1_700_000_000, ""),
-                    stale_generation,
-                )
-            )
-            await pilot.pause()
-            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
-            self.assertFalse(app._clock_sync_in_progress)
-
     async def test_repeated_sync_now_activation_sends_only_one_write(self) -> None:
-        """Item 18: while already syncing, SYNC NOW must not enqueue a
+        """Item 5: while already syncing, SYNC NOW must not enqueue a
 
-        second admin write -- disabled/ignored safely.
+        second admin write -- disabled/ignored safely, and usable again
+        once the feedback window closes.
         """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
@@ -1467,7 +1616,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(radio.sync_clock.call_count, 1)
 
-            app._sync_clock_watchdog_expired(app._clock_sync_generation)
+            app._clock_sync_feedback_expired(app._clock_sync_generation)
             await pilot.pause()
             self.assertFalse(control.disabled)
 
@@ -1479,7 +1628,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(radio.sync_clock.call_count, 1)
 
-    # ---- CLOCK SYNC color + UNCONFIRMED auto-dismiss ----------------------
+    # ---- CLOCK SYNC color ---------------------------------------------
 
     async def test_clock_sync_control_uses_base_not_accent(self) -> None:
         radio = SimulatedRadioService(
@@ -1500,111 +1649,22 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 control.visual_style.foreground.hex6, palette.base.upper()
             )
 
-    async def test_clock_sync_unconfirmed_disappears_after_ten_seconds(self) -> None:
-        """Item 2: fires the SAME auto-dismiss callback directly (the
-
-        established convention -- see _auto_dismiss_send_error's own
-        tests) instead of waiting the real 10s duration.
-        """
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        radio.sync_clock = Mock(
-            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            status = app.query_one("#radio-clock-status", Static)
-            app.query_one(SyncClockControl).focus()
-            await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "UNCONFIRMED" in str(status.render()):
-                    break
-            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
-            self.assertIsNotNone(app._clock_unconfirmed_dismiss_timer)
-
-            app._dismiss_clock_unconfirmed()
-            await pilot.pause()
-
-            self.assertNotIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
-            self.assertIn("TIME UNKNOWN", str(status.render()))
-            self.assertIsNone(app._clock_unconfirmed_dismiss_timer)
-
-    async def test_stale_unconfirmed_timer_cannot_clear_a_newer_status(self) -> None:
-        """A fresh SYNCING (or a later terminal result) must supersede
-
-        an UNCONFIRMED message outright: _set_clock_status stops any
-        pending dismiss timer FIRST, before writing anything else, so
-        the OLD Timer object is replaced (and, per Textual's own
-        Timer.stop() contract, can never fire again) the instant a
-        newer sync begins -- confirmed here by identity, not merely by
-        the visible text, since only the Timer itself proves the old
-        callback can no longer run.
-        """
-        radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        radio.sync_clock = Mock(
-            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
-        )
-        app = MeshtasticPassApp(radio, self.settings)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            status = app.query_one("#radio-clock-status", Static)
-            control = app.query_one(SyncClockControl)
-            control.focus()
-            await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "UNCONFIRMED" in str(status.render()):
-                    break
-            stale_timer = app._clock_unconfirmed_dismiss_timer
-            self.assertIsNotNone(stale_timer)
-
-            radio.sync_clock = Mock(
-                return_value=ClockSyncResult(True, 1_700_000_001, 1_700_000_001, "")
-            )
-            control.focus()
-            await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "CLOCK SYNCED" in str(status.render()):
-                    break
-
-            self.assertIsNot(app._clock_unconfirmed_dismiss_timer, stale_timer)
-            self.assertIn("CLOCK SYNCED", str(status.render()))
-
-            # Even if the (already-stopped, per Textual's own Timer.stop()
-            # contract) old timer's callback somehow still ran, calling it
-            # now must reflect the CURRENT state, never revert to the
-            # stale UNCONFIRMED message it was originally scheduled for.
-            app._dismiss_clock_unconfirmed()
-            await pilot.pause()
-            self.assertIn("CLOCK SYNCED", str(status.render()))
-            self.assertNotIn("UNCONFIRMED", str(status.render()))
-
-    async def test_view_refresh_does_not_shorten_or_extend_unconfirmed_window(
+    async def test_view_refresh_does_not_shorten_or_extend_the_feedback_window(
         self,
     ) -> None:
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
         )
-        radio.sync_clock = Mock(
-            return_value=ClockSyncResult(False, 1_700_000_000, None, "timeout")
-        )
+        radio.sync_clock = Mock(side_effect=lambda: sleep(3))
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
             status = app.query_one("#radio-clock-status", Static)
             app.query_one(SyncClockControl).focus()
             await pilot.press("enter")
-            for _ in range(10):
-                await pilot.pause()
-                if "UNCONFIRMED" in str(status.render()):
-                    break
-            timer_before = app._clock_unconfirmed_dismiss_timer
+            await pilot.pause()
+            self.assertIn("SYNCING TIME", str(status.render()))
+            timer_before = app._clock_sync_feedback_timer
 
             app.show_tab("chat")
             await pilot.pause()
@@ -1613,10 +1673,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app._render_radio_settings()
             await pilot.pause()
 
-            self.assertIs(app._clock_unconfirmed_dismiss_timer, timer_before)
-            self.assertIn("CLOCK SYNC UNCONFIRMED", str(status.render()))
+            self.assertIs(app._clock_sync_feedback_timer, timer_before)
+            self.assertIn("SYNCING TIME", str(status.render()))
 
-    async def test_syncing_never_auto_dismisses_while_pending(self) -> None:
+    async def test_syncing_never_auto_dismisses_early_on_its_own(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
         )
@@ -1628,8 +1688,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             app.query_one(SyncClockControl).focus()
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIn("SYNCING", str(status.render()))
-            self.assertIsNone(app._clock_unconfirmed_dismiss_timer)
+            self.assertIn("SYNCING TIME", str(status.render()))
+            self.assertIsNotNone(app._clock_sync_feedback_timer)
+            self.assertTrue(app._manual_sync_feedback_active)
 
     async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
         radio = SimulatedRadioService(
@@ -3486,7 +3547,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIn(
                     str(widget.delivery_label.render()),
-                    ("→", " →"),
+                    ("▷", " ▷"),
                 )
                 self.assertEqual(
                     widget.delivery_label.visual_style.foreground.hex6,
@@ -3557,8 +3618,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(label)
 
             transitions = (
-                (DeliveryState.SENDING, 1, "→"),
-                (DeliveryState.SENDING, 2, " →"),
+                (DeliveryState.SENDING, 1, "▷"),
+                (DeliveryState.SENDING, 2, " ▷"),
                 (DeliveryState.SENT, 1, "✓"),
                 (DeliveryState.HEARD, 1, "✓✓"),
                 (DeliveryState.FAILED, 1, "✕"),
@@ -4010,7 +4071,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             widget = next(
                 w for w in app.query(ChatEntryWidget) if w.entry is app.chat_history[-1]
             )
-            self.assertIn("→", str(widget.delivery_label.render()))
+            self.assertIn("▷", str(widget.delivery_label.render()))
 
     async def test_normal_graceful_close_while_sending_persists_interrupted(
         self,
@@ -4200,7 +4261,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(entry.delivery_state, DeliveryState.SENDING)
-            self.assertIn("→", str(widget.delivery_label.render()))
+            self.assertIn("▷", str(widget.delivery_label.render()))
 
             # A raw read-only connection here, deliberately NOT another
             # ChatStore.open() call: opening a second store against a
@@ -6231,19 +6292,19 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 str(immediate_widget.delivery_label.render()),
-                "→",
+                "▷",
             )
             self.assertEqual(
                 [
                     str(child.render())
                     for child in immediate_widget.query(".chat-entry-header Static")
                 ],
-                ["YOU", " / ", "→", " / ", "0s"],
+                ["YOU", " / ", "▷", " / ", "0s"],
             )
             app._advance_delivery_states()
             self.assertEqual(
                 str(immediate_widget.delivery_label.render()),
-                " →",
+                " ▷",
             )
             self.assertIsNotNone(app._delivery_timer)
             self.assertEqual(
