@@ -13,6 +13,7 @@ from geo import GeoPosition
 from node_activity import count_active_other_nodes
 from radio_service import (
     ChannelInfo,
+    ClockSyncResult,
     ConfigWriteResult,
     RadioEvent,
     DeliveryState,
@@ -211,6 +212,7 @@ class SimulatedRadioService:
                 "use_12h_clock": False,
             },
             "bluetooth": {"enabled": True},
+            "device": {"tzdef": ""},
         }
 
     def available_device_paths(self) -> tuple[str, ...]:
@@ -413,6 +415,28 @@ class SimulatedRadioService:
             return ConfigWriteResult(False, value, None, "timeout")
         section_values[field] = value
         return ConfigWriteResult(True, value, value, "")
+
+    def supports_clock_sync(self) -> bool:
+        """--simulate always claims support, matching the real SDK's
+
+        current schema (see RadioService.supports_clock_sync) -- never
+        used to exercise the unsupported-hardware path, which is
+        covered directly against RadioService instead.
+        """
+        return True
+
+    def sync_clock(self) -> ClockSyncResult:
+        """Deterministic fake sync -- always succeeds while online, for
+
+        the same reason write_verified_config_field's fake does: this
+        exists to exercise the UI, not RadioService's real ack/rxTime
+        corroboration paths (see tests/test_radio_clock_sync.py for
+        those, against a fake Meshtastic interface).
+        """
+        if not self._online:
+            return ClockSyncResult(False, 0, None, "not_connected")
+        requested_epoch = int(time.time())
+        return ClockSyncResult(True, requested_epoch, requested_epoch, "")
 
     def connection_events(
         self,

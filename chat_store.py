@@ -326,6 +326,22 @@ class ChatStore:
                 (local_sent_at, message_id),
             )
 
+    def delete_message(self, message_id: int) -> None:
+        """Permanently remove one message and its send-attempt history.
+
+        Local delete only (see app.py's DEL action) -- never sends or
+        implies anything to the mesh. Deletes by the stable message_id
+        primary key alone, so another message with identical text, a
+        resend's own separate row, or any other message near the same
+        timestamp is never touched. A no-op if the id no longer exists
+        (e.g. DEL pressed twice in quick succession).
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM send_attempts WHERE message_id = ?", (message_id,)
+            )
+            connection.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+
     def load_recent(
         self,
         channel_index: int = 0,

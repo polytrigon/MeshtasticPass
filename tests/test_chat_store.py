@@ -278,6 +278,80 @@ class ChatStoreTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0].state, "HEARD")
 
+    def test_delete_message_removes_the_message_and_its_send_attempts(self) -> None:
+        message_id = self.store.add_outgoing(
+            text="delete me",
+            channel_index=0,
+            local_sent_at=300.0,
+            delivery_state="FAILED",
+        )
+        self.store.add_send_attempt(message_id, 300.0, "FAILED")
+
+        self.store.delete_message(message_id)
+
+        self.assertEqual(
+            [m.id for m in self.store.load_recent()], []
+        )
+        self.assertEqual(self.store.load_send_attempts(message_id), [])
+        raw = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        try:
+            row = raw.execute(
+                "SELECT COUNT(*) FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            self.assertEqual(row[0], 0)
+            row = raw.execute(
+                "SELECT COUNT(*) FROM send_attempts WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            self.assertEqual(row[0], 0)
+        finally:
+            raw.close()
+
+    def test_delete_message_never_touches_another_message(self) -> None:
+        keep_id = self.store.add_outgoing(
+            text="identical text",
+            channel_index=0,
+            local_sent_at=301.0,
+            delivery_state="SENT",
+        )
+        delete_id = self.store.add_outgoing(
+            text="identical text",
+            channel_index=0,
+            local_sent_at=302.0,
+            delivery_state="FAILED",
+        )
+        self.store.add_send_attempt(keep_id, 301.0, "SENT")
+        self.store.add_send_attempt(delete_id, 302.0, "FAILED")
+
+        self.store.delete_message(delete_id)
+
+        remaining_ids = [m.id for m in self.store.load_recent()]
+        self.assertEqual(remaining_ids, [keep_id])
+        self.assertEqual(len(self.store.load_send_attempts(keep_id)), 1)
+
+    def test_delete_message_is_a_no_op_for_an_unknown_id(self) -> None:
+        message_id = self.store.add_outgoing(
+            text="unrelated",
+            channel_index=0,
+            local_sent_at=303.0,
+            delivery_state="SENT",
+        )
+        self.store.delete_message(message_id + 999)  # never existed
+        self.assertEqual([m.id for m in self.store.load_recent()], [message_id])
+
+    def test_delete_message_persists_across_restart(self) -> None:
+        message_id = self.store.add_outgoing(
+            text="gone for good",
+            channel_index=0,
+            local_sent_at=304.0,
+            delivery_state="FAILED",
+        )
+        self.store.delete_message(message_id)
+        self.store.close()  # close() is idempotent -- tearDown's own close is harmless
+
+        reopened = ChatStore.open(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual([m.id for m in reopened.load_recent()], [])
+
     def test_malformed_database_is_reported_without_deletion(self) -> None:
         self.store.close()
         original = b"not a sqlite database"

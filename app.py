@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from time import monotonic, time
 from typing import Any, Callable
 
@@ -71,6 +72,7 @@ from node_activity import is_node_active
 from radio_capabilities import format_hw_model_name
 from radio_service import (
     ChannelInfo,
+    ClockSyncResult,
     ConfigWriteResult,
     DeliveryState,
     DISPLAY_UNITS_IMPERIAL,
@@ -129,6 +131,22 @@ ANIMATED_STATUS = {
 CONNECTION_LABEL_WIDTH = 12
 CONNECTION_ROW_PREFIX = "  "
 
+
+def _format_time_of_day(epoch: float, is_24h: bool) -> str:
+    """Host-local wall-clock reading of one epoch moment.
+
+    Used only to show WHEN this app last successfully synced the
+    radio's clock (see _apply_sync_clock) -- never presented as the
+    radio's own live time, since no independent radio-time readback
+    exists (see ClockSyncResult's docstring). Respects the same 24
+    HOUR TIME preference as the RADIO section's own Clock24HSelector
+    (see item 13), never a separate, independently-configured setting.
+    """
+    moment = datetime.fromtimestamp(epoch)
+    if is_24h:
+        return moment.strftime("%H:%M")
+    return moment.strftime("%I:%M %p").lstrip("0")
+
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
@@ -137,10 +155,18 @@ SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # successful local send WITHOUT stronger remote confirmation (see
 # RadioService._parse_send_response). HEARD/double-checkmark meaning:
 # a genuinely different node's own routing response reached us -- see
-# the same method's "from" comparison.
+# the same method's "from" comparison. FAILED/U+2715 MULTIPLICATION X:
+# same reasoning as the checkmark -- a plain, Narrow-width text glyph
+# (never "❌", an emoji-presentation glyph that would render double-
+# width), replacing the literal word "FAILED" as pure presentation;
+# the ERROR-colored CSS rule for this state (.delivery-failed) is
+# already theme-driven and untouched by this change. Does not change
+# what causes DeliveryState.FAILED, nor its meaning: a definitive
+# routing failure/NAK.
 DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
     DeliveryState.SENT: "✓",
     DeliveryState.HEARD: "✓✓",
+    DeliveryState.FAILED: "✕",
 }
 # A single narrow glyph (U+2192 RIGHTWARDS ARROW -- plain, non-emoji,
 # never double-width) animated by right-justifying it to a growing
@@ -393,6 +419,37 @@ class Clock24HSelector(KeyboardDropdown):
         )
 
 
+class SyncClockControl(Static):
+    """Explicit, user-activated "[ SYNC CLOCK ]" action -- see
+
+    RadioService.sync_clock and _apply_sync_clock. Never triggers
+    anything on its own: only Enter while this is focused sends the
+    admin write. Uses Widget's own `disabled` (not `display`) for the
+    unsupported/offline/in-flight states, so it naturally drops out of
+    focus eligibility while still integrating with the CONNECTION
+    page's existing `not getattr(control, "disabled", False)`
+    UP/DOWN navigation filter with no separate list to maintain.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ SYNC CLOCK ]",
+            id="sync-clock-control",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter" and not self.disabled:
+            self.post_message(self.Activated())
+            event.stop()
+
+
 class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
@@ -635,6 +692,14 @@ class RadioSettingApplied(Message):
         self.result = result
 
 
+class ClockSyncApplied(Message):
+    """One RadioService.sync_clock() call finished (see _apply_sync_clock)."""
+
+    def __init__(self, result: ClockSyncResult) -> None:
+        super().__init__()
+        self.result = result
+
+
 class LoadOlderControl(Static):
     """Focusable, keyboard-only control for one bounded history page."""
 
@@ -665,6 +730,12 @@ class EndOfChatHistoryMarker(Static):
         )
 
 
+MESSAGE_ACTION_LABELS: dict[str, str] = {
+    "resend": "[ RESEND ]",
+    "delete": "[ DEL ]",
+}
+
+
 class MessageActionControl(Static):
     """A contextual action beneath a message; ready for future action kinds."""
 
@@ -679,7 +750,7 @@ class MessageActionControl(Static):
         self.entry = entry
         self.action = action
         super().__init__(
-            "[ RESEND ]",
+            MESSAGE_ACTION_LABELS[action],
             classes="message-action chat-nav-target",
             markup=False,
         )
@@ -2007,8 +2078,10 @@ class ChatEntryWidget(Vertical):
             markup=False,
         )
         self.selection_marker = Static(" ", classes="chat-selection-marker", markup=False)
-        self.action_control = MessageActionControl(entry)
+        self.action_control = MessageActionControl(entry, action="resend")
         self.action_control.display = False
+        self.delete_control = MessageActionControl(entry, action="delete")
+        self.delete_control.display = False
         classes = "chat-entry new-message" if is_new else "chat-entry"
         if self.favorite:
             classes += " favorite-sender"
@@ -2018,7 +2091,11 @@ class ChatEntryWidget(Vertical):
                 Vertical(header, self.message_label, classes="chat-entry-content"),
                 classes="chat-entry-row",
             ),
-            self.action_control,
+            Horizontal(
+                self.action_control,
+                self.delete_control,
+                classes="message-action-row",
+            ),
             classes=classes,
         )
         self.refresh_delivery_state(1)
@@ -2054,7 +2131,9 @@ class ChatEntryWidget(Vertical):
                 name is visible_state,
                 f"delivery-{name.value.lower()}",
             )
-        self.action_control.display = can_manual_resend(self.entry)
+        actionable = can_manual_resend(self.entry)
+        self.action_control.display = actionable
+        self.delete_control.display = actionable
 
     def on_focus(self, _event: Focus) -> None:
         self.selection_marker.update(">")
@@ -2259,28 +2338,56 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #style-status, #radio-status {
+    #style-status, #radio-status, #radio-clock-status {
         height: 2;
     }
 
-    #style-status.setting-success, #radio-status.setting-success {
+    #style-status.setting-success, #radio-status.setting-success,
+    #radio-clock-status.setting-success {
         color: $white_accent;
     }
 
     Screen.theme-green #style-status.setting-success,
-    Screen.theme-green #radio-status.setting-success {
+    Screen.theme-green #radio-status.setting-success,
+    Screen.theme-green #radio-clock-status.setting-success {
         color: $green_accent;
     }
 
     Screen.theme-orange #style-status.setting-success,
-    Screen.theme-orange #radio-status.setting-success {
+    Screen.theme-orange #radio-status.setting-success,
+    Screen.theme-orange #radio-clock-status.setting-success {
         color: $orange_accent;
     }
 
-    #connection-error, #send-error, #style-status.setting-error, #radio-status.setting-error {
+    #connection-error, #send-error, #style-status.setting-error,
+    #radio-status.setting-error, #radio-clock-status.setting-error {
         height: auto;
         min-height: 1;
         color: $error;
+    }
+
+    #sync-clock-control {
+        color: $white_accent;
+    }
+
+    Screen.theme-green #sync-clock-control {
+        color: $green_accent;
+    }
+
+    Screen.theme-orange #sync-clock-control {
+        color: $orange_accent;
+    }
+
+    #sync-clock-control:disabled {
+        color: $white_dim;
+    }
+
+    Screen.theme-green #sync-clock-control:disabled {
+        color: $green_dim;
+    }
+
+    Screen.theme-orange #sync-clock-control:disabled {
+        color: $orange_dim;
     }
 
     #send-error.older-message-notice {
@@ -2488,6 +2595,11 @@ class MeshtasticPassApp(App[None]):
         height: 1;
         color: #d8d8d8;
         margin-bottom: 1;
+    }
+
+    .message-action-row {
+        width: auto;
+        height: auto;
     }
 
     #end-of-chat-history {
@@ -2721,6 +2833,13 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
+        # Local wall-clock moment the last SYNC CLOCK in THIS session
+        # completed successfully -- never the radio's own time (see
+        # SyncClockControl/_apply_sync_clock: AdminMessage has no
+        # get-time RPC to read that back with, see ClockSyncResult).
+        # None until the first successful sync.
+        self._last_clock_sync_at: float | None = None
+        self._clock_sync_in_progress = False
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -2773,6 +2892,8 @@ class MeshtasticPassApp(App[None]):
                 yield CompassSelector(True)
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
+                yield Static(id="radio-clock-status", markup=False)
+                yield SyncClockControl()
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield ChannelSelector(self._channels, self.current_channel_index)
@@ -3011,6 +3132,7 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
+                    self.query_one(SyncClockControl),
                 )
                 if not getattr(control, "disabled", False)
             ]
@@ -3333,6 +3455,90 @@ class MeshtasticPassApp(App[None]):
                     value=spec.from_schema_value(authoritative),
                 )
 
+    @on(SyncClockControl.Activated)
+    def sync_clock_activated(self, _event: SyncClockControl.Activated) -> None:
+        """Begin an explicit SYNC CLOCK -- see RadioService.sync_clock.
+
+        Only ever reached via SyncClockControl.on_key's own Enter
+        handling, itself only reachable while the control isn't
+        `disabled` -- never on connect/reconnect/tab-open/refresh (see
+        item 14/22: SYNC CLOCK is the ONLY thing in this pass that
+        sends anything to the radio, and only on this exact user
+        action).
+        """
+        control = self.query_one(SyncClockControl)
+        status = self.query_one("#radio-clock-status", Static)
+        if self._clock_sync_in_progress or control.disabled:
+            return
+        if self._radio_state is not RadioState.ONLINE:
+            status.remove_class("setting-success")
+            status.add_class("setting-error")
+            status.update("SYNC CLOCK UNAVAILABLE — RADIO NOT CONNECTED")
+            return
+        self._clock_sync_in_progress = True
+        control.disabled = True
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        status.update("SYNCING CLOCK...")
+        self.run_worker(
+            self._apply_sync_clock_from_thread,
+            thread=True,
+            name="sync-clock",
+            exclusive=True,
+        )
+
+    def _apply_sync_clock_from_thread(self) -> None:
+        try:
+            result = self.radio.sync_clock()
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            result = ClockSyncResult(False, 0, None, f"error: {detail}")
+        self.post_message(ClockSyncApplied(result))
+
+    _CLOCK_SYNC_FAILURE_REASONS = {
+        "not_connected": "RADIO NOT CONNECTED",
+        "disconnected": "CONNECTION LOST",
+        "nak": "REJECTED BY RADIO",
+    }
+
+    @on(ClockSyncApplied)
+    def clock_sync_applied(self, event: ClockSyncApplied) -> None:
+        """Every SYNC CLOCK activation reaches exactly one terminal state
+
+        here (see item 21) -- never left stuck at "SYNCING CLOCK...".
+        "timeout" and "unconfirmed" both settle as UNCONFIRMED: neither
+        is negative evidence (a NAK), but AdminMessage has no get-time
+        RPC to positively confirm the write with either (see
+        ClockSyncResult's own docstring) -- this app never claims
+        stronger confirmation than it actually has.
+        """
+        status = self.query_one("#radio-clock-status", Static)
+        self._clock_sync_in_progress = False
+        self._render_radio_settings()
+        if event.result.applied:
+            self._last_clock_sync_at = time()
+            status.remove_class("setting-error")
+            status.add_class("setting-success")
+            status.update(self._clock_status_text())
+        elif event.result.reason in self._CLOCK_SYNC_FAILURE_REASONS:
+            status.remove_class("setting-success")
+            status.add_class("setting-error")
+            reason = self._CLOCK_SYNC_FAILURE_REASONS[event.result.reason]
+            status.update(f"CLOCK SYNC FAILED — {reason}")
+        else:
+            # "timeout" (no ack/nak at all) or "unconfirmed" (a response
+            # arrived but didn't corroborate the write) -- see
+            # RadioService.sync_clock. Neither is negative evidence.
+            status.remove_class("setting-error")
+            status.remove_class("setting-success")
+            status.update("CLOCK SYNC UNCONFIRMED")
+
+    def _clock_status_text(self) -> str:
+        if self._last_clock_sync_at is None:
+            return "TIME UNKNOWN — SYNC TO SET"
+        is_24h = self.query_one(Clock24HSelector).value
+        return f"CLOCK SYNCED — LAST SYNC {_format_time_of_day(self._last_clock_sync_at, is_24h)}"
+
     def _render_radio_settings(self) -> None:
         """Populate RADIO from the SDK's already-synced state (or mark
 
@@ -3354,11 +3560,16 @@ class MeshtasticPassApp(App[None]):
         palette = THEME_PALETTES[self._current_theme]
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
 
+        sync_control = self.query_one(SyncClockControl)
+        supports_clock = bool(getattr(self.radio, "supports_clock_sync", lambda: False)())
+
         if not online:
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
             text = Text()
-            for index, label in enumerate(("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH")):
+            for index, label in enumerate(
+                ("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH", "TIMEZONE")
+            ):
                 if index:
                     text.append("\n")
                 text.append(
@@ -3379,6 +3590,7 @@ class MeshtasticPassApp(App[None]):
                 override.append(" ", style=palette.base)
                 override.append(placeholder, style=palette.dim_base)
                 dropdown.set_status_override(override)
+            sync_control.disabled = True
             return
 
         identity = self.radio.hardware_identity()
@@ -3388,12 +3600,20 @@ class MeshtasticPassApp(App[None]):
             if bluetooth_enabled is None
             else ("ON" if bluetooth_enabled else "OFF")
         )
+        tzdef = self.radio.read_synced_config_field("device", "tzdef")
+        # Read-only display only -- see the item 16 audit: no CLI
+        # reference, firmware source, or protobuf comment in the
+        # installed meshtastic==2.7.11 package confirms tzdef's exact
+        # expected POSIX-TZ syntax, DST behavior, or sign convention,
+        # so editing it is deliberately NOT exposed this pass.
+        tzdef_text = "—" if tzdef is None else ("NOT SET" if tzdef == "" else tzdef)
         text = Text()
         rows = (
             ("HARDWARE", format_hw_model_name(identity.hw_model_name)),
             ("FIRMWARE", identity.firmware_version or "—"),
             ("ROLE", identity.role_name or "—"),
             ("BLUETOOTH", bluetooth_text),
+            ("TIMEZONE", tzdef_text),
         )
         for index, (label, value) in enumerate(rows):
             if index:
@@ -3405,6 +3625,15 @@ class MeshtasticPassApp(App[None]):
             text.append(" ", style=palette.base)
             text.append(value, style=palette.base)
         info_widget.update(text)
+
+        sync_control.disabled = not supports_clock or self._clock_sync_in_progress
+        if not self._clock_sync_in_progress:
+            status = self.query_one("#radio-clock-status", Static)
+            status.remove_class("setting-success")
+            status.remove_class("setting-error")
+            status.update(
+                "TIME UNSUPPORTED" if not supports_clock else self._clock_status_text()
+            )
 
         for dropdown, spec in dropdowns:
             dropdown.set_status_override(None)
@@ -3565,7 +3794,7 @@ class MeshtasticPassApp(App[None]):
         outcome without simulating a real ack round-trip.
         """
         entry = event.entry
-        if event.generation != entry.send_generation:
+        if entry.deleted or event.generation != entry.send_generation:
             return
         entry.packet_id = event.sent.packet_id
         state = (
@@ -3582,7 +3811,7 @@ class MeshtasticPassApp(App[None]):
 
     @on(SendFailed)
     def send_failed(self, event: SendFailed) -> None:
-        if event.generation != event.entry.send_generation:
+        if event.entry.deleted or event.generation != event.entry.send_generation:
             return
         self._set_delivery_state(
             event.entry,
@@ -3593,7 +3822,7 @@ class MeshtasticPassApp(App[None]):
 
     @on(DeliveryStatusReceived)
     def delivery_status_received(self, event: DeliveryStatusReceived) -> None:
-        if event.generation != event.entry.send_generation:
+        if event.entry.deleted or event.generation != event.entry.send_generation:
             return
         if event.entry.packet_id not in (None, event.status.packet_id):
             return
@@ -4416,6 +4645,58 @@ class MeshtasticPassApp(App[None]):
                 if widget.entry is event.action_control.entry:
                     widget.focus()
                     break
+        elif event.action_control.action == "delete":
+            self._delete_chat_entry(event.action_control.entry)
+
+    def _delete_chat_entry(self, entry: ChatEntry) -> None:
+        """DEL: permanently remove one LOCAL outgoing entry -- never the
+
+        mesh. A packet already handed to the radio for transmission
+        cannot be pulled back out of the air, so this only ever touches
+        local application state: the UI, self.chat_history (and its
+        backing ChannelChatState -- the same list object, see
+        _state_for), and chat_store's persisted row. Generates zero
+        RF/admin traffic on its own.
+
+        Only ever offered where RESEND already is (can_manual_resend),
+        so `entry` is always a member of the CURRENT channel's
+        self.chat_history, exactly like _reposition_chat_entry assumes
+        for RESEND -- never another channel's message, and a RESEND's
+        own copy is a SEPARATE ChatEntry object (see _rebroadcast,
+        which mutates the SAME entry in place rather than creating a
+        new one), so deleting one can never affect the other.
+
+        entry.deleted is set FIRST, before anything else: it is the
+        actual guard send_was_submitted/send_failed/
+        delivery_status_received check before touching a message again,
+        so a response already sitting in the app's own message queue
+        (posted before this ran, processed after) is still caught, not
+        just responses that arrive later. Retiring the radio-layer
+        correlation (_pending_sends) additionally stops a real
+        RadioService from even invoking that status_handler at all for
+        a NOT-yet-queued late response -- belt and suspenders, since
+        _pending_sends is a RadioService-specific implementation detail
+        that not every radio backend (e.g. SimulatedRadioService) has.
+        """
+        if not can_manual_resend(entry):
+            return
+        entry.deleted = True
+        if entry.packet_id is not None:
+            pending_sends = getattr(self.radio, "_pending_sends", None)
+            if isinstance(pending_sends, dict):
+                pending_sends.pop(entry.packet_id, None)
+        if entry in self.chat_history:
+            self.chat_history.remove(entry)
+        for widget in list(self.query(ChatEntryWidget)):
+            if widget.entry is entry:
+                widget.remove()
+                break
+        if self.chat_store is not None and entry.message_id is not None:
+            try:
+                self.chat_store.delete_message(entry.message_id)
+            except ChatStoreError as error:
+                self._show_send_error(str(error))
+        self.query_one(ChatTranscript).focus()
 
     @on(ChatEntryWidget.UserMenuRequested)
     def open_user_menu(self, event: ChatEntryWidget.UserMenuRequested) -> None:

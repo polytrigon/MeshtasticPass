@@ -222,6 +222,39 @@ class ConfigWriteResult:
 
 
 @dataclass(frozen=True)
+class ClockSyncResult:
+    """Outcome of one RadioService.sync_clock() call.
+
+    Unlike write_verified_config_field, AdminMessage exposes no
+    get-time-equivalent RPC (confirmed against the installed
+    meshtastic==2.7.11 protobuf schema: no get_time_request/response
+    field exists anywhere on AdminMessage) -- there is no way to
+    independently ask the radio to report its own current clock value
+    back. `applied` is therefore True only when BOTH a clean
+    mesh-routing ACK for the set_time_only admin write was received AND
+    a best-effort secondary signal -- a subsequently observed packet's
+    own rxTime, the RECEIVING device's own locally-stamped Unix
+    timestamp (see RadioService._accept_received_message's identical
+    use of rxTime for radio_rx_at) -- lands within a few seconds of the
+    host epoch requested. When no such packet ever arrives, or its
+    rxTime doesn't corroborate the write, this settles for
+    "unconfirmed" rather than fabricating "applied" from routing-ack
+    evidence alone -- exactly the same standard ConfigWriteResult
+    already holds ordinary config writes to.
+
+    `reason` is "" when applied is True; otherwise one of:
+    "not_connected", "disconnected", "nak", "timeout" (no ack/nak
+    response at all), or "unconfirmed" (a response arrived but did not
+    corroborate the write).
+    """
+
+    applied: bool
+    requested_epoch: int
+    observed_rx_time: int | None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class ReceivedMessage:
     """A decoded text message with no Meshtastic SDK-specific structures.
 
@@ -284,6 +317,12 @@ class RadioService:
     """Owns the connection between the app and a Meshtastic radio."""
 
     _MAX_PENDING_SENDS = 200
+    # How close a subsequent packet's own rxTime must land to the host
+    # epoch we asked the radio to adopt (see sync_clock) to count as
+    # corroborating evidence -- generous enough to absorb normal
+    # send/serial/processing latency, never so tight that ordinary
+    # round-trip time alone produces a false "unconfirmed".
+    _CLOCK_SYNC_TOLERANCE_SECONDS = 10
 
     def __init__(self, device_path: str = "/dev/ttyUSB0") -> None:
         self.device_path = device_path
@@ -768,6 +807,83 @@ class RadioService:
             time.sleep(0.05)
 
         return ConfigWriteResult(False, value, None, "timeout")
+
+    def supports_clock_sync(self) -> bool:
+        """Whether the installed SDK/protobuf schema exposes
+
+        AdminMessage.set_time_only -- a schema-driven capability check
+        (see item 20: never inferred from device path or board-name
+        string) that stays accurate even against a different installed
+        meshtastic package version than the one this was audited
+        against (2.7.11). Independent of whether a radio is actually
+        connected right now -- callers combine this with connection
+        state separately, exactly like every other capability check in
+        this class.
+        """
+        from meshtastic.protobuf import admin_pb2
+
+        return "set_time_only" in admin_pb2.AdminMessage.DESCRIPTOR.fields_by_name
+
+    def sync_clock(self) -> ClockSyncResult:
+        """Set the radio's clock from THIS host's current wall clock,
+
+        captured as close as practical to the actual write (see
+        ClockSyncResult's docstring for why "applied" is a materially
+        weaker guarantee here than write_verified_config_field's:
+        AdminMessage has no get-time RPC to read the value back with).
+
+        Bypasses node.setTime()/Node's own convenience wrapper on
+        purpose, for the same reason write_verified_config_field
+        bypasses node.writeConfig(): for the LOCAL node those wire no
+        response callback at all, so nothing would ever see the ack or
+        a later packet's rxTime.
+
+        Never called periodically or automatically -- see app.py's own
+        caller, which only ever runs this from an explicit SYNC CLOCK
+        activation.
+        """
+        interface = self._interface
+        if interface is None:
+            return ClockSyncResult(False, 0, None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            return ClockSyncResult(False, 0, None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2
+
+        target_interface = interface
+        requested_epoch = int(time.time())
+        write_message = admin_pb2.AdminMessage()
+        write_message.set_time_only = requested_epoch
+
+        response_seen = {"any": False, "nak": False, "rx_time": None}
+
+        def on_ack(packet: Any) -> None:
+            response_seen["any"] = True
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                response_seen["nak"] = True
+            rx_time = packet.get("rxTime") if isinstance(packet, dict) else None
+            if isinstance(rx_time, (int, float)):
+                response_seen["rx_time"] = int(rx_time)
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+            interface.waitForAckNak()
+        except Exception:
+            pass
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return ClockSyncResult(False, requested_epoch, None, "disconnected")
+        if response_seen["nak"]:
+            return ClockSyncResult(False, requested_epoch, None, "nak")
+        if not response_seen["any"]:
+            return ClockSyncResult(False, requested_epoch, None, "timeout")
+
+        rx_time = response_seen["rx_time"]
+        if rx_time is not None and abs(rx_time - requested_epoch) <= self._CLOCK_SYNC_TOLERANCE_SECONDS:
+            return ClockSyncResult(True, requested_epoch, rx_time, "")
+        return ClockSyncResult(False, requested_epoch, rx_time, "unconfirmed")
 
     def remove_message_handler(
         self,
