@@ -488,6 +488,37 @@ class RadioService:
             result.append(NodeMetadata(local_id, is_local=True))
         return tuple(result)
 
+    def hardware_identity(self):
+        """Read-only: what the connected radio authoritatively reports
+
+        about its own hardware/firmware (see radio_capabilities.
+        hardware_identity for the full field list and exactly which
+        Meshtastic API object each one comes from). Never inferred
+        from device_path/serial device name; returns an all-
+        "unavailable" report if not yet connected, rather than raising.
+        """
+        from radio_capabilities import hardware_identity as _hardware_identity
+
+        return _hardware_identity(self._interface)
+
+    def capability_report(self):
+        """Read-only capability/configuration audit of the connected
+
+        radio (see radio_capabilities.build_capability_matrix) --
+        every already-synced localConfig/moduleConfig/channel section
+        this installed meshtastic package's schema declares, each row
+        paired with this codebase's own writable/reboot/hardware-
+        dependent/safe-to-expose judgment. Never sends a config write,
+        never transmits text, never generates LoRa traffic; secrets
+        (PSKs, passwords, keys) are reported only as configured/not
+        configured. Before a connection exists, still returns the
+        hardware-identity rows with "unavailable"/"not configured"
+        values rather than raising or returning nothing.
+        """
+        from radio_capabilities import build_capability_matrix
+
+        return build_capability_matrix(self._interface)
+
     def _is_local_node(self, node_id: str, node_number: int | None) -> bool:
         interface = self._interface
         my_info = getattr(interface, "myInfo", None)
