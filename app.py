@@ -134,24 +134,6 @@ CONNECTION_ROW_PREFIX = "  "
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
-# RADIO -- SIMPLIFY CLOCK SYNC UX: a fixed UI feedback window, NOT a
-# claim that the underlying set_time_only write itself takes this
-# long -- real hardware shows the radio's displayed clock updates
-# essentially immediately. AdminMessage has no get-time RPC to await a
-# true confirmation with (see ClockSyncResult's own docstring), so the
-# UI no longer waits for or reports on that outcome at all (no more
-# CLOCK SYNC UNCONFIRMED/SYNCED as normal user-facing states): it
-# simply shows SYNCING TIME for this long, then returns to idle,
-# independent of whether the underlying call has actually finished by
-# then (that worker keeps running regardless -- see RadioService.
-# sync_clock's own SDK-imposed ~20s waitForAckNak bound -- and a late
-# completion is safely ignored via the generation guard on
-# ClockSyncApplied). A genuinely KNOWN failure (not connected,
-# connection lost, a definitive NAK, or an immediate exception -- see
-# _CLOCK_SYNC_KNOWN_FAILURE_REASONS) interrupts this window early to
-# show a compact error instead, which then reuses this same duration
-# as its OWN auto-dismiss window before returning to idle.
-CLOCK_SYNC_FEEDBACK_SECONDS = 10.0
 # Same lifecycle again for LONG NAME SAVED/SHORT NAME SAVED (see
 # _set_long_name_status/_set_short_name_status).
 IDENTITY_STATUS_AUTO_DISMISS_SECONDS = 10.0
@@ -515,51 +497,6 @@ class AutoSyncSelector(KeyboardDropdown):
         )
 
 
-class SyncClockControl(Static):
-    """Explicit, user-activated "[ SYNC CLOCK ]" action -- see
-
-    RadioService.sync_clock and _apply_sync_clock. Never triggers
-    anything on its own: only Enter while this is focused sends the
-    admin write. Uses Widget's own `disabled` (not `display`) for the
-    unsupported/offline/in-flight states, so it naturally drops out of
-    focus eligibility while still integrating with the CONNECTION
-    page's existing `not getattr(control, "disabled", False)`
-    UP/DOWN navigation filter with no separate list to maintain.
-    """
-
-    can_focus = True
-
-    class Activated(Message):
-        pass
-
-    def __init__(self) -> None:
-        # Item 10/11: an inline "CLOCK SYNC   [ SYNC NOW ]" row directly
-        # below 24 HOUR TIME, using the SAME label-column/value-column
-        # width math (CONNECTION_ROW_PREFIX + CONNECTION_LABEL_WIDTH) as
-        # every neighboring RADIO row -- not a standalone full-row
-        # button anymore. Replaces the old standalone "[ SYNC CLOCK ]"
-        # control entirely; there is only ever this one clock-sync
-        # control (item 10: "Do not expose duplicate controls").
-        super().__init__(
-            f"{CONNECTION_ROW_PREFIX}{'CLOCK SYNC':<{CONNECTION_LABEL_WIDTH}} [ SYNC NOW ]",
-            id="sync-clock-control",
-            classes="connection-action-row",
-            markup=False,
-        )
-
-    def on_key(self, event: Key) -> None:
-        if event.key == "enter" and not self.disabled:
-            self.post_message(self.Activated())
-            event.stop()
-
-
-# The value/status column starts exactly where "[ SYNC NOW ]" itself
-# starts on SyncClockControl's own row (see its __init__) -- matching
-# that offset, rather than centering, is what item 12 requires ("The
-# second line should align with the value/action column").
-CLOCK_STATUS_INDENT = " " * (len(CONNECTION_ROW_PREFIX) + CONNECTION_LABEL_WIDTH + 1)
-
-
 class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
@@ -809,14 +746,13 @@ class RadioSettingApplied(Message):
 
 
 class ClockSyncApplied(Message):
-    """One RadioService.sync_clock() call finished (see _apply_sync_clock).
+    """One AUTO SYNC RadioService.sync_clock() call finished (see
 
-    `generation` identifies WHICH sync attempt (manual OR auto) this is
-    -- see clock_sync_applied's own guard: a completion whose generation
-    no longer matches the app's current one is stale (a newer attempt
-    already started, or the feedback window already closed -- see
-    CLOCK_SYNC_FEEDBACK_SECONDS) and is safely ignored rather than
-    reverting an already-terminal UI state.
+    _apply_sync_clock_from_thread). `generation` identifies WHICH
+    attempt this is -- see clock_sync_applied's own guard: a completion
+    whose generation no longer matches the app's current one is stale
+    (a newer attempt started, or a disconnect/reconnect superseded it
+    -- see _reset_clock_sync_state) and is safely ignored.
     """
 
     def __init__(self, result: ClockSyncResult, generation: int) -> None:
@@ -2490,11 +2426,11 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #long-name-status, #short-name-status, #timezone-status, #radio-clock-status {
+    #long-name-status, #short-name-status, #timezone-status {
         /* No min-height: display is toggled False when empty (see
            _set_long_name_status/_set_short_name_status/_set_timezone_
-           status/_set_clock_status), so the row collapses to zero
-           height instead of reserving a permanent blank line. */
+           status), so the row collapses to zero height instead of
+           reserving a permanent blank line. */
         height: auto;
     }
 
@@ -2570,35 +2506,11 @@ class MeshtasticPassApp(App[None]):
         color: $amber_confirm;
     }
 
-    .setting-syncing {
-        color: $snow_accent;
-    }
-
-    Screen.theme-amber .setting-syncing {
-        color: $amber_accent;
-    }
-
     #connection-error, #send-error, #style-status.setting-error,
-    #radio-status.setting-error, #radio-clock-status.setting-error {
+    #radio-status.setting-error {
         height: auto;
         min-height: 1;
         color: $error;
-    }
-
-    #sync-clock-control {
-        color: $snow_base;
-    }
-
-    Screen.theme-amber #sync-clock-control {
-        color: $amber_base;
-    }
-
-    #sync-clock-control:disabled {
-        color: $snow_dim;
-    }
-
-    Screen.theme-amber #sync-clock-control:disabled {
-        color: $amber_dim;
     }
 
     #send-error.older-message-notice {
@@ -2954,37 +2866,25 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
-        # Local wall-clock moment the last SYNC CLOCK in THIS session
-        # completed successfully -- never the radio's own time (see
-        # SyncClockControl/_apply_sync_clock: AdminMessage has no
-        # get-time RPC to read that back with, see ClockSyncResult).
-        # None until the first successful sync.
+        # Local wall-clock moment AUTO SYNC last completed a clock-set
+        # successfully in THIS session -- never the radio's own time
+        # (see RadioService.sync_clock: AdminMessage has no get-time
+        # RPC to read that back with, see ClockSyncResult). None until
+        # the first successful sync. Diagnostic only -- never rendered.
         self._last_clock_sync_at: float | None = None
+        # Whether an AUTO SYNC write is currently in flight -- guards
+        # against a reconnect loop launching an overlapping second
+        # write (see _maybe_auto_sync_clock).
         self._clock_sync_in_progress = False
-        # Identifies the CURRENT sync attempt (manual OR auto) -- see
-        # ClockSyncApplied/CLOCK_SYNC_FEEDBACK_SECONDS: a completion
-        # for a stale (superseded/already-resolved) generation is
-        # ignored, so a late orphaned completion from a genuinely stuck
-        # underlying call can never revert an already-terminal UI state.
+        # Identifies the CURRENT AUTO SYNC attempt -- see
+        # ClockSyncApplied/_reset_clock_sync_state: a completion for a
+        # stale (superseded, e.g. by a disconnect/reconnect) generation
+        # is ignored, so a late completion from an abandoned connection
+        # can never corrupt the new one's bookkeeping.
         self._clock_sync_generation = 0
-        # The single timer driving the "SYNCING TIME"/error status back
-        # to idle (see CLOCK_SYNC_FEEDBACK_SECONDS/_clock_sync_feedback_
-        # expired) -- reused for both roles: it is stopped and replaced,
-        # never left to fire twice, exactly like every other transient-
-        # status timer in this class.
-        self._clock_sync_feedback_timer: Timer | None = None
-        # True only while a MANUAL SYNC NOW's own UI (SYNCING TIME, or
-        # the error that may replace it) is on screen -- see
-        # _begin_sync_clock/clock_sync_applied. AUTO SYNC's own trigger
-        # never sets this: it performs the same underlying write
-        # silently, with no visible feedback at all (item 7/8 of
-        # "RADIO -- SIMPLIFY CLOCK SYNC UX"). Also doubles as the guard
-        # that keeps a passive _render_radio_settings() refresh from
-        # overwriting that transient message early.
-        self._manual_sync_feedback_active = False
         # Whether AUTO SYNC has already run once for the CURRENT
-        # connection lifecycle (see _maybe_auto_sync_clock/item 17) --
-        # reset only when _show_connection sees a genuine non-ONLINE ->
+        # connection lifecycle (see _maybe_auto_sync_clock) -- reset
+        # only when _show_connection sees a genuine non-ONLINE ->
         # ONLINE transition, so a reconnect loop can never trigger more
         # than one sync per lifecycle.
         self._clock_auto_sync_done_this_connection = False
@@ -3046,8 +2946,6 @@ class MeshtasticPassApp(App[None]):
                 yield CompassSelector(True)
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
-                yield SyncClockControl()
-                yield Static(id="radio-clock-status", markup=False)
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
@@ -3288,7 +3186,6 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
-                    self.query_one(SyncClockControl),
                     self.query_one(AutoSyncSelector),
                 )
                 if not getattr(control, "disabled", False)
@@ -3747,177 +3644,32 @@ class MeshtasticPassApp(App[None]):
                         value=spec.from_schema_value(authoritative),
                     )
 
-    @on(SyncClockControl.Activated)
-    def sync_clock_activated(self, _event: SyncClockControl.Activated) -> None:
-        """Begin an explicit SYNC CLOCK -- see RadioService.sync_clock.
-
-        Only ever reached via SyncClockControl.on_key's own Enter
-        handling, itself only reachable while the control isn't
-        `disabled`. Shares _begin_sync_clock with AUTO SYNC's own
-        trigger (see _maybe_auto_sync_clock) -- one underlying
-        implementation, never a second protocol path (item 18).
-        """
-        self._begin_sync_clock()
-
-    _CLOCK_STATUS_CLASSES = ("setting-error", "setting-syncing")
-
-    def _set_clock_status(self, text: str, css_class: str | None) -> None:
-        """The one place #radio-clock-status is ever written -- keeps
-
-        the value-column indent and the semantic color class in sync at
-        every call site instead of repeating both by hand. `css_class`
-        is one of setting-error (ERROR), setting-syncing (ACCENT), or
-        None for plain BASE-colored informational text ("TIME
-        UNSUPPORTED"). Collapses to zero height when `text` is empty --
-        the idle state (see "RADIO -- SIMPLIFY CLOCK SYNC UX" item 1)
-        shows no second line at all. Pure "write text + class +
-        collapse" only: the transient-status TIMING (when to call this
-        with what) lives entirely in _begin_sync_clock/clock_sync_
-        applied/_clock_sync_feedback_expired, not here.
-        """
-        status = self.query_one("#radio-clock-status", Static)
-        for name in self._CLOCK_STATUS_CLASSES:
-            status.remove_class(name)
-        if css_class is not None:
-            status.add_class(css_class)
-        status.display = bool(text)
-        status.update(f"{CLOCK_STATUS_INDENT}{text}" if text else "")
-
-    def _set_sync_clock_control_idle(self, available: bool) -> None:
-        """SyncClockControl's own text hides "[ SYNC NOW ]" while a sync
-
-        (or the error that may follow one) is on screen -- see item 1
-        of "RADIO -- SIMPLIFY CLOCK SYNC UX": "immediately replace/hide
-        the action". `available=True` is the normal idle row; `False`
-        also disables the control so repeated ENTER can't re-trigger it
-        (item 5).
-        """
-        control = self.query_one(SyncClockControl)
-        control.disabled = not available
-        control.update(
-            f"{CONNECTION_ROW_PREFIX}{'CLOCK SYNC':<{CONNECTION_LABEL_WIDTH}} [ SYNC NOW ]"
-            if available
-            else f"{CONNECTION_ROW_PREFIX}CLOCK SYNC"
-        )
-
-    def _start_clock_sync_feedback_timer(self, generation: int) -> None:
-        if self._clock_sync_feedback_timer is not None:
-            self._clock_sync_feedback_timer.stop()
-        self._clock_sync_feedback_timer = self.set_timer(
-            CLOCK_SYNC_FEEDBACK_SECONDS,
-            lambda: self._clock_sync_feedback_expired(generation),
-        )
-
-    def _clock_sync_feedback_expired(self, generation: int) -> None:
-        """Ends a MANUAL sync's own transient window -- either a plain
-
-        SYNCING TIME timing out naturally (the common case: no known
-        failure was ever discovered) or a compact error's OWN reused
-        10s dismiss (see _show_clock_sync_error/clock_sync_applied).
-        Either way: restore [ SYNC NOW ], clear the status row, and
-        stop treating this as manual-feedback-active. A stale
-        generation, or a window already closed by something else,
-        makes this a no-op (item 5: generation/timer safety).
-        """
-        self._clock_sync_feedback_timer = None
-        if generation != self._clock_sync_generation or not self._manual_sync_feedback_active:
-            return
-        self._manual_sync_feedback_active = False
-        # If the underlying worker never completed within the window
-        # (a genuinely stuck call, the same root cause this app has
-        # always guarded against), force it out of "in progress" too --
-        # SYNC NOW must never stay permanently blocked by one stuck
-        # call. Bumping the generation makes that orphaned completion,
-        # if it eventually arrives, safely stale (see clock_sync_
-        # applied's own guard) rather than resurrecting this window.
-        self._clock_sync_in_progress = False
-        self._clock_sync_generation += 1
-        self._set_clock_status("", None)
-        self._set_sync_clock_control_idle(True)
-
-    def _show_clock_sync_error(self, reason: str) -> None:
-        """A KNOWN, definitive clock-sync failure (item 3) -- shown
-
-        briefly, never held indefinitely: reuses the SAME feedback-
-        window duration as a normal SYNCING TIME display, just
-        re-purposed as this error's own auto-dismiss window.
-        """
-        self._manual_sync_feedback_active = True
-        self._set_sync_clock_control_idle(False)
-        self._set_clock_status(f"CLOCK SYNC FAILED — {reason}", "setting-error")
-        self._clock_sync_generation += 1
-        self._start_clock_sync_feedback_timer(self._clock_sync_generation)
-
     def _reset_clock_sync_state(self) -> None:
-        """Invalidate any in-flight sync/feedback window outright --
+        """Invalidate whatever the OLD connection's in-flight AUTO SYNC
 
-        called by _show_connection on every genuine connection-state
-        transition (disconnect, error, a fresh (re)connect), never on
-        a redundant "still ONLINE" event or a passive view refresh
-        (see its own call site). A dropped connection makes whatever
-        the OLD connection's write/feedback window was doing
-        meaningless -- the NEXT connection must always start SYNC NOW
-        from a clean idle state, never inheriting a stale disabled/
-        busy control or a leftover SYNCING TIME/error message. Bumping
-        the generation also makes a late completion from the OLD
-        connection's abandoned worker thread safely stale (see
-        clock_sync_applied's own guard).
+        write was doing -- called by _show_connection on every genuine
+        connection-state transition (disconnect, error, a fresh
+        (re)connect), never on a redundant "still ONLINE" event (see
+        its own call site). Bumping the generation makes a late
+        completion from an abandoned connection's worker thread safely
+        stale (see clock_sync_applied's own guard); clearing "in
+        progress" means a genuinely stuck old write can never block the
+        NEW connection's own one-time sync (see _maybe_auto_sync_clock).
         """
-        if self._clock_sync_feedback_timer is not None:
-            self._clock_sync_feedback_timer.stop()
-            self._clock_sync_feedback_timer = None
-        self._manual_sync_feedback_active = False
         self._clock_sync_in_progress = False
         self._clock_sync_generation += 1
-        self._set_clock_status("", None)
-
-    def _begin_sync_clock(self) -> None:
-        control = self.query_one(SyncClockControl)
-        if self._clock_sync_in_progress or control.disabled:
-            # Item 5: a repeated activation while already syncing (or
-            # while an error from the last one is still showing) must
-            # never enqueue a second admin write -- silently ignored,
-            # exactly like every other guarded action in this class.
-            return
-        if self._radio_state is not RadioState.ONLINE:
-            self._show_clock_sync_error("RADIO NOT CONNECTED")
-            return
-        self._clock_sync_generation += 1
-        generation = self._clock_sync_generation
-        self._clock_sync_in_progress = True
-        self._manual_sync_feedback_active = True
-        self._set_sync_clock_control_idle(False)
-        self._set_clock_status("SYNCING TIME", "setting-syncing")
-        # Worker hygiene: a dedicated group, not the implicit shared
-        # "default" one. Without this, an UNRELATED exclusive RADIO
-        # worker (saving a name, applying a different setting) starting
-        # while a sync is in flight would cancel this worker's Textual-
-        # level bookkeeping via exclusive=True's group-wide cancellation,
-        # even though the two operations have nothing to do with each
-        # other.
-        self.run_worker(
-            lambda: self._apply_sync_clock_from_thread(generation),
-            thread=True,
-            name="sync-clock",
-            group="sync-clock",
-            exclusive=True,
-        )
-        self._start_clock_sync_feedback_timer(generation)
 
     def _maybe_auto_sync_clock(self) -> None:
-        """AUTO SYNC's own trigger -- at most once per qualifying
+        """AUTO SYNC's only trigger -- at most once per qualifying
 
         connection lifecycle (see _show_connection, the only caller),
-        never on tab/view/focus changes, never repeated mid-lifecycle --
-        reusing the exact same underlying write manual SYNC NOW uses
-        (RadioService.sync_clock via _apply_sync_clock_from_thread),
-        never a second protocol path. Unlike manual SYNC NOW, this
-        never touches the UI at all (item 7/8 of "RADIO -- SIMPLIFY
-        CLOCK SYNC UX"): no SYNCING TIME, no error, no "AUTO SYNC"
-        confirmation line -- it simply performs the clock set silently
-        during connection establishment. A real failure here is only
-        ever a silent internal fact (item 8): no persistent status row
-        is created just for it.
+        never on tab/view/focus/render/config-snapshot activity, never
+        repeated mid-lifecycle. Entirely silent (see "FINAL CLOCK UI
+        SIMPLIFICATION"): no UI reflects this call either way -- it
+        simply performs RadioService.sync_clock() during connection
+        establishment. A real failure here is only ever a silent
+        internal fact: it must never block app connection/startup (see
+        _apply_sync_clock_from_thread's own try/except).
 
         No trustworthy get-time/RTC-validity signal exists to sync
         "only when needed" instead (see ClockSyncResult's own
@@ -3957,57 +3709,23 @@ class MeshtasticPassApp(App[None]):
             result = ClockSyncResult(False, 0, None, f"error: {detail}")
         self.post_message(ClockSyncApplied(result, generation))
 
-    _CLOCK_SYNC_KNOWN_FAILURE_REASONS = {
-        "not_connected": "RADIO NOT CONNECTED",
-        "disconnected": "CONNECTION LOST",
-        "nak": "REJECTED BY RADIO",
-    }
-
     @on(ClockSyncApplied)
     def clock_sync_applied(self, event: ClockSyncApplied) -> None:
-        """One RadioService.sync_clock() call finished -- see item 4 of
+        """One AUTO SYNC RadioService.sync_clock() call finished --
 
-        "RADIO -- SIMPLIFY CLOCK SYNC UX": success, "timeout", and
-        "unconfirmed" are all treated identically now -- none of them
-        is negative evidence, and none is shown to the user any more
-        (no CLOCK SYNCED, no CLOCK SYNC UNCONFIRMED). Only a KNOWN
-        failure (not connected, disconnected, a definitive NAK, or an
-        immediate exception -- see _CLOCK_SYNC_KNOWN_FAILURE_REASONS)
-        interrupts an in-progress manual feedback window early to show
-        a compact error instead (item 3); otherwise this call just
-        updates internal bookkeeping and lets the feedback timer
-        started by _begin_sync_clock finish on its own.
-
-        A stale generation means a newer attempt has since started, or
-        this one's window already closed -- either way, this late
-        completion must never revert an already-terminal UI state
-        (item 5).
-
-        If no MANUAL feedback window is active at all -- this is an
-        AUTO SYNC result, or a manual one whose window already closed
-        -- the outcome is recorded silently and never surfaces any UI
-        (item 7/8): AUTO SYNC never shows CLOCK SYNC UNCONFIRMED, a
-        success line, or a new persistent failure row.
+        purely internal bookkeeping now (see "FINAL CLOCK UI
+        SIMPLIFICATION"): no UI surfaces the outcome either way,
+        success or failure. A stale generation means a newer attempt
+        (or a disconnect/reconnect -- see _reset_clock_sync_state) has
+        since superseded this one, so it is safely ignored rather than
+        e.g. resurrecting an "in progress" flag the new connection no
+        longer cares about.
         """
         if event.generation != self._clock_sync_generation:
             return
         self._clock_sync_in_progress = False
         if event.result.applied:
             self._last_clock_sync_at = time()
-        if not self._manual_sync_feedback_active:
-            return
-        is_known_failure = (
-            event.result.reason in self._CLOCK_SYNC_KNOWN_FAILURE_REASONS
-            or event.result.reason.startswith("error:")
-        )
-        if not is_known_failure:
-            return
-        if self._clock_sync_feedback_timer is not None:
-            self._clock_sync_feedback_timer.stop()
-            self._clock_sync_feedback_timer = None
-        reason = self._CLOCK_SYNC_KNOWN_FAILURE_REASONS.get(event.result.reason, "SYNC FAILED")
-        self._set_clock_status(f"CLOCK SYNC FAILED — {reason}", "setting-error")
-        self._start_clock_sync_feedback_timer(self._clock_sync_generation)
 
     @staticmethod
     def _snapshot_config_field(snapshot, section: str, field: str) -> str | None:
@@ -4048,9 +3766,6 @@ class MeshtasticPassApp(App[None]):
         palette = THEME_PALETTES[self._current_theme]
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
 
-        sync_control = self.query_one(SyncClockControl)
-        supports_clock = bool(getattr(self.radio, "supports_clock_sync", lambda: False)())
-
         if not online:
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
@@ -4074,7 +3789,6 @@ class MeshtasticPassApp(App[None]):
                 override.append(" ", style=palette.base)
                 override.append(placeholder, style=palette.dim_base)
                 dropdown.set_status_override(override)
-            sync_control.disabled = True
             return
 
         # Item 4: HARDWARE/FIRMWARE/ROLE/BLUETOOTH read the cached
@@ -4138,24 +3852,6 @@ class MeshtasticPassApp(App[None]):
         else:
             timezone_dropdown.set_status_override(None)
             timezone_dropdown.set_options(self._timezone_options_for(tzdef), value=tzdef)
-
-        sync_control.disabled = (
-            not supports_clock
-            or self._clock_sync_in_progress
-            or self._manual_sync_feedback_active
-        )
-        # While a MANUAL sync's own SYNCING TIME/error is still within
-        # its own feedback window, a passive refresh here (e.g. an
-        # unrelated reconnect) must leave it alone entirely -- neither
-        # extending nor cutting short its own timer (item 2 of "RADIO
-        # -- SIMPLIFY CLOCK SYNC UX": "view refresh must not extend the
-        # lifetime").
-        if not self._clock_sync_in_progress and not self._manual_sync_feedback_active:
-            if not supports_clock:
-                self._set_clock_status("TIME UNSUPPORTED", None)
-            else:
-                self._set_sync_clock_control_idle(True)
-                self._set_clock_status("", None)
 
         for dropdown, spec in dropdowns:
             dropdown.set_status_override(None)
@@ -5971,11 +5667,11 @@ class MeshtasticPassApp(App[None]):
         was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
-        # Real-hardware follow-up to "RADIO -- SIMPLIFY CLOCK SYNC UX":
-        # a genuine connection-state transition (anything except a
-        # redundant "still ONLINE" event) must never leave stale
-        # SYNCING TIME/error/busy state behind for the NEXT connection
-        # to inherit -- see _reset_clock_sync_state's own docstring.
+        # A genuine connection-state transition (anything except a
+        # redundant "still ONLINE" event) must never leave an AUTO
+        # SYNC write in flight/attributed to the OLD connection for the
+        # NEW one to inherit -- see _reset_clock_sync_state's own
+        # docstring.
         if not (state is RadioState.ONLINE and was_online):
             self._reset_clock_sync_state()
         if state is RadioState.ONLINE and info is not None and info.channels:
