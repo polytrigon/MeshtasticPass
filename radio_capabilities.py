@@ -333,6 +333,19 @@ def hardware_identity(interface: Any) -> HardwareIdentity:
     )
 
 
+def format_hw_model_name(hw_model_name: str | None) -> str:
+    """Human-readable form of an authoritative hw_model enum name, e.g.
+
+    "HELTEC_V3" -> "HELTEC V3". Purely cosmetic (underscores to spaces)
+    -- never infers or guesses a model; None stays an explicit "—" so a
+    disconnected/unavailable radio can never be mistaken for one that
+    reported an empty model name.
+    """
+    if not hw_model_name:
+        return "—"
+    return hw_model_name.replace("_", " ")
+
+
 def _optional_str(message: Any, name: str) -> str | None:
     if message is None:
         return None

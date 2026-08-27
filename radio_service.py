@@ -182,6 +182,45 @@ class RadioEvent:
     message: str = ""
 
 
+# Named localConfig.display.units enum values, so callers (the UI) never
+# need to import the Meshtastic protobuf package directly to build a
+# units selector -- see write_verified_config_field's module docstring
+# note about RadioService being the sole SDK-facing layer.
+DISPLAY_UNITS_METRIC = 0
+DISPLAY_UNITS_IMPERIAL = 1
+
+# localConfig.display.screen_on_secs is a firmware uint32; this exact
+# value (2**32 - 1) is documented by the installed meshtastic package's
+# own DisplayConfig.screen_on_secs field comment as "MAXUINT for always
+# on" -- confirmed via the installed .pyi stub, never invented.
+SCREEN_ON_SECS_ALWAYS_ON = 4294967295
+
+
+@dataclass(frozen=True)
+class ConfigWriteResult:
+    """Outcome of one RadioService.write_verified_config_field() call.
+
+    `applied` is True ONLY when a fresh radio-originated
+    getConfigResponse for the written section named that exact field
+    and its value matched what was requested -- never merely because
+    the local Python config object was mutated (the SDK does that
+    before any hardware confirmation exists) and never merely because
+    a routing ACK/NAK arrived (that proves packet delivery, not that
+    the admin operation was applied). See radio_write_readback_probe.py
+    for the real-hardware investigation that established this
+    verification model.
+
+    `reason` is "" when applied is True; otherwise one of:
+    "not_connected", "disconnected" (connection/interface changed
+    mid-verification), "nak", "timeout", or "mismatch".
+    """
+
+    applied: bool
+    requested_value: Any
+    readback_value: Any | None
+    reason: str = ""
+
+
 @dataclass(frozen=True)
 class ReceivedMessage:
     """A decoded text message with no Meshtastic SDK-specific structures.
@@ -595,6 +634,129 @@ class RadioService:
                 if isinstance(user, dict):
                     user["shortName"] = normalized
         return replace(self._read_radio_info(), short_name=normalized)
+
+    def read_synced_config_field(self, section: str, field: str) -> Any | None:
+        """Read localConfig.<section>.<field> from the SDK's already-
+
+        synced local cache -- no new radio request, no RF traffic. Use
+        this for initial population and reconnect refresh (see item 17
+        of the RADIO-section task: normal initial sync is authoritative
+        enough for display; a fresh explicit request is reserved for
+        verifying a write). Returns None if not connected or if this
+        installed schema does not declare the field (a future/older
+        firmware's schema drifting must render as "unavailable", never
+        crash the caller).
+        """
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        local_config = getattr(local_node, "localConfig", None)
+        section_message = getattr(local_config, section, None)
+        if section_message is None:
+            return None
+        try:
+            return getattr(section_message, field)
+        except AttributeError:
+            return None
+
+    def write_verified_config_field(
+        self,
+        section: str,
+        field: str,
+        value: Any,
+        *,
+        timeout: float = 15.0,
+    ) -> ConfigWriteResult:
+        """Write ONE localConfig.<section>.<field> and verify it with a
+
+        fresh radio-originated getConfigResponse -- the exact technique
+        radio_write_readback_probe.py established on real hardware (see
+        ConfigWriteResult's docstring for what "verified" means and
+        does not mean). This bypasses node.writeConfig()/requestConfig()'s
+        convenience wrappers on purpose: for the LOCAL node they wire no
+        response callback at all, so nothing would ever confirm the
+        write happened or parse the read reply.
+
+        Never touches any field but the one named here. Detects a
+        connection loss OR an interface swap (a reconnect completing
+        mid-verification) during the wait and reports "disconnected"
+        rather than fabricating a result from a stale interface's
+        response.
+        """
+        interface = self._interface
+        if interface is None:
+            return ConfigWriteResult(False, value, None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        local_config = getattr(local_node, "localConfig", None) if local_node else None
+        section_message = getattr(local_config, section, None) if local_config is not None else None
+        if local_node is None or section_message is None:
+            return ConfigWriteResult(False, value, None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2
+
+        target_interface = interface
+        setattr(section_message, field, value)
+
+        write_message = admin_pb2.AdminMessage()
+        getattr(write_message.set_config, section).CopyFrom(section_message)
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+            interface.waitForAckNak()
+        except Exception:
+            # A missing/weak ack must not by itself fail OR pass the
+            # write -- only the fresh readback below is authoritative.
+            pass
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return ConfigWriteResult(False, value, None, "disconnected")
+        if nak_seen["nak"]:
+            return ConfigWriteResult(False, value, None, "nak")
+
+        read_request = admin_pb2.AdminMessage()
+        read_request.get_config_request = admin_pb2.AdminMessage.ConfigType.Value(
+            f"{section.upper()}_CONFIG"
+        )
+        found: dict[str, Any] = {}
+
+        def on_response(packet: Any) -> None:
+            # Reuse the SDK's own extraction/CopyFrom logic (normally
+            # only wired for remote-node requests) so localConfig is
+            # updated through the real mechanism too.
+            local_node.onResponseRequestSettings(packet)
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            if not isinstance(admin, dict):
+                return
+            raw = admin.get("raw")
+            if raw is None or not raw.HasField("get_config_response"):
+                return
+            if raw.get_config_response.WhichOneof("payload_variant") == section:
+                found["value"] = getattr(getattr(raw.get_config_response, section), field)
+
+        try:
+            local_node._sendAdmin(read_request, onResponse=on_response)
+        except Exception:
+            return ConfigWriteResult(False, value, None, "timeout")
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                return ConfigWriteResult(False, value, None, "disconnected")
+            if "value" in found:
+                readback = found["value"]
+                if readback == value:
+                    return ConfigWriteResult(True, value, readback, "")
+                return ConfigWriteResult(False, value, readback, "mismatch")
+            time.sleep(0.05)
+
+        return ConfigWriteResult(False, value, None, "timeout")
 
     def remove_message_handler(
         self,

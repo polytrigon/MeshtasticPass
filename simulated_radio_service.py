@@ -13,8 +13,10 @@ from geo import GeoPosition
 from node_activity import count_active_other_nodes
 from radio_service import (
     ChannelInfo,
+    ConfigWriteResult,
     RadioEvent,
     DeliveryState,
+    DISPLAY_UNITS_METRIC,
     RadioInfo,
     RadioIdentityError,
     RadioSendError,
@@ -196,6 +198,20 @@ class SimulatedRadioService:
         self._send_count = 0
         self._activity_reference_time: float | None = None
         self._direct_observations: dict[str, float] = {}
+        # Deterministic fake RADIO-section state -- mirrors the real
+        # localConfig sections RadioService.write_verified_config_field
+        # writes/reads, so app.py's RADIO section behaves identically
+        # under --simulate without touching real hardware.
+        self._config_sections: dict[str, dict[str, object]] = {
+            "display": {
+                "screen_on_secs": 300,
+                "units": DISPLAY_UNITS_METRIC,
+                "compass_north_top": True,
+                "flip_screen": False,
+                "use_12h_clock": False,
+            },
+            "bluetooth": {"enabled": True},
+        }
 
     def available_device_paths(self) -> tuple[str, ...]:
         """Return fake ports without asking the host operating system."""
@@ -336,6 +352,67 @@ class SimulatedRadioService:
             raise RadioIdentityError("The simulated radio is not connected.")
         self.info = replace(self.info, short_name=normalized)
         return self.info
+
+    def hardware_identity(self):
+        """Deterministic fake identity, structurally identical to
+
+        RadioService.hardware_identity()'s real HardwareIdentity so
+        app.py's RADIO section renders identically under --simulate.
+        """
+        from radio_capabilities import HardwareIdentity
+
+        node_num = int(self.info.node_id[1:], 16)
+        return HardwareIdentity(
+            hw_model_raw=39,
+            hw_model_name="HELTEC_V3",
+            hw_model_source="simulated",
+            role_raw=0,
+            role_name="CLIENT",
+            role_source="simulated",
+            firmware_version=self.info.firmware_version,
+            firmware_edition=None,
+            min_app_version=None,
+            node_num=node_num,
+            node_id=self.info.node_id,
+            device_id="not configured",
+            pio_env="simulated",
+            macaddr="not configured",
+            has_wifi=False,
+            has_bluetooth=True,
+            has_ethernet=False,
+            has_remote_hardware=False,
+            has_pkc=False,
+            can_shutdown=False,
+            excluded_modules=None,
+        )
+
+    def read_synced_config_field(self, section: str, field: str):
+        """Deterministic fake read, mirroring RadioService's real method."""
+        if not self._online:
+            return None
+        return self._config_sections.get(section, {}).get(field)
+
+    def write_verified_config_field(
+        self,
+        section: str,
+        field: str,
+        value,
+        *,
+        timeout: float = 15.0,
+    ) -> ConfigWriteResult:
+        """Deterministic fake write -- always succeeds while online, since
+
+        --simulate exists to exercise the UI, not RadioService's real
+        verification/failure paths (see tests/test_radio_service.py and
+        tests/test_radio_write_readback_probe.py for those).
+        """
+        if not self._online:
+            return ConfigWriteResult(False, value, None, "not_connected")
+        section_values = self._config_sections.setdefault(section, {})
+        if field not in section_values:
+            return ConfigWriteResult(False, value, None, "timeout")
+        section_values[field] = value
+        return ConfigWriteResult(True, value, value, "")
 
     def connection_events(
         self,
