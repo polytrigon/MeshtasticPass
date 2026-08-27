@@ -23,8 +23,8 @@ from app import (
 from app_controller import received_chat_entry
 from app_settings import AppSettings
 from chat_store import ChatStore
-from keyboard_dropdown import KeyboardDropdown
-from radio_service import DeliveryState
+from keyboard_dropdown import DropdownOption, KeyboardDropdown
+from radio_service import ChannelInfo, DeliveryState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 
 
@@ -139,6 +139,59 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
 
             await app._switch_channel(0)
             self.assertEqual(app.chat_history[0].channel_index, 0)
+
+    async def test_channel_switch_preserves_each_channels_own_draft(self) -> None:
+        """Item 27: an unfinished LongFast draft must survive inspecting
+
+        Hiking and switching back -- never lost, and never leaked into
+        Hiking's own composer.
+        """
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
+            chat_input.value = "unfinished longfast thought"
+
+            await app._switch_channel(1)
+            self.assertEqual(chat_input.value, "")
+            chat_input.value = "a different hiking draft"
+
+            await app._switch_channel(0)
+            self.assertEqual(chat_input.value, "unfinished longfast thought")
+            self.assertEqual(chat_input.cursor_position, len(chat_input.value))
+
+            await app._switch_channel(1)
+            self.assertEqual(chat_input.value, "a different hiking draft")
+
+    async def test_duplicate_channel_display_names_remain_independent(self) -> None:
+        """Item F/24: identity is by stable channel INDEX, never display
+
+        name -- two configured channels sharing a user-facing name must
+        still keep completely separate history/drafts/unread state.
+        """
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._channels = (ChannelInfo(0, "Shared"), ChannelInfo(1, "Shared"))
+            app.query_one(ChannelSelector).set_options(
+                (DropdownOption(c.name, c.index) for c in app._channels),
+                value=0,
+            )
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
+            chat_input.value = "on the first Shared channel"
+
+            await app._switch_channel(1)
+            self.assertEqual(chat_input.value, "")
+            app._accept_received_message(replace(SIMULATED_MESSAGES[0], channel_index=1))
+            self.assertEqual([e.channel_index for e in app.chat_history], [1])
+
+            await app._switch_channel(0)
+            self.assertEqual(chat_input.value, "on the first Shared channel")
+            self.assertEqual(app.chat_history, [])
 
     async def test_arrows_navigate_whole_messages_controls_and_resend(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)

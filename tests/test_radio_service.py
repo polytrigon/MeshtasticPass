@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from geo import GeoPosition
+from node_activity import ACTIVE_WINDOW_SECONDS
 from radio_service import (
     ChannelInfo,
     RadioConnectionError,
@@ -357,29 +358,32 @@ class RadioServiceTests(unittest.TestCase):
                 next(events)
 
     def test_active_node_count_reads_node_database_without_sending(self) -> None:
+        # now=10_000 (not the old 1_000): ACTIVE_WINDOW_SECONDS is now
+        # 7200 (2h, firmware-aligned -- see node_activity.py), so node 3's
+        # deliberately-excluded age must exceed that, not the old 300s.
         service = RadioService()
         interface = make_interface()
         local_number = interface.myInfo.my_node_num
-        interface.nodesByNum[local_number]["lastHeard"] = 1_000
+        interface.nodesByNum[local_number]["lastHeard"] = 10_000
         interface.nodesByNum[2] = {
             "user": {"id": "!00000002"},
-            "lastHeard": 990,
+            "lastHeard": 9_990,
         }
         interface.nodesByNum[3] = {
             "user": {"id": "!00000003"},
-            "lastHeard": 600,
+            "lastHeard": 2_000,  # age 8_000s > ACTIVE_WINDOW_SECONDS (7_200)
         }
         interface.sendText = Mock()
         service._interface = interface
 
-        self.assertEqual(service.active_node_count(now=1_000), 1)
+        self.assertEqual(service.active_node_count(now=10_000), 1)
         interface.sendText.assert_not_called()
 
         interface.nodesByNum[4] = {
             "user": {"id": "!00000004"},
-            "lastHeard": 999,
+            "lastHeard": 9_999,
         }
-        self.assertEqual(service.active_node_count(now=1_000), 2)
+        self.assertEqual(service.active_node_count(now=10_000), 2)
         interface.sendText.assert_not_called()
 
     def test_active_node_count_is_unavailable_while_disconnected(self) -> None:
@@ -460,7 +464,9 @@ class RadioServiceTests(unittest.TestCase):
             service._on_text_received(packet, interface)
 
         self.assertEqual(service.active_node_count(now=1_000), 1)
-        self.assertEqual(service.active_node_count(now=1_300), 0)
+        self.assertEqual(
+            service.active_node_count(now=1_000 + ACTIVE_WINDOW_SECONDS), 0
+        )
         interface.sendText.assert_not_called()
 
     def test_direct_activity_excludes_self_and_clears_on_device_switch(self) -> None:

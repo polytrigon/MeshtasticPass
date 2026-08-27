@@ -26,8 +26,8 @@ class NodeActivityTests(unittest.TestCase):
             2,
         )
 
-    def test_exact_five_minute_boundary_is_inactive(self) -> None:
-        now = 1_000.0
+    def test_exact_active_window_boundary_is_inactive(self) -> None:
+        now = ACTIVE_WINDOW_SECONDS + 1_000.0
         nodes = ((2, {"lastHeard": now - ACTIVE_WINDOW_SECONDS}),)
 
         self.assertEqual(
@@ -109,13 +109,14 @@ class NodeActivityTests(unittest.TestCase):
         )
 
     def test_direct_observation_ages_out_at_exact_boundary(self) -> None:
+        now = ACTIVE_WINDOW_SECONDS + 1_000
         self.assertEqual(
             count_active_other_nodes(
                 (),
                 local_node_number=1,
                 local_node_id="!self0001",
-                now=1_000,
-                direct_observations={"!alice001": 700},
+                now=now,
+                direct_observations={"!alice001": now - ACTIVE_WINDOW_SECONDS},
             ),
             0,
         )

@@ -6,6 +6,7 @@ from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
+from node_activity import ACTIVE_WINDOW_SECONDS
 from radio_service import RadioIdentityError, RadioState
 from simulated_radio_service import (
     SIMULATED_MESSAGES,
@@ -168,8 +169,15 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         with patch("simulated_radio_service.time.time", return_value=1_000):
             service.connect()
 
-        self.assertEqual(service.active_node_count(now=1_000), 2)
-        self.assertEqual(service.active_node_count(now=1_001), 1)
+        # Alice(30s)/Bob(299s)/Cafe(400s) are well inside the firmware-aligned
+        # ACTIVE_WINDOW_SECONDS (7200s); NOLN/No Short Name (600s each) are
+        # the next to age out, exactly when the window elapses since their
+        # last-heard time -- BAD's malformed "recent" value and NONE's
+        # missing timestamp are never active at any `now`.
+        self.assertEqual(service.active_node_count(now=1_000), 5)
+        self.assertEqual(
+            service.active_node_count(now=1_000 + ACTIVE_WINDOW_SECONDS - 600), 3
+        )
         self.assertEqual(service.info.known_nodes, 8)
         self.assertEqual(service.sent_messages, ())
 
@@ -208,7 +216,10 @@ class SimulatedRadioServiceTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(service.active_node_count(now=1_000), 3)
+        # 5 NodeDB-active nodes at now=1_000 (Alice/Bob/Cafe/NOLN/No Short
+        # Name, all inside the firmware-aligned ACTIVE_WINDOW_SECONDS) plus
+        # the freshly direct-observed "!new00006" sender.
+        self.assertEqual(service.active_node_count(now=1_000), 6)
         info = service.set_long_name("Clockwork Nomad")
         self.assertEqual(info.long_name, "Clockwork Nomad")
         self.assertEqual(service.info.long_name, "Clockwork Nomad")

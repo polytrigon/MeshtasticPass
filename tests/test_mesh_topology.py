@@ -76,10 +76,14 @@ from mesh_topology import (
     place_within_bounds,
     project_to_viewport,
     route_chain,
+    route_chain_avoiding,
     route_connector,
+    route_connector_avoiding,
 )
+from mesh_topology import _route_connector_alternate_elbow
 import mesh_topology as mesh_topology_module
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
+from relative_time import format_relative_age
 from radio_service import NodeMetadata, RadioState
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
@@ -641,6 +645,70 @@ class RouteConnectorTests(unittest.TestCase):
 
     def test_route_is_deterministic(self) -> None:
         self.assertEqual(route_connector(1, 1, 9, 6), route_connector(1, 1, 9, 6))
+
+
+class RouteConnectorAvoidingTests(unittest.TestCase):
+    """route_connector_avoiding/route_chain_avoiding: the real-world bug
+
+    this fixes is a direct ALICE<->ME connector visually passing
+    through an unrelated real node BOB's own cell merely because BOB
+    sits geometrically between them, with no relay/hop evidence BOB
+    ever carried that traffic (see item 8 of the MESH topology task).
+    """
+
+    def test_no_obstacle_matches_plain_route_connector(self) -> None:
+        self.assertEqual(
+            route_connector_avoiding(0, 0, 8, 4, frozenset()),
+            route_connector(0, 0, 8, 4),
+        )
+
+    def test_bob_geometrically_between_alice_and_me_is_avoided(self) -> None:
+        """The exact reported scenario: BOB's cell sits on the default
+
+        elbow route between ALICE and ME, but BOB is not an evidenced
+        relay for this connection -- the route must steer around BOB's
+        cell entirely, never rendering ALICE -> BOB -> ME.
+        """
+        primary = route_connector(0, 0, 8, 4)
+        bob_position = next((x, y) for x, y, _glyph in primary)
+        result = route_connector_avoiding(0, 0, 8, 4, frozenset({bob_position}))
+        result_points = {(x, y) for x, y, _glyph in result}
+        self.assertNotIn(bob_position, result_points)
+        # A real, still-orthogonal path was found -- not an empty/broken
+        # result.
+        self.assertGreater(len(result), 0)
+
+    def test_both_elbow_orderings_blocked_falls_back_to_primary(self) -> None:
+        primary = route_connector(0, 0, 8, 4)
+        alternate = _route_connector_alternate_elbow(0, 0, 8, 4)
+        obstacles = frozenset(
+            {(x, y) for x, y, _glyph in primary} | {(x, y) for x, y, _glyph in alternate}
+        )
+        result = route_connector_avoiding(0, 0, 8, 4, obstacles)
+        self.assertEqual(result, primary)
+
+    def test_collinear_pair_has_no_elbow_choice_and_ignores_obstacles(self) -> None:
+        # A straight line has only one possible route regardless of
+        # obstacles -- avoidance can never fabricate a detour off-axis.
+        result = route_connector_avoiding(0, 0, 5, 0, frozenset({(2, 0)}))
+        self.assertEqual(result, route_connector(0, 0, 5, 0))
+
+    def test_alternate_elbow_never_touches_the_endpoints(self) -> None:
+        alternate = _route_connector_alternate_elbow(0, 0, 8, 4)
+        points = {(x, y) for x, y, _glyph in alternate}
+        self.assertNotIn((0, 0), points)
+        self.assertNotIn((8, 4), points)
+
+    def test_route_chain_avoiding_steers_each_segment_around_obstacles(self) -> None:
+        # A 3-point relay chain (YOU -> relay -> CLIENT); an obstacle on
+        # the first segment's default route must not affect the second
+        # segment at all.
+        points = ((0, 0), (8, 4), (8, 8))
+        primary_first_segment = route_connector(0, 0, 8, 4)
+        obstacle = next((x, y) for x, y, _glyph in primary_first_segment)
+        result = route_chain_avoiding(points, frozenset({obstacle}))
+        result_points = {(x, y) for x, y, _glyph in result}
+        self.assertNotIn(obstacle, result_points)
 
 
 class MeshCanvasRenderTests(unittest.TestCase):
@@ -1627,7 +1695,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         rssi=None,
                         snr=None,
                         packet_id=9_000_000 + index,
-                        radio_rx_at=1_700_000_000.0 - index,
+                        radio_rx_at=time.time() - index,
                     )
                 )
             await self._open_mesh(pilot)
@@ -1635,7 +1703,15 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             remote_count = sum(1 for state in view.working_set if not state.node.is_local)
             self.assertEqual(remote_count, DEFAULT_MAX_REMOTE_NODES)
 
-    async def test_stale_fallback_appears_when_nothing_is_recent(self) -> None:
+    async def test_very_old_client_is_excluded_from_the_working_set(self) -> None:
+        """Beyond MESH_VERY_OLD_THRESHOLD_SECONDS, a node's connector is
+
+        removed from the board entirely (see MeshActivityTier.VERY_OLD)
+        -- this used to be the "stale fallback still shows up" case, but
+        that behavior was superseded once VERY_OLD nodes stopped
+        occupying a working-set slot at all (see item 6 of the MESH
+        activity-model task).
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
@@ -1661,7 +1737,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             remote_ids = {
                 state.node.node_id for state in view.working_set if not state.node.is_local
             }
-            self.assertIn("!oldclient", remote_ids)
+            self.assertNotIn("!oldclient", remote_ids)
 
     async def test_unchanged_data_produces_unchanged_positions(self) -> None:
         """A second refresh moments later, with no underlying data change,
@@ -1726,7 +1802,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             app._accept_received_message(
@@ -1739,7 +1815,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=2,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
@@ -1772,7 +1848,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         rssi=None,
                         snr=None,
                         packet_id=hash(node_id) & 0xFFFF,
-                        radio_rx_at=1_700_000_000.0,
+                        radio_rx_at=time.time(),
                     )
                 )
             await self._open_mesh(pilot)
@@ -1805,7 +1881,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         rssi=None,
                         snr=None,
                         packet_id=hash(node_id) & 0xFFFF,
-                        radio_rx_at=1_700_000_000.0,
+                        radio_rx_at=time.time(),
                     )
                 )
             await self._open_mesh(pilot)
@@ -1837,7 +1913,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         rssi=None,
                         snr=None,
                         packet_id=hash(node.node_id) & 0xFFFF,
-                        radio_rx_at=1_700_000_000.0,
+                        radio_rx_at=time.time(),
                     )
                 )
             await self._open_mesh(pilot)
@@ -1897,14 +1973,14 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             view.select_node("!unknownhop")
             view.set_nodes(
-                view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_000.0
+                view.working_set, view.base_positions, theme=app._current_theme, now=time.time()
             )
             app._update_mesh_context_status()
             await pilot.pause()
@@ -2011,7 +2087,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
@@ -2064,7 +2140,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         rssi=None,
                         snr=None,
                         packet_id=100 + index,
-                        radio_rx_at=1_700_000_000.0,
+                        radio_rx_at=time.time(),
                     )
                 )
             await self._open_mesh(pilot)
@@ -2169,7 +2245,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
@@ -2215,7 +2291,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await pilot.press("2")
@@ -2260,7 +2336,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
@@ -2316,7 +2392,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=hash(node_id) & 0xFFFF,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
         await self._open_mesh(pilot)
@@ -3410,7 +3486,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_699_999_970.0,
+                    radio_rx_at=time.time() - 30,
                 )
             )
             await self._open_mesh(pilot)
@@ -3453,7 +3529,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
@@ -3487,7 +3563,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         rssi=None,
                         snr=None,
                         packet_id=hash(node_id) & 0xFFFF,
-                        radio_rx_at=1_700_000_000.0,
+                        radio_rx_at=time.time(),
                     )
                 )
             await self._open_mesh(pilot)
@@ -3554,7 +3630,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     rssi=None,
                     snr=None,
                     packet_id=1,
-                    radio_rx_at=1_700_000_000.0,
+                    radio_rx_at=time.time(),
                 )
             )
             await self._open_mesh(pilot)
@@ -3604,7 +3680,12 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            very_old = 1_700_000_000.0 - MESH_STALE_THRESHOLD_SECONDS * 5
+            # Beyond ACTIVE_WINDOW_SECONDS but within
+            # MESH_VERY_OLD_THRESHOLD_SECONDS -- STALE, not VERY_OLD, so
+            # the node stays admitted (and rendered dim) rather than
+            # being excluded from the board entirely (see
+            # MeshActivityTier).
+            very_old = 1_700_000_000.0 - MESH_STALE_THRESHOLD_SECONDS // 2
             app._accept_received_message(
                 SIMULATED_MESSAGES[0].__class__(
                     sender_node_id="!stale001",
@@ -4665,13 +4746,15 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(view.relay_stages), 3)
             self.assertGreater(len(self._connector_cells(view)), 0)
 
-    async def test_stale_known_hops_stays_visible_without_active_connector(
+    async def test_stale_known_hops_stays_visible_with_dashed_connector(
         self,
     ) -> None:
         """Case E: a stale node with a known hop count remains visible
 
-        and selectable, stroked/DIM_BASE, with no active connector or
-        relay chain of its own.
+        and selectable, stroked/DIM_BASE, with a DIM+DOTTED direct
+        connector (no relay chain of its own -- see item 5 of the MESH
+        activity-model task: STALE no longer means "no connector at
+        all", only "no active/relay-chain connector").
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -4687,7 +4770,9 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.relay_stages, ())
-            self.assertEqual(len(self._connector_cells(view)), 0)
+            cells = self._connector_cells(view)
+            self.assertGreater(len(cells), 0)
+            self.assertTrue(any(glyph in ("╌", "╎") for _x, _y, glyph, _c in cells))
             self.assertIn("!stale002", {w.node_id for w in app.query(MeshNodeWidget)})
             await pilot.press("up")
             await pilot.pause()
@@ -4747,9 +4832,11 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_hops_node_stale_to_active_gains_connector_in_place(
         self,
     ) -> None:
-        """Case G: endpoint position stays fixed; it fills and its
+        """Case G: endpoint position stays fixed; its DASHED stale
 
-        connector appears on the exact refresh it becomes active.
+        connector becomes a normal SOLID one on the exact refresh it
+        becomes active (see item 5: STALE now draws a dim/dotted
+        connector rather than none at all).
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -4765,7 +4852,9 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             position_before = view.base_positions["!transit1"]
-            self.assertEqual(len(self._connector_cells(view)), 0)
+            stale_cells = self._connector_cells(view)
+            self.assertGreater(len(stale_cells), 0)
+            self.assertTrue(any(glyph in ("╌", "╎") for _x, _y, glyph, _c in stale_cells))
 
             active = NodeMetadata(
                 "!transit1", "Transit", "TR", None,
@@ -4775,7 +4864,9 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             self.assertEqual(view.base_positions["!transit1"], position_before)
-            self.assertGreater(len(self._connector_cells(view)), 0)
+            active_cells = self._connector_cells(view)
+            self.assertGreater(len(active_cells), 0)
+            self.assertFalse(any(glyph in ("╌", "╎") for _x, _y, glyph, _c in active_cells))
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!transit1")
             self.assertEqual(str(widget.render()).strip(), CIRCLE_SOLID_LARGE)
 
@@ -4784,7 +4875,8 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         """Case H: the reverse transition -- endpoint stays fixed, dims,
 
-        and its connector disappears.
+        and its SOLID connector becomes a DASHED one (never disappears
+        outright -- see item 5).
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -4800,7 +4892,9 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             position_before = view.base_positions["!transit2"]
-            self.assertGreater(len(self._connector_cells(view)), 0)
+            active_cells = self._connector_cells(view)
+            self.assertGreater(len(active_cells), 0)
+            self.assertFalse(any(glyph in ("╌", "╎") for _x, _y, glyph, _c in active_cells))
 
             stale = NodeMetadata(
                 "!transit2", "Transit2", "TR2", None,
@@ -4810,12 +4904,265 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             self.assertEqual(view.base_positions["!transit2"], position_before)
-            self.assertEqual(len(self._connector_cells(view)), 0)
+            stale_cells = self._connector_cells(view)
+            self.assertGreater(len(stale_cells), 0)
+            self.assertTrue(any(glyph in ("╌", "╎") for _x, _y, glyph, _c in stale_cells))
             palette = THEME_PALETTES[app._current_theme]
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!transit2")
             self.assertEqual(str(widget.render()).strip(), CIRCLE_STROKED_LARGE)
             self.assertEqual(
                 widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
+            )
+
+
+class MeshUnrelatedNodeObstacleAvoidanceTests(unittest.IsolatedAsyncioTestCase):
+    """The real reported visual bug (item 8 of the MESH topology task):
+
+    a direct ALICE<->ME connector could previously render as if it
+    passed straight through BOB's own rendered cell merely because BOB
+    happens to sit geometrically between them -- with no relay/hop
+    evidence BOB actually carried that traffic. Positions below are
+    empirically confirmed (not guessed) to place BOB exactly on
+    ALICE's DEFAULT (obstacle-unaware) elbow route.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def test_connector_avoids_an_unrelated_real_node_geometrically_in_the_way(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            you = NodeMetadata(app.radio.info.node_id, is_local=True)
+            alice = NodeMetadata("!a1a1a1a1", "Alice", "AL", 0, last_heard=1_800_000_000.0)
+
+            # ALICE alone first: confirms BOB's position (below) really
+            # does sit on ALICE's unobstructed default route -- the
+            # precondition this test depends on, checked directly
+            # rather than assumed.
+            view.set_nodes(
+                (
+                    MeshNodeState(
+                        node=you, is_client=False, is_relay=False, last_interaction_at=None
+                    ),
+                    MeshNodeState(
+                        node=alice,
+                        is_client=True,
+                        is_relay=False,
+                        last_interaction_at=1_800_000_000.0,
+                    ),
+                ),
+                {app.radio.info.node_id: (0, 0), "!a1a1a1a1": (8, 4)},
+                theme="white",
+                now=1_800_000_000.0,
+            )
+            await pilot.pause()
+            baseline_positions = {
+                (x, y) for x, y, _glyph, _color in view.board.query_one(MeshCanvas)._signature[2]
+            }
+            bob_position = (72, 22)
+            self.assertIn(bob_position, baseline_positions)
+
+            bob = NodeMetadata("!b0b0b0b0", "Bob", "BB", 0, last_heard=1_800_000_000.0)
+            view.set_nodes(
+                (
+                    MeshNodeState(
+                        node=you, is_client=False, is_relay=False, last_interaction_at=None
+                    ),
+                    MeshNodeState(
+                        node=alice,
+                        is_client=True,
+                        is_relay=False,
+                        last_interaction_at=1_800_000_000.0,
+                    ),
+                    MeshNodeState(
+                        node=bob, is_client=True, is_relay=False, last_interaction_at=1_800_000_000.0
+                    ),
+                ),
+                {
+                    app.radio.info.node_id: (0, 0),
+                    "!a1a1a1a1": (8, 4),
+                    "!b0b0b0b0": (4, 4),
+                },
+                theme="white",
+                now=1_800_000_000.0,
+            )
+            await pilot.pause()
+            bob_widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!b0b0b0b0")
+            self.assertEqual(
+                (int(bob_widget.styles.offset.x.value), int(bob_widget.styles.offset.y.value)),
+                bob_position,
+            )
+            routed_positions = {
+                (x, y) for x, y, _glyph, _color in view.board.query_one(MeshCanvas)._signature[2]
+            }
+            self.assertNotIn(bob_position, routed_positions)
+
+
+class MeshSelectedRoutePaintPriorityTests(unittest.IsolatedAsyncioTestCase):
+    """The real reported visual bug (item 10/11 of the MESH topology
+
+    task): when many connectors overlap, focusing a node could
+    previously render only PART of its own route in ACCENT, because a
+    later-drawn unselected connector painted over shared cells --
+    MeshCanvas's overlay dict keys on (x, y), so whichever connector's
+    cells are appended LAST to the `connectors` tuple wins any shared
+    cell. This constructs two clients whose default elbow routes
+    genuinely share several transit cells (found empirically, not
+    fabricated) to prove the fix: the SELECTED node's connector is now
+    always appended last, so it always wins.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    def _set_overlapping_pair(self, app: MeshtasticPassApp) -> MeshTopologyView:
+        """YOU at the origin; A and B's default elbow routes share every
+
+        cell of YOU's own row out to column -32/+32 respectively (both
+        turn at the same row) -- confirmed empirically, not asserted
+        blindly; test_the_two_routes_genuinely_overlap below re-verifies
+        this same precondition so a future geometry change that removes
+        the overlap fails loudly here instead of silently proving
+        nothing.
+        """
+        view = app.query_one(MeshTopologyView)
+        you = NodeMetadata(app.radio.info.node_id, is_local=True)
+        a = NodeMetadata("!aaaaaaaa", "A", "A", 0, last_heard=1_800_000_000.0)
+        b = NodeMetadata("!bbbbbbbb", "B", "B", 0, last_heard=1_800_000_000.0)
+        working_set = (
+            MeshNodeState(node=you, is_client=False, is_relay=False, last_interaction_at=None),
+            MeshNodeState(
+                node=a, is_client=True, is_relay=False, last_interaction_at=1_800_000_000.0
+            ),
+            MeshNodeState(
+                node=b, is_client=True, is_relay=False, last_interaction_at=1_800_000_000.0
+            ),
+        )
+        base_positions = {
+            app.radio.info.node_id: (0, 0),
+            "!aaaaaaaa": (-4, -6),
+            "!bbbbbbbb": (4, -2),
+        }
+        view.set_nodes(working_set, base_positions, theme="white", now=1_800_000_000.0)
+        return view
+
+    def _connector_cells(self, view: MeshTopologyView):
+        canvas = view.board.query_one(MeshCanvas)
+        return canvas._signature[2]
+
+    async def test_the_two_routes_genuinely_overlap(self) -> None:
+        """Precondition check, not the fix itself: if this ever starts
+
+        failing, the OTHER tests below stop meaning anything (they
+        would trivially pass with no paint-priority fix at all).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            view = self._set_overlapping_pair(app)
+            await pilot.pause()
+            cells = self._connector_cells(view)
+            positions = [(x, y) for x, y, _glyph, _color in cells]
+            self.assertGreater(len(positions), len(set(positions)))
+
+    async def test_selected_route_is_fully_accent_despite_overlap(self) -> None:
+        """Every position where A's and B's routes genuinely collide
+
+        (found directly from the RAW connector cells' own duplicates,
+        never independently recomputed -- obstacle avoidance means
+        B's route can legitimately differ depending on whether A is
+        present at all, so a separately-computed "B alone" baseline is
+        not a valid ground truth here) must resolve to ACCENT once B is
+        selected: MeshCanvas's overlay dict keys on (x, y), so the
+        LAST-drawn connector wins a shared cell -- this is what proves
+        the selected route is drawn last, not merely coincidentally
+        unaffected.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            # Select A specifically: A is iterated BEFORE B in
+            # working_set (see _set_overlapping_pair), so without the
+            # "selected drawn last" fix, B's later-drawn DIM cells would
+            # silently overwrite A's ACCENT ones at every shared
+            # position -- this ordering is what makes the test
+            # genuinely exercise the fix, not just coincidentally pass.
+            view = self._set_overlapping_pair(app)
+            view.select_node("!aaaaaaaa")
+            view.set_nodes(
+                view.working_set, view.base_positions, theme="white", now=1_800_000_000.0
+            )
+            await pilot.pause()
+            palette = THEME_PALETTES["white"]
+            raw_cells = self._connector_cells(view)
+            positions = [(x, y) for x, y, _glyph, _color in raw_cells]
+            duplicated = {p for p in positions if positions.count(p) > 1}
+            self.assertGreater(len(duplicated), 0)
+            by_position = {(x, y): color for x, y, _glyph, color in raw_cells}
+            for position in duplicated:
+                self.assertEqual(by_position[position], palette.accent)
+
+    async def test_deselecting_restores_ordinary_dim_styling(self) -> None:
+        """Focus moving away must not leave any paint contamination --
+
+        set_nodes() recomputes ordering fresh every call, nothing
+        persists across calls.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            view = self._set_overlapping_pair(app)
+            view.select_node("!bbbbbbbb")
+            view.set_nodes(
+                view.working_set, view.base_positions, theme="white", now=1_800_000_000.0
+            )
+            await pilot.pause()
+
+            view.select_local()
+            view.set_nodes(
+                view.working_set, view.base_positions, theme="white", now=1_800_000_000.0
+            )
+            await pilot.pause()
+            palette = THEME_PALETTES["white"]
+            cells = self._connector_cells(view)
+            self.assertTrue(
+                all(color == palette.dim_base for _x, _y, _glyph, color in cells)
             )
 
 
@@ -4873,7 +5220,7 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             text = await self._mesh_status_text(app)
             self.assertIn("LAST UPDATE", text)
-            self.assertIn("8m", text)
+            self.assertIn(format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60), text)
 
     async def test_fresh_board_still_shows_last_update_age(self) -> None:
         """LAST UPDATE is a persistent freshness indicator, not a

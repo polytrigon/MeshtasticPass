@@ -47,6 +47,11 @@ class AppSettings:
     color: str = DEFAULT_COLOR
     device_path: str = DEFAULT_DEVICE_PATH
     favorite_node_ids: set[str] = field(default_factory=set)
+    # A MeshtasticPass-local behavior preference, never a radio config
+    # field (see RadioService.sync_clock/SyncClockControl) -- OFF until
+    # the user explicitly turns it on; never silently enabled by a
+    # default-on migration or an unrelated setting.
+    clock_auto_sync: bool = False
     config_path: Path = field(
         default_factory=lambda: default_config_home()
         / "meshtasticpass"
@@ -83,7 +88,14 @@ class AppSettings:
         settings._unknown = {
             key: value
             for key, value in raw.items()
-            if key not in ("font_size", "color", "device_path", "favorite_node_ids")
+            if key
+            not in (
+                "font_size",
+                "color",
+                "device_path",
+                "favorite_node_ids",
+                "clock_auto_sync",
+            )
         }
         candidate = raw.get("font_size")
         if cls.is_valid_font_size(candidate):
@@ -101,6 +113,9 @@ class AppSettings:
                 for value in favorites
                 if isinstance(value, str) and value.strip()
             }
+        auto_sync_candidate = raw.get("clock_auto_sync")
+        if isinstance(auto_sync_candidate, bool):
+            settings.clock_auto_sync = auto_sync_candidate
         return settings
 
     @staticmethod
@@ -136,6 +151,10 @@ class AppSettings:
             raise ValueError("USB device path cannot be empty.")
         self.device_path = device_path.strip()
 
+    def set_clock_auto_sync(self, enabled: bool) -> None:
+        """Explicit opt-in only -- see item 16: never enabled silently."""
+        self.clock_auto_sync = bool(enabled)
+
     def is_favorite(self, node_id: str | None) -> bool:
         return (
             isinstance(node_id, str)
@@ -159,6 +178,7 @@ class AppSettings:
         data["color"] = self.color
         data["device_path"] = self.device_path
         data["favorite_node_ids"] = sorted(self.favorite_node_ids)
+        data["clock_auto_sync"] = self.clock_auto_sync
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         self._atomic_write(self.config_path, content)
 
