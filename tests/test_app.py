@@ -969,6 +969,121 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(radio.read_synced_config_field("device", "tzdef"), before)
 
+    # ---- Connect-time CONFIG snapshot (RADIO/CONFIG audit) ----------------
+
+    async def test_radio_info_reads_the_cached_snapshot_not_a_fresh_request(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            info = app.query_one("#radio-info", Static)
+            rendered = str(info.render())
+            self.assertIn("HARDWARE", rendered)
+            self.assertIn("HELTEC V3", rendered)
+            self.assertNotIn("LOADING", rendered)
+
+    async def test_opening_and_revisiting_config_sends_zero_additional_requests(
+        self,
+    ) -> None:
+        """Item 4/13: CONFIG->CHAT->CONFIG, and repeated focus changes,
+
+        must generate zero config requests -- no refresh, no write, no
+        RF traffic of any kind.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.refresh_config_snapshot = Mock(wraps=radio.refresh_config_snapshot)
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            radio.sync_clock = Mock()
+            radio.set_long_name = Mock()
+            radio.set_short_name = Mock()
+
+            for _ in range(3):
+                app.show_tab("chat")
+                await pilot.pause()
+                app.show_tab("connection")
+                await pilot.pause()
+
+            for control in (
+                app.query_one(FontSizeSelector),
+                app.query_one(ColorSelector),
+                app.query_one(ScreenTimeoutSelector),
+            ):
+                control.focus()
+                await pilot.pause()
+
+            radio.refresh_config_snapshot.assert_not_called()
+            radio.write_verified_config_field.assert_not_called()
+            radio.sync_clock.assert_not_called()
+            radio.set_long_name.assert_not_called()
+            radio.set_short_name.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
+    async def test_missing_snapshot_shows_loading_state_not_a_crash(self) -> None:
+        """Item 11: a connected radio with no snapshot yet (or one that
+
+        failed to build) must show a compact loading state, never
+        crash the whole CONFIG view.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio._config_snapshot = None
+            app._render_radio_settings()
+            await pilot.pause()
+            info = app.query_one("#radio-info", Static)
+            self.assertIn("LOADING RADIO CONFIG", str(info.render()))
+
+    async def test_reconnect_replaces_the_snapshot_without_extra_requests(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            first_generation = radio.config_snapshot().connection_generation
+
+            radio.close()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            self.assertIsNone(radio.config_snapshot())
+
+            radio.connect()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            second_snapshot = radio.config_snapshot()
+            self.assertIsNotNone(second_snapshot)
+            self.assertGreater(second_snapshot.connection_generation, first_generation)
+            info = app.query_one("#radio-info", Static)
+            self.assertIn("HARDWARE", str(info.render()))
+
+    async def test_no_periodic_config_polling(self) -> None:
+        """No timer anywhere in the app calls refresh_config_snapshot."""
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.refresh_config_snapshot = Mock(wraps=radio.refresh_config_snapshot)
+            for _ in range(20):
+                await pilot.pause()
+            radio.refresh_config_snapshot.assert_not_called()
+
     async def test_auto_sync_defaults_off_and_generates_no_automatic_write(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()

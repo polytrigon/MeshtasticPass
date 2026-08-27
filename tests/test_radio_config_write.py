@@ -141,6 +141,38 @@ class WriteVerifiedConfigFieldTests(unittest.TestCase):
         self.assertEqual(result.reason, "mismatch")
         self.assertEqual(result.readback_value, 999)
 
+    def test_confirmed_write_rebuilds_the_config_snapshot(self) -> None:
+        """Item 6: applied=True is the ONLY thing that ever updates the
+
+        cached RadioConfigurationSnapshot -- never optimistically,
+        before this exact verification level is reached (see
+        test_mismatching_readback_does_not_rebuild_the_snapshot below).
+        """
+        service, node = make_service()
+        service._rebuild_config_snapshot()
+        before = service.config_snapshot()
+        self.assertIsNotNone(before)
+        node.respond_with_value = 240
+
+        result = service.write_verified_config_field("display", "screen_on_secs", 240)
+
+        self.assertTrue(result.applied)
+        after = service.config_snapshot()
+        self.assertIsNot(after, before)
+        display = next(s for s in after.local_config if s.section == "display")
+        self.assertEqual(display.fields["screen_on_secs"], "240")
+
+    def test_mismatching_readback_does_not_rebuild_the_snapshot(self) -> None:
+        service, node = make_service()
+        service._rebuild_config_snapshot()
+        before = service.config_snapshot()
+        node.respond_with_value = 999
+
+        result = service.write_verified_config_field("display", "screen_on_secs", 240)
+
+        self.assertFalse(result.applied)
+        self.assertIs(service.config_snapshot(), before)
+
     def test_e_no_response_times_out(self) -> None:
         service, node = make_service()
         node.respond_with_value = None

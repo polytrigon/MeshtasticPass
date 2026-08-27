@@ -341,6 +341,13 @@ class RadioService:
         # an earlier local/implicit one) can still be observed instead
         # of silently dropped. Bounded by _MAX_PENDING_SENDS.
         self._pending_sends: dict[int, Callable[[SendStatus], None]] = {}
+        # See config_snapshot()/refresh_config_snapshot(): a snapshot is
+        # only ever attached to the connection GENERATION that built
+        # it, so a stale snapshot from a previous (or failed) connect()
+        # can never be presented as current -- config_snapshot() itself
+        # is the only reader and always reflects the CURRENT connection.
+        self._connection_generation = 0
+        self._config_snapshot: RadioConfigurationSnapshot | None = None
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -356,6 +363,16 @@ class RadioService:
             ):
                 self._direct_observations.clear()
             self._activity_local_node_id = info.node_id
+            # Item 7: a NEW connection always gets a NEW generation and
+            # a freshly-built snapshot -- whether this is a reconnect to
+            # the SAME radio or a genuinely different one (a different
+            # node_id, hardware, and config set entirely). The OLD
+            # snapshot is simply replaced, never merged with or patched
+            # from, so stale V3 settings can never leak into a V4's own
+            # snapshot (see item 8: capability comes from what the SDK
+            # actually reports here, never from device_path).
+            self._connection_generation += 1
+            self._rebuild_config_snapshot()
             return info
         except RadioConnectionError:
             self.close()
@@ -608,6 +625,52 @@ class RadioService:
 
         return build_capability_matrix(self._interface)
 
+    def config_snapshot(self):
+        """The current connection's cached RadioConfigurationSnapshot,
+
+        or None if not yet connected (or the snapshot hasn't been
+        built for this generation yet -- see _rebuild_config_snapshot).
+        Pure cache read: never touches the interface, never sends
+        anything -- see item 4/13 (opening/switching to CONFIG/RADIO,
+        and repeated focus changes, must generate zero radio traffic).
+        """
+        return self._config_snapshot
+
+    def refresh_config_snapshot(self):
+        """Explicit REFRESH (item 5): rebuild the snapshot from the
+
+        SDK's CURRENT already-synced local objects. Still zero new RF
+        traffic -- localConfig/moduleConfig/channels/metadata are live
+        Python objects the SDK keeps updated in place as its own
+        background sync (or a write this session made) progresses;
+        "refreshing" means re-reading them now rather than requesting
+        anything new. Returns the new snapshot (or None if not
+        connected). Never called automatically/periodically -- see
+        app.py's own caller, which only runs this from an explicit
+        user-activated refresh.
+        """
+        self._rebuild_config_snapshot()
+        return self._config_snapshot
+
+    def _rebuild_config_snapshot(self) -> None:
+        """Shared by connect() and refresh_config_snapshot() -- see
+
+        item 6: also the only place a write's confirmed result is
+        folded back in (write_verified_config_field calls this again
+        after a successful, verified write, never before).
+        """
+        if self._interface is None:
+            self._config_snapshot = None
+            return
+        from radio_config_snapshot import build_radio_configuration_snapshot
+
+        self._config_snapshot = build_radio_configuration_snapshot(
+            self._interface,
+            device_path=self.device_path,
+            connection_generation=self._connection_generation,
+            generated_at=time.time(),
+        )
+
     def _is_local_node(self, node_id: str, node_number: int | None) -> bool:
         interface = self._interface
         my_info = getattr(interface, "myInfo", None)
@@ -802,6 +865,11 @@ class RadioService:
             if "value" in found:
                 readback = found["value"]
                 if readback == value:
+                    # Item 6: the cached snapshot is rebuilt ONLY here,
+                    # after a genuinely radio-confirmed write -- never
+                    # optimistically, before this exact verification
+                    # level is reached.
+                    self._rebuild_config_snapshot()
                     return ConfigWriteResult(True, value, readback, "")
                 return ConfigWriteResult(False, value, readback, "mismatch")
             time.sleep(0.05)
@@ -1056,6 +1124,13 @@ class RadioService:
 
     def close(self) -> None:
         """Close the serial connection if it is open."""
+        # Item 7: a closed connection's config snapshot is never
+        # current for whatever connects next -- discarded here rather
+        # than left to be silently overwritten by the next connect(),
+        # so a caller that queries config_snapshot() during the gap
+        # (disconnected, or a failed reconnect attempt) truthfully sees
+        # None instead of the PREVIOUS radio's now-stale configuration.
+        self._config_snapshot = None
         if self._interface is not None:
             interface = self._interface
             self._interface = None

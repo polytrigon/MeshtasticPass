@@ -3860,6 +3860,23 @@ class MeshtasticPassApp(App[None]):
         is_24h = self.query_one(Clock24HSelector).value
         return f"CLOCK SYNCED — LAST SYNC {_format_time_of_day(self._last_clock_sync_at, is_24h)}"
 
+    @staticmethod
+    def _snapshot_config_field(snapshot, section: str, field: str) -> str | None:
+        """One localConfig.<section>.<field> value out of an already-
+
+        built RadioConfigurationSnapshot's local_config sections
+        (already-stringified by radio_capabilities.describe_scalar_
+        fields -- secrets already redacted at that source, never read
+        here). None if the section/field isn't present on this
+        installed schema, exactly like RadioService.
+        read_synced_config_field's own "unavailable, never crash"
+        contract.
+        """
+        for report in snapshot.local_config:
+            if report.section == section:
+                return report.fields.get(field)
+        return None
+
     def _render_radio_settings(self) -> None:
         """Populate RADIO from the SDK's already-synced state (or mark
 
@@ -3914,38 +3931,56 @@ class MeshtasticPassApp(App[None]):
             sync_control.disabled = True
             return
 
-        identity = self.radio.hardware_identity()
-        bluetooth_enabled = self.radio.read_synced_config_field("bluetooth", "enabled")
-        bluetooth_text = (
-            "—"
-            if bluetooth_enabled is None
-            else ("ON" if bluetooth_enabled else "OFF")
-        )
-        tzdef = self.radio.read_synced_config_field("device", "tzdef")
-        # Read-only display only -- see the item 16 audit: no CLI
-        # reference, firmware source, or protobuf comment in the
-        # installed meshtastic==2.7.11 package confirms tzdef's exact
-        # expected POSIX-TZ syntax, DST behavior, or sign convention,
-        # so editing it is deliberately NOT exposed this pass.
-        tzdef_text = "—" if tzdef is None else ("NOT SET" if tzdef == "" else tzdef)
-        text = Text()
-        rows = (
-            ("HARDWARE", format_hw_model_name(identity.hw_model_name)),
-            ("FIRMWARE", identity.firmware_version or "—"),
-            ("ROLE", identity.role_name or "—"),
-            ("BLUETOOTH", bluetooth_text),
-            ("TIMEZONE", tzdef_text),
-        )
-        for index, (label, value) in enumerate(rows):
-            if index:
-                text.append("\n")
+        # Item 4: HARDWARE/FIRMWARE/ROLE/BLUETOOTH/TIMEZONE read the
+        # cached RadioConfigurationSnapshot -- built once at connect
+        # time (see RadioService.connect/_rebuild_config_snapshot),
+        # never re-derived per render -- rather than calling
+        # hardware_identity()/read_synced_config_field() fresh here.
+        # Both are pure zero-RF reads of already-synced local objects
+        # either way, so this is an architecture choice (one cached,
+        # explicitly-invalidated source of truth), not a traffic fix.
+        snapshot = getattr(self.radio, "config_snapshot", lambda: None)()
+        if snapshot is None:
+            # Item 11: a real, if normally brief (see item 3 -- the
+            # real RadioService builds this synchronously inside
+            # connect(), before ONLINE is ever announced), transient
+            # state -- never a permanent one, and never a crash.
+            text = Text()
             text.append(
-                f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
-                style=palette.base,
+                f"{CONNECTION_ROW_PREFIX}LOADING RADIO CONFIG...",
+                style=palette.dim_base,
             )
-            text.append(" ", style=palette.base)
-            text.append(value, style=palette.base)
-        info_widget.update(text)
+            info_widget.update(text)
+        else:
+            bluetooth_raw = self._snapshot_config_field(snapshot, "bluetooth", "enabled")
+            bluetooth_text = (
+                "—" if bluetooth_raw is None else ("ON" if bluetooth_raw == "True" else "OFF")
+            )
+            tzdef = self._snapshot_config_field(snapshot, "device", "tzdef")
+            # Read-only display only -- see the item 16 audit: no CLI
+            # reference, firmware source, or protobuf comment in the
+            # installed meshtastic==2.7.11 package confirms tzdef's exact
+            # expected POSIX-TZ syntax, DST behavior, or sign convention,
+            # so editing it is deliberately NOT exposed this pass.
+            tzdef_text = "—" if tzdef is None else ("NOT SET" if tzdef == "" else tzdef)
+            text = Text()
+            rows = (
+                ("HARDWARE", format_hw_model_name(snapshot.hardware.hw_model_name)),
+                ("FIRMWARE", snapshot.hardware.firmware_version or "—"),
+                ("ROLE", snapshot.hardware.role_name or "—"),
+                ("BLUETOOTH", bluetooth_text),
+                ("TIMEZONE", tzdef_text),
+            )
+            for index, (label, value) in enumerate(rows):
+                if index:
+                    text.append("\n")
+                text.append(
+                    f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
+                    style=palette.base,
+                )
+                text.append(" ", style=palette.base)
+                text.append(value, style=palette.base)
+            info_widget.update(text)
 
         sync_control.disabled = not supports_clock or self._clock_sync_in_progress
         # While a CLOCK SYNC UNCONFIRMED message is still within its

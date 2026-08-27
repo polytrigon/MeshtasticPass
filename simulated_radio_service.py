@@ -213,7 +213,19 @@ class SimulatedRadioService:
             },
             "bluetooth": {"enabled": True},
             "device": {"tzdef": ""},
+            # A deterministic, always-present POSITION config section --
+            # see item 9: "no current fix" is itself a real, common,
+            # honest state, not an error, so the simulated snapshot
+            # models it directly rather than only ever a fix.
+            "position": {
+                "gps_enabled": True,
+                "gps_update_interval": 120,
+                "gps_en_gpio": 34,
+                "position_broadcast_smart_enabled": True,
+            },
         }
+        self._connection_generation = 0
+        self._config_snapshot = None
 
     def available_device_paths(self) -> tuple[str, ...]:
         """Return fake ports without asking the host operating system."""
@@ -251,6 +263,8 @@ class SimulatedRadioService:
         self._closed = False
         self._online = True
         self._activity_reference_time = time.time()
+        self._connection_generation += 1
+        self._rebuild_config_snapshot()
         return self.info
 
     def active_node_count(self, now: float | None = None) -> int | None:
@@ -414,7 +428,70 @@ class SimulatedRadioService:
         if field not in section_values:
             return ConfigWriteResult(False, value, None, "timeout")
         section_values[field] = value
+        self._rebuild_config_snapshot()
         return ConfigWriteResult(True, value, value, "")
+
+    def config_snapshot(self):
+        """The current connection's cached fake RadioConfigurationSnapshot,
+
+        or None -- mirrors RadioService.config_snapshot() exactly (see
+        its own docstring): a pure cache read, never touches anything.
+        """
+        return self._config_snapshot
+
+    def refresh_config_snapshot(self):
+        """Deterministic fake refresh -- mirrors RadioService's own."""
+        self._rebuild_config_snapshot()
+        return self._config_snapshot
+
+    def _rebuild_config_snapshot(self) -> None:
+        if not self._online:
+            self._config_snapshot = None
+            return
+        from radio_config_snapshot import LocalPositionSnapshot, RadioConfigurationSnapshot
+        from radio_capabilities import ChannelReport, ConfigSectionReport
+
+        channels = tuple(
+            ChannelReport(
+                index=channel.index,
+                name=channel.name,
+                role="PRIMARY" if channel.index == 0 else "SECONDARY",
+                psk="not configured",
+            )
+            for channel in self.info.channels
+        )
+        local_config = tuple(
+            ConfigSectionReport(
+                category="DEVICE CONFIG" if section == "device" else section.upper(),
+                section=section,
+                fields={name: str(value) for name, value in fields.items()},
+            )
+            for section, fields in self._config_sections.items()
+        )
+        position_fields = self._config_sections.get("position", {})
+        position_section = next(
+            (report for report in local_config if report.section == "position"), None
+        )
+        self._config_snapshot = RadioConfigurationSnapshot(
+            connection_generation=self._connection_generation,
+            node_id=self.info.node_id,
+            device_path=self.device_path,
+            hardware=self.hardware_identity(),
+            local_config=local_config,
+            module_config=(),
+            channels=channels,
+            position=LocalPositionSnapshot(
+                gps_capable=position_section is not None,
+                config=position_section,
+                has_fix=False,
+                latitude=None,
+                longitude=None,
+                altitude=None,
+                location_source=None,
+                last_position_time=None,
+            ),
+            generated_at=time.time(),
+        )
 
     def supports_clock_sync(self) -> bool:
         """--simulate always claims support, matching the real SDK's
@@ -567,6 +644,7 @@ class SimulatedRadioService:
 
     def close(self) -> None:
         """Stop the simulator. Safe to call more than once."""
+        self._config_snapshot = None
         self._online = False
         self._closed = True
         self._stop_event.set()
