@@ -1612,7 +1612,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             radio.set_long_name.assert_not_called()
             self.assertIn(
                 "RADIO NOT CONNECTED",
-                str(app.query_one("#identity-status", Static).render()),
+                str(app.query_one("#long-name-status", Static).render()),
             )
 
     async def test_identity_edit_success_failure_and_protocol_validation(self) -> None:
@@ -1629,7 +1629,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             control = app.query_one(LongNameControl)
             identity = app.query_one("#identity-values", Static)
             short_editor = app.query_one("#short-name-input", Input)
-            status = app.query_one("#identity-status", Static)
+            status = app.query_one("#long-name-status", Static)
             self.assertEqual(editor.value, "Simulated Node")
             self.assertTrue(editor.disabled)
             self.assertFalse(control.disabled)
@@ -1686,6 +1686,278 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(editor.disabled)
             self.assertEqual(editor.value, "")
             self.assertIn("NODE ID      —", str(identity.render()))
+
+    # ---- LONG NAME/SHORT NAME status layout + auto-dismiss ---------------
+
+    async def _save_long_name(self, pilot, app, value: str) -> None:
+        control = app.query_one(LongNameControl)
+        control.focus()
+        await pilot.press("enter")
+        control.editor.value = value
+        await pilot.press("enter")
+        status = app.query_one("#long-name-status", Static)
+        for _ in range(10):
+            await pilot.pause()
+            if "SAVED" in str(status.render()):
+                break
+
+    async def _save_short_name(self, pilot, app, value: str) -> None:
+        control = app.query_one(ShortNameControl)
+        control.focus()
+        await pilot.press("enter")
+        control.editor.value = value
+        await pilot.press("enter")
+        status = app.query_one("#short-name-status", Static)
+        for _ in range(10):
+            await pilot.pause()
+            if "SAVED" in str(status.render()):
+                break
+
+    async def test_long_name_saved_appears_directly_beneath_and_aligned(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            control = app.query_one(LongNameControl)
+            gutter = control.query_one(".connection-selection-gutter", Static)
+            label = control.query_one(".connection-label", Static)
+            status = app.query_one("#long-name-status", Static)
+
+            await self._save_long_name(pilot, app, "Aligned Name")
+
+            self.assertEqual(status.region.y, control.region.y + 1)
+            self.assertEqual(status.region.x, control.region.x)
+            label_start_x = gutter.region.x + gutter.region.width
+            self.assertEqual(label.region.x, label_start_x)
+            status_text = str(status.render())
+            status_text_start = len(status_text) - len(status_text.lstrip(" "))
+            self.assertEqual(status.region.x + status_text_start, label_start_x)
+            self.assertNotEqual(label_start_x - status.region.x, 15)
+
+    async def test_short_name_saved_appears_directly_beneath_and_aligned(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            control = app.query_one(ShortNameControl)
+            gutter = control.query_one(".connection-selection-gutter", Static)
+            label = control.query_one(".connection-label", Static)
+            status = app.query_one("#short-name-status", Static)
+
+            await self._save_short_name(pilot, app, "ALND")
+
+            self.assertEqual(status.region.y, control.region.y + 1)
+            self.assertEqual(status.region.x, control.region.x)
+            label_start_x = gutter.region.x + gutter.region.width
+            self.assertEqual(label.region.x, label_start_x)
+            status_text = str(status.render())
+            status_text_start = len(status_text) - len(status_text.lstrip(" "))
+            self.assertEqual(status.region.x + status_text_start, label_start_x)
+
+    async def test_identity_saved_confirmations_use_confirm_token(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            for theme in ("snow", "amber"):
+                app._apply_color_theme(theme)
+                palette = THEME_PALETTES[theme]
+
+                long_status = app.query_one("#long-name-status", Static)
+                await self._save_long_name(pilot, app, f"{theme} long")
+                self.assertTrue(long_status.has_class("setting-success"))
+                self.assertEqual(
+                    long_status.visual_style.foreground.hex6, palette.confirm.upper()
+                )
+
+                short_status = app.query_one("#short-name-status", Static)
+                await self._save_short_name(pilot, app, theme[:4].upper())
+                self.assertTrue(short_status.has_class("setting-success"))
+                self.assertEqual(
+                    short_status.visual_style.foreground.hex6, palette.confirm.upper()
+                )
+
+    async def test_identity_status_auto_dismisses_after_ten_seconds(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            long_status = app.query_one("#long-name-status", Static)
+            short_status = app.query_one("#short-name-status", Static)
+            await self._save_long_name(pilot, app, "Dismiss Me")
+            await self._save_short_name(pilot, app, "DISM")
+            self.assertIn("LONG NAME SAVED", str(long_status.render()))
+            self.assertIn("SHORT NAME SAVED", str(short_status.render()))
+            self.assertIsNotNone(app._long_name_status_dismiss_timer)
+            self.assertIsNotNone(app._short_name_status_dismiss_timer)
+
+            app._dismiss_long_name_status()
+            app._dismiss_short_name_status()
+            await pilot.pause()
+
+            self.assertEqual(str(long_status.render()), "")
+            self.assertEqual(str(short_status.render()), "")
+            self.assertIsNone(app._long_name_status_dismiss_timer)
+            self.assertIsNone(app._short_name_status_dismiss_timer)
+
+    async def test_identity_status_dismissal_collapses_the_row(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            long_status = app.query_one("#long-name-status", Static)
+            self.assertFalse(long_status.display)
+
+            await self._save_long_name(pilot, app, "Collapse Me")
+            self.assertTrue(long_status.display)
+
+            app._dismiss_long_name_status()
+            await pilot.pause()
+            self.assertFalse(long_status.display)
+
+    async def test_repeated_identity_save_restarts_the_dismiss_timer(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            await self._save_long_name(pilot, app, "First Save")
+            first_timer = app._long_name_status_dismiss_timer
+            self.assertIsNotNone(first_timer)
+
+            await self._save_long_name(pilot, app, "Second Save")
+            second_timer = app._long_name_status_dismiss_timer
+            self.assertIsNotNone(second_timer)
+            self.assertIsNot(second_timer, first_timer)
+
+            status = app.query_one("#long-name-status", Static)
+            self.assertIn("LONG NAME SAVED", str(status.render()))
+
+    async def test_stale_identity_status_timer_cannot_clear_a_newer_status(self) -> None:
+        """A validation error after a successful save must supersede the
+
+        SAVED confirmation outright -- its own dismiss timer is
+        replaced, and calling the stale callback directly (as if it had
+        raced past its own cancellation) must reflect the CURRENT
+        status, never revert to the stale SAVED message.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#long-name-status", Static)
+            await self._save_long_name(pilot, app, "Will Be Superseded")
+            stale_timer = app._long_name_status_dismiss_timer
+            self.assertIsNotNone(stale_timer)
+
+            control = app.query_one(LongNameControl)
+            control.focus()
+            await pilot.press("enter")
+            control.editor.value = ""
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # The OLD "SAVED" dismiss Timer object is stopped outright
+            # the instant the error status is set (see
+            # _set_long_name_status's own guard) -- proven here by its
+            # reference being replaced with None, meaning Textual can
+            # never invoke its callback again; the error message is
+            # what remains, never reverted back to the stale SAVED text.
+            self.assertIn("cannot be empty", str(status.render()).lower())
+            self.assertIsNone(app._long_name_status_dismiss_timer)
+            self.assertNotIn("SAVED", str(status.render()))
+
+    async def test_identity_status_survives_focus_tab_and_view_refresh(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#long-name-status", Static)
+            await self._save_long_name(pilot, app, "Survives Refresh")
+            timer_before = app._long_name_status_dismiss_timer
+            self.assertIsNotNone(timer_before)
+
+            app.query_one(ShortNameControl).focus()
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            app._render_radio_settings()
+            await pilot.pause()
+
+            self.assertIs(app._long_name_status_dismiss_timer, timer_before)
+            self.assertIn("LONG NAME SAVED", str(status.render()))
+
+    async def test_expired_identity_status_does_not_reappear(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            status = app.query_one("#long-name-status", Static)
+            await self._save_long_name(pilot, app, "Expires Soon")
+            app._dismiss_long_name_status()
+            await pilot.pause()
+            self.assertEqual(str(status.render()), "")
+
+            app.query_one(ShortNameControl).focus()
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            app._render_radio_settings()
+            await pilot.pause()
+
+            self.assertEqual(str(status.render()), "")
+            self.assertFalse(status.display)
+
+    async def test_identity_status_changes_generate_zero_rf_or_admin_traffic(
+        self,
+    ) -> None:
+        """The presentation/timer changes themselves never touch the
+
+        radio -- only the pre-existing, unchanged set_long_name/
+        set_short_name calls the user's own edit already triggers.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock()
+            radio.write_verified_config_field = Mock()
+
+            await self._save_long_name(pilot, app, "RF Check")
+            app._dismiss_long_name_status()
+            await pilot.pause()
+            app.query_one(ShortNameControl).focus()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+
+            radio.sync_clock.assert_not_called()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
 
     async def test_long_name_navigation_edit_cancel_save_and_arrow_ownership(self) -> None:
         radio = SimulatedRadioService(
@@ -1830,7 +2102,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             control = app.query_one(ShortNameControl)
             editor = control.editor
             font = app.query_one(FontSizeSelector)
-            status = app.query_one("#identity-status", Static)
+            status = app.query_one("#short-name-status", Static)
             node_id = app.query_one("#identity-values", Static)
 
             control.focus()

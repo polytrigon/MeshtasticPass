@@ -175,6 +175,9 @@ CLOCK_SYNC_WATCHDOG_SECONDS = 25.0
 # SYNCING, which stays operation-driven) clears itself back to the
 # persistent status line after this many seconds.
 CLOCK_UNCONFIRMED_AUTO_DISMISS_SECONDS = 10.0
+# Same lifecycle again for LONG NAME SAVED/SHORT NAME SAVED (see
+# _set_long_name_status/_set_short_name_status).
+IDENTITY_STATUS_AUTO_DISMISS_SECONDS = 10.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -747,9 +750,10 @@ class IdentitySaved(Message):
 class IdentitySaveFailed(Message):
     """An identity-name update failed validation or radio submission."""
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, field_label: str) -> None:
         super().__init__()
         self.detail = detail
+        self.field_label = field_label
 
 
 class RadioSettingApplied(Message):
@@ -2453,20 +2457,24 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #identity-status {
+    #long-name-status, #short-name-status {
+        /* No min-height: display is toggled False when empty (see
+           _set_long_name_status/_set_short_name_status), so the row
+           collapses to zero height instead of reserving a permanent
+           blank line. */
         height: auto;
-        min-height: 1;
     }
 
-    #identity-status {
+    #long-name-status, #short-name-status {
         color: $snow_confirm;
     }
 
-    Screen.theme-amber #identity-status {
+    Screen.theme-amber #long-name-status,
+    Screen.theme-amber #short-name-status {
         color: $amber_confirm;
     }
 
-    #identity-status.setting-error {
+    #long-name-status.setting-error, #short-name-status.setting-error {
         color: $error;
     }
 
@@ -2952,6 +2960,8 @@ class MeshtasticPassApp(App[None]):
         self._delivery_timer: Timer | None = None
         self._send_error_message = ""
         self._send_error_dismiss_timer: Timer | None = None
+        self._long_name_status_dismiss_timer: Timer | None = None
+        self._short_name_status_dismiss_timer: Timer | None = None
         self._arrival_sequence = 0
         self._send_animation_frame = 1
         self._has_older_history = False
@@ -2984,9 +2994,10 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
                 yield LongNameControl()
+                yield Static(id="long-name-status", markup=False)
                 yield ShortNameControl()
+                yield Static(id="short-name-status", markup=False)
                 yield Static(id="identity-values", markup=False)
-                yield Static(id="identity-status", markup=False)
                 yield Static("STYLE", id="style-title", classes="page-title")
                 yield FontSizeSelector(self.settings.font_size)
                 yield ColorSelector(self.settings.color)
@@ -3273,26 +3284,79 @@ class MeshtasticPassApp(App[None]):
             self.show_tab(tab_for_key[event.key])
             event.stop()
 
+    def _set_long_name_status(self, text: str, css_class: str | None) -> None:
+        """LONG NAME's own status row -- see item ("RADIO — LONG NAME /
+
+        SHORT NAME STATUS LAYOUT"): aligned to the LONG NAME label's
+        own x-start (CONNECTION_ROW_PREFIX -- never the value/input
+        column), collapses to zero height when empty instead of
+        reserving a permanent blank row, and auto-dismisses a SAVED
+        confirmation after IDENTITY_STATUS_AUTO_DISMISS_SECONDS -- any
+        earlier pending dismiss is always stopped first, exactly like
+        _set_clock_status's own guard, so a stale timer can never
+        clear a newer status.
+        """
+        if self._long_name_status_dismiss_timer is not None:
+            self._long_name_status_dismiss_timer.stop()
+            self._long_name_status_dismiss_timer = None
+        status = self.query_one("#long-name-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_ROW_PREFIX}{text}" if text else "")
+        if css_class == "setting-success":
+            self._long_name_status_dismiss_timer = self.set_timer(
+                IDENTITY_STATUS_AUTO_DISMISS_SECONDS, self._dismiss_long_name_status
+            )
+
+    def _dismiss_long_name_status(self) -> None:
+        self._long_name_status_dismiss_timer = None
+        self._set_long_name_status("", None)
+
+    def _set_short_name_status(self, text: str, css_class: str | None) -> None:
+        """SHORT NAME's own status row -- see _set_long_name_status,
+
+        which this exactly mirrors for the other identity field.
+        """
+        if self._short_name_status_dismiss_timer is not None:
+            self._short_name_status_dismiss_timer.stop()
+            self._short_name_status_dismiss_timer = None
+        status = self.query_one("#short-name-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_ROW_PREFIX}{text}" if text else "")
+        if css_class == "setting-success":
+            self._short_name_status_dismiss_timer = self.set_timer(
+                IDENTITY_STATUS_AUTO_DISMISS_SECONDS, self._dismiss_short_name_status
+            )
+
+    def _dismiss_short_name_status(self) -> None:
+        self._short_name_status_dismiss_timer = None
+        self._set_short_name_status("", None)
+
     @on(Input.Submitted, "#long-name-input")
     def save_long_name(self, event: Input.Submitted) -> None:
         """Apply an identity edit through the active radio service."""
-        status = self.query_one("#identity-status", Static)
         control = self.query_one(LongNameControl)
         if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update("LONG NAME UNAVAILABLE — RADIO NOT CONNECTED")
+            self._set_long_name_status(
+                "LONG NAME UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+            )
             return
         try:
             long_name = validate_long_name(event.value)
         except RadioIdentityError as error:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update(str(error))
+            self._set_long_name_status(str(error), "setting-error")
             return
         control.finish_edit(long_name)
-        status.remove_class("setting-error")
-        status.update("SAVING NAME...")
+        self._set_long_name_status("SAVING NAME...", None)
         self.run_worker(
             lambda: self._save_long_name_from_thread(long_name),
             thread=True,
@@ -3306,33 +3370,33 @@ class MeshtasticPassApp(App[None]):
             info = self.radio.set_long_name(long_name)
         except (RadioIdentityError, AttributeError) as error:
             detail = str(error).strip() or "The radio identity could not be saved."
-            self.post_message(IdentitySaveFailed(detail))
+            self.post_message(IdentitySaveFailed(detail, "LONG NAME"))
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
-            self.post_message(IdentitySaveFailed(f"Could not save Long Name: {detail}"))
+            self.post_message(
+                IdentitySaveFailed(f"Could not save Long Name: {detail}", "LONG NAME")
+            )
         else:
             self.post_message(IdentitySaved(info, "LONG NAME"))
 
     @on(Input.Submitted, "#short-name-input")
     def save_short_name(self, event: Input.Submitted) -> None:
         """Apply a Short Name edit through the active radio service."""
-        status = self.query_one("#identity-status", Static)
         control = self.query_one(ShortNameControl)
         if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update("SHORT NAME UNAVAILABLE — RADIO NOT CONNECTED")
+            self._set_short_name_status(
+                "SHORT NAME UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+            )
             return
         try:
             short_name = validate_short_name(event.value)
         except RadioIdentityError as error:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update(str(error))
+            self._set_short_name_status(str(error), "setting-error")
             return
         control.finish_edit(short_name)
-        status.remove_class("setting-error")
-        status.update("SAVING SHORT NAME...")
+        self._set_short_name_status("SAVING SHORT NAME...", None)
         self.run_worker(
             lambda: self._save_short_name_from_thread(short_name),
             thread=True,
@@ -3346,10 +3410,12 @@ class MeshtasticPassApp(App[None]):
             info = self.radio.set_short_name(short_name)
         except (RadioIdentityError, AttributeError) as error:
             detail = str(error).strip() or "The radio identity could not be saved."
-            self.post_message(IdentitySaveFailed(detail))
+            self.post_message(IdentitySaveFailed(detail, "SHORT NAME"))
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
-            self.post_message(IdentitySaveFailed(f"Could not save Short Name: {detail}"))
+            self.post_message(
+                IdentitySaveFailed(f"Could not save Short Name: {detail}", "SHORT NAME")
+            )
         else:
             self.post_message(IdentitySaved(info, "SHORT NAME"))
 
@@ -3358,16 +3424,18 @@ class MeshtasticPassApp(App[None]):
         self._radio_info = event.info
         self._render_identity(force_value=True)
         self._refresh_mesh()
-        status = self.query_one("#identity-status", Static)
-        status.remove_class("setting-error")
-        status.update(f"{event.field_label} SAVED")
+        if event.field_label == "LONG NAME":
+            self._set_long_name_status("LONG NAME SAVED", "setting-success")
+        else:
+            self._set_short_name_status("SHORT NAME SAVED", "setting-success")
 
     @on(IdentitySaveFailed)
     def identity_save_failed(self, event: IdentitySaveFailed) -> None:
         self._render_identity(force_value=True)
-        status = self.query_one("#identity-status", Static)
-        status.add_class("setting-error")
-        status.update(event.detail)
+        if event.field_label == "LONG NAME":
+            self._set_long_name_status(event.detail, "setting-error")
+        else:
+            self._set_short_name_status(event.detail, "setting-error")
 
     def show_tab(self, tab_id: str) -> None:
         if self.current_tab == "chat" and tab_id != "chat":
@@ -5736,9 +5804,8 @@ class MeshtasticPassApp(App[None]):
                 self._connection_animation_timer.pause()
             else:
                 self._connection_animation_timer.resume()
-        identity_status = self.query_one("#identity-status", Static)
-        identity_status.remove_class("setting-error")
-        identity_status.update("")
+        self._set_long_name_status("", None)
+        self._set_short_name_status("", None)
         self._render_connection_details()
         self._render_identity(force_value=True)
         self._render_radio_settings()
