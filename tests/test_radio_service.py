@@ -213,6 +213,51 @@ class RadioServiceTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(events)
 
+    def test_subscribing_after_a_looser_optional_interface_listener_does_not_raise(
+        self,
+    ) -> None:
+        """Regression test for a real-hardware failure: pypubsub rejects a
+
+        REQUIRED-arg listener joining a topic whose message-data-spec was
+        already established as optional by an earlier subscriber (e.g. a
+        standalone diagnostic script's own connection-lost observer,
+        which reasonably declares `interface=None` since it doesn't
+        control what publishes). RadioService._on_connection_lost used to
+        declare `interface` with no default -- inconsistent with its own
+        sibling listeners _on_text_received/_on_any_packet_for_debug --
+        which raised exactly this pypubsub error the moment the real
+        radio tried to connect after radio_write_readback_probe.py's
+        PacketObserver had already subscribed to the same topic.
+        """
+        from pubsub import pub
+
+        def looser_listener(interface=None, **_kwargs):
+            pass
+
+        lost_topic = "meshtastic.connection.lost"
+        text_topic = "meshtastic.receive.text"
+        service = RadioService()
+        pub.subscribe(looser_listener, lost_topic)
+        try:
+            service._subscribe_to_events(pub)
+        except Exception as error:
+            self.fail(
+                "RadioService._on_connection_lost must tolerate a topic "
+                f"whose message spec was already established as optional: {error}"
+            )
+        finally:
+            for callback, topic in (
+                (looser_listener, lost_topic),
+                (service._on_connection_lost, lost_topic),
+                (service._on_text_received, text_topic),
+            ):
+                try:
+                    pub.unsubscribe(callback, topic)
+                except Exception:
+                    pass
+            pub.getDefaultTopicMgr().delTopic(lost_topic)
+            pub.getDefaultTopicMgr().delTopic(text_topic)
+
     def test_retries_after_initial_connection_failure(self) -> None:
         service = RadioService()
         interface = make_interface()

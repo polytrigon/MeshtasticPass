@@ -759,7 +759,7 @@ class RadioService:
 
         self._pub = pub
 
-    def _on_connection_lost(self, interface: Any, **_kwargs: Any) -> None:
+    def _on_connection_lost(self, interface: Any = None, **_kwargs: Any) -> None:
         if interface is self._interface:
             self._connection_lost.set()
 
