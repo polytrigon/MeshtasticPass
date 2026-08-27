@@ -50,6 +50,7 @@ from geo import format_distance_miles
 from grapheme_text import install_flag_pair_protection, truncate_to_cells
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
+    MeshActivityTier,
     MeshNodeState,
     _remote_name_segments,
     build_mesh_working_set,
@@ -66,7 +67,7 @@ from mesh_topology import (
     directional_target,
     place_within_bounds,
     project_to_viewport,
-    route_chain,
+    route_chain_avoiding,
 )
 from node_activity import is_node_active
 from radio_capabilities import format_hw_model_name
@@ -322,6 +323,14 @@ CLOCK_24H_CHOICES = (
     ("OFF", False),
 )
 
+# OFF first: this is a MeshtasticPass-local behavior preference (see
+# AppSettings.clock_auto_sync), never a radio config field, and must
+# default to and visually lead with OFF -- explicit opt-in only (item 16).
+AUTO_SYNC_CHOICES = (
+    ("OFF", False),
+    ("ON", True),
+)
+
 
 @dataclass(frozen=True)
 class RadioSettingSpec:
@@ -414,6 +423,26 @@ class Clock24HSelector(KeyboardDropdown):
             (DropdownOption(name, value) for name, value in CLOCK_24H_CHOICES),
             is_24h,
             widget_id="radio-clock-24h-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class AutoSyncSelector(KeyboardDropdown):
+    """A MeshtasticPass-local preference, never written to the radio --
+
+    see AppSettings.clock_auto_sync/_maybe_auto_sync_clock. Uses the
+    same dropdown grammar as every other RADIO-section control (item
+    15) even though nothing here is a localConfig field.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        super().__init__(
+            "clock_auto_sync",
+            "AUTO SYNC",
+            (DropdownOption(name, value) for name, value in AUTO_SYNC_CHOICES),
+            enabled,
+            widget_id="radio-auto-sync-selector",
             label_width=CONNECTION_LABEL_WIDTH,
             classes="keyboard-dropdown connection-action-row",
         )
@@ -601,6 +630,11 @@ class EmojiPicker(Static):
 @dataclass
 class ChannelChatState:
     entries: list[ChatEntry] = field(default_factory=list)
+    # An unfinished composer draft is preserved per channel (item 27):
+    # switching CHANNELS -- LongFast to Local, say -- must not lose an
+    # in-progress message on the channel the user is leaving, and must
+    # not leak that text into the channel being switched to either.
+    draft: str = ""
     unread_count: int = 0
     transcript_new_count: int = 0
     has_older_history: bool = False
@@ -985,6 +1019,21 @@ def _mesh_relay_color(theme: str) -> str:
     anywhere else on the board.
     """
     return THEME_PALETTES[theme].dim_base
+
+
+# A STALE connector's straight runs render dashed (see item 5 of the
+# MESH activity-model task: "STALE connection: DIM + DOTTED"), reusing
+# the SAME box-drawing weight (LIGHT) as the solid glyphs they replace
+# so the dash pattern reads as "the same kind of line, aged" rather
+# than a visually unrelated style. Elbow corners are left as their
+# solid glyph unchanged -- a "dashed corner" has no single-cell
+# box-drawing equivalent, and one corner cell alone does not read as
+# meaningfully dotted either way.
+_MESH_DASHED_CONNECTOR_GLYPHS = {"─": "╌", "│": "╎"}
+
+
+def _mesh_dashed_glyph(glyph: str) -> str:
+    return _MESH_DASHED_CONNECTOR_GLYPHS.get(glyph, glyph)
 
 
 def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
@@ -1753,18 +1802,28 @@ class MeshTopologyView(Container):
         for stages in stages_by_client.values():
             stages.sort(key=lambda stage: stage.index)
 
+        # STALE nodes (see MeshNodeState.activity_tier) now ALSO draw a
+        # connector -- DIM + DOTTED, direct only (no relay chain: a
+        # stale node keeps its last-known position but no known-active
+        # route, same as any other non-active node) -- rather than
+        # vanishing outright the moment they fall out of the ACTIVE
+        # window (see item 5 of the MESH activity-model task).
+        # VERY_OLD nodes never reach this loop at all: build_mesh_
+        # working_set already filters them out of `working_set` itself.
         connector_cells: list[tuple[int, int, str, str]] = []
+        selected_connector_cells: list[tuple[int, int, str, str]] = []
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
-                if (
-                    state.node.is_local
-                    or remote_id not in centers
-                    or not is_node_active(state.node.last_heard, now)
-                ):
+                if state.node.is_local or remote_id not in centers:
                     continue
-                chain_stages = stages_by_client.get(remote_id, ())
+                tier = state.activity_tier(now=now)
+                if tier is MeshActivityTier.VERY_OLD:
+                    continue
+                is_stale = tier is MeshActivityTier.STALE
+                chain_stages = () if is_stale else stages_by_client.get(remote_id, ())
                 chain_ids = {remote_id, *(stage.node_id for stage in chain_stages)}
+                is_selected = self._selected_node_id in chain_ids
                 chain_points = (
                     centers[you_id],
                     *(
@@ -1774,12 +1833,18 @@ class MeshTopologyView(Container):
                     ),
                     centers[remote_id],
                 )
-                color = (
-                    palette.accent
-                    if self._selected_node_id in chain_ids
-                    else palette.dim_base
+                # Obstacles: every OTHER real node/relay-stage's own
+                # occupied cell -- never this chain's own endpoints or
+                # relay stages (see route_chain_avoiding/item 8: real
+                # node cells are obstacles unless evidence-supported for
+                # THIS connection). Selection state and staleness never
+                # change the geometry, only the color/glyph below.
+                obstacles = frozenset(
+                    position
+                    for node_id, position in centers.items()
+                    if node_id not in chain_ids
                 )
-                route_cells = route_chain(chain_points)
+                route_cells = route_chain_avoiding(chain_points, obstacles)
                 if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
                     # build_relay_stages already guarantees an ordered,
                     # non-self-overlapping chain in LOGICAL space (see
@@ -1795,12 +1860,36 @@ class MeshTopologyView(Container):
                     # positions (see the glyph-placement loop above),
                     # never fabricated or hidden, only the connecting
                     # LINE no longer visits them.
-                    route_cells = route_chain((centers[you_id], centers[remote_id]))
-                connector_cells.extend(
-                    (x, y, glyph, color) for x, y, glyph in route_cells
-                )
+                    route_cells = route_chain_avoiding(
+                        (centers[you_id], centers[remote_id]), obstacles
+                    )
+                if is_selected:
+                    color = palette.accent
+                elif is_stale:
+                    color = palette.dim_base
+                    route_cells = tuple(
+                        (x, y, _mesh_dashed_glyph(glyph)) for x, y, glyph in route_cells
+                    )
+                else:
+                    color = palette.dim_base
+                target = selected_connector_cells if is_selected else connector_cells
+                target.extend((x, y, glyph, color) for x, y, glyph in route_cells)
+        # Selected route drawn LAST: MeshCanvas's own overlay dict keys
+        # on (x, y), so whichever connector's cells are appended last
+        # wins any shared cell -- painting the focused node's full
+        # route after every other connector (rather than in working-set
+        # order, where an unselected connector drawn later could paint
+        # over part of an earlier-drawn selected one) is what guarantees
+        # it stays fully ACCENT wherever it is drawable, regardless of
+        # how many other connectors happen to overlap it (see item 10).
+        # Moving focus away naturally restores ordinary styling on the
+        # very next set_nodes() call -- nothing here persists paint
+        # state across calls.
         self.board.query_one(MeshCanvas).render_scene(
-            board_width, board_height, tuple(connector_cells), theme
+            board_width,
+            board_height,
+            tuple(connector_cells) + tuple(selected_connector_cells),
+            theme,
         )
 
     def clear_nodes(self) -> None:
@@ -2840,6 +2929,12 @@ class MeshtasticPassApp(App[None]):
         # None until the first successful sync.
         self._last_clock_sync_at: float | None = None
         self._clock_sync_in_progress = False
+        # Whether AUTO SYNC has already run once for the CURRENT
+        # connection lifecycle (see _maybe_auto_sync_clock/item 17) --
+        # reset only when _show_connection sees a genuine non-ONLINE ->
+        # ONLINE transition, so a reconnect loop can never trigger more
+        # than one sync per lifecycle.
+        self._clock_auto_sync_done_this_connection = False
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -2893,6 +2988,7 @@ class MeshtasticPassApp(App[None]):
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
                 yield Static(id="radio-clock-status", markup=False)
+                yield AutoSyncSelector(self.settings.clock_auto_sync)
                 yield SyncClockControl()
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
@@ -3132,6 +3228,7 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
+                    self.query_one(AutoSyncSelector),
                     self.query_one(SyncClockControl),
                 )
                 if not getattr(control, "disabled", False)
@@ -3316,6 +3413,16 @@ class MeshtasticPassApp(App[None]):
         if event.setting_name in RADIO_SETTINGS:
             self._apply_radio_setting(event.dropdown, event.setting_name, event.value)
             return
+        if event.setting_name == "clock_auto_sync":
+            self.settings.set_clock_auto_sync(bool(event.value))
+            self.settings.save()
+            clock_status = self.query_one("#radio-clock-status", Static)
+            clock_status.remove_class("setting-error")
+            clock_status.add_class("setting-success")
+            clock_status.update(
+                "AUTO SYNC ENABLED" if event.value else "AUTO SYNC DISABLED"
+            )
+            return
 
         status = self.query_one("#style-status", Static)
         try:
@@ -3461,11 +3568,13 @@ class MeshtasticPassApp(App[None]):
 
         Only ever reached via SyncClockControl.on_key's own Enter
         handling, itself only reachable while the control isn't
-        `disabled` -- never on connect/reconnect/tab-open/refresh (see
-        item 14/22: SYNC CLOCK is the ONLY thing in this pass that
-        sends anything to the radio, and only on this exact user
-        action).
+        `disabled`. Shares _begin_sync_clock with AUTO SYNC's own
+        trigger (see _maybe_auto_sync_clock) -- one underlying
+        implementation, never a second protocol path (item 18).
         """
+        self._begin_sync_clock()
+
+    def _begin_sync_clock(self) -> None:
         control = self.query_one(SyncClockControl)
         status = self.query_one("#radio-clock-status", Static)
         if self._clock_sync_in_progress or control.disabled:
@@ -3486,6 +3595,33 @@ class MeshtasticPassApp(App[None]):
             name="sync-clock",
             exclusive=True,
         )
+
+    def _maybe_auto_sync_clock(self) -> None:
+        """AUTO SYNC's own trigger -- see item 17: at most once per
+
+        qualifying connection lifecycle (see _show_connection, the only
+        caller), never on tab/view/focus changes, never repeated
+        mid-lifecycle -- reusing the exact same _begin_sync_clock()
+        manual SYNC CLOCK uses (item 18).
+
+        No trustworthy get-time/RTC-validity signal exists to sync
+        "only when needed" instead (see ClockSyncResult's own
+        docstring: AdminMessage has no get-time RPC -- confirmed
+        against the installed meshtastic==2.7.11 schema), and
+        RadioService's connection state machine has no separate "this
+        reconnect followed a reboot" signal either -- a dropped
+        connection always re-enters RadioState.CONNECTING identically
+        (see _connection_status_rich_text's own docstring). Given the
+        real-hardware finding that this device's clock does NOT
+        reliably survive a reboot, one sync per NEW connection
+        lifecycle is the documented, audit-sanctioned fallback:
+        harmless if the clock already survived, corrective if it
+        didn't.
+        """
+        if not self.settings.clock_auto_sync or self._clock_auto_sync_done_this_connection:
+            return
+        self._clock_auto_sync_done_this_connection = True
+        self._begin_sync_clock()
 
     def _apply_sync_clock_from_thread(self) -> None:
         try:
@@ -3982,6 +4118,9 @@ class MeshtasticPassApp(App[None]):
         state.has_older_history = self._has_older_history
         state.mounted_target = self._mounted_chat_target
         state.open_scroll_pending = self._chat_open_scroll_pending
+        chat_inputs = list(self.query("#chat-input"))
+        if chat_inputs:
+            state.draft = chat_inputs[0].value
 
     def _restore_channel_state(self, channel_index: int) -> ChannelChatState:
         state = self._ensure_channel_loaded(channel_index)
@@ -4021,6 +4160,10 @@ class MeshtasticPassApp(App[None]):
             self._mark_new_messages_read()
         self._capture_current_channel_state()
         state = self._restore_channel_state(channel_index)
+        chat_inputs = list(self.query("#chat-input"))
+        if chat_inputs:
+            chat_inputs[0].value = state.draft
+            chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
         await transcript.remove_children()
         widgets: list[Static | ChatEntryWidget] = []
@@ -5390,6 +5533,12 @@ class MeshtasticPassApp(App[None]):
         info: RadioInfo | None = None,
         message: str = "",
     ) -> None:
+        # Captured before overwriting self._radio_state -- the ONLY
+        # signal AUTO SYNC uses to detect "a NEW connection lifecycle
+        # just began" (see _maybe_auto_sync_clock/item 17): an
+        # already-ONLINE radio calling this again (e.g. a redundant
+        # event) must never re-trigger a sync.
+        was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
         if state is RadioState.ONLINE and info is not None and info.channels:
@@ -5427,6 +5576,9 @@ class MeshtasticPassApp(App[None]):
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
+        if state is RadioState.ONLINE and not was_online:
+            self._clock_auto_sync_done_this_connection = False
+            self._maybe_auto_sync_clock()
 
     def _connection_status_color(self) -> str:
         """The semantic color for the current non-ONLINE radio state --

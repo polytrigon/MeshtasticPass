@@ -8,6 +8,7 @@ testable.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Iterable, Mapping
 
 from geo import distance_between
@@ -19,6 +20,47 @@ from relative_time import format_relative_age
 
 MESH_STALE_THRESHOLD_SECONDS = 24 * 60 * 60
 DEFAULT_MAX_REMOTE_NODES = 8
+
+# Beyond this, a remote node's connector is removed from the CURRENT
+# board (see MeshActivityTier.VERY_OLD / build_mesh_working_set) --
+# never a NodeDB/CHAT deletion, and never a permanent decision: a node
+# that becomes active again is recomputed fresh into the working set on
+# the very next refresh, exactly like any other node. Deliberately
+# reuses the SAME 24-hour figure MESH_STALE_THRESHOLD_SECONDS already
+# used (for the separate, CHAT-interaction-based is_stale() concept
+# below) rather than inventing a second arbitrary number -- both agree
+# that "over a day since anything real happened" is the point past
+# which presenting something as a current connection would mislead.
+MESH_VERY_OLD_THRESHOLD_SECONDS = MESH_STALE_THRESHOLD_SECONDS
+
+
+class MeshActivityTier(Enum):
+    """Board/connector rendering tier for an already-admitted remote node.
+
+    Distinct from MeshNodeState.is_stale() below (CHAT-interaction-only,
+    24h, decides nothing about rendering today -- see its own
+    docstring): this tier decides how a node's CONNECTOR renders on the
+    CURRENT board, from the freshest available evidence (last_heard OR
+    CHAT interaction, mirroring build_mesh_working_set's own ranking
+    recency -- either one is real observed traffic, see item 7 "passive
+    only").
+
+    ACTIVE: counts toward MESH(N); normal connector/glyph rendering.
+    STALE: excluded from MESH(N), but the connector remains visible --
+        historical topology evidence, not a live connection (see
+        app._mesh_dashed_glyph for how it renders: DIM + DOTTED).
+    VERY_OLD: not rendered on the current board at all (see
+        build_mesh_working_set, which filters these out of its
+        returned working set entirely). Nothing here ever deletes
+        NodeDB or CHAT history -- becoming active again restores
+        normal rendering automatically, since the working set is
+        always recomputed fresh from live data, never a persisted
+        "removed" flag.
+    """
+
+    ACTIVE = "active"
+    STALE = "stale"
+    VERY_OLD = "very_old"
 
 
 def normalize_mesh_node_id(node_id: str) -> str:
@@ -91,6 +133,30 @@ class MeshNodeState:
         if self.last_interaction_at is None:
             return True
         return (now - self.last_interaction_at) > MESH_STALE_THRESHOLD_SECONDS
+
+    def activity_tier(self, *, now: float) -> "MeshActivityTier":
+        """See MeshActivityTier -- board/connector rendering only, never
+
+        NodeDB/CHAT persistence. YOU has no activity concept (mirrors
+        _mesh_node_color's existing "YOU always uses ordinary
+        ACCENT/BASE" rule) and is always ACTIVE.
+        """
+        if self.node.is_local:
+            return MeshActivityTier.ACTIVE
+        candidates = [
+            timestamp
+            for timestamp in (self.last_interaction_at, self.node.last_heard)
+            if timestamp is not None
+        ]
+        freshest = max(candidates) if candidates else None
+        if freshest is not None and is_node_active(freshest, now):
+            return MeshActivityTier.ACTIVE
+        if freshest is None:
+            return MeshActivityTier.VERY_OLD
+        age = now - freshest
+        if age < MESH_VERY_OLD_THRESHOLD_SECONDS:
+            return MeshActivityTier.STALE
+        return MeshActivityTier.VERY_OLD
 
     def glyph_is_solid(self) -> bool:
         """SOLID means exclusively "confirmed CLIENT" -- never fabricated.
@@ -231,6 +297,20 @@ def build_mesh_working_set(
                 distance_miles=distance_between(local_position, node.position),
             )
         )
+
+    # VERY_OLD nodes never occupy a working-set slot at all (see
+    # MeshActivityTier.VERY_OLD) -- filtered here, before bounding, so a
+    # VERY_OLD node can never crowd out a genuinely ACTIVE/STALE one
+    # under max_remote_nodes. This is the ONLY place a node's connector
+    # is kept off the current board for being too old; nothing here
+    # touches NodeDB or CHAT history, and a node recomputed as active
+    # again on a later refresh is admitted normally with no special
+    # "restore" step needed.
+    candidates = [
+        state
+        for state in candidates
+        if state.activity_tier(now=now) is not MeshActivityTier.VERY_OLD
+    ]
 
     def rank_key(state: MeshNodeState) -> tuple[int, int, float, str]:
         active = is_node_active(state.node.last_heard, now)

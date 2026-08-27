@@ -1004,6 +1004,99 @@ def _elbow_glyph(step_x: int, step_y: int) -> str:
     return "┌" if step_y > 0 else "└"
 
 
+def _elbow_glyph_vh(step_x: int, step_y: int) -> str:
+    """Box-drawing corner for a VERTICAL run turning into a horizontal one
+
+    (the mirror-image elbow route_connector_avoiding falls back to --
+    see _route_connector_alternate_elbow). The corner sits at
+    (from_x, to_y): its vertical stroke points back toward from_y
+    (north when step_y > 0, since we moved down to reach the corner),
+    and its horizontal stroke points on toward to_x (east when
+    step_x > 0).
+    """
+    if step_y > 0:
+        return "└" if step_x > 0 else "┘"
+    return "┌" if step_x > 0 else "┐"
+
+
+def _route_connector_alternate_elbow(
+    from_x: int, from_y: int, to_x: int, to_y: int
+) -> tuple[tuple[int, int, str], ...]:
+    """The other single-elbow ordering: a vertical run along the origin's
+
+    column, then a horizontal run along the target's row -- route_
+    connector's mirror image. Degenerates identically to route_connector
+    for a collinear pair (there is no elbow choice to make), so this is
+    only ever meaningfully different for a genuinely diagonal pair.
+    """
+    if from_x == to_x or from_y == to_y:
+        return route_connector(from_x, from_y, to_x, to_y)
+    step_x = 1 if to_x > from_x else -1
+    step_y = 1 if to_y > from_y else -1
+    cells: list[tuple[int, int, str]] = []
+    for y in range(from_y + step_y, to_y, step_y):
+        cells.append((from_x, y, "│"))
+    cells.append((from_x, to_y, _elbow_glyph_vh(step_x, step_y)))
+    for x in range(from_x + step_x, to_x, step_x):
+        cells.append((x, to_y, "─"))
+    return tuple(cells)
+
+
+def route_connector_avoiding(
+    from_x: int,
+    from_y: int,
+    to_x: int,
+    to_y: int,
+    obstacles: frozenset[tuple[int, int]],
+) -> tuple[tuple[int, int, str], ...]:
+    """Like route_connector, but steers around occupied cells when a
+
+    single-elbow alternative can.
+
+    REAL VISUAL PROBLEM this fixes: with only one fixed elbow ordering,
+    a direct ALICE<->ME connector can visually pass straight through an
+    unrelated real node BOB's own rendered cell merely because BOB
+    happens to sit geometrically between them -- with no actual
+    relay/hop evidence that BOB carried that traffic (see mesh_state/
+    RelayStage: this app never fabricates intermediate-hop identity
+    from geometry). `obstacles` should be every OTHER real node's own
+    occupied cell -- never this connector's own two endpoints, which
+    route_connector already excludes by design.
+
+    Tries the default horizontal-then-vertical elbow first; if any of
+    its cells lands on an obstacle, retries with the vertical-then-
+    horizontal elbow instead (_route_connector_alternate_elbow). If
+    BOTH single-elbow orderings are blocked, falls back to the default
+    ordering rather than fabricating a longer multi-elbow detour --
+    this resolves the common single-obstacle case (one unrelated node
+    geometrically in the way), not general obstacle-dense pathfinding.
+    """
+    primary = route_connector(from_x, from_y, to_x, to_y)
+    if not any((x, y) in obstacles for x, y, _glyph in primary):
+        return primary
+    alternate = _route_connector_alternate_elbow(from_x, from_y, to_x, to_y)
+    if not any((x, y) in obstacles for x, y, _glyph in alternate):
+        return alternate
+    return primary
+
+
+def route_chain_avoiding(
+    points: tuple[tuple[int, int], ...], obstacles: frozenset[tuple[int, int]]
+) -> tuple[tuple[int, int, str], ...]:
+    """route_chain, but each segment is routed by route_connector_avoiding
+
+    instead of the plain single-ordering route_connector -- see that
+    function's own docstring for what "avoiding" does and does not
+    guarantee.
+    """
+    cells: list[tuple[int, int, str]] = []
+    for start, end in zip(points, points[1:]):
+        cells.extend(
+            route_connector_avoiding(start[0], start[1], end[0], end[1], obstacles)
+        )
+    return tuple(cells)
+
+
 def directional_target(
     current_node_id: str,
     layout: TopologyLayout,

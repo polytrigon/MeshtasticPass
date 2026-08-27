@@ -22,6 +22,7 @@ from textual.widgets import Input, Static
 from app import (
     ANIMATED_STATUS,
     TAB_NAMES,
+    AutoSyncSelector,
     ChannelSelector,
     Clock24HSelector,
     CompassSelector,
@@ -831,6 +832,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(Clock24HSelector))
             await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(AutoSyncSelector))
+            await pilot.press("down")
             self.assertIs(app.focused, app.query_one(SyncClockControl))
 
     async def test_sync_clock_applies_and_shows_last_sync_time(self) -> None:
@@ -960,6 +963,144 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 if not app._clock_sync_in_progress:
                     break
             self.assertEqual(radio.read_synced_config_field("device", "tzdef"), before)
+
+    async def test_auto_sync_defaults_off_and_generates_no_automatic_write(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertFalse(self.settings.clock_auto_sync)
+            self.assertFalse(app.query_one(AutoSyncSelector).value)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 0)
+
+    async def test_auto_sync_on_syncs_once_per_new_connection_lifecycle(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(AutoSyncSelector).focus()
+            await pilot.press("enter", "down", "enter")
+            await pilot.pause()
+            self.assertTrue(self.settings.clock_auto_sync)
+
+            # Already ONLINE -- toggling the preference itself must not
+            # retroactively trigger a sync; only a NEW connection
+            # lifecycle does.
+            self.assertEqual(radio.sync_clock.call_count, 0)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+            # Redundant ONLINE calls within the SAME lifecycle (e.g. a
+            # duplicated event) must not trigger a second sync.
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+    async def test_auto_sync_does_not_trigger_from_tab_or_view_changes(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            app._render_radio_settings()
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+    async def test_auto_sync_survives_a_reconnect_loop_without_hammering(self) -> None:
+        """Several rapid OFFLINE<->ONLINE flips (a reconnect loop) must
+
+        still produce exactly one sync per genuine ONLINE entry -- never
+        more per lifecycle, and never from the OFFLINE half of the loop.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+            for _ in range(3):
+                app._show_connection(RadioState.OFFLINE, message="lost")
+                await pilot.pause()
+                app._show_connection(RadioState.ONLINE, radio.info)
+                await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 4)
+
+    async def test_auto_sync_preference_persists_across_restart(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(AutoSyncSelector).focus()
+            await pilot.press("enter", "down", "enter")
+            await pilot.pause()
+            self.assertTrue(self.settings.clock_auto_sync)
+
+        reloaded = AppSettings.load(
+            config_path=self.settings.config_path,
+            profile_path=self.settings.profile_path,
+        )
+        self.assertTrue(reloaded.clock_auto_sync)
+
+    async def test_auto_sync_and_manual_sync_share_one_implementation(self) -> None:
+        """Both call the SAME RadioService.sync_clock -- no second
+
+        protocol path (item 18).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+
+            app.query_one(SyncClockControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 2)
 
     async def test_connection_state_feedback_clears_stale_metadata(self) -> None:
         radio = SimulatedRadioService(

@@ -15,6 +15,7 @@ from mesh_state import (
 )
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
 from radio_service import NodeMetadata
+from relative_time import format_relative_age
 
 
 NOW = 1_000_000.0
@@ -287,28 +288,57 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         self.assertEqual(remote_ids, ["!active", "!stale"])
 
     def test_favorite_outranks_non_favorite_among_non_active_nodes(self) -> None:
-        favorite = NodeMetadata("!fav", "Favorite", None, None, NOW - 10_000)
-        plain = NodeMetadata("!plain", "Plain", None, None, NOW - 1_000)
+        # Both beyond ACTIVE_WINDOW_SECONDS (now 2h, firmware-aligned) but
+        # within MESH_VERY_OLD_THRESHOLD_SECONDS (24h), so both are
+        # STALE -- admitted, non-active, and ranked on favorite status.
+        favorite = NodeMetadata("!fav", "Favorite", None, None, NOW - 20_000)
+        plain = NodeMetadata("!plain", "Plain", None, None, NOW - 10_000)
         result = build_mesh_working_set(
             [YOU, plain, favorite], now=NOW, favorite_ids={"!fav"}
         )
         remote_ids = [state.node.node_id for state in result if not state.node.is_local]
         self.assertEqual(remote_ids, ["!fav", "!plain"])
 
-    def test_stale_fallback_shows_most_recent_historical_nodes(self) -> None:
-        """When nothing is recent, ranking naturally surfaces the most
+    def test_very_old_nodes_are_excluded_from_the_working_set(self) -> None:
+        """Beyond MESH_VERY_OLD_THRESHOLD_SECONDS, a node's connector is
 
-        recently-active stale nodes instead of an empty working set --
-        there is no separate priority tier that would exclude them.
+        removed from the current board entirely (see
+        MeshActivityTier.VERY_OLD) -- never merely ranked last. Nothing
+        here deletes NodeDB/CHAT history; a node heard again later is
+        admitted normally on the very next refresh.
         """
         very_old = NOW - MESH_STALE_THRESHOLD_SECONDS * 10
         last_message_at = {f"!n{i:04x}": very_old - i for i in range(5)}
         result = build_mesh_working_set(
             [YOU], now=NOW, last_message_at=last_message_at
         )
-        self.assertEqual(len(result) - 1, 5)
-        remotes = [state for state in result if not state.node.is_local]
-        self.assertTrue(all(state.is_stale(now=NOW) for state in remotes))
+        self.assertEqual(len(result), 1)  # YOU only -- all 5 filtered out
+        self.assertTrue(result[0].node.is_local)
+
+    def test_very_old_node_reappears_once_heard_again(self) -> None:
+        """No persistent "removed" state: the working set is recomputed
+
+        fresh from live last_heard/last_message_at every call, so a
+        node that was VERY_OLD a moment ago is admitted completely
+        normally the instant fresher evidence exists -- no special
+        "restore" step anywhere.
+        """
+        node = NodeMetadata("!revive01", "Revived", "RVV")
+        very_old_at = NOW - MESH_STALE_THRESHOLD_SECONDS * 10
+        excluded = build_mesh_working_set(
+            [YOU, node], now=NOW, last_message_at={"!revive01": very_old_at}
+        )
+        self.assertEqual(
+            [state.node.node_id for state in excluded if not state.node.is_local], []
+        )
+
+        heard_again = build_mesh_working_set(
+            [YOU, node], now=NOW, last_message_at={"!revive01": NOW - 5}
+        )
+        remote_ids = [
+            state.node.node_id for state in heard_again if not state.node.is_local
+        ]
+        self.assertEqual(remote_ids, ["!revive01"])
 
     def test_ranking_is_deterministic_and_arrival_order_independent(self) -> None:
         last_message_at = {f"!n{i:04x}": NOW - i * 7 for i in range(10)}
@@ -524,7 +554,7 @@ class LastSeenConsistencyTests(unittest.TestCase):
         )
         self.assertFalse(is_node_active(node.last_heard, NOW))
         line = format_mesh_context_line(state, now=NOW)
-        self.assertIn("8m", line)
+        self.assertIn(format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60), line)
         self.assertNotIn("?", line.split(" / ")[4])
 
     def test_missing_last_heard_and_chat_history_stays_question_mark(self) -> None:

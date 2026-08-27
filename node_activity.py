@@ -6,7 +6,22 @@ from math import isfinite
 from typing import Any, Iterable, Mapping
 
 
-ACTIVE_WINDOW_SECONDS = 300.0
+# 2 hours -- FIRMWARE-SOURCE-VERIFIED to match Meshtastic firmware's own
+# "N Online" threshold exactly: NUM_ONLINE_SECS in src/mesh/NodeDB.cpp
+# (`#define NUM_ONLINE_SECS (60 * 60 * 2)`), used by
+# NodeDB::getNumOnlineMeshNodes() as `sinceLastSeen(node) < NUM_ONLINE_SECS`
+# -- i.e. purely last_heard recency, no hop-count/neighbor-status
+# involvement, unchanged since a 2022 typo fix (5e109d9) predating both
+# firmware 2.5 and 2.7. This was previously 300.0 (5 minutes), a
+# MeshtasticPass-invented value with no firmware basis -- that mismatch
+# (24x narrower than firmware's own window) is why MESH(N) could read
+# dramatically lower than the radio's own onscreen "N ONLINE" and could
+# fall from several active nodes to almost none within a few quiet
+# minutes, even though firmware still considered those same nodes
+# legitimately online. See mesh_state.MeshActivityTier for the
+# STALE/VERY_OLD tiers firmware itself does not define (its own
+# online/offline split is binary).
+ACTIVE_WINDOW_SECONDS = 60 * 60 * 2
 
 
 def is_node_active(last_heard: object, now: object) -> bool:
@@ -33,7 +48,9 @@ def count_active_other_nodes(
     now: float,
     direct_observations: Mapping[str, float] | None = None,
 ) -> int:
-    """Count unique other nodes heard less than five minutes ago.
+    """Count unique other nodes heard within ACTIVE_WINDOW_SECONDS (2 hours,
+
+    matching Meshtastic firmware's own "N Online" threshold).
 
     Node-database ``lastHeard`` values and packets directly observed by the
     application are combined by node ID. A node heard exactly
