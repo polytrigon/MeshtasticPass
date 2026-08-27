@@ -1628,6 +1628,111 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(radio.sync_clock.call_count, 1)
 
+    # ---- SYNC NOW enablement follows live connection state -------------
+
+    async def test_sync_now_enablement_follows_connection_lifecycle(self) -> None:
+        """Real-hardware follow-up: a HELTEC_V4 connect left SYNC NOW
+
+        dimmed/disabled. Locks in the full expected state machine --
+        DISCONNECTED->disabled, CONNECTED+idle->enabled, activation->
+        temporarily unavailable with SYNCING TIME, feedback window
+        elapsed->enabled again, disconnect->disabled, reconnect->
+        enabled -- driven entirely by the live RadioState transitions
+        _show_connection receives (never by device-path existing).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=10, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            control = app.query_one(SyncClockControl)
+
+            # 1/2: still connecting -- disabled/dimmed.
+            self.assertTrue(control.disabled)
+
+            # 3/4: CONNECTED + IDLE -- enabled, base "[ SYNC NOW ]" text.
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertFalse(control.disabled)
+            self.assertIn("[ SYNC NOW ]", str(control.render()))
+
+            # 5/6: activate -- exactly one write, temporary feedback state.
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+            self.assertTrue(control.disabled)
+            status = app.query_one("#radio-clock-status", Static)
+            self.assertIn("SYNCING TIME", str(status.render()))
+
+            # 7/8: ten seconds later (fired directly, established
+            # convention) -- SYNCING TIME gone, SYNC NOW returns.
+            app._clock_sync_feedback_expired(app._clock_sync_generation)
+            await pilot.pause()
+            self.assertFalse(control.disabled)
+            self.assertEqual(str(status.render()), "")
+
+            # 9/10: disconnect -- disabled again.
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            self.assertTrue(control.disabled)
+
+            # 11/12: reconnect -- enabled once more.
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertFalse(control.disabled)
+            self.assertIn("[ SYNC NOW ]", str(control.render()))
+
+    async def test_reconnect_during_active_feedback_window_leaves_control_usable(
+        self,
+    ) -> None:
+        """A disconnect while SYNCING TIME is still showing must not
+
+        leave the NEXT connection's SYNC NOW permanently stuck disabled
+        -- the OLD connection's busy/timer/generation state is
+        invalidated outright by _reset_clock_sync_state, and even a
+        late, defensively-fired stale callback from that old window
+        must remain a no-op against the new one.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.sync_clock = Mock(side_effect=lambda: sleep(3))
+            control = app.query_one(SyncClockControl)
+            control.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(control.disabled)
+            self.assertIsNotNone(app._clock_sync_feedback_timer)
+            stale_generation = app._clock_sync_generation
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            self.assertTrue(control.disabled)  # offline -- disabled regardless
+            self.assertFalse(app._manual_sync_feedback_active)
+            self.assertFalse(app._clock_sync_in_progress)
+            self.assertIsNone(app._clock_sync_feedback_timer)
+
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertFalse(control.disabled)
+            self.assertIn("[ SYNC NOW ]", str(control.render()))
+
+            # Even if the (already-stopped) old window's callback somehow
+            # still ran, its stale generation must make it a no-op against
+            # the new connection's clean idle state.
+            app._clock_sync_feedback_expired(stale_generation)
+            await pilot.pause()
+            self.assertFalse(control.disabled)
+            self.assertIn("[ SYNC NOW ]", str(control.render()))
+
     # ---- CLOCK SYNC color ---------------------------------------------
 
     async def test_clock_sync_control_uses_base_not_accent(self) -> None:

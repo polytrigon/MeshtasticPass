@@ -3848,6 +3848,29 @@ class MeshtasticPassApp(App[None]):
         self._clock_sync_generation += 1
         self._start_clock_sync_feedback_timer(self._clock_sync_generation)
 
+    def _reset_clock_sync_state(self) -> None:
+        """Invalidate any in-flight sync/feedback window outright --
+
+        called by _show_connection on every genuine connection-state
+        transition (disconnect, error, a fresh (re)connect), never on
+        a redundant "still ONLINE" event or a passive view refresh
+        (see its own call site). A dropped connection makes whatever
+        the OLD connection's write/feedback window was doing
+        meaningless -- the NEXT connection must always start SYNC NOW
+        from a clean idle state, never inheriting a stale disabled/
+        busy control or a leftover SYNCING TIME/error message. Bumping
+        the generation also makes a late completion from the OLD
+        connection's abandoned worker thread safely stale (see
+        clock_sync_applied's own guard).
+        """
+        if self._clock_sync_feedback_timer is not None:
+            self._clock_sync_feedback_timer.stop()
+            self._clock_sync_feedback_timer = None
+        self._manual_sync_feedback_active = False
+        self._clock_sync_in_progress = False
+        self._clock_sync_generation += 1
+        self._set_clock_status("", None)
+
     def _begin_sync_clock(self) -> None:
         control = self.query_one(SyncClockControl)
         if self._clock_sync_in_progress or control.disabled:
@@ -4116,7 +4139,11 @@ class MeshtasticPassApp(App[None]):
             timezone_dropdown.set_status_override(None)
             timezone_dropdown.set_options(self._timezone_options_for(tzdef), value=tzdef)
 
-        sync_control.disabled = not supports_clock or self._clock_sync_in_progress
+        sync_control.disabled = (
+            not supports_clock
+            or self._clock_sync_in_progress
+            or self._manual_sync_feedback_active
+        )
         # While a MANUAL sync's own SYNCING TIME/error is still within
         # its own feedback window, a passive refresh here (e.g. an
         # unrelated reconnect) must leave it alone entirely -- neither
@@ -5944,6 +5971,13 @@ class MeshtasticPassApp(App[None]):
         was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
+        # Real-hardware follow-up to "RADIO -- SIMPLIFY CLOCK SYNC UX":
+        # a genuine connection-state transition (anything except a
+        # redundant "still ONLINE" event) must never leave stale
+        # SYNCING TIME/error/busy state behind for the NEXT connection
+        # to inherit -- see _reset_clock_sync_state's own docstring.
+        if not (state is RadioState.ONLINE and was_online):
+            self._reset_clock_sync_state()
         if state is RadioState.ONLINE and info is not None and info.channels:
             self._channels = info.channels
             selector = self.query_one(ChannelSelector)
