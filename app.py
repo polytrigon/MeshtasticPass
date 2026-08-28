@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from threading import Thread
 from time import monotonic, time
 from typing import Any, Callable
 
@@ -130,6 +131,15 @@ ANIMATED_STATUS = {
 
 CONNECTION_LABEL_WIDTH = 12
 CONNECTION_ROW_PREFIX = "  "
+# Where a KeyboardDropdown's own "[ VALUE ▾ ]" begins on any RADIO/
+# STYLE row built with label_width=CONNECTION_LABEL_WIDTH -- its own
+# heading is "{marker} {label:<CONNECTION_LABEL_WIDTH}} [ ... ]", and
+# marker+space is exactly len(CONNECTION_ROW_PREFIX) wide, so this
+# stays correct automatically if either constant ever changes, rather
+# than hardcoding a column number. Reused by any status row that must
+# align under the control/value column instead of the label column
+# (see _set_font_size_status).
+CONNECTION_VALUE_COLUMN_INDENT = " " * (len(CONNECTION_ROW_PREFIX) + CONNECTION_LABEL_WIDTH + 1)
 
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
@@ -2426,26 +2436,46 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #long-name-status, #short-name-status, #timezone-status {
+    #long-name-status, #short-name-status, #timezone-status,
+    #font-size-status, #color-status {
         /* No min-height: display is toggled False when empty (see
            _set_long_name_status/_set_short_name_status/_set_timezone_
-           status), so the row collapses to zero height instead of
-           reserving a permanent blank line. */
+           status/_set_font_size_status/_set_color_status), so the row
+           collapses to zero height instead of reserving a permanent
+           blank line. */
         height: auto;
     }
 
-    #long-name-status, #short-name-status, #timezone-status {
+    #long-name-status, #short-name-status, #timezone-status, #font-size-status {
         color: $snow_confirm;
     }
 
     Screen.theme-amber #long-name-status,
     Screen.theme-amber #short-name-status,
-    Screen.theme-amber #timezone-status {
+    Screen.theme-amber #timezone-status,
+    Screen.theme-amber #font-size-status {
         color: $amber_confirm;
     }
 
     #long-name-status.setting-error, #short-name-status.setting-error,
-    #timezone-status.setting-error {
+    #timezone-status.setting-error, #font-size-status.setting-error,
+    #color-status.setting-error {
+        color: $error;
+    }
+
+    /* Textual's own CSS specificity (id, class, type) otherwise lets
+       the theme-scoped CONFIRM override above win under AMBER, since
+       "Screen.theme-amber #widget" carries one more type-selector
+       component than "#widget.setting-error" -- these repeat the
+       error color with that SAME extra Screen.theme-amber qualifier
+       so ERROR always wins regardless of the active theme. $error is
+       already theme-independent (NEON_RED in both palettes); only the
+       selector's specificity needs raising here, not its value. */
+    Screen.theme-amber #long-name-status.setting-error,
+    Screen.theme-amber #short-name-status.setting-error,
+    Screen.theme-amber #timezone-status.setting-error,
+    Screen.theme-amber #font-size-status.setting-error,
+    Screen.theme-amber #color-status.setting-error {
         color: $error;
     }
 
@@ -2494,7 +2524,7 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #style-status, #radio-status {
+    #radio-status {
         height: 2;
     }
 
@@ -2506,8 +2536,7 @@ class MeshtasticPassApp(App[None]):
         color: $amber_confirm;
     }
 
-    #connection-error, #send-error, #style-status.setting-error,
-    #radio-status.setting-error {
+    #connection-error, #send-error, #radio-status.setting-error {
         height: auto;
         min-height: 1;
         color: $error;
@@ -2888,6 +2917,12 @@ class MeshtasticPassApp(App[None]):
         # ONLINE transition, so a reconnect loop can never trigger more
         # than one sync per lifecycle.
         self._clock_auto_sync_done_this_connection = False
+        # One entry per named radio-write operation currently in flight
+        # (see _run_radio_worker) -- lets a new call in the SAME group
+        # be refused outright while the previous one is still running,
+        # without depending on Textual's own worker exclusivity (which
+        # cannot actually interrupt a blocking thread either way).
+        self._radio_workers: dict[str, Thread] = {}
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -2935,8 +2970,9 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="identity-values", markup=False)
                 yield Static("STYLE", id="style-title", classes="page-title")
                 yield FontSizeSelector(self.settings.font_size)
+                yield Static(id="font-size-status", markup=False)
                 yield ColorSelector(self.settings.color)
-                yield Static(id="style-status")
+                yield Static(id="color-status", markup=False)
                 yield Static("RADIO", id="radio-title", classes="page-title")
                 yield Static(id="radio-info", markup=False)
                 yield TimezoneSelector("")
@@ -2987,6 +3023,12 @@ class MeshtasticPassApp(App[None]):
         self._terminal_cursor.hide()
         self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
+        # FONT SIZE/COLOR are local settings, independent of the radio
+        # connection lifecycle -- collapsed here once at startup, unlike
+        # the RADIO-section per-field rows _show_connection resets on
+        # every connection-state transition.
+        self._set_font_size_status("", None)
+        self._set_color_status("", None)
         self._show_connection(RadioState.CONNECTING)
         self._connection_animation_timer = self.set_interval(
             0.45,
@@ -3298,6 +3340,41 @@ class MeshtasticPassApp(App[None]):
         self._timezone_status_dismiss_timer = None
         self._set_timezone_status("", None)
 
+    def _set_font_size_status(self, text: str, css_class: str | None) -> None:
+        """FONT SIZE's own status row -- aligned under FONT SIZE's own
+
+        control/value column (CONNECTION_VALUE_COLUMN_INDENT), not the
+        left label column, and collapses to zero height when empty. No
+        auto-dismiss timer: preserves FONT SIZE's existing lifetime --
+        the confirmation stays until the user changes FONT SIZE again,
+        exactly as before this row was split out of the shared STYLE
+        status.
+        """
+        status = self.query_one("#font-size-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
+
+    def _set_color_status(self, text: str, css_class: str | None) -> None:
+        """COLOR's own status row -- ERROR only. A successful color
+
+        change needs no confirmation beyond the visible theme switch
+        and the dropdown's own new value, so this is only ever called
+        with text="" on success (see dropdown_selected's own "color"
+        branch) -- collapses to zero height, leaving no empty row or
+        extra spacing behind.
+        """
+        status = self.query_one("#color-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
+
     @staticmethod
     def _timezone_options_for(tzdef: str) -> tuple[DropdownOption, ...]:
         """TIMEZONE_CHOICES, plus a synthetic CUSTOM entry when `tzdef`
@@ -3311,6 +3388,49 @@ class MeshtasticPassApp(App[None]):
         if tzdef and tzdef not in known_values:
             return options + (DropdownOption("CUSTOM", tzdef),)
         return options
+
+    def _run_radio_worker(self, group: str, target: Callable[[], None]) -> None:
+        """Run one radio admin-write/save/sync call on a dedicated daemon
+
+        thread, never through Textual's run_worker(thread=True).
+
+        Textual's thread-mode workers are ultimately dispatched via
+        asyncio's DEFAULT executor (loop.run_in_executor(None, ...) --
+        see Worker._run_threaded), and Python's own asyncio.run() --
+        which is exactly how Textual's own App.run() drives the event
+        loop -- unconditionally waits, with NO timeout, for every job
+        that executor has ever accepted before the interpreter may
+        exit at all (see BaseEventLoop.shutdown_default_executor(),
+        called from asyncio.run()'s own `finally` block). A genuinely
+        stalled SDK call -- a real, previously-documented failure mode:
+        a serial-layer stall can occur BEFORE the SDK's own
+        waitForAckNak timeout even starts ticking -- would therefore
+        hang the ENTIRE process at exit no matter what MeshtasticPass's
+        own shutdown code does. A plain daemon thread is never tracked
+        by that executor, so it can never block process termination:
+        Python simply abandons it once every non-daemon thread has
+        finished, exactly like RadioMonitor's own monitoring thread
+        already does. Correctness-neutral for every caller here: each
+        already treats its own result as best-effort, reacting only to
+        the Message it later posts (post_message is safe to call, and
+        simply returns False, even after this app has fully closed --
+        see MessagePump.post_message) -- never by blocking on this
+        thread's outcome directly.
+
+        `group` allows at most one in-flight thread per named
+        operation -- a second call for the SAME group while the first
+        is still running is refused outright, mirroring (and actually
+        strengthening) the exclusivity Textual's own
+        group=.../exclusive=True previously provided: that mechanism
+        could never truly stop an already-running blocking call either,
+        so two overlapping SDK calls could already race in practice.
+        """
+        existing = self._radio_workers.get(group)
+        if existing is not None and existing.is_alive():
+            return
+        thread = Thread(target=target, name=group, daemon=True)
+        self._radio_workers[group] = thread
+        thread.start()
 
     @on(Input.Submitted, "#long-name-input")
     def save_long_name(self, event: Input.Submitted) -> None:
@@ -3330,12 +3450,8 @@ class MeshtasticPassApp(App[None]):
             return
         control.finish_edit(long_name)
         self._set_long_name_status("SAVING NAME...", None)
-        self.run_worker(
-            lambda: self._save_long_name_from_thread(long_name),
-            thread=True,
-            name="save-radio-long-name",
-            group="save-radio-long-name",
-            exclusive=True,
+        self._run_radio_worker(
+            "save-radio-long-name", lambda: self._save_long_name_from_thread(long_name)
         )
 
     def _save_long_name_from_thread(self, long_name: str) -> None:
@@ -3370,12 +3486,8 @@ class MeshtasticPassApp(App[None]):
             return
         control.finish_edit(short_name)
         self._set_short_name_status("SAVING SHORT NAME...", None)
-        self.run_worker(
-            lambda: self._save_short_name_from_thread(short_name),
-            thread=True,
-            name="save-radio-short-name",
-            group="save-radio-short-name",
-            exclusive=True,
+        self._run_radio_worker(
+            "save-radio-short-name", lambda: self._save_short_name_from_thread(short_name)
         )
 
     def _save_short_name_from_thread(self, short_name: str) -> None:
@@ -3475,29 +3587,32 @@ class MeshtasticPassApp(App[None]):
             self.settings.save()
             return
 
-        status = self.query_one("#style-status", Static)
-        try:
-            if event.setting_name == "font_size":
+        if event.setting_name == "font_size":
+            try:
                 self.settings.set_font_size(int(event.value))
                 self.settings.save()
                 self.settings.update_lxterminal_profile()
-            elif event.setting_name == "color":
+            except (OSError, ValueError) as error:
+                self._set_font_size_status(f"FONT SIZE NOT SAVED — {error}", "setting-error")
+            else:
+                self._set_font_size_status(
+                    "FONT SIZE SAVED - RELAUNCH TO APPLY", "setting-success"
+                )
+            return
+        if event.setting_name == "color":
+            # Item ("RADIO POLISH -- REMOVE COLOR SAVED"): the visible
+            # theme switch and the selected COLOR value are themselves
+            # sufficient confirmation -- no success status is ever
+            # shown here, only a genuine persistence failure.
+            try:
                 self.settings.set_color(str(event.value))
                 self.settings.save()
                 self._apply_color_theme(self.settings.color)
-        except (OSError, ValueError) as error:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
-            status.update(f"SETTING NOT SAVED — {error}")
-        else:
-            status.remove_class("setting-error")
-            status.add_class("setting-success")
-            message = (
-                "FONT SIZE SAVED — APPLIES ON NEXT LAUNCH"
-                if event.setting_name == "font_size"
-                else "COLOR SAVED"
-            )
-            status.update(message)
+            except (OSError, ValueError) as error:
+                self._set_color_status(f"COLOR NOT SAVED — {error}", "setting-error")
+            else:
+                self._set_color_status("", None)
+            return
 
     async def _switch_device(self, device_path: str) -> None:
         if device_path == getattr(self.radio, "device_path", None):
@@ -3566,14 +3681,11 @@ class MeshtasticPassApp(App[None]):
             status.remove_class("setting-success")
             status.update(f"APPLYING {dropdown.label}...")
         schema_value = spec.to_schema_value(dropdown_value)
-        self.run_worker(
+        self._run_radio_worker(
+            "apply-radio-setting",
             lambda: self._apply_radio_setting_from_thread(
                 dropdown, spec, setting_name, schema_value
             ),
-            thread=True,
-            name="apply-radio-setting",
-            group="apply-radio-setting",
-            exclusive=True,
         )
 
     def _apply_radio_setting_from_thread(
@@ -3693,12 +3805,8 @@ class MeshtasticPassApp(App[None]):
         self._clock_sync_generation += 1
         generation = self._clock_sync_generation
         self._clock_sync_in_progress = True
-        self.run_worker(
-            lambda: self._apply_sync_clock_from_thread(generation),
-            thread=True,
-            name="sync-clock",
-            group="sync-clock",
-            exclusive=True,
+        self._run_radio_worker(
+            "sync-clock", lambda: self._apply_sync_clock_from_thread(generation)
         )
 
     def _apply_sync_clock_from_thread(self, generation: int) -> None:

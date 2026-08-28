@@ -23,6 +23,7 @@ from app import (
     ANIMATED_STATUS,
     CONNECTION_LABEL_WIDTH,
     CONNECTION_ROW_PREFIX,
+    CONNECTION_VALUE_COLUMN_INDENT,
     TAB_NAMES,
     AutoSyncSelector,
     ChannelSelector,
@@ -667,8 +668,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(selector.font_size, 22)
             self.assertEqual(self.settings.font_size, 22)
             self.assertIn(
-                "APPLIES ON NEXT LAUNCH",
-                str(app.query_one("#style-status", Static).render()),
+                "FONT SIZE SAVED - RELAUNCH TO APPLY",
+                str(app.query_one("#font-size-status", Static).render()),
             )
 
         reloaded = AppSettings.load(
@@ -2139,7 +2140,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         reloaded = AppSettings.load(config_path=self.settings.config_path)
         self.assertEqual(reloaded.color, "snow")
 
-    async def test_style_status_inherits_snow_and_amber(self) -> None:
+    async def test_font_size_status_inherits_snow_and_amber(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
             message_interval=0,
@@ -2148,45 +2149,18 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         app = MeshtasticPassApp(radio, self.settings)
 
         async with app.run_test(size=(100, 30)) as pilot:
-            status = app.query_one("#style-status", Static)
+            status = app.query_one("#font-size-status", Static)
             font = app.query_one(FontSizeSelector)
-            color = app.query_one(ColorSelector)
             for theme, palette in THEME_PALETTES.items():
                 app._apply_color_theme(theme)
                 await app.dropdown_selected(
                     KeyboardDropdown.Selected(font, font.value)
                 )
                 await pilot.pause()
-                self.assertIn("FONT SIZE SAVED", str(status.render()))
-                self.assertTrue(status.has_class("setting-success"))
-                # setting-success now resolves to CONFIRM, not ACCENT
-                # (item 35: SAVED/APPLIED feedback is success feedback).
-                self.assertEqual(
-                    status.visual_style.foreground.hex6,
-                    palette.confirm,
+                self.assertIn(
+                    "FONT SIZE SAVED - RELAUNCH TO APPLY", str(status.render())
                 )
-
-                color.value = theme
-                observed_theme: list[bool] = []
-                original_update = status.update
-
-                def capture_update(content: object, *args: object, **kwargs: object) -> object:
-                    if content == "COLOR SAVED":
-                        observed_theme.append(
-                            app.screen.has_class(f"theme-{theme}")
-                        )
-                    return original_update(content, *args, **kwargs)
-
-                status.update = capture_update  # type: ignore[method-assign]
-                try:
-                    await app.dropdown_selected(
-                        KeyboardDropdown.Selected(color, theme)
-                    )
-                finally:
-                    status.update = original_update  # type: ignore[method-assign]
-                await pilot.pause()
-                self.assertEqual(observed_theme, [True])
-                self.assertIn("COLOR SAVED", str(status.render()))
+                self.assertTrue(status.has_class("setting-success"))
                 self.assertEqual(
                     status.visual_style.foreground.hex6,
                     palette.confirm,
@@ -2203,6 +2177,82 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(status.has_class("setting-error"))
             self.assertFalse(status.has_class("setting-success"))
+            self.assertEqual(status.visual_style.foreground.hex6, ERROR)
+
+    async def test_font_size_status_aligns_to_the_control_value_column(self) -> None:
+        """"RADIO POLISH -- FONT SIZE STATUS": the status begins at the
+
+        same horizontal position as FONT SIZE's own "[ ... ]" control,
+        not the left label column -- computed from the same shared
+        CONNECTION_LABEL_WIDTH/CONNECTION_ROW_PREFIX layout math every
+        other RADIO/STYLE row uses (CONNECTION_VALUE_COLUMN_INDENT),
+        never a hardcoded space count, so it stays correct if those
+        constants ever change.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            font = app.query_one(FontSizeSelector)
+            status = app.query_one("#font-size-status", Static)
+            await app.dropdown_selected(KeyboardDropdown.Selected(font, font.value))
+            await pilot.pause()
+
+            rendered = str(status.render())
+            control_rendered = str(font.render())
+            self.assertNotEqual(rendered, "")
+            # Directly beneath FONT SIZE (not the shared style status).
+            self.assertNotIn("style-status", [w.id for w in app.query("Static")])
+            indent = len(rendered) - len(rendered.lstrip(" "))
+            self.assertEqual(indent, control_rendered.index("["))
+            # Never a bare hardcoded literal -- always the shared,
+            # reusable indent constant.
+            self.assertEqual(rendered[:indent], CONNECTION_VALUE_COLUMN_INDENT)
+
+    async def test_color_change_shows_no_success_status(self) -> None:
+        """"RADIO POLISH -- REMOVE COLOR SAVED": the visible theme
+
+        switch and the dropdown's own new value are sufficient
+        confirmation on their own -- no COLOR SAVED (or any other
+        success) status is ever shown, and the row stays collapsed
+        (no empty row, no extra spacing). A genuine persistence
+        failure still surfaces a compact ERROR.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0,
+            message_interval=0,
+            scripted_messages=(),
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            status = app.query_one("#color-status", Static)
+            color = app.query_one(ColorSelector)
+            self.assertEqual(str(status.render()), "")
+            self.assertFalse(status.display)
+
+            for theme in THEME_PALETTES:
+                color.value = theme
+                await app.dropdown_selected(KeyboardDropdown.Selected(color, theme))
+                await pilot.pause()
+                self.assertTrue(app.screen.has_class(f"theme-{theme}"))
+                self.assertEqual(str(status.render()), "")
+                self.assertFalse(status.display)
+                self.assertFalse(status.has_class("setting-success"))
+
+            original_save = self.settings.save
+            self.settings.save = Mock(side_effect=OSError("read only"))
+            try:
+                await app.dropdown_selected(
+                    KeyboardDropdown.Selected(color, color.value)
+                )
+            finally:
+                self.settings.save = original_save
+            await pilot.pause()
+            self.assertIn("COLOR NOT SAVED", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
             self.assertEqual(status.visual_style.foreground.hex6, ERROR)
 
     async def test_only_snow_and_amber_are_selectable(self) -> None:
@@ -2971,6 +3021,127 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         cursor.hide.assert_called_once_with()
         cursor.restore.assert_called_once_with()
+
+    # ---- Clean shutdown (uConsole exit-hang regression) ------------------
+
+    async def test_normal_exit_closes_the_radio_service(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.close = Mock(wraps=radio.close)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("f4")
+            await pilot.pause()
+
+        radio.close.assert_called()
+
+    async def test_normal_exit_stops_the_radio_monitor(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            monitor = app._monitor
+            self.assertTrue(monitor.is_running)
+            await pilot.press("f4")
+            await pilot.pause()
+
+        self.assertTrue(monitor._stopped)
+        self.assertFalse(monitor.is_running)
+
+    async def test_normal_exit_stops_application_timers(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=10, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            animation_timer = app._connection_animation_timer
+            self.assertIsNotNone(animation_timer)
+            await pilot.press("f4")
+            await pilot.pause()
+
+        # Textual's own Timer has no public "is this stopped" flag, so
+        # this is proven indirectly: the app's own on_unmount explicitly
+        # calls .stop() on every one it owns (see on_unmount) -- calling
+        # it again here must remain safe/idempotent, matching Timer's
+        # own documented contract.
+        animation_timer.stop()
+
+    async def test_no_reconnect_or_auto_sync_starts_after_exit_begins(self) -> None:
+        """A stray late RadioMonitor event arriving after on_unmount has
+
+        already run must never resurrect the connection state machine
+        or trigger a new AUTO SYNC write (see _radio_event_from_thread's
+        own RuntimeError guard around a closed message pump).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            self.assertEqual(radio.sync_clock.call_count, 1)
+            await pilot.press("f4")
+            await pilot.pause()
+
+            # Simulate a monitor thread event that raced shutdown and
+            # arrived just after on_unmount ran -- must be a safe no-op.
+            app._radio_event_from_thread(RadioEvent(RadioState.ONLINE, info=radio.info))
+
+        self.assertEqual(radio.sync_clock.call_count, 1)
+
+    async def test_repeated_monitor_stop_is_idempotent(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            monitor = app._monitor
+            monitor.stop()
+            monitor.stop()
+            monitor.stop()
+            await pilot.pause()
+
+        # No exception raised by any of the repeated calls above.
+
+    async def test_auto_sync_worker_runs_on_a_daemon_thread(self) -> None:
+        """The actual shutdown-hang fix: AUTO SYNC's clock-set call runs
+
+        on a plain daemon thread (see _run_radio_worker), never through
+        Textual's run_worker(thread=True) -- whose underlying asyncio
+        default-executor job would otherwise be joined, with no
+        timeout, by asyncio.run()'s own shutdown sequence (see
+        BaseEventLoop.shutdown_default_executor()), hanging the entire
+        process if the SDK call never returns. See tests/test_shutdown.py
+        for the real process-level proof.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        started = Event()
+        blocked = Event()
+        radio.sync_clock = lambda: (started.set(), blocked.wait(2))[-1] and ClockSyncResult(
+            True, 1_700_000_000, 1_700_000_000, ""
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            self.assertTrue(started.wait(2))
+            thread = app._radio_workers.get("sync-clock")
+            self.assertIsNotNone(thread)
+            self.assertTrue(thread.daemon)
+            blocked.set()
+            await pilot.pause()
 
     async def test_chat_header_no_longer_shows_redundant_active_count(self) -> None:
         """CHAT's header used to duplicate an ACTIVE node count that
