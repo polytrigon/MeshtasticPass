@@ -47,6 +47,7 @@ from chat_store import (
     ChatStoreError,
 )
 from geo import format_distance_miles
+from host_timezone import detect_host_timezone
 from grapheme_text import install_flag_pair_protection, truncate_to_cells
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
@@ -253,10 +254,18 @@ class ThinScrollBarRender(ScrollBarRender):
 
 
 class FontSizeSelector(KeyboardDropdown):
+    """User-facing label is "UI SCALE" -- the setting_name ("font_size"),
+
+    underlying AppSettings field/JSON key, and widget id are all kept
+    as "font_size"/"font-size-*" for compatibility with already-saved
+    settings files and existing internal call sites; only the DISPLAYED
+    text changed.
+    """
+
     def __init__(self, font_size: int) -> None:
         super().__init__(
             "font_size",
-            "FONT SIZE",
+            "UI SCALE",
             (DropdownOption(name, value) for name, value in FONT_SIZE_CHOICES),
             font_size,
             widget_id="font-size-selector",
@@ -543,17 +552,22 @@ class Clock24HSelector(KeyboardDropdown):
 
 
 class AutoSyncSelector(KeyboardDropdown):
-    """A MeshtasticPass-local preference, never written to the radio --
+    """User-facing label is "CLOCK SYNC" -- the setting_name
 
-    see AppSettings.clock_auto_sync/_maybe_auto_sync_clock. Uses the
-    same dropdown grammar as every other RADIO-section control (item
-    15) even though nothing here is a localConfig field.
+    ("clock_auto_sync"), AppSettings field/JSON key, class name, and
+    widget id are all kept as "clock_auto_sync"/"auto-sync"/
+    "AutoSyncSelector" for persistence/internal compatibility; only the
+    DISPLAYED text changed. A MeshtasticPass-local preference, never
+    written to the radio -- see AppSettings.clock_auto_sync/
+    _maybe_auto_sync_clock. Uses the same dropdown grammar as every
+    other RADIO-section control even though nothing here is a
+    localConfig field.
     """
 
     def __init__(self, enabled: bool) -> None:
         super().__init__(
             "clock_auto_sync",
-            "AUTO SYNC",
+            "CLOCK SYNC",
             (DropdownOption(name, value) for name, value in AUTO_SYNC_CHOICES),
             enabled,
             widget_id="radio-auto-sync-selector",
@@ -3100,7 +3114,7 @@ class MeshtasticPassApp(App[None]):
         self._terminal_cursor.hide()
         self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
-        # FONT SIZE/COLOR are local settings, independent of the radio
+        # UI SCALE/COLOR are local settings, independent of the radio
         # connection lifecycle -- collapsed here once at startup, unlike
         # the RADIO-section per-field rows _show_connection resets on
         # every connection-state transition.
@@ -3444,12 +3458,12 @@ class MeshtasticPassApp(App[None]):
         self._set_role_status("", None)
 
     def _set_font_size_status(self, text: str, css_class: str | None) -> None:
-        """FONT SIZE's own status row -- aligned under FONT SIZE's own
+        """UI SCALE's own status row -- aligned under UI SCALE's own
 
         control/value column (CONNECTION_VALUE_COLUMN_INDENT), not the
         left label column, and collapses to zero height when empty. No
-        auto-dismiss timer: preserves FONT SIZE's existing lifetime --
-        the confirmation stays until the user changes FONT SIZE again,
+        auto-dismiss timer: preserves this row's existing lifetime --
+        the confirmation stays until the user changes UI SCALE again,
         exactly as before this row was split out of the shared STYLE
         status.
         """
@@ -3696,10 +3710,10 @@ class MeshtasticPassApp(App[None]):
                 self.settings.save()
                 self.settings.update_lxterminal_profile()
             except (OSError, ValueError) as error:
-                self._set_font_size_status(f"FONT SIZE NOT SAVED — {error}", "setting-error")
+                self._set_font_size_status(f"UI SCALE NOT SAVED — {error}", "setting-error")
             else:
                 self._set_font_size_status(
-                    "FONT SIZE SAVED - RELAUNCH TO APPLY", "setting-success"
+                    "UI SCALE SAVED - RELAUNCH TO APPLY", "setting-success"
                 )
             return
         if event.setting_name == "color":
@@ -3906,14 +3920,16 @@ class MeshtasticPassApp(App[None]):
         self._clock_sync_generation += 1
 
     def _maybe_auto_sync_clock(self) -> None:
-        """AUTO SYNC's only trigger -- at most once per qualifying
+        """CLOCK SYNC's only trigger -- at most once per qualifying
 
         connection lifecycle (see _show_connection, the only caller),
         never on tab/view/focus/render/config-snapshot activity, never
         repeated mid-lifecycle. Entirely silent (see "FINAL CLOCK UI
         SIMPLIFICATION"): no UI reflects this call either way -- it
-        simply performs RadioService.sync_clock() during connection
-        establishment. A real failure here is only ever a silent
+        performs RadioService.sync_clock() (host epoch) AND a best-
+        effort host-timezone -> device.tzdef sync (see
+        _sync_host_timezone_from_thread) during connection
+        establishment. A real failure in either is only ever a silent
         internal fact: it must never block app connection/startup (see
         _apply_sync_clock_from_thread's own try/except).
 
@@ -3949,7 +3965,69 @@ class MeshtasticPassApp(App[None]):
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
             result = ClockSyncResult(False, 0, None, f"error: {detail}")
+        self._sync_host_timezone_from_thread()
         self.post_message(ClockSyncApplied(result, generation))
+
+    def _sync_host_timezone_from_thread(self) -> None:
+        """Best-effort host-timezone -> device.tzdef sync, run from the
+
+        SAME background daemon thread as the epoch sync it always
+        follows (see _apply_sync_clock_from_thread) -- entirely silent
+        to the user (CLOCK SYNC's own contract), only ever a plain
+        diagnostic print (see rx_debug_log's own "not logging.*, a
+        lightweight opt-in-free terminal trace" precedent).
+
+        Detecting/converting the host timezone (see host_timezone.
+        detect_host_timezone) touches only the local filesystem --
+        zero Meshtastic traffic by itself, regardless of outcome. A
+        write is only ATTEMPTED when detection produced a confidently-
+        derived tzdef (never a guess from the host's current UTC
+        offset alone -- see detect_host_timezone's own docstring) AND
+        the connected schema actually declares device.tzdef
+        (read_synced_config_field is the SAME zero-RF cached
+        capability probe the manual TIMEZONE control's own render-time
+        check already uses). Detection/conversion failing, or the
+        field being unsupported, always leaves device.tzdef untouched
+        -- the epoch sync above still already happened regardless.
+
+        Reuses write_verified_config_field's existing verified write
+        -> readback -> snapshot-rebuild pipeline unchanged, so a
+        confirmed write here updates the SAME cached
+        RadioConfigurationSnapshot the TIMEZONE dropdown reads --
+        which is why a successful write also asks the main thread to
+        re-render RADIO settings below, so TIMEZONE reflects the
+        actual confirmed radio state promptly rather than only after
+        some unrelated future reconnect/redraw.
+        """
+        host = detect_host_timezone()
+        if host.tzdef is None:
+            print(f"[CLOCK SYNC] host timezone not synced: {host.detail}", flush=True)
+            return
+        if self.radio.read_synced_config_field("device", "tzdef") is None:
+            print(
+                "[CLOCK SYNC] host timezone not synced: "
+                "device.tzdef unsupported by this schema",
+                flush=True,
+            )
+            return
+        try:
+            result = self.radio.write_verified_config_field("device", "tzdef", host.tzdef)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            print(f"[CLOCK SYNC] host timezone write failed: error: {detail}", flush=True)
+            return
+        if not result.applied:
+            print(f"[CLOCK SYNC] host timezone write not applied: {result.reason}", flush=True)
+            return
+        print(
+            f"[CLOCK SYNC] host timezone synced to {host.iana_name} ({host.tzdef})",
+            flush=True,
+        )
+        try:
+            self.call_from_thread(self._render_radio_settings)
+        except RuntimeError:
+            # The UI may already be stopping while this worker finishes.
+            pass
 
     @on(ClockSyncApplied)
     def clock_sync_applied(self, event: ClockSyncApplied) -> None:

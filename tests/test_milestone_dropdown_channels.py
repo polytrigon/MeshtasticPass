@@ -53,16 +53,16 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             color = app.query_one(ColorSelector)
             device = app.query_one(DeviceSelector)
 
-            # A fresh install's default is XL (item 4: first-run default
+            # A fresh install's default is LARGE (first-run default
             # text size), not MEDIUM -- see AppSettings.DEFAULT_FONT_SIZE.
-            self.assertIn("[ XL ▾ ]", str(font.render()))
+            self.assertIn("[ LARGE ▾ ]", str(font.render()))
             await pilot.press("enter", "down", "escape")
             self.assertFalse(font.is_open)
-            self.assertEqual(font.font_size, 18)
+            self.assertEqual(font.font_size, 16)
 
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
-            self.assertEqual(font.font_size, 22)
+            self.assertEqual(font.font_size, 18)
             self.assertFalse(font.is_open)
 
             self.assertEqual(
