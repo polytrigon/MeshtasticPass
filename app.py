@@ -2840,7 +2840,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-amber #chat-input {
-        color: $amber_base;
+        color: $amber_accent2;
     }
 
     Screen.theme-amber .page-title {
@@ -3028,7 +3028,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-amber #dm-input {
-        color: $amber_base;
+        color: $amber_accent2;
     }
 
     #mesh-view {
@@ -3885,6 +3885,7 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
+                    self.query_one(HopLimitSelector),
                     self.query_one(AutoSyncSelector),
                 )
                 if not getattr(control, "disabled", False)

@@ -1520,6 +1520,130 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 5)
             self.assertIn("[ 5 ▾ ]", str(app.query_one(HopLimitSelector).render()))
 
+    # ---- HOP LIMIT keyboard-focus-chain regression (real-hardware
+    # report: the row rendered but was unreachable by UP/DOWN because
+    # HopLimitSelector was never added to on_key's own separate
+    # CONNECTION-page navigation tuple, even though it was already
+    # correctly wired into RADIO_SETTINGS/_render_radio_settings) ----
+
+    async def test_hop_limit_reachable_via_normal_up_down_navigation(self) -> None:
+        """Drives REAL settings navigation (not dropdown.focus()) to
+
+        prove the keyboard can actually land on HOP LIMIT -- the
+        previous tests above all used .focus() directly, which is
+        exactly why this reachability gap went uncaught.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(Clock24HSelector).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, HopLimitSelector)
+
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, AutoSyncSelector)
+
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, HopLimitSelector)
+
+    async def test_hop_limit_enter_opens_dropdown_from_real_navigation(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(Clock24HSelector).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            self.assertIs(app.focused, dropdown)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(dropdown.is_open)
+            self.assertEqual([o.label for o in dropdown.options], [str(n) for n in range(8)])
+
+    async def test_hop_limit_dropdown_navigation_does_not_move_settings_focus(
+        self,
+    ) -> None:
+        """Overlay key ownership (the same rule established for the
+
+        node/user menu and the CHAT header dropdowns): while HOP LIMIT
+        owns UP/DOWN, the underlying CONNECTION settings focus chain
+        must not also move.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            dropdown.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(dropdown.is_open)
+
+            await pilot.press("up", "up", "down")
+            await pilot.pause()
+            self.assertIs(app.focused, dropdown)
+            self.assertTrue(dropdown.is_open)
+
+    async def test_hop_limit_esc_closes_dropdown_with_zero_writes(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["lora"]["hop_limit"] = 3
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            dropdown = app.query_one(HopLimitSelector)
+            dropdown.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("up", "up")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(dropdown.is_open)
+            self.assertIs(app.focused, dropdown)
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 3)
+            self.assertIn("[ 3 ▾ ]", str(dropdown.render()))
+
+    async def test_focusing_and_opening_hop_limit_generates_zero_traffic(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            app.query_one(Clock24HSelector).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
     # ---- Section headers use DIM, not ACCENT ---------------------------
 
     async def test_section_headers_use_dim_not_accent(self) -> None:
@@ -1598,6 +1722,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, app.query_one(FlipScreenSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(Clock24HSelector))
+            await pilot.press("down")
+            # PR #46 final follow-up Part A: HOP LIMIT was previously
+            # missing from this exact navigation tuple even though it
+            # was already wired into RADIO_SETTINGS/compose() -- real
+            # hardware could see the row but never reach it via
+            # UP/DOWN.
+            self.assertIs(app.focused, app.query_one(HopLimitSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(AutoSyncSelector))
 

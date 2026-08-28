@@ -925,5 +925,139 @@ class DmDropdownTests(ChatDmMentionAppTestsBase):
             self.assertFalse(app.query_one(DMModeSelector).is_open)
 
 
+# ---- AMBER CHAT composer = ACCENT2 (PR #46 final follow-up Part B) -------
+
+
+class AmberComposerColorTests(ChatDmMentionAppTestsBase):
+    async def test_amber_channel_composer_uses_accent2(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._apply_color_theme("amber")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(
+                chat_input.styles.color.hex.upper(),
+                THEME_PALETTES["amber"].accent2.upper(),
+            )
+
+    async def test_amber_dm_composer_uses_accent2(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._switch_chat_mode("dms")
+            await pilot.pause()
+            app._apply_color_theme("amber")
+            await pilot.pause()
+            dm_input = app.query_one("#dm-input", Input)
+            self.assertEqual(
+                dm_input.styles.color.hex.upper(),
+                THEME_PALETTES["amber"].accent2.upper(),
+            )
+
+    async def test_amber_accent2_is_unchanged_value(self) -> None:
+        self.assertEqual(THEME_PALETTES["amber"].accent2, "#40C4FF")
+
+    async def test_no_hardcoded_hex_in_composer_css(self) -> None:
+        """Item 10: the composer rule must reference the semantic
+
+        ACCENT2 token, never a literal #40C4FF baked in specifically
+        for the input widgets (the token itself is still allowed to
+        appear once, in the CSS variable definition).
+        """
+        css = MeshtasticPassApp.CSS
+        chat_rule_start = css.index("Screen.theme-amber #chat-input")
+        chat_rule = css[chat_rule_start : chat_rule_start + 80]
+        self.assertNotIn("#40C4FF", chat_rule.upper())
+        self.assertIn("$amber_accent2", chat_rule)
+        dm_rule_start = css.index("Screen.theme-amber #dm-input")
+        dm_rule = css[dm_rule_start : dm_rule_start + 80]
+        self.assertNotIn("#40C4FF", dm_rule.upper())
+        self.assertIn("$amber_accent2", dm_rule)
+
+    async def test_snow_composer_appearance_unchanged(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(
+                chat_input.styles.color.hex.upper(),
+                THEME_PALETTES["snow"].base.upper(),
+            )
+
+    async def test_live_snow_to_amber_switch_updates_composer(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(
+                chat_input.styles.color.hex.upper(),
+                THEME_PALETTES["snow"].base.upper(),
+            )
+            app._apply_color_theme("amber")
+            await pilot.pause()
+            self.assertEqual(
+                chat_input.styles.color.hex.upper(),
+                THEME_PALETTES["amber"].accent2.upper(),
+            )
+
+    async def test_live_amber_to_snow_switch_restores_snow_appearance(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._apply_color_theme("amber")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(
+                chat_input.styles.color.hex.upper(),
+                THEME_PALETTES["amber"].accent2.upper(),
+            )
+            app._apply_color_theme("snow")
+            await pilot.pause()
+            self.assertEqual(
+                chat_input.styles.color.hex.upper(),
+                THEME_PALETTES["snow"].base.upper(),
+            )
+
+    async def test_amber_composer_keyboard_and_send_behavior_unchanged(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._apply_color_theme("amber")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.focus()
+            await pilot.press("h", "i")
+            await pilot.pause()
+            self.assertEqual(chat_input.value, "hi")
+            await pilot.press("enter")
+            for _ in range(5):
+                await pilot.pause()
+            self.assertEqual(radio.sent_texts, ["hi"])
+
+    async def test_amber_theme_switch_generates_zero_rf(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._apply_color_theme("amber")
+            await pilot.pause()
+            app._apply_color_theme("snow")
+            await pilot.pause()
+            self.assertEqual(radio.sent_texts, [])
+
+
 if __name__ == "__main__":
     unittest.main()
