@@ -149,14 +149,14 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             labels = [item.label for item in menu.items]
             self.assertEqual(
                 labels,
-                ["Alice Trail", "ALCE", "1 HOP AWAY", "REPLY", "FAVORITE"],
+                ["Alice Trail", "ALCE", "1 HOP AWAY", "REPLY", "DM", "FAVORITE"],
             )
             self.assertEqual(
                 [item.actionable for item in menu.items],
-                [False, False, False, True, True],
+                [False, False, False, True, True, True],
             )
             await pilot.press("up", "down")
-            self.assertEqual(menu.highlighted_index, 4)
+            self.assertEqual(menu.highlighted_index, 5)
             self.assertIsNotNone(menu.placement)
             assert menu.placement is not None
             self.assertLessEqual(menu.placement.y + menu.placement.height, 14)
@@ -319,7 +319,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             labels = [item.label for item in app._user_menu.items]
-            self.assertEqual(labels, ["NOLN", "2 HOPS AWAY", "REPLY", "FAVORITE"])
+            self.assertEqual(labels, ["NOLN", "2 HOPS AWAY", "REPLY", "DM", "FAVORITE"])
             await pilot.press("escape")
 
             missing_short_unknown_hops = replace(
@@ -335,7 +335,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             labels = [item.label for item in app._user_menu.items]
-            self.assertEqual(labels, ["No Short Name", "REPLY", "FAVORITE"])
+            self.assertEqual(labels, ["No Short Name", "REPLY", "DM", "FAVORITE"])
 
     async def test_right_and_end_jump_newest_without_footer_hint(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)

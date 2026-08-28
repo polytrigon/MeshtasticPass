@@ -221,6 +221,99 @@ class RealRadioSendTests(unittest.TestCase):
         self.assertEqual(status.state, DeliveryState.HEARD)
         self.assertEqual(status.packet_id, 8)
 
+    def test_dm_explicit_ack_from_the_real_destination_is_heard(self) -> None:
+        """DM ACK correlation (item 6): a clean routing response whose
+
+        "from" matches the DM's OWN destination resolves to HEARD.
+        """
+        statuses = []
+        self.interface.sendText.return_value = SimpleNamespace(id=55)
+        self.service.send_text(
+            "dm hello",
+            destination_node_id="!abcdef01",
+            status_handler=statuses.append,
+        )
+        self.assertEqual(REMOTE_NODE_NUMBER, 0xABCDEF01)
+
+        self.service._on_routing_response(
+            packet=self.routing_response(55, from_number=REMOTE_NODE_NUMBER),
+            interface=self.interface,
+        )
+
+        self.assertEqual([status.state for status in statuses], [DeliveryState.HEARD])
+        self.assertNotIn(55, self.service._pending_sends)
+
+    def test_dm_ack_from_an_unrelated_node_never_completes_as_heard(self) -> None:
+        """A clean routing response from a DIFFERENT node than the DM's
+
+        OWN destination must never complete the DM as HEARD (item 6) --
+        it carries no status at all, leaving the send pending.
+        """
+        unrelated_node_number = 0xDEAD0001
+        statuses = []
+        self.interface.sendText.return_value = SimpleNamespace(id=56)
+        self.service.send_text(
+            "dm hello",
+            destination_node_id="!abcdef01",
+            status_handler=statuses.append,
+        )
+
+        self.service._on_routing_response(
+            packet=self.routing_response(56, from_number=unrelated_node_number),
+            interface=self.interface,
+        )
+
+        self.assertEqual(statuses, [])
+        self.assertIn(56, self.service._pending_sends)
+
+        # The REAL destination's ack, arriving afterward, still resolves
+        # it correctly -- the unrelated response did not corrupt tracking.
+        self.service._on_routing_response(
+            packet=self.routing_response(56, from_number=REMOTE_NODE_NUMBER),
+            interface=self.interface,
+        )
+        self.assertEqual([status.state for status in statuses], [DeliveryState.HEARD])
+
+    def test_dm_local_implicit_ack_still_reports_sent_not_heard(self) -> None:
+        """A DM's own implicit ack (from == local node) behaves exactly
+
+        like a broadcast's: SENT, never HEARD -- the destination
+        correlation only ever STRENGTHENS the HEARD requirement, never
+        weakens the existing implicit-vs-remote distinction.
+        """
+        statuses = []
+        self.interface.sendText.return_value = SimpleNamespace(id=57)
+        self.service.send_text(
+            "dm hello",
+            destination_node_id="!abcdef01",
+            status_handler=statuses.append,
+        )
+
+        self.service._on_routing_response(
+            packet=self.routing_response(57, from_number=LOCAL_NODE_NUMBER),
+            interface=self.interface,
+        )
+
+        self.assertEqual([status.state for status in statuses], [DeliveryState.SENT])
+
+    def test_broadcast_ack_correlation_unchanged_any_remote_node_is_heard(self) -> None:
+        """Regression: a BROADCAST send (no destination) must keep its
+
+        existing "any non-local responder is HEARD" behavior -- the new
+        destination-specific requirement only applies when
+        expected_destination_number is not None.
+        """
+        statuses = []
+        self.interface.sendText.return_value = SimpleNamespace(id=58)
+        self.service.send_text("broadcast hello", status_handler=statuses.append)
+
+        self.service._on_routing_response(
+            packet=self.routing_response(58, from_number=0x99999999),
+            interface=self.interface,
+        )
+
+        self.assertEqual([status.state for status in statuses], [DeliveryState.HEARD])
+
     def test_local_cache_alone_cannot_produce_heard(self) -> None:
         """Calling send_text() and having it return successfully must
 

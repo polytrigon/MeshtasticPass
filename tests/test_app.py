@@ -526,7 +526,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         assert its exact order/membership directly, the same source
         _update_tab_bar() renders from.
         """
-        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh"])
+        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh", "dm"])
         self.assertNotIn("profile", TAB_NAMES)
 
     async def test_nav_bar_renders_connection_chat_mesh_with_active_count(
@@ -578,34 +578,37 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("3")
             self.assertEqual(app.current_tab, "mesh")
 
-    async def test_key_4_does_not_select_mesh_or_hidden_profile(self) -> None:
+    async def test_key_4_selects_dm_not_mesh_or_hidden_profile(self) -> None:
+        """"4" is now the legitimate DM tab (PART A item 1) -- PROFILE
+
+        remains hidden/unreachable via any digit key, unchanged.
+        """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
             await pilot.press("4")
-            self.assertEqual(app.current_tab, "connection")
+            self.assertEqual(app.current_tab, "dm")
+            self.assertNotEqual(app.current_tab, "profile")
 
             await pilot.press("2")
             self.assertEqual(app.current_tab, "chat")
             await pilot.press("escape", "4")
-            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app.current_tab, "dm")
 
-    async def test_footer_help_text_reflects_1_through_3(self) -> None:
+    async def test_footer_help_text_reflects_1_through_4(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-3", footer_text)
-            self.assertNotIn("1-4", footer_text)
+            self.assertIn("1-4", footer_text)
 
             await pilot.press("3")
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-3", footer_text)
-            self.assertNotIn("1-4", footer_text)
+            self.assertIn("1-4", footer_text)
 
     async def test_composer_hint_shows_enter_send_ctrl_e_emoji_esc_cancel(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())

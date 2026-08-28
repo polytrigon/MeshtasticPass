@@ -233,6 +233,114 @@ class ReceivedMessageTests(unittest.TestCase):
         # unsubscribe for a topic that was never joined is harmless.
         self.assertEqual(pub.unsubscribe.call_count, 4)
 
+    def test_broadcast_packet_is_never_direct(self) -> None:
+        """PART A item 3: SDK-source-verified check (__main__.py's own
+
+        DM-detection pattern) -- a broadcast packet's "to" is
+        BROADCAST_NUM (0xFFFFFFFF), never a real node number.
+        """
+        interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=0x51A00001))
+        packet = {
+            "from": 0xABC12345,
+            "to": 0xFFFFFFFF,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi all"},
+        }
+
+        message = self.service._parse_text_packet(packet, interface)
+
+        self.assertFalse(message.is_direct)
+
+    def test_packet_addressed_to_local_node_is_direct(self) -> None:
+        local_number = 0x51A00001
+        interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=local_number))
+        packet = {
+            "from": 0xABC12345,
+            "to": local_number,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "just for you"},
+        }
+
+        message = self.service._parse_text_packet(packet, interface)
+
+        self.assertTrue(message.is_direct)
+
+    def test_packet_addressed_to_someone_else_is_not_direct(self) -> None:
+        """A packet destined for a DIFFERENT node than us (e.g. sniffed
+
+        while relaying) must never be treated as a local DM.
+        """
+        local_number = 0x51A00001
+        interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=local_number))
+        packet = {
+            "from": 0xABC12345,
+            "to": 0xDEADBEEF,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "not for you"},
+        }
+
+        message = self.service._parse_text_packet(packet, interface)
+
+        self.assertFalse(message.is_direct)
+
+    def test_missing_destination_field_is_not_direct(self) -> None:
+        interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=0x51A00001))
+        packet = {
+            "from": 0xABC12345,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "no to field"},
+        }
+
+        message = self.service._parse_text_packet(packet, interface)
+
+        self.assertFalse(message.is_direct)
+
+    def test_destination_classification_survives_signed_unsigned_mismatch(self) -> None:
+        """Item 7 of the MESH FOLLOW-UP applies equally here: a node
+
+        number with bit 31 set can surface as a negative Python int
+        from one source and unsigned from another -- canonical masking
+        must still correctly recognize the match.
+        """
+        high_bit_number = 0xF0000001
+        interface = SimpleNamespace(
+            myInfo=SimpleNamespace(my_node_num=high_bit_number - (1 << 32))
+        )
+        packet = {
+            "from": 0xABC12345,
+            "to": high_bit_number,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "signed mismatch"},
+        }
+
+        message = self.service._parse_text_packet(packet, interface)
+
+        self.assertTrue(message.is_direct)
+
+    def test_dm_detection_never_uses_channel_index_as_a_heuristic(self) -> None:
+        """A packet on channel 0 (or any index) addressed to someone
+
+        else is still never a DM -- and one addressed to us is a DM
+        REGARDLESS of its channel index (item 3: never a heuristic).
+        """
+        local_number = 0x51A00001
+        interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=local_number))
+        not_a_dm = self.service._parse_text_packet(
+            {
+                "from": 1,
+                "to": 0xFFFFFFFF,
+                "channel": 0,
+                "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "broadcast ch0"},
+            },
+            interface,
+        )
+        is_a_dm = self.service._parse_text_packet(
+            {
+                "from": 1,
+                "to": local_number,
+                "channel": 3,
+                "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "dm ch3"},
+            },
+            interface,
+        )
+        self.assertFalse(not_a_dm.is_direct)
+        self.assertTrue(is_a_dm.is_direct)
+
     def test_delivers_one_clean_message_to_each_handler(self) -> None:
         handler = Mock()
         interface = SimpleNamespace(nodesByNum={}, nodes={})

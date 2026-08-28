@@ -122,6 +122,11 @@ TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
     "mesh": "MESH",
+    # No unread-count badge here (unlike CHAT's own) -- item 8: "Do not
+    # use unread counts unless actual unread state is implemented
+    # correctly", and this pass deliberately does not implement one for
+    # DM conversations.
+    "dm": "DM",
 }
 
 ANIMATED_STATUS = {
@@ -2730,6 +2735,84 @@ class MeshtasticPassApp(App[None]):
         color: $amber_base;
     }
 
+    #dm-content {
+        height: 1fr;
+    }
+
+    #dm-list {
+        height: 1fr;
+        scrollbar-size: 1 1;
+    }
+
+    .dm-list-row {
+        height: 1;
+        width: 1fr;
+        color: $snow_base;
+    }
+
+    Screen.theme-amber .dm-list-row {
+        color: $amber_base;
+    }
+
+    .dm-list-row.highlighted {
+        color: $snow_accent;
+        text-style: bold;
+    }
+
+    Screen.theme-amber .dm-list-row.highlighted {
+        color: $amber_accent;
+    }
+
+    .dm-list-empty {
+        color: $snow_dim;
+        height: 1;
+    }
+
+    Screen.theme-amber .dm-list-empty {
+        color: $amber_dim;
+    }
+
+    #dm-header {
+        height: auto;
+        min-height: 1;
+        text-style: bold;
+        color: $snow_base;
+    }
+
+    Screen.theme-amber #dm-header {
+        color: $amber_base;
+    }
+
+    #dm-log {
+        height: 1fr;
+        scrollbar-size: 1 1;
+        scrollbar-color: $snow_base;
+        scrollbar-color-hover: $snow_base;
+        scrollbar-color-active: $snow_base;
+        scrollbar-background: $snow_dim;
+        scrollbar-background-hover: $snow_dim;
+        scrollbar-background-active: $snow_dim;
+    }
+
+    Screen.theme-amber #dm-log {
+        scrollbar-color: $amber_base;
+        scrollbar-color-hover: $amber_base;
+        scrollbar-color-active: $amber_base;
+        scrollbar-background: $amber_dim;
+        scrollbar-background-hover: $amber_dim;
+        scrollbar-background-active: $amber_dim;
+    }
+
+    #dm-send-error {
+        height: auto;
+        min-height: 1;
+        color: $error;
+    }
+
+    Screen.theme-amber #dm-input {
+        color: $amber_base;
+    }
+
     #mesh-view {
         height: 1fr;
         /* Horizontal centering is applied explicitly in code as a
@@ -2979,6 +3062,18 @@ class MeshtasticPassApp(App[None]):
         border: none;
     }
 
+    #dm-input {
+        height: 1;
+        border: none;
+        padding: 0;
+        background: #101010;
+        color: $snow_base;
+    }
+
+    #dm-input:focus {
+        border: none;
+    }
+
     #chat-new-below {
         height: 1;
         color: $snow_accent;
@@ -3027,6 +3122,17 @@ class MeshtasticPassApp(App[None]):
         self.chat_history = self._channel_states[0].entries
         self.unread_count = 0
         self.transcript_new_count = 0
+        # Direct Messages are a DISTINCT conversation model from channel
+        # CHAT (item 1): a separate per-conversation state dict, keyed
+        # by the remote party's canonical node ID (never a display
+        # name -- item 2), each reusing the SAME ChannelChatState shape
+        # (entries/draft/etc.) channel CHAT already uses. current_dm_
+        # node_id is None while the DM tab shows its conversation LIST;
+        # set to a specific conversation's node ID once opened.
+        self._dm_states: dict[str, ChannelChatState] = {}
+        self.current_dm_node_id: str | None = None
+        self._dm_conversation_order: list[str] = []
+        self._dm_list_highlighted_index = 0
         self.chat_store = chat_store
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
@@ -3157,7 +3263,20 @@ class MeshtasticPassApp(App[None]):
                 with Horizontal(id="mesh-bottom-row"):
                     yield Static(id="mesh-context-status", markup=False)
                     yield Static(id="mesh-last-update", markup=False)
-        yield Static("1-3 switch tabs    F4 quit", id="footer")
+            with Vertical(id="dm", classes="tab-page"):
+                yield Static(id="dm-connection-status", classes="page-title", markup=False)
+                with ContentSwitcher(initial="dm-list", id="dm-content"):
+                    yield VerticalScroll(id="dm-list")
+                    with Vertical(id="dm-conversation"):
+                        yield Static(id="dm-header", markup=False)
+                        yield ChatTranscript(id="dm-log")
+                        yield Static(id="dm-send-error")
+                        yield ChatMessageInput(
+                            placeholder="> message",
+                            id="dm-input",
+                            select_on_focus=False,
+                        )
+        yield Static("1-4 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -3231,7 +3350,7 @@ class MeshtasticPassApp(App[None]):
         """
         if self.chat_store is None:
             return
-        for state in self._channel_states.values():
+        for state in (*self._channel_states.values(), *self._dm_states.values()):
             for entry in state.entries:
                 if not entry.outgoing or entry.delivery_state is not DeliveryState.SENDING:
                     continue
@@ -3274,6 +3393,12 @@ class MeshtasticPassApp(App[None]):
                 event.stop()
             elif self.focused.id == "chat-input" and event.key == "up":
                 self._move_chat_focus(-1)
+                event.stop()
+            elif self.focused.id == "dm-input" and event.key == "escape":
+                self.query_one("#dm-log", ChatTranscript).focus()
+                event.stop()
+            elif self.focused.id == "dm-input" and event.key == "up":
+                self._move_dm_focus(-1)
                 event.stop()
             elif self.focused.id == "long-name-input" and event.key == "escape":
                 self.query_one(LongNameControl).cancel_edit()
@@ -3318,14 +3443,14 @@ class MeshtasticPassApp(App[None]):
             if (
                 event.is_printable
                 and event.character
-                # "1"/"2"/"3" must still reach the tab-switch dispatch
+                # "1"/"2"/"3"/"4" must still reach the tab-switch dispatch
                 # below even from CHAT's neutral state -- see
                 # tab_for_key -- or the keyboard could never leave CHAT
                 # once on it (they only ever type into the composer when
                 # it is ALREADY focused, via the isinstance(self.focused,
                 # Input) branch above, which returns before this code
                 # even runs).
-                and event.key not in ("1", "2", "3")
+                and event.key not in ("1", "2", "3", "4")
             ):
                 # Any other printable character begins composing: focus
                 # the input and insert exactly what was typed, appending
@@ -3357,6 +3482,50 @@ class MeshtasticPassApp(App[None]):
             self._open_mesh_node_menu()
             event.stop()
             return
+
+        if self.current_tab == "dm":
+            if self.current_dm_node_id is None:
+                # Conversation LIST mode: UP/DOWN move the highlight,
+                # ENTER opens the highlighted conversation. Any other
+                # key (notably the "1"-"4" tab-switch digits) falls
+                # through unhandled, exactly like CHAT's own neutral
+                # state does, so the keyboard is never trapped here.
+                if event.key in ("up", "down"):
+                    self._move_dm_list_highlight(-1 if event.key == "up" else 1)
+                    event.stop()
+                    return
+                if event.key == "enter":
+                    self._activate_dm_list_selection()
+                    event.stop()
+                    return
+            else:
+                if event.key == "escape":
+                    self._close_dm_conversation()
+                    event.stop()
+                    return
+                transcript = self.query_one("#dm-log", ChatTranscript)
+                if event.key in ("up", "down"):
+                    self._move_dm_focus(-1 if event.key == "up" else 1)
+                    event.stop()
+                    return
+                if event.key in ("pageup", "pagedown"):
+                    step = max(1, transcript.region.height - 2)
+                    transcript.scroll_relative(
+                        y=-step if event.key == "pageup" else step
+                    )
+                    event.stop()
+                    return
+                if (
+                    event.is_printable
+                    and event.character
+                    and event.key not in ("1", "2", "3", "4")
+                ):
+                    dm_input = self.query_one("#dm-input", Input)
+                    if not dm_input.disabled:
+                        self._focus_dm_composer()
+                        dm_input.insert_text_at_cursor(event.character)
+                        event.stop()
+                        return
 
         if self.current_tab == "connection" and event.key in ("up", "down"):
             controls = [
@@ -3403,6 +3572,7 @@ class MeshtasticPassApp(App[None]):
             "1": "connection",
             "2": "chat",
             "3": "mesh",
+            "4": "dm",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -3696,8 +3866,14 @@ class MeshtasticPassApp(App[None]):
     def show_tab(self, tab_id: str) -> None:
         if self.current_tab == "chat" and tab_id != "chat":
             self._mark_new_messages_read()
-            if self._emoji_picker is not None:
-                self._close_emoji_picker()
+        if self.current_tab == "dm" and tab_id != "dm":
+            self._capture_current_dm_state()
+        if self._emoji_picker is not None:
+            # Reachable only from the composer of whichever of CHAT/DM
+            # is currently active (Ctrl+E requires that Input to be
+            # focused) -- so this is correct and sufficient for both,
+            # with no tab-specific branching needed.
+            self._close_emoji_picker()
         self.current_tab = tab_id
         if tab_id == "chat":
             self._mark_unread_messages_viewed()
@@ -3735,6 +3911,17 @@ class MeshtasticPassApp(App[None]):
             # below, is what CONNECTION and CHAT already do for
             # themselves by claiming their own widget's focus.
             self.set_focus(None)
+        elif tab_id == "dm":
+            if self.current_dm_node_id is None:
+                self._refresh_dm_list()
+                self.query_one("#dm-list", VerticalScroll).focus()
+            else:
+                self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+                dm_input = self.query_one("#dm-input", Input)
+                if not dm_input.disabled:
+                    dm_input.focus()
+                else:
+                    self.query_one("#dm-log", ChatTranscript).focus()
         else:
             self.set_focus(None)
         self._update_footer()
@@ -4322,9 +4509,18 @@ class MeshtasticPassApp(App[None]):
             )
 
         try:
+            # entry.dm_node_id is None for every ordinary channel entry
+            # (its existing, unchanged behavior) -- set only for a DM
+            # entry (item 4: "Use the SDK's existing explicit-
+            # destination send path"), where RadioService.send_text
+            # forwards it as sendText's own destinationId, and also
+            # uses it to require a DM's explicit ack come specifically
+            # from THIS destination (item 6; see RadioService.
+            # _parse_send_response). Never a custom RF protocol.
             sent = self.radio.send_text(
                 entry.text,
                 channel_index=entry.channel_index,
+                destination_node_id=entry.dm_node_id,
                 status_handler=status_handler,
             )
         except RadioSendError as error:
@@ -4407,7 +4603,10 @@ class MeshtasticPassApp(App[None]):
             DeliveryState.FAILED,
             detail=event.detail,
         )
-        self._show_send_error(event.detail)
+        if event.entry.dm_node_id is not None:
+            self._show_dm_send_error(event.detail)
+        else:
+            self._show_send_error(event.detail)
 
     @on(DeliveryStatusReceived)
     def delivery_status_received(self, event: DeliveryStatusReceived) -> None:
@@ -4455,6 +4654,14 @@ class MeshtasticPassApp(App[None]):
             # silently swallow a legitimate incoming CHAT message --
             # persistence below still has to run regardless.
             pass
+        if message.is_direct:
+            # RadioService's own packet-destination classification
+            # (never a heuristic based on sender name/channel index --
+            # item 3) already decided this; route it to its own DM
+            # conversation, never mingled into channel history merely
+            # because packet.channel happens to be present (item 12).
+            self._accept_received_dm(message)
+            return
         channel_index = message.channel_index or 0
         state = self._ensure_channel_loaded(channel_index)
         app_received_at = time()
@@ -5019,8 +5226,11 @@ class MeshtasticPassApp(App[None]):
         should not normally arise -- a selected_node_id that no longer
         resolves to a working-set member or a mounted glyph widget
         (anonymous relay stages are never selectable at all; see
-        MeshRelayWidget). allow_reply=False: MESH never gains a
-        messaging/DM action from this menu.
+        MeshRelayWidget). allow_reply=False: MESH never gains
+        REPLY/@mention-into-CHAT-composer -- but DM (open/create that
+        node's own conversation, item 16) IS offered here, since
+        _open_node_menu's allow_dm defaults to True and MESH does not
+        override it.
         """
         view = self.query_one(MeshTopologyView)
         node_id = view.selected_node_id
@@ -5156,7 +5366,7 @@ class MeshtasticPassApp(App[None]):
         as always.
         """
         targets: list[Static | ChatEntryWidget] = []
-        transcript = self.query_one(ChatTranscript)
+        transcript = self.query_one("#chat-log", ChatTranscript)
         for widget in transcript.walk_children():
             if isinstance(widget, MessageActionControl):
                 if widget.display and widget.action == "resend":
@@ -5328,19 +5538,385 @@ class MeshtasticPassApp(App[None]):
         chat_input.focus()
         chat_input.cursor_position = len(chat_input.value)
 
+    # --- Direct Messages -------------------------------------------------
+    #
+    # A DM conversation is a DISTINCT model from channel CHAT (item 1),
+    # keyed entirely by the remote party's stable node ID (item 2) --
+    # never a display name. Deliberately reuses ChatEntryWidget/
+    # ChatTranscript/ChatMessageInput/the delivery-state pipeline/
+    # _rebroadcast (all already generic over a ChatEntry) rather than a
+    # second, divergent widget tree; the conversation LIST/transcript
+    # navigation below is its own, simpler model (no "load older"
+    # pagination or unread-count badges in this first pass -- see item 8
+    # and the completion report).
+
+    def _dm_state_for(self, node_id: str) -> ChannelChatState:
+        return self._dm_states.setdefault(node_id, ChannelChatState())
+
+    def _ensure_dm_loaded(self, node_id: str) -> ChannelChatState:
+        state = self._dm_state_for(node_id)
+        if state.loaded:
+            return state
+        state.loaded = True
+        if self.chat_store is None:
+            return state
+        try:
+            page = self.chat_store.load_recent_dm_page(
+                node_id, limit=DEFAULT_HISTORY_LIMIT
+            )
+        except ChatStoreError as error:
+            self._show_dm_send_error(str(error))
+            return state
+        state.entries.extend(stored_chat_entry(stored) for stored in page.messages)
+        return state
+
+    def _capture_current_dm_state(self) -> None:
+        if self.current_dm_node_id is None:
+            return
+        state = self._dm_state_for(self.current_dm_node_id)
+        dm_inputs = list(self.query("#dm-input"))
+        if dm_inputs:
+            state.draft = dm_inputs[0].value
+
+    def _dm_display_name(
+        self, node_id: str, long_name: str | None, short_name: str | None
+    ) -> str:
+        if long_name and short_name and long_name != short_name:
+            return f"{long_name} ({short_name})"
+        return long_name or short_name or node_id
+
+    def _dm_identity(self, node_id: str) -> tuple[str | None, str | None]:
+        """Best-known LONG NAME/SHORT NAME for a DM party -- the SAME
+
+        zero-RF NodeDB lookup open_user_menu already uses, falling back
+        to whatever name this conversation's own most recent message
+        carried (real evidence too, just possibly older) when NodeDB
+        currently has nothing.
+        """
+        long_name = short_name = None
+        getter = getattr(self.radio, "get_node_metadata", None)
+        if callable(getter):
+            try:
+                metadata = getter(node_id)
+            except Exception:
+                metadata = None
+            if isinstance(metadata, NodeMetadata):
+                long_name = metadata.long_name
+                short_name = metadata.short_name
+        if not long_name and not short_name:
+            state = self._dm_states.get(node_id)
+            if state is not None:
+                for entry in reversed(state.entries):
+                    if not entry.outgoing:
+                        long_name = entry.sender_name
+                        short_name = entry.sender_short_name
+                        break
+        return long_name, short_name
+
+    def _refresh_dm_list(self) -> None:
+        """Rebuild the conversation list from persisted history -- zero
+
+        RF traffic (get_node_metadata is a cached NodeDB read; see
+        RadioService.get_node_metadata). Sorted by most-recent activity
+        (item 8), never by name.
+        """
+        try:
+            conversations = (
+                self.chat_store.list_dm_conversations()
+                if self.chat_store is not None
+                else []
+            )
+        except ChatStoreError as error:
+            self._show_dm_send_error(str(error))
+            conversations = []
+        self._dm_conversation_order = [node_id for node_id, _time in conversations]
+        self._dm_list_highlighted_index = min(
+            self._dm_list_highlighted_index, max(0, len(self._dm_conversation_order) - 1)
+        )
+        list_container = self.query_one("#dm-list", VerticalScroll)
+        list_container.remove_children()
+        if not self._dm_conversation_order:
+            list_container.mount(
+                Static("No DM conversations yet.", classes="dm-list-empty", markup=False)
+            )
+            return
+        rows = []
+        for index, node_id in enumerate(self._dm_conversation_order):
+            long_name, short_name = self._dm_identity(node_id)
+            label = self._dm_display_name(node_id, long_name, short_name)
+            row = Static(f"{label}  {node_id}", classes="dm-list-row", markup=False)
+            row.set_class(index == self._dm_list_highlighted_index, "highlighted")
+            rows.append(row)
+        list_container.mount(*rows)
+
+    def _move_dm_list_highlight(self, direction: int) -> None:
+        if not self._dm_conversation_order:
+            return
+        self._dm_list_highlighted_index = (
+            self._dm_list_highlighted_index + direction
+        ) % len(self._dm_conversation_order)
+        rows = list(self.query("#dm-list .dm-list-row"))
+        for index, row in enumerate(rows):
+            row.set_class(index == self._dm_list_highlighted_index, "highlighted")
+        if 0 <= self._dm_list_highlighted_index < len(rows):
+            rows[self._dm_list_highlighted_index].scroll_visible(animate=False)
+
+    def _activate_dm_list_selection(self) -> None:
+        if not self._dm_conversation_order:
+            return
+        index = min(self._dm_list_highlighted_index, len(self._dm_conversation_order) - 1)
+        node_id = self._dm_conversation_order[index]
+        long_name, short_name = self._dm_identity(node_id)
+        self._open_dm_conversation(node_id, long_name=long_name, short_name=short_name)
+
+    def open_dm(
+        self,
+        node_id: str,
+        *,
+        long_name: str | None = None,
+        short_name: str | None = None,
+    ) -> None:
+        """Public DM entry point: open/create this node's conversation and
+
+        switch to the DM tab -- used by the CHAT sender menu and the
+        MESH node menu (item 7/16), and directly by tests.
+        """
+        self.show_tab("dm")
+        self._open_dm_conversation(node_id, long_name=long_name, short_name=short_name)
+
+    def _open_dm_conversation(
+        self,
+        node_id: str,
+        *,
+        long_name: str | None,
+        short_name: str | None,
+    ) -> None:
+        if self.current_dm_node_id == node_id:
+            self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+            return
+        self._capture_current_dm_state()
+        state = self._ensure_dm_loaded(node_id)
+        self.current_dm_node_id = node_id
+        self.query_one("#dm-header", Static).update(
+            self._dm_header_text(node_id, long_name, short_name)
+        )
+        transcript = self.query_one("#dm-log", ChatTranscript)
+        transcript.remove_children()
+        widgets = [self._chat_entry_widget(entry) for entry in state.entries]
+        if widgets:
+            transcript.mount(*widgets)
+        dm_input = self.query_one("#dm-input", Input)
+        dm_input.value = state.draft
+        dm_input.cursor_position = len(state.draft)
+        self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+        self._update_tab_bar()
+        self.call_after_refresh(transcript.scroll_end, animate=False)
+        if not dm_input.disabled:
+            self.call_after_refresh(dm_input.focus)
+
+    def _dm_header_text(
+        self, node_id: str, long_name: str | None, short_name: str | None
+    ) -> str:
+        display_name = self._dm_display_name(node_id, long_name, short_name)
+        if display_name == node_id:
+            return f"DM / {node_id}"
+        return f"DM / {display_name} / {node_id}"
+
+    def _close_dm_conversation(self) -> None:
+        self._capture_current_dm_state()
+        self.current_dm_node_id = None
+        self.query_one("#dm-content", ContentSwitcher).current = "dm-list"
+        self._refresh_dm_list()
+        list_container = self.query_one("#dm-list", VerticalScroll)
+        list_container.focus()
+        self._update_tab_bar()
+
+    def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
+        targets: list[Static | ChatEntryWidget] = []
+        transcript = self.query_one("#dm-log", ChatTranscript)
+        for widget in transcript.walk_children():
+            if isinstance(widget, MessageActionControl):
+                if widget.display and widget.action == "resend":
+                    targets.append(widget)
+                continue
+            if (
+                isinstance(widget, ChatEntryWidget)
+                and widget.display
+                and not can_manual_resend(widget.entry)
+            ):
+                targets.append(widget)
+        return targets
+
+    def _move_dm_focus(self, direction: int) -> None:
+        targets = self._dm_navigation_targets()
+        if not targets:
+            if direction > 0:
+                self._focus_dm_composer()
+            return
+        try:
+            index = targets.index(self.focused)
+            next_index = index + direction
+            if direction > 0 and next_index >= len(targets):
+                self._focus_dm_composer()
+                return
+            target = targets[max(0, min(len(targets) - 1, next_index))]
+        except ValueError:
+            if direction > 0:
+                self._focus_dm_composer()
+                return
+            target = targets[-1]
+        target.focus()
+        target.scroll_visible(animate=False)
+
+    def _focus_dm_composer(self) -> None:
+        dm_input = self.query_one("#dm-input", Input)
+        if dm_input.disabled:
+            return
+        dm_input.focus()
+        dm_input.cursor_position = len(dm_input.value)
+
+    def _show_dm_send_error(self, message: str) -> None:
+        widgets = list(self.query("#dm-send-error"))
+        if widgets:
+            widgets[0].update(message)
+
+    def _start_dm_outgoing(self, node_id: str, text: str) -> ChatEntry:
+        state = self._dm_state_for(node_id)
+        entry = outgoing_chat_entry(
+            text,
+            dm_node_id=node_id,
+            delivery_state=DeliveryState.SENDING,
+        )
+        entry.send_generation = 1
+        self._assign_arrival_order(entry)
+        self._persist_outgoing(entry)
+        state.entries.append(entry)
+        if self.current_dm_node_id == node_id:
+            transcript = self.query_one("#dm-log", ChatTranscript)
+            transcript.mount(self._chat_entry_widget(entry))
+            transcript.scroll_end(animate=False)
+            dm_input = self.query_one("#dm-input", Input)
+            dm_input.value = ""
+            self._show_dm_send_error("")
+        return entry
+
+    @on(Input.Submitted, "#dm-input")
+    def dm_input_submitted(self, event: Input.Submitted) -> None:
+        if self.current_dm_node_id is None or self._radio_state is not RadioState.ONLINE:
+            return
+        text = event.value
+        if not text.strip():
+            self._show_dm_send_error("Message text cannot be empty.")
+            return
+        entry = self._start_dm_outgoing(self.current_dm_node_id, text)
+        generation = entry.send_generation
+        self.run_worker(
+            lambda: self._send_from_thread(entry, generation),
+            thread=True,
+        )
+
+    @on(Input.Changed, "#dm-input")
+    def dm_input_changed(self, _event: Input.Changed) -> None:
+        self._show_dm_send_error("")
+
+    def _accept_received_dm(self, message: ReceivedMessage) -> None:
+        """Route an incoming DM to its own conversation -- NEVER mingled
+
+        into channel history merely because packet.channel is present
+        (item 12): this is only reached when RadioService's own
+        packet-destination classification (message.is_direct) already
+        said so (see _accept_received_message).
+        """
+        node_id = message.sender_node_id
+        state = self._ensure_dm_loaded(node_id)
+        entry = received_chat_entry(
+            message,
+            app_received_at=time(),
+            monotonic_now=monotonic(),
+            is_new=True,
+        )
+        self._assign_arrival_order(entry)
+        inserted = self._persist_incoming(entry)
+        if not inserted:
+            return
+        state.entries.append(entry)
+        is_open = self.current_tab == "dm" and self.current_dm_node_id == node_id
+        if is_open:
+            transcript = self.query_one("#dm-log", ChatTranscript)
+            transcript.mount(self._chat_entry_widget(entry))
+            transcript.scroll_end(animate=False)
+        if self.current_tab == "dm" and self.current_dm_node_id is None:
+            self._refresh_dm_list()
+
+    def _reposition_dm_entry(self, entry: ChatEntry) -> None:
+        if entry.dm_node_id is None:
+            return
+        state = self._dm_states.get(entry.dm_node_id)
+        if state is None or entry not in state.entries:
+            return
+        state.entries.remove(entry)
+        self._insert_entry_in_order(state.entries, entry)
+        if self.current_dm_node_id != entry.dm_node_id or self.current_tab != "dm":
+            return
+        widget = next(
+            (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
+            None,
+        )
+        if widget is not None:
+            transcript = self.query_one("#dm-log", ChatTranscript)
+            others = [
+                candidate
+                for candidate in transcript.query(ChatEntryWidget)
+                if candidate is not widget
+            ]
+            if others:
+                transcript.move_child(widget, after=others[-1])
+
+    def _delete_dm_entry(self, entry: ChatEntry) -> None:
+        """DEL for a DM message: local history deletion only, zero RF
+
+        traffic -- mirrors _delete_chat_entry's own guarantees, simpler
+        focus restoration (DM's own navigation model has no vertical
+        LEFT/RIGHT power-navigation to preserve).
+        """
+        if not can_manual_resend(entry) or entry.dm_node_id is None:
+            return
+        state = self._dm_states.get(entry.dm_node_id)
+        entry.deleted = True
+        if entry.packet_id is not None:
+            pending_sends = getattr(self.radio, "_pending_sends", None)
+            if isinstance(pending_sends, dict):
+                pending_sends.pop(entry.packet_id, None)
+        if state is not None and entry in state.entries:
+            state.entries.remove(entry)
+        if entry.message_id is not None and self.chat_store is not None:
+            try:
+                self.chat_store.delete_message(entry.message_id)
+            except ChatStoreError as error:
+                self._show_dm_send_error(str(error))
+        for widget in list(self.query(ChatEntryWidget)):
+            if widget.entry is entry:
+                widget.remove()
+                break
+        self._focus_dm_composer()
+
     @on(MessageActionControl.Activated)
     def message_action_activated(
         self,
         event: MessageActionControl.Activated,
     ) -> None:
+        entry = event.action_control.entry
         if event.action_control.action == "resend":
-            self._rebroadcast(event.action_control.entry)
+            self._rebroadcast(entry)
             for widget in self.query(ChatEntryWidget):
-                if widget.entry is event.action_control.entry:
+                if widget.entry is entry:
                     widget.focus()
                     break
         elif event.action_control.action == "delete":
-            self._delete_chat_entry(event.action_control.entry)
+            if entry.dm_node_id is not None:
+                self._delete_dm_entry(entry)
+            else:
+                self._delete_chat_entry(entry)
 
     def _delete_chat_entry(self, entry: ChatEntry) -> None:
         """DEL: permanently remove one LOCAL outgoing entry -- never the
@@ -5416,7 +5992,7 @@ class MeshtasticPassApp(App[None]):
                 return
             self._focus_chat_composer()
             return
-        self.query_one(ChatTranscript).focus()
+        self.query_one("#chat-log", ChatTranscript).focus()
 
     @on(ChatEntryWidget.UserMenuRequested)
     def open_user_menu(self, event: ChatEntryWidget.UserMenuRequested) -> None:
@@ -5441,6 +6017,14 @@ class MeshtasticPassApp(App[None]):
         entry = event.widget.entry
         if entry.outgoing or not entry.node_id:
             return
+        if entry.dm_node_id is not None:
+            # Inside a DM's own transcript, the person you're already
+            # 1:1 with is unambiguous (see the DM header) -- REPLY's
+            # @mention exists to disambiguate a sender in a multi-person
+            # CHANNEL, which does not apply here, so this menu is simply
+            # not offered on a DM message (item 9: "reply insertion if
+            # it makes sense inside a 1:1 conversation" -- it does not).
+            return
         metadata = NodeMetadata(
             entry.node_id,
             entry.author,
@@ -5460,12 +6044,13 @@ class MeshtasticPassApp(App[None]):
                     current.hops_away,
                     current.last_heard,
                     current.is_local,
+                    is_unmessagable=current.is_unmessagable,
                 )
 
         self._open_node_menu(
             metadata,
             event.widget,
-            self.query_one(ChatTranscript),
+            self.query_one("#chat-log", ChatTranscript),
         )
 
     def _open_node_menu(
@@ -5476,17 +6061,24 @@ class MeshtasticPassApp(App[None]):
         *,
         include_rx_age: bool = False,
         allow_reply: bool = True,
+        allow_dm: bool = True,
     ) -> None:
         """Open the shared CHAT/MESH node-details menu.
 
         allow_reply defaults to True, preserving CHAT's existing
         REPLY-then-@mention gesture unchanged. MESH's own call site
-        passes allow_reply=False: the MESH VIEW PASS deliberately
-        keeps the node-options menu to informational rows plus
-        FAVORITE, with no messaging/DM action (DM does not exist in
-        this app) -- everything else about this shared menu (name/
-        hops rows, FAVORITE toggle, highlight/placement behavior)
-        stays exactly as CHAT already uses it.
+        passes allow_reply=False: within MESH, the node-options menu
+        deliberately never gains a REPLY-into-CHAT-composer action --
+        everything else about this shared menu (name/hops rows,
+        FAVORITE toggle, highlight/placement behavior) stays exactly
+        as CHAT already uses it.
+
+        allow_dm defaults to True; DM (open/create that node's Direct
+        Message conversation) is offered for any remote node UNLESS the
+        caller passes allow_dm=False or the node's own NodeDB metadata
+        says it cannot receive messages (metadata.is_unmessagable --
+        see RadioService/NodeMetadata). Never offered for YOU (the
+        is_local branch below has no actionable rows at all).
         """
 
         items: list[PopupItem] = []
@@ -5524,6 +6116,8 @@ class MeshtasticPassApp(App[None]):
         else:
             if allow_reply:
                 items.append(PopupItem("REPLY", "reply", actionable=True))
+            if allow_dm and not metadata.is_unmessagable:
+                items.append(PopupItem("DM", "dm", actionable=True))
             favorite = self.settings.is_favorite(metadata.node_id)
             action = "unfavorite" if favorite else "favorite"
             items.append(PopupItem(action.upper(), action, actionable=True))
@@ -5562,6 +6156,14 @@ class MeshtasticPassApp(App[None]):
         """
         if action == "reply":
             self._activate_reply(metadata)
+            return
+        if action == "dm":
+            self._close_user_menu(restore_focus=False)
+            self.open_dm(
+                metadata.node_id,
+                long_name=metadata.long_name,
+                short_name=metadata.short_name,
+            )
             return
         self._activate_node_action(metadata.node_id, action)
 
@@ -5908,6 +6510,7 @@ class MeshtasticPassApp(App[None]):
                 origin_sent_at=entry.origin_sent_at,
                 radio_rx_at=entry.radio_rx_at,
                 received_at=entry.app_received_at,
+                dm_node_id=entry.dm_node_id,
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -5924,6 +6527,7 @@ class MeshtasticPassApp(App[None]):
                 channel_index=entry.channel_index,
                 local_sent_at=entry.local_sent_at or entry.app_received_at,
                 delivery_state=(entry.delivery_state or DeliveryState.SENDING).value,
+                dm_node_id=entry.dm_node_id,
             )
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
@@ -6034,7 +6638,10 @@ class MeshtasticPassApp(App[None]):
                 self.chat_store.update_message_chronology(entry.message_id, wall_now)
             except ChatStoreError as error:
                 self._show_send_error(str(error))
-        self._reposition_chat_entry(entry)
+        if entry.dm_node_id is not None:
+            self._reposition_dm_entry(entry)
+        else:
+            self._reposition_chat_entry(entry)
 
     def _reposition_chat_entry(self, entry: ChatEntry) -> None:
         """Move `entry` (and its mounted widget, if any) to the list
@@ -6104,11 +6711,17 @@ class MeshtasticPassApp(App[None]):
             text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
         elif self.current_tab == "chat":
             text = "↑↓ navigate    C channel    ENTER action    F4 quit"
+        elif self.current_tab == "dm" and isinstance(self.focused, Input):
+            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
+        elif self.current_tab == "dm" and self.current_dm_node_id is None:
+            text = "↑↓ select    ENTER open    1-4 tabs    F4 quit"
+        elif self.current_tab == "dm":
+            text = "↑↓ navigate    ENTER action    ESC back    F4 quit"
         else:
             text = (
-                "↑↓←→ select    1-3 tabs    F4 quit"
+                "↑↓←→ select    1-4 tabs    F4 quit"
                 if self.current_tab == "mesh"
-                else "1-3 switch tabs    F4 quit"
+                else "1-4 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 
@@ -6259,6 +6872,9 @@ class MeshtasticPassApp(App[None]):
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
             chat_inputs[0].disabled = self._radio_state is not RadioState.ONLINE
+        dm_inputs = list(self.query("#dm-input"))
+        if dm_inputs:
+            dm_inputs[0].disabled = self._radio_state is not RadioState.ONLINE
         self._render_chat_status()
 
         selectors = list(self.query(ChannelSelector))
@@ -6266,12 +6882,19 @@ class MeshtasticPassApp(App[None]):
             selectors[0].set_status_override(self._connection_status_rich_text())
 
         status_rich_text = self._connection_status_rich_text()
+        dm_status_widgets = list(self.query("#dm-connection-status"))
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:
                 widget = mesh_status_widgets[0]
                 widget.update(status_rich_text)
                 widget.display = True
+            if dm_status_widgets:
+                widget = dm_status_widgets[0]
+                widget.update(status_rich_text)
+                widget.display = True
+        elif dm_status_widgets:
+            dm_status_widgets[0].display = False
 
     def _update_mesh_status_line(
         self, working_set: tuple[MeshNodeState, ...], now: float

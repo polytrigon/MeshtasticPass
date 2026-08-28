@@ -9,7 +9,7 @@ import sqlite3
 from threading import RLock
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
 
@@ -34,6 +34,15 @@ class StoredMessage:
     local_sent_at: float | None
     delivery_state: str | None
     created_at: float
+    # The remote party's canonical node ID for a Direct Message row --
+    # NULL for an ordinary channel/broadcast row. Set identically for
+    # BOTH directions of one DM conversation (the sender for incoming,
+    # the destination for outgoing), so a conversation is always keyed
+    # by this single stable value, never by channel_index (see item 2:
+    # DM identity must never be a display name). channel_index is still
+    # populated on a DM row (0) but carries no meaning there -- every
+    # DM query filters by dm_node_id, never channel_index.
+    dm_node_id: str | None = None
 
     @property
     def message_time(self) -> float | None:
@@ -187,15 +196,21 @@ class ChatStore:
         radio_rx_at: float | None,
         received_at: float,
         origin_sent_at: float | None = None,
+        dm_node_id: str | None = None,
     ) -> InsertResult:
-        """Persist one incoming packet, deduplicating stable packet identities."""
+        """Persist one incoming packet, deduplicating stable packet identities.
+
+        `dm_node_id` set (to the sender's own canonical ID) marks this
+        row as belonging to a Direct Message conversation rather than a
+        channel -- see StoredMessage.dm_node_id.
+        """
         created_at = received_at
         sql = """
             INSERT OR IGNORE INTO messages (
                 direction, packet_id, node_id, sender_name, sender_short_name,
                 channel_index, text, origin_sent_at, radio_rx_at, received_at, local_sent_at,
-                delivery_state, created_at
-            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                delivery_state, created_at, dm_node_id
+            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
         """
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -211,6 +226,7 @@ class ChatStore:
                     radio_rx_at,
                     received_at,
                     created_at,
+                    dm_node_id,
                 ),
             )
             if cursor.rowcount:
@@ -219,9 +235,9 @@ class ChatStore:
                 """
                 SELECT id FROM messages
                 WHERE direction = 'incoming' AND node_id = ?
-                    AND packet_id = ? AND channel_index = ?
+                    AND packet_id = ? AND channel_index = ? AND dm_node_id IS ?
                 """,
-                (node_id, packet_id, channel_index),
+                (node_id, packet_id, channel_index, dm_node_id),
             ).fetchone()
             if row is None:
                 raise ChatStoreError("Incoming message was not stored.")
@@ -234,6 +250,7 @@ class ChatStore:
         channel_index: int,
         local_sent_at: float,
         delivery_state: str,
+        dm_node_id: str | None = None,
     ) -> int:
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -241,8 +258,8 @@ class ChatStore:
                 INSERT INTO messages (
                     direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
-                    received_at, local_sent_at, delivery_state, created_at
-                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
+                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel_index,
@@ -251,6 +268,7 @@ class ChatStore:
                     local_sent_at,
                     delivery_state,
                     local_sent_at,
+                    dm_node_id,
                 ),
             )
             return int(cursor.lastrowid)
@@ -363,10 +381,10 @@ class ChatStore:
                     """
                     SELECT id, direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
-                    received_at, local_sent_at, delivery_state, created_at
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
                     FROM (
                         SELECT * FROM messages
-                        WHERE channel_index = ?
+                        WHERE channel_index = ? AND dm_node_id IS NULL
                         ORDER BY
                             COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
                             received_at DESC,
@@ -414,6 +432,7 @@ class ChatStore:
                     FROM messages
                     WHERE direction = 'incoming'
                         AND node_id IS NOT NULL
+                        AND dm_node_id IS NULL
                         AND COALESCE(origin_sent_at, radio_rx_at) IS NOT NULL
                     GROUP BY LOWER(node_id)
                     """
@@ -459,9 +478,10 @@ class ChatStore:
                     )
                     SELECT messages.id, direction, packet_id, node_id, sender_name,
                         sender_short_name, messages.channel_index, text, origin_sent_at,
-                        radio_rx_at, received_at, local_sent_at, delivery_state, created_at
+                        radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
+                        dm_node_id
                     FROM messages CROSS JOIN cursor
-                    WHERE messages.channel_index = ? AND (
+                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL AND (
                         COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
                             < cursor.order_time
                         OR (
@@ -497,6 +517,167 @@ class ChatStore:
             tuple(StoredMessage(**dict(row)) for row in selected),
             has_older,
         )
+
+    def load_recent_dm_page(
+        self,
+        dm_node_id: str,
+        limit: int = DEFAULT_HISTORY_LIMIT,
+    ) -> HistoryPage:
+        """Load the newest bounded page of ONE DM conversation, keyed
+
+        entirely by the remote party's stable node ID -- never
+        channel_index, which carries no meaning on a DM row (see
+        StoredMessage.dm_node_id). Mirrors load_recent_page's own
+        ordering/paging contract exactly.
+        """
+        self._validate_history_limit(limit)
+        try:
+            with self._lock:
+                self._ensure_open()
+                rows = self._connection.execute(
+                    """
+                    SELECT id, direction, packet_id, node_id, sender_name,
+                    sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
+                    FROM (
+                        SELECT * FROM messages
+                        WHERE dm_node_id = ?
+                        ORDER BY
+                            COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
+                            received_at DESC,
+                            id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY
+                        COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) ASC,
+                        received_at ASC,
+                        id ASC
+                    """,
+                    (dm_node_id, limit + 1),
+                ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(f"Could not load DM history: {error}") from error
+        has_older = len(rows) > limit
+        selected = rows[-limit:]
+        return HistoryPage(
+            tuple(StoredMessage(**dict(row)) for row in selected),
+            has_older,
+        )
+
+    def load_older_dm_page(
+        self,
+        before_message_id: int,
+        dm_node_id: str,
+        limit: int = OLDER_HISTORY_PAGE_SIZE,
+    ) -> HistoryPage:
+        """Load a bounded page immediately older than a stable message ID,
+
+        within ONE DM conversation. Mirrors load_older_page's own cursor
+        contract, keyed by dm_node_id instead of channel_index.
+        """
+        if (
+            isinstance(before_message_id, bool)
+            or not isinstance(before_message_id, int)
+            or before_message_id <= 0
+        ):
+            raise ValueError("Message cursor must be a positive integer.")
+        self._validate_history_limit(limit)
+        try:
+            with self._lock:
+                self._ensure_open()
+                rows = self._connection.execute(
+                    """
+                    WITH cursor AS (
+                        SELECT
+                            COALESCE(
+                                origin_sent_at, radio_rx_at, local_sent_at, received_at
+                            ) AS order_time,
+                            received_at AS cursor_received_at,
+                            id AS cursor_id
+                        FROM messages
+                        WHERE id = ? AND dm_node_id = ?
+                    )
+                    SELECT messages.id, direction, packet_id, node_id, sender_name,
+                        sender_short_name, messages.channel_index, text, origin_sent_at,
+                        radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
+                        dm_node_id
+                    FROM messages CROSS JOIN cursor
+                    WHERE messages.dm_node_id = ? AND (
+                        COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
+                            < cursor.order_time
+                        OR (
+                            COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
+                                = cursor.order_time
+                            AND received_at < cursor.cursor_received_at
+                        )
+                        OR (
+                            COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
+                                = cursor.order_time
+                            AND received_at = cursor.cursor_received_at
+                            AND messages.id < cursor.cursor_id
+                        )
+                    )
+                    ORDER BY
+                        COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
+                        received_at DESC,
+                        id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        before_message_id,
+                        dm_node_id,
+                        dm_node_id,
+                        limit + 1,
+                    ),
+                ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(f"Could not load older DM history: {error}") from error
+        has_older = len(rows) > limit
+        selected = list(reversed(rows[:limit]))
+        return HistoryPage(
+            tuple(StoredMessage(**dict(row)) for row in selected),
+            has_older,
+        )
+
+    def list_dm_conversations(self) -> list[tuple[str, float]]:
+        """Return (dm_node_id, latest_message_time) for every DM
+
+        conversation with at least one persisted message, sorted by
+        most-recent activity descending (item 8's own preferred sort).
+        `latest_message_time` matches each row's own StoredMessage.
+        message_time precedence (outgoing: local_sent_at; incoming:
+        origin_sent_at, else radio_rx_at, else received_at as a last
+        resort) taken as a MAX over the whole conversation -- never
+        loads message rows into memory.
+        """
+        try:
+            with self._lock:
+                self._ensure_open()
+                rows = self._connection.execute(
+                    """
+                    SELECT
+                        dm_node_id,
+                        MAX(
+                            CASE
+                                WHEN direction = 'outgoing' THEN
+                                    COALESCE(local_sent_at, received_at)
+                                ELSE
+                                    COALESCE(origin_sent_at, radio_rx_at, received_at)
+                            END
+                        ) AS latest_message_time
+                    FROM messages
+                    WHERE dm_node_id IS NOT NULL
+                    GROUP BY dm_node_id
+                    ORDER BY latest_message_time DESC
+                    """
+                ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(f"Could not list DM conversations: {error}") from error
+        return [
+            (str(row["dm_node_id"]), float(row["latest_message_time"]))
+            for row in rows
+            if str(row["dm_node_id"]).strip()
+        ]
 
     def load_oldest_incoming_by_ids(
         self,
@@ -605,12 +786,9 @@ class ChatStore:
                         received_at REAL NOT NULL,
                         local_sent_at REAL,
                         delivery_state TEXT,
-                        created_at REAL NOT NULL
+                        created_at REAL NOT NULL,
+                        dm_node_id TEXT
                     );
-
-                    CREATE UNIQUE INDEX IF NOT EXISTS incoming_packet_identity
-                    ON messages(node_id, packet_id, channel_index)
-                    WHERE direction = 'incoming' AND packet_id IS NOT NULL;
 
                     CREATE TABLE IF NOT EXISTS send_attempts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -627,38 +805,82 @@ class ChatStore:
                     "SELECT version FROM schema_version LIMIT 1"
                 ).fetchone()
                 if row is None:
+                    # A brand-new database: the executescript CREATE TABLE
+                    # above already has every column/index this version
+                    # needs, so there is nothing to migrate.
                     connection.execute(
                         "INSERT INTO schema_version(version) VALUES (?)",
                         (SCHEMA_VERSION,),
                     )
-                elif int(row["version"]) == 1:
+                else:
+                    current_version = int(row["version"])
+                    if current_version not in (1, 2, SCHEMA_VERSION):
+                        raise ChatStoreError(
+                            f"Unsupported CHAT schema version {current_version}."
+                        )
                     columns = {
                         column["name"]
                         for column in connection.execute(
                             "PRAGMA table_info(messages)"
                         ).fetchall()
                     }
-                    if "origin_sent_at" not in columns:
+                    if current_version <= 1 and "origin_sent_at" not in columns:
                         connection.execute(
                             "ALTER TABLE messages ADD COLUMN origin_sent_at REAL"
                         )
-                    connection.execute(
-                        "UPDATE schema_version SET version = ?",
-                        (SCHEMA_VERSION,),
-                    )
-                elif int(row["version"]) != SCHEMA_VERSION:
-                    raise ChatStoreError(
-                        f"Unsupported CHAT schema version {row['version']}."
-                    )
-                # Only after any v1->v2 migration above is origin_sent_at
-                # guaranteed to exist on every database this app has ever
-                # created, so this index (which references it) is created
-                # last rather than in the main script above.
+                    if current_version <= 2 and "dm_node_id" not in columns:
+                        # v2 -> v3: add DM conversation identity. Existing
+                        # rows get dm_node_id = NULL, which is exactly
+                        # "this is a channel message" -- every existing
+                        # channel history row is preserved unchanged and
+                        # stays correctly excluded from every DM query.
+                        connection.execute(
+                            "ALTER TABLE messages ADD COLUMN dm_node_id TEXT"
+                        )
+                    if current_version != SCHEMA_VERSION:
+                        connection.execute(
+                            "UPDATE schema_version SET version = ?",
+                            (SCHEMA_VERSION,),
+                        )
+                # Only after any migration above is origin_sent_at/
+                # dm_node_id guaranteed to exist on every database this
+                # app has ever created are these indexes (which reference
+                # them) created -- last, rather than in the main script
+                # above, and the dedup index is unconditionally dropped
+                # and rebuilt every open() (cheap, one-time per process)
+                # since CREATE INDEX IF NOT EXISTS alone would never widen
+                # an index already existing under this name from a prior
+                # schema version's narrower column list.
+                #
+                # COALESCE(dm_node_id, '') rather than the bare column:
+                # standard SQL (and SQLite) UNIQUE constraints treat every
+                # NULL as distinct from every other NULL, so a bare
+                # dm_node_id column here would silently stop deduplicating
+                # ALL channel messages (whose dm_node_id is always NULL)
+                # the moment this column was introduced. The column
+                # itself stays genuinely NULL for a channel row -- every
+                # `dm_node_id IS NULL` filter elsewhere is unaffected --
+                # only this index's own notion of "equal" is coerced.
+                connection.execute("DROP INDEX IF EXISTS incoming_packet_identity")
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX incoming_packet_identity
+                    ON messages(node_id, packet_id, channel_index, COALESCE(dm_node_id, ''))
+                    WHERE direction = 'incoming' AND packet_id IS NOT NULL
+                    """
+                )
                 connection.execute(
                     """
                     CREATE INDEX IF NOT EXISTS incoming_node_message_time
                     ON messages(node_id, origin_sent_at, radio_rx_at)
                     WHERE direction = 'incoming'
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS dm_conversation_lookup
+                    ON messages(dm_node_id)
+                    WHERE dm_node_id IS NOT NULL
                     """
                 )
         except sqlite3.DatabaseError as error:

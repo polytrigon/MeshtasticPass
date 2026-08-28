@@ -41,6 +41,11 @@ class ChatEntry:
     sender_name: str | None = None
     sender_short_name: str | None = None
     channel_index: int = 0
+    # The remote party's canonical node ID for a Direct Message entry --
+    # None for an ordinary channel entry (see chat_store.StoredMessage.
+    # dm_node_id, which this mirrors 1:1). Never a display name: DM
+    # identity is always this stable ID (item 2).
+    dm_node_id: str | None = None
     delivery_state: DeliveryState | None = None
     active_attempt_id: int | None = None
     confirmation_deadline: float | None = None
@@ -117,6 +122,11 @@ def received_chat_entry(
         sender_name=message.sender_long_name,
         sender_short_name=message.sender_short_name,
         channel_index=message.channel_index or 0,
+        # Derived straight from RadioService's own destination-field
+        # classification (message.is_direct) -- never re-decided here
+        # from sender name/channel index (item 3). A DM conversation is
+        # keyed by the SENDER's own stable ID for an incoming message.
+        dm_node_id=message.sender_node_id if message.is_direct else None,
     )
 
 
@@ -126,6 +136,7 @@ def outgoing_chat_entry(
     monotonic_now: float | None = None,
     channel_index: int = 0,
     delivery_state: DeliveryState = DeliveryState.SENDING,
+    dm_node_id: str | None = None,
 ) -> ChatEntry:
     """Create a local outgoing transcript entry before SDK completion."""
     local_received_at = time() if app_received_at is None else app_received_at
@@ -141,6 +152,7 @@ def outgoing_chat_entry(
         age_is_receive_time=False,
         outgoing=True,
         channel_index=channel_index,
+        dm_node_id=dm_node_id,
         delivery_state=delivery_state,
     )
 
@@ -231,6 +243,7 @@ def stored_chat_entry(
         sender_name=stored.sender_name,
         sender_short_name=stored.sender_short_name,
         channel_index=stored.channel_index,
+        dm_node_id=stored.dm_node_id,
         delivery_state=state,
         arrival_order=stored.id,
     )

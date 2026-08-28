@@ -64,6 +64,27 @@ def _canonical_node_number(number: Any) -> int | None:
     return number & 0xFFFFFFFF
 
 
+def _node_number_from_id(node_id: str | None) -> int | None:
+    """Parse a canonical "!xxxxxxxx" node-ID string into its node number.
+
+    Returns None for a broadcast/channel send (node_id is None) or an
+    unparseable string -- used only to let a DM send correlate an
+    incoming routing response against its OWN destination (see
+    RadioService.send_text/_parse_send_response), never to construct
+    an outgoing packet (the SDK's own sendText already accepts the
+    "!xxxxxxxx" string form of destinationId directly).
+    """
+    if not isinstance(node_id, str):
+        return None
+    stripped = node_id.strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped.removeprefix("!"), 16)
+    except ValueError:
+        return None
+
+
 class RadioState(Enum):
     """Connection states that callers can display without knowing SDK details."""
 
@@ -177,6 +198,12 @@ class NodeMetadata:
     last_heard: float | None = None
     is_local: bool = False
     position: GeoPosition | None = None
+    # User.is_unmessagable (PROTOBUF-SOURCE-VERIFIED field name/spelling
+    # -- note the SDK protobuf itself drops the second 'e': "is_unmessagable",
+    # doc: "Whether or not the node can be messaged") -- False (the
+    # SAFE, non-suppressing default) whenever the field is absent, so
+    # incomplete NodeDB metadata never hides a legitimate DM target.
+    is_unmessagable: bool = False
 
 
 @dataclass(frozen=True)
@@ -294,6 +321,12 @@ class ReceivedMessage:
     radio_rx_at: float | None = None
     local_position: GeoPosition | None = None
     sender_position: GeoPosition | None = None
+    # True only when the packet's own destination (MeshPacket.to) names
+    # THIS radio's node number specifically -- never inferred from
+    # channel index, sender name, or any other heuristic (see
+    # RadioService._parse_text_packet/_is_direct_message). False for an
+    # ordinary broadcast/channel message, where `to` is BROADCAST_NUM.
+    is_direct: bool = False
 
 
 @dataclass(frozen=True)
@@ -352,14 +385,22 @@ class RadioService:
         self._direct_observations: dict[str, float] = {}
         self._activity_local_node_id: str | None = None
         # Tracks in-flight outgoing sends by packet ID, keyed to the
-        # status_handler given to send_text(). See _on_routing_response:
-        # unlike the SDK's own one-shot onResponse callback (which
-        # discards its handler after the FIRST matching packet), this
-        # keeps watching so a genuinely stronger, later-arriving
-        # confirmation (e.g. a DM destination's own ack arriving after
-        # an earlier local/implicit one) can still be observed instead
-        # of silently dropped. Bounded by _MAX_PENDING_SENDS.
-        self._pending_sends: dict[int, Callable[[SendStatus], None]] = {}
+        # status_handler given to send_text() plus the EXPECTED
+        # destination node number (None for a broadcast/channel send).
+        # See _on_routing_response: unlike the SDK's own one-shot
+        # onResponse callback (which discards its handler after the
+        # FIRST matching packet), this keeps watching so a genuinely
+        # stronger, later-arriving confirmation (e.g. a DM destination's
+        # own ack arriving after an earlier local/implicit one) can
+        # still be observed instead of silently dropped. Bounded by
+        # _MAX_PENDING_SENDS. The destination is carried alongside the
+        # handler so _parse_send_response can require a DM's explicit
+        # ack to come specifically FROM that destination -- a clean
+        # routing response from some OTHER, unrelated node must never
+        # complete a DM as HEARD (see send_text/_parse_send_response).
+        self._pending_sends: dict[
+            int, tuple[Callable[[SendStatus], None], int | None]
+        ] = {}
         # See config_snapshot()/refresh_config_snapshot(): a snapshot is
         # only ever attached to the connection GENERATION that built
         # it, so a stale snapshot from a previous (or failed) connect()
@@ -545,6 +586,7 @@ class RadioService:
             last_heard=last_heard,
             is_local=self._is_local_node(normalized, node_number),
             position=self._position_from_record(record),
+            is_unmessagable=bool(user.get("isUnmessagable", False)),
         )
 
     def get_known_nodes(self) -> tuple[NodeMetadata, ...]:
@@ -594,6 +636,7 @@ class RadioService:
                     last_heard=last_heard,
                     is_local=self._is_local_node(node_id, number),
                     position=self._position_from_record(record),
+                    is_unmessagable=bool(user.get("isUnmessagable", False)),
                 )
             )
 
@@ -1017,6 +1060,14 @@ class RadioService:
             "text": message.text,
             "channelIndex": message.channel_index,
         }
+        # Resolved once, up front, so both the immediate onAckNak
+        # callback and the independent _on_routing_response watch below
+        # require an explicit DM ack to come specifically from THIS
+        # destination -- never merely "some other, unrelated node" (see
+        # MESHTASTICPASS DM item 6/_parse_send_response). None for a
+        # broadcast/channel send, matching send_text's own existing
+        # implicit-vs-remote distinction there unchanged.
+        expected_destination_number = _node_number_from_id(message.destination_node_id)
         if message.destination_node_id is not None:
             sdk_arguments["destinationId"] = message.destination_node_id
 
@@ -1024,7 +1075,9 @@ class RadioService:
             # Meshtastic 2.7.x only permits ordinary ACK packets through a
             # sendText response callback when its name is exactly onAckNak.
             def onAckNak(packet: dict[str, Any]) -> None:
-                status = self._parse_send_response(packet)
+                status = self._parse_send_response(
+                    packet, expected_destination_number=expected_destination_number
+                )
                 if status is not None:
                     status_handler(status)
 
@@ -1044,7 +1097,7 @@ class RadioService:
             # "meshtastic.receive.routing" topic so a genuinely stronger,
             # later-arriving confirmation is never silently dropped (see
             # _on_routing_response).
-            self._pending_sends[packet_id] = status_handler
+            self._pending_sends[packet_id] = (status_handler, expected_destination_number)
             while len(self._pending_sends) > self._MAX_PENDING_SENDS:
                 self._pending_sends.pop(next(iter(self._pending_sends)), None)
         return SentMessage(
@@ -1077,17 +1130,25 @@ class RadioService:
         )
         if packet_id is None:
             return
-        handler = self._pending_sends.get(packet_id)
-        if handler is None:
+        pending = self._pending_sends.get(packet_id)
+        if pending is None:
             return
-        status = self._parse_send_response(packet)
+        handler, expected_destination_number = pending
+        status = self._parse_send_response(
+            packet, expected_destination_number=expected_destination_number
+        )
         if status is None:
             return
         handler(status)
         if status.state in (DeliveryState.HEARD, DeliveryState.FAILED):
             self._pending_sends.pop(packet_id, None)
 
-    def _parse_send_response(self, packet: Any) -> SendStatus | None:
+    def _parse_send_response(
+        self,
+        packet: Any,
+        *,
+        expected_destination_number: int | None = None,
+    ) -> SendStatus | None:
         """Convert a Meshtastic routing response into truthful delivery
 
         evidence. A clean ack whose "from" is our OWN node number is
@@ -1098,6 +1159,17 @@ class RadioService:
         "from" names a DIFFERENT node -- a DM destination's own
         explicit ack, or any other node's routing response genuinely
         reaching us -- is strong enough to report HEARD.
+
+        `expected_destination_number` (set only for a DM send, never a
+        broadcast/channel one -- see send_text) additionally REQUIRES
+        that non-local "from" to equal the DM's own destination: a
+        clean response from any other node must never complete a DM as
+        HEARD (MESHTASTICPASS DM item 6). Such a response is not a NAK
+        either -- it simply carries no conclusive evidence about THIS
+        send, so it resolves to no status at all (None) rather than
+        being reported as any terminal state, leaving the pending send
+        exactly as it was (still eligible for a genuine ack, NAK, or
+        eventual UNCONFIRMED timeout).
         """
         if not isinstance(packet, dict):
             return None
@@ -1127,6 +1199,11 @@ class RadioService:
             and local_number is not None
             and from_number != local_number
         ):
+            if (
+                expected_destination_number is not None
+                and from_number != expected_destination_number
+            ):
+                return None
             return SendStatus(DeliveryState.HEARD, packet_id)
         return SendStatus(DeliveryState.SENT, packet_id)
 
@@ -1433,9 +1510,10 @@ class RadioService:
         sender_number = self._optional_int(packet.get("from"))
         sender_id = packet.get("fromId")
         if not isinstance(sender_id, str) or not sender_id:
+            canonical_sender_number = _canonical_node_number(sender_number)
             sender_id = (
-                f"!{sender_number:08x}"
-                if sender_number is not None
+                f"!{canonical_sender_number:08x}"
+                if canonical_sender_number is not None
                 else "unknown"
             )
 
@@ -1462,6 +1540,36 @@ class RadioService:
             radio_rx_at=self._optional_float(packet.get("rxTime")),
             local_position=self._local_position(interface),
             sender_position=self._position_from_record(sender_record),
+            is_direct=self._is_direct_message(packet, interface),
+        )
+
+    @staticmethod
+    def _is_direct_message(packet: dict[str, Any], interface: Any) -> bool:
+        """True only when MeshPacket.to names THIS radio's own node
+
+        number specifically -- the exact destination/routing check the
+        Meshtastic SDK's own bundled CLI uses (__main__.py:
+        ``packet["to"] == interface.myInfo.my_node_num``;
+        SDK-SOURCE-VERIFIED), never a heuristic based on sender name,
+        display name, or channel index. An ordinary broadcast/channel
+        packet's `to` is BROADCAST_NUM (0xFFFFFFFF, PROTOBUF-SOURCE-
+        VERIFIED: MeshPacket.to's own field doc), which can never equal
+        a real node number, so comparing only against the local node
+        number already correctly excludes it -- no separate broadcast
+        check is needed. Both sides are canonically masked to unsigned
+        32-bit first (see _canonical_node_number) so a signed/unsigned
+        representation mismatch can never produce a false negative.
+        """
+        destination_number = _canonical_node_number(
+            RadioService._optional_int(packet.get("to"))
+        )
+        local_number = _canonical_node_number(
+            getattr(getattr(interface, "myInfo", None), "my_node_num", None)
+        )
+        return (
+            destination_number is not None
+            and local_number is not None
+            and destination_number == local_number
         )
 
     @staticmethod
