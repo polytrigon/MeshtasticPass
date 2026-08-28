@@ -212,7 +212,10 @@ class SimulatedRadioService:
                 "use_12h_clock": False,
             },
             "bluetooth": {"enabled": True},
-            "device": {"tzdef": ""},
+            # role=0 is Config.DeviceConfig.Role.CLIENT (see
+            # radio_capabilities.role_choices) -- matches this fake
+            # radio's own hardware_identity() role_name="CLIENT" below.
+            "device": {"tzdef": "", "role": 0},
             # A deterministic, always-present POSITION config section --
             # see item 9: "no current fix" is itself a real, common,
             # honest state, not an error, so the simulated snapshot

@@ -70,7 +70,7 @@ from mesh_topology import (
     route_chain_avoiding,
 )
 from node_activity import is_node_active
-from radio_capabilities import format_hw_model_name
+from radio_capabilities import format_hw_model_name, role_choices
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -324,6 +324,15 @@ FLIP_SCREEN_CHOICES = (
     ("ON", True),
 )
 
+# bluetooth.enabled -- the CONNECTED RADIO's own Bluetooth, never the
+# host uConsole's. A plain boolean localConfig field, so this reuses
+# the exact same verified write/readback/RADIO_SETTINGS machinery as
+# every other row here.
+BLUETOOTH_CHOICES = (
+    ("ON", True),
+    ("OFF", False),
+)
+
 CLOCK_24H_CHOICES = (
     ("ON", True),
     ("OFF", False),
@@ -385,6 +394,8 @@ class RadioSettingSpec:
 
 
 RADIO_SETTINGS: dict[str, RadioSettingSpec] = {
+    "role": RadioSettingSpec("device", "role"),
+    "bluetooth": RadioSettingSpec("bluetooth", "enabled"),
     "screen_timeout": RadioSettingSpec("display", "screen_on_secs"),
     "units": RadioSettingSpec("display", "units"),
     "compass": RadioSettingSpec("display", "compass_north_top"),
@@ -397,6 +408,50 @@ RADIO_SETTINGS: dict[str, RadioSettingSpec] = {
     ),
     "timezone": RadioSettingSpec("device", "tzdef"),
 }
+
+
+class RoleSelector(KeyboardDropdown):
+    """ROLE -- backed by device.role. Options are built once from
+
+    role_choices(), itself derived from the installed protobuf
+    schema's own enum, never a hardcoded role list -- see that
+    function's own docstring. Never pre-selects or infers a role: the
+    initial `role` value always comes from the connected radio's own
+    already-synced config. A live value this installed schema doesn't
+    recognize (e.g. a newer firmware's role not yet in this SDK
+    version) falls back to KeyboardDropdown.selected_label's own safe
+    "show the raw number" behavior rather than crashing or silently
+    coercing it to a known role.
+    """
+
+    def __init__(self, role: int) -> None:
+        super().__init__(
+            "role",
+            "ROLE",
+            (DropdownOption(name, value) for name, value in role_choices()),
+            role,
+            widget_id="radio-role-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class BluetoothSelector(KeyboardDropdown):
+    """BLUETOOTH -- backed by bluetooth.enabled on the CONNECTED RADIO,
+
+    never the host uConsole's own Bluetooth.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        super().__init__(
+            "bluetooth",
+            "BLUETOOTH",
+            (DropdownOption(name, value) for name, value in BLUETOOTH_CHOICES),
+            enabled,
+            widget_id="radio-bluetooth-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
 
 
 class TimezoneSelector(KeyboardDropdown):
@@ -426,7 +481,7 @@ class ScreenTimeoutSelector(KeyboardDropdown):
     def __init__(self, screen_on_secs: int) -> None:
         super().__init__(
             "screen_timeout",
-            "SCREEN TIMEOUT",
+            "SCREEN SLP",
             (DropdownOption(name, value) for name, value in SCREEN_TIMEOUT_CHOICES),
             screen_on_secs,
             widget_id="radio-screen-timeout-selector",
@@ -2371,6 +2426,21 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
+    /* CONNECTION/STYLE/RADIO's own section headers use DIM (the
+       theme's 50%-BASE-over-background token), never ACCENT/ACCENT2 --
+       ID-scoped so "PROFILE" and #mesh-connection-status (which
+       reuse .page-title for its own layout/weight, not this coloring)
+       are entirely unaffected. */
+    #connection-title, #style-title, #radio-title {
+        color: $snow_dim;
+    }
+
+    Screen.theme-amber #connection-title,
+    Screen.theme-amber #style-title,
+    Screen.theme-amber #radio-title {
+        color: $amber_dim;
+    }
+
     #connection-status, #connection-details, #identity-values, #radio-info {
         height: auto;
         min-height: 1;
@@ -2436,30 +2506,32 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #long-name-status, #short-name-status, #timezone-status,
+    #long-name-status, #short-name-status, #timezone-status, #role-status,
     #font-size-status, #color-status {
         /* No min-height: display is toggled False when empty (see
            _set_long_name_status/_set_short_name_status/_set_timezone_
-           status/_set_font_size_status/_set_color_status), so the row
-           collapses to zero height instead of reserving a permanent
-           blank line. */
+           status/_set_role_status/_set_font_size_status/
+           _set_color_status), so the row collapses to zero height
+           instead of reserving a permanent blank line. */
         height: auto;
     }
 
-    #long-name-status, #short-name-status, #timezone-status, #font-size-status {
+    #long-name-status, #short-name-status, #timezone-status,
+    #role-status, #font-size-status {
         color: $snow_confirm;
     }
 
     Screen.theme-amber #long-name-status,
     Screen.theme-amber #short-name-status,
     Screen.theme-amber #timezone-status,
+    Screen.theme-amber #role-status,
     Screen.theme-amber #font-size-status {
         color: $amber_confirm;
     }
 
     #long-name-status.setting-error, #short-name-status.setting-error,
-    #timezone-status.setting-error, #font-size-status.setting-error,
-    #color-status.setting-error {
+    #timezone-status.setting-error, #role-status.setting-error,
+    #font-size-status.setting-error, #color-status.setting-error {
         color: $error;
     }
 
@@ -2474,6 +2546,7 @@ class MeshtasticPassApp(App[None]):
     Screen.theme-amber #long-name-status.setting-error,
     Screen.theme-amber #short-name-status.setting-error,
     Screen.theme-amber #timezone-status.setting-error,
+    Screen.theme-amber #role-status.setting-error,
     Screen.theme-amber #font-size-status.setting-error,
     Screen.theme-amber #color-status.setting-error {
         color: $error;
@@ -2932,6 +3005,7 @@ class MeshtasticPassApp(App[None]):
         self._long_name_status_dismiss_timer: Timer | None = None
         self._short_name_status_dismiss_timer: Timer | None = None
         self._timezone_status_dismiss_timer: Timer | None = None
+        self._role_status_dismiss_timer: Timer | None = None
         self._arrival_sequence = 0
         self._send_animation_frame = 1
         self._has_older_history = False
@@ -2958,7 +3032,7 @@ class MeshtasticPassApp(App[None]):
         yield Static(id="tab-bar")
         with ContentSwitcher(initial="connection", id="content"):
             with ConnectionPage(id="connection", classes="tab-page"):
-                yield Static("CONNECTION", classes="page-title")
+                yield Static("CONNECTION", id="connection-title", classes="page-title")
                 yield Static(id="connection-status")
                 yield DeviceSelector(self.settings.device_path, devices)
                 yield Static(id="connection-details")
@@ -2975,6 +3049,9 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="color-status", markup=False)
                 yield Static("RADIO", id="radio-title", classes="page-title")
                 yield Static(id="radio-info", markup=False)
+                yield RoleSelector(0)
+                yield Static(id="role-status", markup=False)
+                yield BluetoothSelector(True)
                 yield TimezoneSelector("")
                 yield Static(id="timezone-status", markup=False)
                 yield ScreenTimeoutSelector(300)
@@ -3222,6 +3299,8 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(ShortNameControl),
                     self.query_one(FontSizeSelector),
                     self.query_one(ColorSelector),
+                    self.query_one(RoleSelector),
+                    self.query_one(BluetoothSelector),
                     self.query_one(TimezoneSelector),
                     self.query_one(ScreenTimeoutSelector),
                     self.query_one(UnitsSelector),
@@ -3339,6 +3418,30 @@ class MeshtasticPassApp(App[None]):
     def _dismiss_timezone_status(self) -> None:
         self._timezone_status_dismiss_timer = None
         self._set_timezone_status("", None)
+
+    def _set_role_status(self, text: str, css_class: str | None) -> None:
+        """ROLE's own status row -- see _set_long_name_status, which
+
+        this exactly mirrors for the RADIO-section ROLE control.
+        """
+        if self._role_status_dismiss_timer is not None:
+            self._role_status_dismiss_timer.stop()
+            self._role_status_dismiss_timer = None
+        status = self.query_one("#role-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_ROW_PREFIX}{text}" if text else "")
+        if css_class == "setting-success":
+            self._role_status_dismiss_timer = self.set_timer(
+                IDENTITY_STATUS_AUTO_DISMISS_SECONDS, self._dismiss_role_status
+            )
+
+    def _dismiss_role_status(self) -> None:
+        self._role_status_dismiss_timer = None
+        self._set_role_status("", None)
 
     def _set_font_size_status(self, text: str, css_class: str | None) -> None:
         """FONT SIZE's own status row -- aligned under FONT SIZE's own
@@ -3658,18 +3761,17 @@ class MeshtasticPassApp(App[None]):
         arrives. Never claims APPLIED merely because this call returned.
         """
         spec = RADIO_SETTINGS[setting_name]
-        # TIMEZONE gets its own dedicated, aligned, auto-dismissing
-        # status row (see _set_timezone_status) instead of the shared
-        # #radio-status used by every other RADIO_SETTINGS dropdown --
-        # matching the LONG NAME/SHORT NAME per-field layout, per
-        # "SMALL MESHTASTICPASS FOLLOW-UP" item 10.
-        if setting_name == "timezone":
+        # TIMEZONE/ROLE get their own dedicated, aligned, auto-
+        # dismissing status row (see _set_timezone_status/
+        # _set_role_status) instead of the shared #radio-status used by
+        # every other RADIO_SETTINGS dropdown -- matching the LONG
+        # NAME/SHORT NAME per-field layout.
+        dedicated = self._dedicated_status_setter(setting_name)
+        if dedicated is not None:
             if self._radio_state is not RadioState.ONLINE:
-                self._set_timezone_status(
-                    f"{dropdown.label} UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
-                )
+                dedicated(f"{dropdown.label} UNAVAILABLE — RADIO NOT CONNECTED", "setting-error")
                 return
-            self._set_timezone_status("SAVING TIMEZONE...", None)
+            dedicated(f"SAVING {dropdown.label}...", None)
         else:
             status = self.query_one("#radio-status", Static)
             if self._radio_state is not RadioState.ONLINE:
@@ -3710,51 +3812,83 @@ class MeshtasticPassApp(App[None]):
         "mismatch": "READBACK MISMATCH",
     }
 
+    # BLUETOOTH's changed value is already sufficient confirmation on
+    # its own (see RoleSelector/BluetoothSelector's own docstrings) --
+    # no redundant "BLUETOOTH APPLIED" success line, matching the same
+    # reasoning already applied to COLOR/AUTO SYNC. A genuine failure
+    # still surfaces through the shared #radio-status normally.
+    _SILENT_SUCCESS_SETTINGS = {"bluetooth"}
+
+    def _dedicated_status_setter(
+        self, setting_name: str
+    ) -> Callable[[str, str | None], None] | None:
+        """TIMEZONE/ROLE each have their own aligned, auto-dismissing
+
+        status row instead of the shared #radio-status -- see
+        _set_timezone_status/_set_role_status.
+        """
+        if setting_name == "timezone":
+            return self._set_timezone_status
+        if setting_name == "role":
+            return self._set_role_status
+        return None
+
+    def _dropdown_options_for_write(self, setting_name: str, schema_value: Any) -> Any:
+        """TIMEZONE's options must be recomputed (CUSTOM injection) for
+
+        whatever value a write/readback just settled on -- see
+        _timezone_options_for. Every other dropdown's own `.options` is
+        already the complete, static choice list.
+        """
+        if setting_name == "timezone":
+            return self._timezone_options_for(schema_value)
+        return None
+
     @on(RadioSettingApplied)
     def radio_setting_applied(self, event: RadioSettingApplied) -> None:
         spec = RADIO_SETTINGS[event.setting_name]
-        is_timezone = event.setting_name == "timezone"
+        dedicated = self._dedicated_status_setter(event.setting_name)
         if event.result.applied:
-            if is_timezone:
-                self._set_timezone_status("TIMEZONE SAVED", "setting-success")
-                event.dropdown.set_options(
-                    self._timezone_options_for(event.result.readback_value),
-                    value=event.result.readback_value,
-                )
-            else:
+            if dedicated is not None:
+                dedicated(f"{event.dropdown.label} SAVED", "setting-success")
+            elif event.setting_name not in self._SILENT_SUCCESS_SETTINGS:
                 status = self.query_one("#radio-status", Static)
                 status.remove_class("setting-error")
                 status.add_class("setting-success")
                 status.update(f"{event.dropdown.label} APPLIED")
-                event.dropdown.set_options(
-                    event.dropdown.options,
-                    value=spec.from_schema_value(event.result.readback_value),
-                )
+            else:
+                status = self.query_one("#radio-status", Static)
+                status.remove_class("setting-error")
+                status.remove_class("setting-success")
+                status.update("")
+            options = self._dropdown_options_for_write(
+                event.setting_name, event.result.readback_value
+            )
+            event.dropdown.set_options(
+                event.dropdown.options if options is None else options,
+                value=spec.from_schema_value(event.result.readback_value),
+            )
         else:
             reason = self._RADIO_FAILURE_REASONS.get(
                 event.result.reason, event.result.reason.upper()
             )
-            # Return the row to the authoritative radio value rather than
-            # leaving the user's rejected selection displayed as if it
-            # had taken effect.
-            authoritative = self.radio.read_synced_config_field(spec.section, spec.field)
-            if is_timezone:
-                self._set_timezone_status(f"TIMEZONE NOT SAVED — {reason}", "setting-error")
-                if authoritative is not None:
-                    event.dropdown.set_options(
-                        self._timezone_options_for(authoritative),
-                        value=authoritative,
-                    )
+            if dedicated is not None:
+                dedicated(f"{event.dropdown.label} NOT SAVED — {reason}", "setting-error")
             else:
                 status = self.query_one("#radio-status", Static)
                 status.remove_class("setting-success")
                 status.add_class("setting-error")
                 status.update(f"{event.dropdown.label} NOT APPLIED — {reason}")
-                if authoritative is not None:
-                    event.dropdown.set_options(
-                        event.dropdown.options,
-                        value=spec.from_schema_value(authoritative),
-                    )
+            # Return the row to the authoritative radio value rather than
+            # leaving the user's rejected selection displayed as if it
+            # had taken effect.
+            authoritative = self.radio.read_synced_config_field(spec.section, spec.field)
+            if authoritative is not None:
+                options = self._dropdown_options_for_write(event.setting_name, authoritative)
+                event.dropdown.set_options(
+                    event.dropdown.options if options is None else options,
+                    value=spec.from_schema_value(authoritative),
+                )
 
     def _reset_clock_sync_state(self) -> None:
         """Invalidate whatever the OLD connection's in-flight AUTO SYNC
@@ -3865,6 +3999,8 @@ class MeshtasticPassApp(App[None]):
         info_widget = self.query_one("#radio-info", Static)
         timezone_dropdown = self.query_one(TimezoneSelector)
         dropdowns: tuple[tuple[KeyboardDropdown, RadioSettingSpec], ...] = (
+            (self.query_one(RoleSelector), RADIO_SETTINGS["role"]),
+            (self.query_one(BluetoothSelector), RADIO_SETTINGS["bluetooth"]),
             (self.query_one(ScreenTimeoutSelector), RADIO_SETTINGS["screen_timeout"]),
             (self.query_one(UnitsSelector), RADIO_SETTINGS["units"]),
             (self.query_one(CompassSelector), RADIO_SETTINGS["compass"]),
@@ -3878,7 +4014,7 @@ class MeshtasticPassApp(App[None]):
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
             text = Text()
-            for index, label in enumerate(("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH")):
+            for index, label in enumerate(("HARDWARE", "FIRMWARE")):
                 if index:
                     text.append("\n")
                 text.append(
@@ -3899,16 +4035,17 @@ class MeshtasticPassApp(App[None]):
                 dropdown.set_status_override(override)
             return
 
-        # Item 4: HARDWARE/FIRMWARE/ROLE/BLUETOOTH read the cached
-        # RadioConfigurationSnapshot -- built once at connect time (see
-        # RadioService.connect/_rebuild_config_snapshot), never
-        # re-derived per render -- rather than calling hardware_
-        # identity()/read_synced_config_field() fresh here. Both are
-        # pure zero-RF reads of already-synced local objects either
-        # way, so this is an architecture choice (one cached,
+        # Item 4: HARDWARE/FIRMWARE read the cached RadioConfiguration
+        # Snapshot -- built once at connect time (see RadioService.
+        # connect/_rebuild_config_snapshot), never re-derived per
+        # render -- rather than calling hardware_identity() fresh here.
+        # Both are pure zero-RF reads of already-synced local objects
+        # either way, so this is an architecture choice (one cached,
         # explicitly-invalidated source of truth), not a traffic fix.
-        # TIMEZONE reads from this SAME snapshot (see below) rather
-        # than read_synced_config_field, for the same reason.
+        # TIMEZONE reads from this SAME snapshot (see below) for the
+        # same reason; ROLE/BLUETOOTH are editable (see dropdowns
+        # above) and read live via read_synced_config_field instead,
+        # exactly like every other RADIO_SETTINGS dropdown.
         snapshot = getattr(self.radio, "config_snapshot", lambda: None)()
         if snapshot is None:
             # Item 11: a real, if normally brief (see item 3 -- the
@@ -3923,17 +4060,11 @@ class MeshtasticPassApp(App[None]):
             info_widget.update(text)
             tzdef = None
         else:
-            bluetooth_raw = self._snapshot_config_field(snapshot, "bluetooth", "enabled")
-            bluetooth_text = (
-                "—" if bluetooth_raw is None else ("ON" if bluetooth_raw == "True" else "OFF")
-            )
             tzdef = self._snapshot_config_field(snapshot, "device", "tzdef")
             text = Text()
             rows = (
                 ("HARDWARE", format_hw_model_name(snapshot.hardware.hw_model_name)),
                 ("FIRMWARE", snapshot.hardware.firmware_version or "—"),
-                ("ROLE", snapshot.hardware.role_name or "—"),
-                ("BLUETOOTH", bluetooth_text),
             )
             for index, (label, value) in enumerate(rows):
                 if index:
@@ -5811,6 +5942,7 @@ class MeshtasticPassApp(App[None]):
         self._set_long_name_status("", None)
         self._set_short_name_status("", None)
         self._set_timezone_status("", None)
+        self._set_role_status("", None)
         self._render_connection_details()
         self._render_identity(force_value=True)
         self._render_radio_settings()

@@ -71,6 +71,31 @@ def _enum_name(field_descriptor: Any, raw_value: Any) -> str:
         return f"UNKNOWN({raw_value!r})"
 
 
+def role_choices() -> tuple[tuple[str, int], ...]:
+    """Every device.role value the installed protobuf schema declares,
+
+    as (friendly_label, enum_number) pairs -- discovered from the
+    schema itself, never a hardcoded role list, so a future meshtastic
+    release adding a new role appears automatically with no code
+    change here. Order matches the schema's own declaration order;
+    this never ranks or recommends any particular role. Returns an
+    empty tuple if the installed package or this exact field is
+    unavailable for any reason, rather than raising -- the caller
+    (RoleSelector) treats that the same as any other unsupported field.
+    """
+    try:
+        from meshtastic.protobuf import config_pb2
+    except ImportError:
+        return ()
+    role_field = config_pb2.Config.DeviceConfig.DESCRIPTOR.fields_by_name.get("role")
+    if role_field is None or role_field.enum_type is None:
+        return ()
+    return tuple(
+        (value.name.replace("_", " "), value.number)
+        for value in role_field.enum_type.values
+    )
+
+
 def describe_scalar_fields(message: Any) -> dict[str, str]:
     """Flatten one protobuf message's own scalar fields (never
 

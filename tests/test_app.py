@@ -26,6 +26,7 @@ from app import (
     CONNECTION_VALUE_COLUMN_INDENT,
     TAB_NAMES,
     AutoSyncSelector,
+    BluetoothSelector,
     ChannelSelector,
     Clock24HSelector,
     ClockSyncApplied,
@@ -43,6 +44,7 @@ from app import (
     ShortNameControl,
     MessageActionControl,
     MeshtasticPassApp,
+    RoleSelector,
     ScreenTimeoutSelector,
     ThinScrollBarRender,
     TimezoneSelector,
@@ -54,6 +56,7 @@ from app_settings import AppSettings
 from chat_store import ChatStore
 from geo import format_distance_miles
 from keyboard_dropdown import KeyboardDropdown
+from radio_capabilities import role_choices
 from radio_service import (
     ClockSyncResult,
     ConfigWriteResult,
@@ -695,10 +698,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             info_text = str(app.query_one("#radio-info", Static).render())
             self.assertIn("HARDWARE     HELTEC V3", info_text)
             self.assertIn("FIRMWARE     sim-1.0.0", info_text)
-            self.assertIn("ROLE         CLIENT", info_text)
-            self.assertIn("BLUETOOTH    ON", info_text)
+            self.assertNotIn("ROLE", info_text)
+            self.assertNotIn("BLUETOOTH", info_text)
             self.assertNotIn("TIMEZONE", info_text)
 
+            self.assertIn("[ CLIENT ▾ ]", str(app.query_one(RoleSelector).render()))
+            self.assertIn("[ ON ▾ ]", str(app.query_one(BluetoothSelector).render()))
             self.assertIn("[ NOT SET ▾ ]", str(app.query_one(TimezoneSelector).render()))
             self.assertIn("5 MIN", str(app.query_one(ScreenTimeoutSelector).render()))
             self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
@@ -707,6 +712,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ON", str(app.query_one(Clock24HSelector).render()))
 
             for control in (
+                app.query_one(RoleSelector),
+                app.query_one(BluetoothSelector),
                 app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
                 app.query_one(UnitsSelector),
@@ -734,6 +741,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("HELTEC", info_text)
 
             for control in (
+                app.query_one(RoleSelector),
+                app.query_one(BluetoothSelector),
                 app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
                 app.query_one(UnitsSelector),
@@ -764,7 +773,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 if "APPLIED" in str(status.render()):
                     break
-            self.assertIn("SCREEN TIMEOUT APPLIED", str(status.render()))
+            self.assertIn("SCREEN SLP APPLIED", str(status.render()))
             self.assertIn("10 MIN", str(selector.render()))
             self.assertEqual(
                 radio.read_synced_config_field("display", "screen_on_secs"), 600
@@ -996,6 +1005,299 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             radio.write_verified_config_field.assert_not_called()
             self.assertEqual(radio.sent_messages, ())
 
+    # ---- ROLE (device.role) -------------------------------------------
+
+    async def test_role_options_are_derived_from_the_protobuf_enum(self) -> None:
+        """"ADDITIONAL RADIO CONFIG CHANGES" item 1: never a hardcoded
+
+        role list -- the dropdown's own options must come directly
+        from role_choices(), which introspects the installed protobuf
+        schema.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            expected = tuple(role_choices())
+            self.assertEqual(
+                tuple((o.label, o.value) for o in dropdown.options), expected
+            )
+            self.assertGreaterEqual(len(expected), 10)  # a real, non-trivial enum
+
+    async def test_role_never_automatically_selects_a_role(self) -> None:
+        """A fresh connection must show exactly whatever the radio itself
+
+        reports -- never silently defaulted/upgraded to ROUTER or any
+        other "recommended" role.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertIn("[ CLIENT ▾ ]", str(app.query_one(RoleSelector).render()))
+            self.assertEqual(radio.read_synced_config_field("device", "role"), 0)
+
+    async def test_role_write_uses_verified_pipeline_and_updates_snapshot(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.config_snapshot()
+            dropdown = app.query_one(RoleSelector)
+            status = app.query_one("#role-status", Static)
+            dropdown.focus()
+            # CLIENT -> CLIENT MUTE.
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "SAVED" in str(status.render()):
+                    break
+            self.assertIn("ROLE SAVED", str(status.render()))
+            self.assertTrue(status.has_class("setting-success"))
+            self.assertEqual(radio.read_synced_config_field("device", "role"), 1)
+            self.assertIn("[ CLIENT MUTE ▾ ]", str(dropdown.render()))
+
+            after = radio.config_snapshot()
+            self.assertIsNot(after, before)
+
+            self._role_status_dismiss_check(app, status)
+
+    def _role_status_dismiss_check(self, app, status) -> None:
+        app._dismiss_role_status()
+        self.assertEqual(str(status.render()), "")
+
+    async def test_role_failed_write_reverts_to_authoritative_value(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            status = app.query_one("#role-status", Static)
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, 1, None, "mismatch")
+            )
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT SAVED" in str(status.render()):
+                    break
+            self.assertIn("ROLE NOT SAVED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+            self.assertIn("[ CLIENT ▾ ]", str(dropdown.render()))
+
+    async def test_role_unsupported_schema_disables_dropdown_safely(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            del radio._config_sections["device"]["role"]
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            self.assertIn("UNSUPPORTED", str(dropdown.render()))
+            self.assertTrue(dropdown.disabled)
+
+    async def test_role_preserves_an_unrecognized_enum_value_safely(self) -> None:
+        """A live role number this installed schema's enum doesn't
+
+        declare (e.g. a newer firmware) must render safely -- never
+        crash, never get silently coerced to a known role.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["device"]["role"] = 999
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            self.assertIn("999", str(dropdown.render()))
+            self.assertEqual(radio.read_synced_config_field("device", "role"), 999)
+
+    # ---- BLUETOOTH (bluetooth.enabled, on the RADIO, not the host) -----
+
+    async def test_bluetooth_write_uses_verified_pipeline_and_updates_snapshot(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.config_snapshot()
+            dropdown = app.query_one(BluetoothSelector)
+            self.assertIn("[ ON ▾ ]", str(dropdown.render()))
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "OFF" in str(dropdown.render()):
+                    break
+            self.assertIn("[ OFF ▾ ]", str(dropdown.render()))
+            self.assertEqual(radio.read_synced_config_field("bluetooth", "enabled"), False)
+            after = radio.config_snapshot()
+            self.assertIsNot(after, before)
+
+    async def test_bluetooth_change_shows_no_success_status(self) -> None:
+        """Item 2: the changed ON/OFF value is itself sufficient --
+
+        no redundant "BLUETOOTH APPLIED" status noise on success. A
+        genuine write failure still surfaces through the shared
+        #radio-status normally.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(BluetoothSelector)
+            status = app.query_one("#radio-status", Static)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "OFF" in str(dropdown.render()):
+                    break
+            self.assertNotIn("BLUETOOTH", str(status.render()))
+            self.assertFalse(status.has_class("setting-success"))
+
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, True, None, "mismatch")
+            )
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT APPLIED" in str(status.render()):
+                    break
+            self.assertIn("BLUETOOTH NOT APPLIED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+
+    async def test_bluetooth_unsupported_schema_disables_dropdown_safely(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            del radio._config_sections["bluetooth"]["enabled"]
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(BluetoothSelector)
+            self.assertIn("UNSUPPORTED", str(dropdown.render()))
+            self.assertTrue(dropdown.disabled)
+
+    async def test_disabling_radio_bluetooth_keeps_the_usb_connection_online(
+        self,
+    ) -> None:
+        """Item 2: disabling the CONNECTED RADIO's Bluetooth must not
+
+        drop the USB/serial link this app is talking over.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(BluetoothSelector)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "OFF" in str(dropdown.render()):
+                    break
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+            self.assertEqual(radio.read_synced_config_field("bluetooth", "enabled"), False)
+
+    async def test_opening_config_sends_zero_role_or_bluetooth_requests(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            app.query_one(RoleSelector).focus()
+            await pilot.pause()
+            app.query_one(BluetoothSelector).focus()
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
+    # ---- Section headers use DIM, not ACCENT ---------------------------
+
+    async def test_section_headers_use_dim_not_accent(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            for theme in THEME_PALETTES:
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                palette = THEME_PALETTES[theme]
+                for widget_id in ("connection-title", "style-title", "radio-title"):
+                    widget = app.query_one(f"#{widget_id}", Static)
+                    self.assertEqual(
+                        widget.visual_style.foreground.hex6, palette.dim.upper()
+                    )
+                    self.assertNotEqual(
+                        widget.visual_style.foreground.hex6, palette.accent.upper()
+                    )
+
+    async def test_screen_slp_label_rename_preserves_behavior(self) -> None:
+        """"SCREEN LABEL RENAME": presentation only -- the underlying
+
+        screen_on_secs field, choices, and write/readback behavior are
+        all unchanged.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            selector = app.query_one(ScreenTimeoutSelector)
+            self.assertIn("SCREEN SLP", str(selector.render()))
+            self.assertNotIn("SCREEN TIMEOUT", str(selector.render()))
+            self.assertIn("5 MIN", str(selector.render()))
+
+            status = app.query_one("#radio-status", Static)
+            selector.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "APPLIED" in str(status.render()):
+                    break
+            self.assertIn("SCREEN SLP APPLIED", str(status.render()))
+            self.assertEqual(
+                radio.read_synced_config_field("display", "screen_on_secs"), 600
+            )
+
     async def test_radio_dropdowns_reachable_by_keyboard_navigation(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
@@ -1007,6 +1309,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
             app.query_one(ColorSelector).focus()
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(RoleSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(BluetoothSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(TimezoneSelector))
             await pilot.press("down")
