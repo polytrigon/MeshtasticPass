@@ -2207,25 +2207,50 @@ class MeshTopologyView(Container):
                     for node_id, position in centers.items()
                     if node_id not in chain_ids
                 )
-                route_cells = route_chain_avoiding(chain_points, obstacles)
-                if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
-                    # build_relay_stages already guarantees an ordered,
-                    # non-self-overlapping chain in LOGICAL space (see
-                    # its own docstring), but project_to_viewport clips
-                    # each node's position independently, with no
-                    # awareness of chain order -- a chain whose stages
-                    # get clipped onto DIFFERENT edge cells can still
-                    # end up geometrically out of order once translated
-                    # to screen coordinates. Rather than let that render
-                    # as a branch, fall back to a direct YOU-to-endpoint
-                    # line for the connector's PATH only -- the relay
-                    # dots themselves stay rendered at their own clipped
-                    # positions (see the glyph-placement loop above),
-                    # never fabricated or hidden, only the connecting
-                    # LINE no longer visits them.
+                # build_relay_stages already guarantees an ordered,
+                # non-self-overlapping chain in LOGICAL space (see its
+                # own docstring), but project_to_viewport clips each
+                # node's position independently, with no awareness of
+                # chain order -- once the current selection recenters
+                # the board, an INTERMEDIATE relay stage (never the
+                # real you_id/remote_id endpoints, whose own off-screen
+                # clipping is the intended "edge indicator" case) can
+                # independently clip onto a viewport edge far from its
+                # true interpolated position, breaking the straight-
+                # line ordering the chain's geometry otherwise
+                # guarantees. Detected directly against the same
+                # edge_ids project_to_viewport already computed --
+                # real-hardware regression: this used to be detected
+                # only indirectly, by checking for a DUPLICATE cell in
+                # the resulting route, which caught some but not all
+                # such cases (a chain can retrace across itself and
+                # visibly zigzag across the whole board -- "start in
+                # the lower topology, rise to the top, then run
+                # horizontally across it" -- entirely through CELLS
+                # that never individually repeat). Falling back to a
+                # direct YOU-to-endpoint line for the connector's PATH
+                # only -- the relay dots themselves stay rendered at
+                # their own clipped positions (see the glyph-placement
+                # loop above), never fabricated or hidden, only the
+                # connecting LINE no longer visits them.
+                relay_stage_ids_in_chain = {
+                    stage.node_id for stage in chain_stages if stage.node_id in centers
+                }
+                if relay_stage_ids_in_chain & self._edge_node_ids:
                     route_cells = route_chain_avoiding(
                         (centers[you_id], centers[remote_id]), obstacles
                     )
+                else:
+                    route_cells = route_chain_avoiding(chain_points, obstacles)
+                    if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
+                        # Belt-and-suspenders: a chain with every stage
+                        # genuinely on-screen could still self-overlap
+                        # via obstacle-avoidance detours alone (see
+                        # route_connector_avoiding) -- same fallback,
+                        # different trigger.
+                        route_cells = route_chain_avoiding(
+                            (centers[you_id], centers[remote_id]), obstacles
+                        )
                 if is_selected:
                     color = palette.accent
                 elif is_stale:
@@ -2843,6 +2868,19 @@ class MeshtasticPassApp(App[None]):
         color: $amber_accent2;
     }
 
+    /* "> message" is Textual's OWN Input.placeholder, styled via the
+       separate "input--placeholder" component class (Textual's
+       get_component_rich_style machinery, DEFAULT_CSS: "color:
+       $text-disabled") -- a completely different mechanism from the
+       plain `color` property above, which only ever affected TYPED
+       text. Real hardware exposed that the prompt stayed Textual's
+       own built-in disabled-grey under AMBER; this targets that exact
+       component class so the prompt shares the same AMBER ACCENT2
+       identity as typed text. */
+    Screen.theme-amber #chat-input > .input--placeholder {
+        color: $amber_accent2;
+    }
+
     Screen.theme-amber .page-title {
         color: $amber_accent;
     }
@@ -3028,6 +3066,10 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-amber #dm-input {
+        color: $amber_accent2;
+    }
+
+    Screen.theme-amber #dm-input > .input--placeholder {
         color: $amber_accent2;
     }
 

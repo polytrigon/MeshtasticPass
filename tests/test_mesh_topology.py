@@ -6240,6 +6240,264 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(0 <= y < height)
 
 
+class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestCase):
+    """Real-hardware regression: selecting a multi-hop REMOTE node
+
+    recenters the viewport on IT (see MeshTopologyView.set_nodes'
+    own docstring: "recentered on the selection") -- which can push an
+    INTERMEDIATE relay stage (never tested by
+    test_multi_hop_off_screen_endpoint_keeps_one_ordered_chain above,
+    whose own fixture deliberately keeps every relay stage on-screen
+    and never selects the remote endpoint at all) onto a viewport edge
+    independently of its neighbors in the chain. project_to_viewport
+    clips each node with no awareness of chain order, so the resulting
+    multi-point route can retrace/zigzag across the whole board --
+    visually: starts in one corner, rises to the opposite edge, then
+    runs along it -- while never containing an exact duplicate cell,
+    which is what the PRE-EXISTING fallback in MeshTopologyView.
+    set_nodes actually checked for (see app.py's own comment there).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    def _fixture(self, you_id: str):
+        """A 3-hop remote positioned so that, once the board recenters
+
+        on IT, exactly one intermediate relay stage independently
+        edge-clips -- confirmed (via direct mesh_topology helper calls
+        against this exact test's own (60, 14)-terminal viewport
+        dimensions, outside this test file) to make the OLD algorithm
+        (before this fix) render a spurious CLOSED-LOOP connector (42
+        cells, no exact duplicates -- so the pre-existing duplicate-
+        cell fallback never caught it) where the correct direct route
+        is only 13 cells.
+        """
+        working_set = (
+            MeshNodeState(
+                node=NodeMetadata(you_id, "You", "YOU", is_local=True),
+                is_client=False,
+                is_relay=False,
+                last_interaction_at=None,
+            ),
+            MeshNodeState(
+                node=NodeMetadata(
+                    "!faroff03",
+                    "Far Multi Hop",
+                    "FMH3",
+                    3,
+                    last_heard=1_700_000_000.0,
+                ),
+                is_client=False,
+                is_relay=False,
+                last_interaction_at=None,
+            ),
+        )
+        base_positions = {
+            you_id: (7, 2),
+            "!faroff03": (8, 5),
+        }
+        return working_set, base_positions
+
+    async def test_selecting_remote_node_produces_bounded_connected_route(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+
+            # select_node() only accepts an ID already in the working
+            # set (see its own docstring), so the working set must be
+            # established once first before selecting the remote node
+            # and re-rendering to actually apply the recentering.
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            view.select_node("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            self.assertEqual(len(view.relay_stages), 3)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+            # First confirm the fixture actually DOES independently
+            # edge-clip a relay stage once recentered -- otherwise this
+            # test would trivially pass without exercising the bug.
+            # NOTE: the PUBLIC edge_node_ids property deliberately
+            # excludes anonymous relay-stage IDs (see its own
+            # docstring: "never a selectable edge concept") -- the
+            # internal _edge_node_ids is the one that still includes
+            # them, which is exactly what a white-box check like this
+            # one needs.
+            self.assertTrue(
+                relay_ids & view._edge_node_ids,
+                "fixture must genuinely reproduce an edge-clipped relay "
+                "stage, or this test proves nothing",
+            )
+
+            canvas = view.board.query_one(MeshCanvas)
+            width, height, connectors, _theme = canvas._signature
+            coordinates = {(x, y) for x, y, _glyph, _color in connectors}
+
+            self.assertEqual(
+                len(coordinates),
+                len(connectors),
+                "connector must remain one continuous chain, no branch",
+            )
+            for x, y, _glyph, _color in connectors:
+                self.assertTrue(0 <= x < width)
+                self.assertTrue(0 <= y < height)
+
+            # The precise, deterministic check: once an intermediate
+            # relay stage is independently edge-clipped, the ordered-
+            # chain geometric guarantee no longer holds (see app.py's
+            # own comment at this exact fallback) -- the rendered
+            # connector must be EXACTLY the direct YOU<->remote elbow,
+            # never a multi-point route through the (now unreliable)
+            # relay-stage waypoints. This is what actually distinguishes
+            # correct behavior from the bug: the OLD code's multi-point
+            # route for this exact fixture visits MORE cells than the
+            # direct route (a real, verified difference -- not merely a
+            # coincidental match), including cells nowhere near a
+            # legitimate YOU-remote path.
+            row_count, column_count, center_row, center_column = (
+                view.current_grid_dimensions()
+            )
+            translated = _mesh_translated_positions(
+                view.base_positions, "!faroff03",
+                center_row=center_row, center_column=center_column,
+            )
+            viewport_positions, _edge_ids = project_to_viewport(
+                translated, row_count=row_count, column_count=column_count
+            )
+            you_center = _mesh_grid_pixel(*viewport_positions[you_id])
+            remote_center = _mesh_grid_pixel(*viewport_positions["!faroff03"])
+            direct_route = route_connector_avoiding(
+                you_center[0], you_center[1], remote_center[0], remote_center[1],
+                frozenset(),
+            )
+            self.assertEqual(
+                coordinates,
+                {(x, y) for x, y, _glyph in direct_route},
+                "an edge-clipped relay stage must fall back to the "
+                "direct YOU<->remote connector, never a stale multi-"
+                "point route through it",
+            )
+
+    async def test_you_and_remote_selection_yield_identical_logical_graph(
+        self,
+    ) -> None:
+        """Selection is presentation state -- the underlying node set
+
+        and edge (adjacency) list must never change merely because
+        the user moved focus.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+
+            view.select_node(you_id)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            you_selected_node_ids = {state.node.node_id for state in view.working_set}
+            you_selected_relay_sources = {
+                stage.source_node_id for stage in view.relay_stages
+            }
+
+            view.select_node("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            remote_selected_node_ids = {state.node.node_id for state in view.working_set}
+            remote_selected_relay_sources = {
+                stage.source_node_id for stage in view.relay_stages
+            }
+
+            self.assertEqual(you_selected_node_ids, remote_selected_node_ids)
+            self.assertEqual(you_selected_relay_sources, remote_selected_relay_sources)
+            self.assertEqual(len(view.relay_stages), 3)
+
+    async def test_repeated_selection_toggling_is_deterministic(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            canvas = view.board.query_one(MeshCanvas)
+
+            def current_connectors():
+                view.set_nodes(
+                    working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+                )
+                _w, _h, connectors, _theme = canvas._signature
+                return connectors
+
+            view.select_node(you_id)
+            you_connectors_first = current_connectors()
+            view.select_node("!faroff03")
+            remote_connectors_first = current_connectors()
+            view.select_node(you_id)
+            you_connectors_second = current_connectors()
+            view.select_node("!faroff03")
+            remote_connectors_second = current_connectors()
+
+            self.assertEqual(you_connectors_first, you_connectors_second)
+            self.assertEqual(remote_connectors_first, remote_connectors_second)
+
+    async def test_selected_route_paint_priority_still_wins(self) -> None:
+        """Preserve item 10/25: the selected connector still paints
+
+        ACCENT, last, regardless of this fix.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            view.select_node("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            canvas = view.board.query_one(MeshCanvas)
+            _w, _h, connectors, _theme = canvas._signature
+            palette = THEME_PALETTES[app._current_theme]
+            colors = {color for _x, _y, _glyph, color in connectors}
+            self.assertIn(palette.accent, colors)
+
+
 class ProjectToViewportTests(unittest.TestCase):
     """Pure tests for mesh_topology.project_to_viewport -- the direct-
 
