@@ -6,10 +6,12 @@ from app import MeshtasticPassApp
 from theme_palette import (
     BACKGROUND,
     DIM_BASE_ALPHA,
+    DIM_BASE_QUARTER_ALPHA,
     ERROR,
     THEME_PALETTES,
     ThemePalette,
     dim_base,
+    dim_base_quarter,
 )
 
 
@@ -102,6 +104,55 @@ class ThemePaletteTests(unittest.TestCase):
                     int(palette.dim[5:7], 16) / 255,
                 )[1]
                 self.assertLess(dim_l, base_l)
+
+    def test_dim_quarter_is_exact_textual_blend_for_every_theme(self) -> None:
+        """PR #43 follow-up Part B: the CHAT SENDING animation's inactive
+
+        arrow is 25% BASE-over-background -- derived via the exact same
+        blend machinery as DIM (dim_base), never a hardcoded literal.
+        """
+        self.assertEqual(DIM_BASE_QUARTER_ALPHA, 0.25)
+        for palette in THEME_PALETTES.values():
+            with self.subTest(base=palette.base):
+                self.assertEqual(palette.dim_quarter, dim_base_quarter(palette.base))
+
+    def test_dim_quarter_is_weaker_than_ordinary_dim(self) -> None:
+        """25%-BASE must be visually weaker (closer to background) than
+
+        the ordinary 50% DIM token -- never a reuse of DIM itself.
+        """
+        import colorsys
+
+        for name, palette in THEME_PALETTES.items():
+            with self.subTest(theme=name):
+                self.assertNotEqual(palette.dim_quarter, palette.dim)
+                background_l = colorsys.rgb_to_hls(
+                    int(BACKGROUND[1:3], 16) / 255,
+                    int(BACKGROUND[3:5], 16) / 255,
+                    int(BACKGROUND[5:7], 16) / 255,
+                )[1]
+                dim_l = colorsys.rgb_to_hls(
+                    int(palette.dim[1:3], 16) / 255,
+                    int(palette.dim[3:5], 16) / 255,
+                    int(palette.dim[5:7], 16) / 255,
+                )[1]
+                dim_quarter_l = colorsys.rgb_to_hls(
+                    int(palette.dim_quarter[1:3], 16) / 255,
+                    int(palette.dim_quarter[3:5], 16) / 255,
+                    int(palette.dim_quarter[5:7], 16) / 255,
+                )[1]
+                # Closer to the background's own lightness than DIM is.
+                self.assertLess(
+                    abs(dim_quarter_l - background_l), abs(dim_l - background_l)
+                )
+
+    def test_amber_dim_quarter_preserves_orange_hue(self) -> None:
+        amber = THEME_PALETTES["amber"]
+        r = int(amber.dim_quarter[1:3], 16)
+        g = int(amber.dim_quarter[3:5], 16)
+        b = int(amber.dim_quarter[5:7], 16)
+        self.assertGreater(r, g)
+        self.assertGreaterEqual(g, b)
 
     def test_amber_dim_is_a_real_orange_not_generic_gray(self) -> None:
         """Item 26: AMBER's DIM must preserve BASE's own orange hue --

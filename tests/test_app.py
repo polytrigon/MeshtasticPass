@@ -371,11 +371,16 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(radio.sent_texts, ["unresolved delivery"])
 
-    async def test_arrow_animation_has_exactly_two_positions(self) -> None:
-        """The real animation cycle (_advance_delivery_states, driven by
+    async def test_sending_animation_is_two_permanently_visible_alternating_arrows(
+        self,
+    ) -> None:
+        """PR #43 follow-up Part B: SENDING always shows TWO "▷" glyphs at
 
-        the existing 0.45s delivery timer -- no new timer added) must
-        only ever produce "▷" and " ▷", never a longer-padded frame.
+        stable width/position -- the real animation cycle
+        (_advance_delivery_states, driven by the existing 0.45s
+        delivery timer -- no new timer added) only ever alternates
+        which one carries ACCENT versus the derived 25%-BASE "inactive"
+        color; the text itself never changes.
         """
         radio = ControllableSendRadioService()
         app = MeshtasticPassApp(radio, self.settings)
@@ -383,16 +388,62 @@ class UnresolvedDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             entry = await self._send_and_get_entry(app, pilot)
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
+            palette = THEME_PALETTES[app._current_theme]
+            accent = palette.accent.upper()
+            dim_quarter = palette.dim_quarter.upper()
 
-            seen = set()
+            seen_texts = set()
+            seen_left_colors = set()
             for _ in range(6):
                 app._advance_delivery_states()
-                seen.add(str(widget.delivery_label.render()))
-            self.assertEqual(seen, {"▷", " ▷"})
-            self.assertEqual(
-                widget.delivery_label.visual_style.foreground.hex6,
-                THEME_PALETTES[app._current_theme].accent.upper(),
-            )
+                rendered = widget.delivery_label.render()
+                seen_texts.add(str(rendered))
+                left_color = rendered.spans[0].style.foreground.hex6
+                right_color = rendered.spans[1].style.foreground.hex6
+                seen_left_colors.add(left_color)
+                # Both arrows are ALWAYS visible, never blank/removed,
+                # and always exactly one of each color -- never both
+                # ACCENT, never both dim.
+                self.assertEqual({left_color, right_color}, {accent, dim_quarter})
+
+            # The text/width never changes -- only color alternates.
+            self.assertEqual(seen_texts, {"▷ ▷"})
+            self.assertEqual(seen_left_colors, {accent, dim_quarter})
+
+    async def test_transition_out_of_sending_stops_the_animation_for_good(self) -> None:
+        """Once a message leaves SENDING, a later, unrelated
+
+        _advance_delivery_states() tick (still firing for OTHER
+        messages) must never revert this widget back to the two-arrow
+        animation -- proving the transition genuinely stops it, not
+        just looks right at one snapshot in time.
+        """
+        for target_state, expected_text in (
+            (DeliveryState.SENT, "✓"),
+            (DeliveryState.HEARD, "✓✓"),
+            (DeliveryState.UNCONFIRMED, "⟐"),
+            (DeliveryState.FAILED, "✕"),
+        ):
+            with self.subTest(target_state=target_state):
+                radio = ControllableSendRadioService()
+                app = MeshtasticPassApp(radio, self.settings)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.pause()
+                    entry = await self._send_and_get_entry(app, pilot)
+                    widget = next(
+                        w for w in app.query(ChatEntryWidget) if w.entry is entry
+                    )
+                    self.assertEqual(str(widget.delivery_label.render()), "▷ ▷")
+
+                    entry.delivery_state = target_state
+                    widget.refresh_delivery_state(1)
+                    await pilot.pause()
+                    self.assertEqual(str(widget.delivery_label.render()), expected_text)
+
+                    for _ in range(4):
+                        app._advance_delivery_states()
+                    self.assertEqual(str(widget.delivery_label.render()), expected_text)
+                    self.assertNotIn("▷", str(widget.delivery_label.render()))
 
 
 class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
@@ -3884,14 +3935,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 entry.delivery_state = DeliveryState.SENDING
                 widget.refresh_delivery_state(1)
                 await pilot.pause()
-                self.assertIn(
-                    str(widget.delivery_label.render()),
-                    ("▷", " ▷"),
-                )
-                self.assertEqual(
-                    widget.delivery_label.visual_style.foreground.hex6,
-                    palette.accent.upper(),
-                )
+                rendered = widget.delivery_label.render()
+                self.assertEqual(str(rendered), "▷ ▷")
+                colors = {span.style.foreground.hex6 for span in rendered.spans}
+                self.assertEqual(colors, {palette.accent.upper(), palette.dim_quarter.upper()})
 
                 entry.delivery_state = DeliveryState.SENT
                 widget.refresh_delivery_state(2)
@@ -3957,8 +4004,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(label)
 
             transitions = (
-                (DeliveryState.SENDING, 1, "▷"),
-                (DeliveryState.SENDING, 2, " ▷"),
+                (DeliveryState.SENDING, 1, "▷ ▷"),
+                (DeliveryState.SENDING, 2, "▷ ▷"),
                 (DeliveryState.SENT, 1, "✓"),
                 (DeliveryState.HEARD, 1, "✓✓"),
                 (DeliveryState.FAILED, 1, "✕"),
@@ -3975,8 +4022,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(label.region.width, len(expected))
                 widths.append(label.region.width)
 
-            self.assertGreater(widths[1], widths[0])  # the arrow itself grows frame to frame
-            self.assertLess(widths[2], widths[1])
+            # SENDING's own two frames occupy IDENTICAL width -- only
+            # color alternates, never horizontal size (item 8).
+            self.assertEqual(widths[0], widths[1])
+            self.assertLess(widths[2], widths[0])  # ✓ SENT narrower than "▷ ▷"
             self.assertGreater(widths[3], widths[2])
             self.assertLess(widths[4], widths[3])  # ✕ (1 cell) is narrower than ✓✓ (2 cells)
             self.assertEqual(widths[5], widths[4])  # ⟐ is also a 1-cell glyph, like ✕
@@ -6631,19 +6680,26 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(
                 str(immediate_widget.delivery_label.render()),
-                "▷",
+                "▷ ▷",
             )
             self.assertEqual(
                 [
                     str(child.render())
                     for child in immediate_widget.query(".chat-entry-header Static")
                 ],
-                ["YOU", " / ", "▷", " / ", "0s"],
+                ["YOU", " / ", "▷ ▷", " / ", "0s"],
             )
+            first_spans = immediate_widget.delivery_label.render().spans
             app._advance_delivery_states()
+            # Two arrows, same text, both frames -- only the COLOR
+            # alternates (see MESH FOLLOW-UP -- PR #43 follow-up Part B).
             self.assertEqual(
                 str(immediate_widget.delivery_label.render()),
-                " ▷",
+                "▷ ▷",
+            )
+            second_spans = immediate_widget.delivery_label.render().spans
+            self.assertNotEqual(
+                first_spans[0].style.foreground, second_spans[0].style.foreground
             )
             self.assertIsNotNone(app._delivery_timer)
             self.assertEqual(

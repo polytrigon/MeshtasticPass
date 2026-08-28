@@ -7177,3 +7177,167 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(view.selected_node_id, "!aaaaaaaa")
             you_state = next(s for s in view.working_set if s.node.is_local)
             self.assertEqual(you_state.node.node_id, "!bbbbbbbb")
+
+
+class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
+    """PR #43 FOLLOW-UP Part A: the ACTUAL RENDERED topology label text/
+
+    color for the local node, not just working-set state -- proving
+    the fix closes the real-hardware symptom (topology label showed
+    the NodeDB name instead of "YOU" even though is_local and the
+    bottom-left context were already correct).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    def _you_label_widget(self, app):
+        view = app.query_one(MeshTopologyView)
+        you_id = next(s.node.node_id for s in view.working_set if s.node.is_local)
+        return next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == you_id), you_id
+
+    async def test_topology_label_renders_you_not_the_radios_own_name(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            v4_info = replace(
+                app.radio.info, node_id="!bbbbbbbb", long_name="V4 Radio", short_name="V4"
+            )
+            app._show_connection(RadioState.OFFLINE, message="switching device")
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata("!bbbbbbbb", "V4 Radio", "V4", 0, is_local=True),
+            )
+            app._show_connection(RadioState.ONLINE, v4_info)
+            await self._open_mesh(pilot)
+
+            label_widget, _you_id = self._you_label_widget(app)
+            rendered_text = str(label_widget.render())
+            self.assertEqual(rendered_text, "YOU")
+            self.assertNotEqual(rendered_text, "V4")
+            self.assertNotEqual(rendered_text, "V4 Radio")
+
+            # Bottom-left still correctly shows the real identity.
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("YOU / V4 Radio / V4"))
+
+    async def test_topology_label_renders_you_with_accent2_color(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(
+                    app.radio.info.node_id, "Simulated Node", "SIM", 0, is_local=True
+                ),
+            )
+            await self._open_mesh(pilot)
+            label_widget, _you_id = self._you_label_widget(app)
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertEqual(
+                label_widget.render().spans[0].style.foreground,
+                Color.parse(palette.accent2),
+            )
+
+    async def test_old_radio_keeps_its_own_topology_label_only_new_is_you(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            v4_info = replace(
+                app.radio.info, node_id="!bbbbbbbb", long_name="V4 Radio", short_name="V4"
+            )
+            app._show_connection(RadioState.OFFLINE, message="switching device")
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata("!bbbbbbbb", "V4 Radio", "V4", 0, is_local=True),
+                NodeMetadata(
+                    "!aaaaaaaa", "Old V3", "V3", 0, last_heard=time.time() - 5
+                ),
+            )
+            app._show_connection(RadioState.ONLINE, v4_info)
+            await self._open_mesh(pilot)
+
+            you_label, you_id = self._you_label_widget(app)
+            self.assertEqual(str(you_label.render()), "YOU")
+            self.assertEqual(you_id, "!bbbbbbbb")
+
+            old_label = next(
+                w for w in app.query(MeshNodeLabelWidget) if w.node_id == "!aaaaaaaa"
+            )
+            old_text = str(old_label.render())
+            self.assertIn(old_text, ("Old V3", "V3"))
+            self.assertNotEqual(old_text, "YOU")
+
+    async def test_self_heard_echo_of_own_transmission_still_renders_you(self) -> None:
+        """The exact real-hardware mechanism this bug traced to: a CHAT
+
+        message is received whose sender_node_id equals the LOCAL
+        radio's own ID (a self-heard echo/rebroadcast) -- this must
+        never create a second, is_local=False working-set entry for
+        YOU's own ID that a naive node_id-keyed dict could pick instead
+        of the correct one (see mesh_state.build_mesh_working_set's
+        self-heard-echo comment).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, "Simulated Node", "SIM", 0, is_local=True),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=you_id,
+                    sender_long_name="Simulated Node",
+                    sender_short_name="SIM",
+                    channel_index=0,
+                    text="echo",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            matching_states = [s for s in view.working_set if s.node.node_id == you_id]
+            self.assertEqual(len(matching_states), 1)
+            self.assertTrue(matching_states[0].node.is_local)
+            label_widget, _ = self._you_label_widget(app)
+            self.assertEqual(str(label_widget.render()), "YOU")
+
+    async def test_radio_swap_still_works_alongside_label_fix(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            first_label, first_id = self._you_label_widget(app)
+            self.assertEqual(str(first_label.render()), "YOU")
+
+            v4_info = replace(
+                app.radio.info, node_id="!bbbbbbbb", long_name="V4 Radio", short_name="V4"
+            )
+            app._show_connection(RadioState.OFFLINE, message="switching device")
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata("!bbbbbbbb", "V4 Radio", "V4", 0, is_local=True),
+            )
+            app._show_connection(RadioState.ONLINE, v4_info)
+            await pilot.pause()
+
+            second_label, second_id = self._you_label_widget(app)
+            self.assertEqual(str(second_label.render()), "YOU")
+            self.assertNotEqual(second_id, first_id)
+            self.assertEqual(second_id, "!bbbbbbbb")

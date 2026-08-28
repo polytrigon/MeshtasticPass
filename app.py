@@ -176,14 +176,40 @@ DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
 }
 # A single narrow glyph (U+25B7 WHITE RIGHT-POINTING TRIANGLE -- plain,
 # non-emoji, never double-width; confirmed via grapheme_text.cell_len
-# the same way every other delivery glyph in this module was) animated
-# by right-justifying it to a growing field width each frame: "▷",
-# " ▷", looping at exactly SENDING_ARROW_FRAMES' own cadence. Reads as
-# "in flight / still being resolved", never as success -- unlike the
-# checkmarks above, SENDING covers every outgoing message for which a
-# NAK is still a legitimate possible outcome (see send_was_submitted).
+# the same way every other delivery glyph in this module was). SENDING
+# always renders TWO of these, "▷ ▷", never moving horizontally --
+# only which one carries ACCENT (the "active" arrow) versus the
+# 25%-BASE-over-background "inactive" arrow alternates, at exactly
+# SENDING_ARROW_FRAMES' own pre-existing cadence (see
+# _sending_arrows_text/refresh_delivery_state). Reads as "in flight /
+# still being resolved", never as success -- unlike the checkmarks
+# above, SENDING covers every outgoing message for which a NAK is
+# still a legitimate possible outcome (see send_was_submitted).
 SENDING_ARROW_GLYPH = "▷"
 SENDING_ARROW_FRAMES = (1, 2)
+
+
+def _sending_arrows_text(animation_frame: int, theme: str) -> Text:
+    """Two permanently visible "▷ ▷" arrows -- COLOR alternates between
+
+    them each frame, never horizontal position/width (see MESH FOLLOW-
+    UP item 6-8): frame 1 is DIM25/ACCENT, frame 2 is ACCENT/DIM25,
+    matching the SAME 1/2 toggle _advance_delivery_states already
+    drives (see SENDING_ARROW_FRAMES) -- no second timer. DIM25 (25%
+    BASE-over-background -- deliberately weaker than the ordinary 50%
+    DIM token) is theme_palette.dim_base_quarter, derived the exact
+    same way DIM itself already is, so this needs no theme-specific
+    literal color and resolves correctly for both SNOW and AMBER.
+    """
+    palette = THEME_PALETTES[theme]
+    left_is_active = animation_frame == 2
+    left_color = palette.accent if left_is_active else palette.dim_quarter
+    right_color = palette.dim_quarter if left_is_active else palette.accent
+    text = Text()
+    text.append(SENDING_ARROW_GLYPH, style=Style(color=left_color))
+    text.append(" ")
+    text.append(SENDING_ARROW_GLYPH, style=Style(color=right_color))
+    return text
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
@@ -2362,10 +2388,12 @@ class ChatEntryWidget(Vertical):
         internal_state = self.entry.delivery_state or DeliveryState.SENT
         visible_state = internal_state
         if visible_state is DeliveryState.SENDING:
-            text = SENDING_ARROW_GLYPH.rjust(animation_frame)
+            self.delivery_label.update(
+                _sending_arrows_text(animation_frame, self.app._current_theme)
+            )
         else:
             text = DELIVERY_CHECKMARKS.get(visible_state, visible_state.value)
-        self.delivery_label.update(text)
+            self.delivery_label.update(text)
         for name in DeliveryState:
             self.set_class(
                 name is visible_state,
@@ -2880,10 +2908,16 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    /* Delivery color grammar (item 9/28): -> animated = ACCENT,
-       ✓ SENT = BASE, ✓✓ HEARD = ACCENT, ⟐ UNCONFIRMED = ACCENT2,
-       ✕ FAILED/INTERRUPTED = ERROR. Semantics (DeliveryState) are
-       unchanged -- only which token each visible glyph resolves to. */
+    /* Delivery color grammar (item 9/28): ✓✓ HEARD = ACCENT,
+       ✓ SENT = BASE, ⟐ UNCONFIRMED = ACCENT2, ✕ FAILED/INTERRUPTED =
+       ERROR. Semantics (DeliveryState) are unchanged -- only which
+       token each visible glyph resolves to. SENDING's own two "▷ ▷"
+       arrows are explicitly two-toned (ACCENT/DIM25, alternating -- see
+       app._sending_arrows_text), rendered as Rich Text spans that
+       override this single-color CSS rule for the actual glyphs; this
+       selector's own ACCENT is kept as delivery-sending's base/fallback
+       widget color only (e.g. before the very first refresh_delivery_
+       state call paints the spans). */
     .chat-entry.delivery-sending .chat-entry-delivery,
     .chat-entry.delivery-heard .chat-entry-delivery {
         color: $snow_accent;

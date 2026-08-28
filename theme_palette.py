@@ -25,6 +25,12 @@ FAVORITE_ACCENT = "#FFD700"
 # separate literal DIM color is ever hand-picked, and AMBER's DIM is
 # never a generic gray -- it is BASE's own orange, halved.
 DIM_BASE_ALPHA = 0.5
+# A CHAT SENDING animation's inactive arrow (see app.py's
+# SendingArrowAnimation/DELIVERY_CHECKMARKS) is deliberately weaker
+# than the ordinary 50%-intensity DIM token above -- 25% BASE-over-
+# background, derived via the exact same blend machinery, never a
+# hand-picked gray or a reuse of DIM_BASE_ALPHA.
+DIM_BASE_QUARTER_ALPHA = 0.25
 GRID_DOT_ALPHA = 0.10
 
 
@@ -44,6 +50,11 @@ def dim_base(base: str) -> str:
     return _blend_over_background(base, DIM_BASE_ALPHA)
 
 
+def dim_base_quarter(base: str) -> str:
+    """Resolve BASE at 25% opacity: a CHAT SENDING animation's inactive arrow."""
+    return _blend_over_background(base, DIM_BASE_QUARTER_ALPHA)
+
+
 def grid_dot(base: str) -> str:
     """Resolve BASE at ~10% opacity: the subtle MESH background dot grid."""
     return _blend_over_background(base, GRID_DOT_ALPHA)
@@ -60,6 +71,7 @@ class ThemePalette:
     error: str
     confirm: str
     grid_dot: str
+    dim_quarter: str
     favorite_accent: str = FAVORITE_ACCENT
 
     @property
@@ -71,7 +83,16 @@ class ThemePalette:
 def _palette(
     base: str, accent: str, accent2: str, error: str, confirm: str
 ) -> ThemePalette:
-    return ThemePalette(base, accent, accent2, dim_base(base), error, confirm, grid_dot(base))
+    return ThemePalette(
+        base,
+        accent,
+        accent2,
+        dim_base(base),
+        error,
+        confirm,
+        grid_dot(base),
+        dim_base_quarter(base),
+    )
 
 
 # High-saturation, terminal-readable "neon" colors only -- no desaturated

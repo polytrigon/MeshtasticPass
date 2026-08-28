@@ -268,6 +268,22 @@ def build_mesh_working_set(
     # (item 4), it just never doubles as YOU.
     if len(local_candidates) == 1:
         local = local_candidates[0]
+        # A self-heard echo of YOU's own transmission (a real mesh
+        # phenomenon: another node rebroadcasts a packet and it reaches
+        # this radio again, or the SDK reports a locally-originated
+        # packet as "received") can otherwise leave YOU's own ID ALSO
+        # sitting in known_by_id/normalized_interactions below, which
+        # would admit a SECOND, is_local=False MeshNodeState carrying
+        # the identical node_id -- a duplicate key that a plain dict
+        # keyed by node_id (see app.py's MeshTopologyView.set_nodes:
+        # states_by_id) resolves by LAST-WRITE-WINS, silently handing
+        # the topology label widget the wrong (remote-shaped) state
+        # while callers using next()/first-match (e.g. the bottom-left
+        # context) keep seeing the correct one. YOU's own ID must never
+        # be admitted as a remote candidate at all, closing this at the
+        # source rather than relying on every consumer to pick the
+        # right duplicate.
+        known_by_id.pop(local.node_id, None)
     else:
         for candidate in local_candidates:
             known_by_id.setdefault(candidate.node_id, replace(candidate, is_local=False))
@@ -291,8 +307,14 @@ def build_mesh_working_set(
     # about, plus every node that has originated a CHAT message we
     # received even if NodeDB has no record for it (yet). Sorting and
     # bounding below keeps the OUTPUT small regardless of how large this
-    # candidate pool is.
+    # candidate pool is. YOU's own ID is excluded even if it reached
+    # normalized_interactions alone (see the self-heard-echo comment
+    # above) -- a bare, name-less NodeMetadata(node_id) fallback for
+    # YOU's own ID would be exactly as duplicate-key-dangerous as one
+    # sourced from known_by_id.
     candidate_ids = set(known_by_id) | set(normalized_interactions)
+    if local is not None:
+        candidate_ids.discard(local.node_id)
 
     local_position = local.position if local is not None else None
     candidates: list[MeshNodeState] = []

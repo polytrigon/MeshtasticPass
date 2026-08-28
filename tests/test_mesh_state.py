@@ -164,6 +164,33 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         remote = next(state for state in result if state.node.node_id == "!aaaaaaaa")
         self.assertFalse(remote.node.is_local)
 
+    def test_self_heard_echo_never_admits_you_as_a_duplicate_remote(self) -> None:
+        """PR #43 FOLLOW-UP Part A: a self-heard echo of YOU's own
+
+        transmission (another node rebroadcasts it, or the SDK reports
+        a locally-originated packet as "received") must never leave
+        YOU's own ID ALSO sitting in the working set as a SECOND,
+        is_local=False entry -- that duplicate key is exactly what let
+        the MESH topology label widget pick the wrong (remote-shaped)
+        MeshNodeState via last-write-wins dict construction while the
+        bottom-left context (first-match via next()) kept showing the
+        correct one. Exactly one entry for YOU's ID, and it is local.
+        """
+        you = NodeMetadata("!bbbbbbbb", "V4 Radio", "V4", 0, NOW - 5, is_local=True)
+        remote = NodeMetadata("!c0ffee01", "Real Remote", "RMT", 1, NOW - 5)
+        result = build_mesh_working_set(
+            [you, remote],
+            now=NOW,
+            # Simulates a CHAT-received message whose sender_node_id is
+            # YOU's own ID -- a self-heard echo, never a real remote
+            # interaction.
+            last_message_at={"!bbbbbbbb": NOW - 2, "!c0ffee01": NOW - 2},
+        )
+        matches = [state for state in result if state.node.node_id == "!bbbbbbbb"]
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0].node.is_local)
+        self.assertEqual(matches[0].node.long_name, "V4 Radio")
+
     def test_ambiguous_multiple_is_local_flags_prefer_no_you_over_guessing(self) -> None:
         """Defense-in-depth (item 8): if the upstream data ever reports
 
