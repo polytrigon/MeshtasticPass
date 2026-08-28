@@ -378,6 +378,14 @@ CLOCK_24H_CHOICES = (
     ("OFF", False),
 )
 
+# lora.hop_limit -- PROTOBUF-SOURCE-VERIFIED (Config.LoRaConfig.hop_limit
+# docstring, config_pb2.pyi): "Maximum number of hops. This can't be
+# greater than 7. Default of 3." hop_start/hop_limit are also
+# PROTOBUF-SOURCE-VERIFIED as a 3-bit wire field (mesh_pb2.pyi), so 0-7
+# is the full range the protocol itself can represent -- never an
+# app-invented cap below 7, and 7 is never treated as invalid/excessive.
+HOP_LIMIT_CHOICES = tuple((str(value), value) for value in range(8))
+
 # OFF first: this is a MeshtasticPass-local behavior preference (see
 # AppSettings.clock_auto_sync), never a radio config field, and must
 # default to and visually lead with OFF -- explicit opt-in only (item 16).
@@ -447,6 +455,7 @@ RADIO_SETTINGS: dict[str, RadioSettingSpec] = {
         from_schema_value=lambda use_12h_clock: not use_12h_clock,
     ),
     "timezone": RadioSettingSpec("device", "tzdef"),
+    "hop_limit": RadioSettingSpec("lora", "hop_limit"),
 }
 
 
@@ -577,6 +586,28 @@ class Clock24HSelector(KeyboardDropdown):
             (DropdownOption(name, value) for name, value in CLOCK_24H_CHOICES),
             is_24h,
             widget_id="radio-clock-24h-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class HopLimitSelector(KeyboardDropdown):
+    """HOP LIMIT -- backed by lora.hop_limit (see HOP_LIMIT_CHOICES for
+
+    sourcing). The initial value is always the CONNECTED radio's own
+    synced value (never defaulted to 3 here -- see _render_radio_settings,
+    which reads it live via read_synced_config_field exactly like every
+    other RADIO_SETTINGS dropdown); the 3 passed to __init__ below is
+    only compose()'s placeholder before the first connection.
+    """
+
+    def __init__(self, hop_limit: int) -> None:
+        super().__init__(
+            "hop_limit",
+            "HOP LIMIT",
+            (DropdownOption(name, value) for name, value in HOP_LIMIT_CHOICES),
+            hop_limit,
+            widget_id="radio-hop-limit-selector",
             label_width=CONNECTION_LABEL_WIDTH,
             classes="keyboard-dropdown connection-action-row",
         )
@@ -3228,6 +3259,7 @@ class MeshtasticPassApp(App[None]):
                 yield CompassSelector(True)
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
+                yield HopLimitSelector(3)
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
@@ -4071,8 +4103,12 @@ class MeshtasticPassApp(App[None]):
     # its own (see RoleSelector/BluetoothSelector's own docstrings) --
     # no redundant "BLUETOOTH APPLIED" success line, matching the same
     # reasoning already applied to COLOR/AUTO SYNC. A genuine failure
-    # still surfaces through the shared #radio-status normally.
-    _SILENT_SUCCESS_SETTINGS = {"bluetooth"}
+    # still surfaces through the shared #radio-status normally. HOP
+    # LIMIT joins this set per its own explicit requirement (PART E):
+    # the visibly changed dropdown value is sufficient confirmation --
+    # no "HOP LIMIT SAVED" success noise -- while a real failure still
+    # surfaces an ERROR through the exact same shared #radio-status path.
+    _SILENT_SUCCESS_SETTINGS = {"bluetooth", "hop_limit"}
 
     def _dedicated_status_setter(
         self, setting_name: str
@@ -4325,6 +4361,7 @@ class MeshtasticPassApp(App[None]):
             (self.query_one(CompassSelector), RADIO_SETTINGS["compass"]),
             (self.query_one(FlipScreenSelector), RADIO_SETTINGS["flip_screen"]),
             (self.query_one(Clock24HSelector), RADIO_SETTINGS["clock_24h"]),
+            (self.query_one(HopLimitSelector), RADIO_SETTINGS["hop_limit"]),
         )
         palette = THEME_PALETTES[self._current_theme]
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
@@ -4587,9 +4624,16 @@ class MeshtasticPassApp(App[None]):
             if entry.delivery_state in (DeliveryState.HEARD, DeliveryState.FAILED)
             else event.sent.immediate_state or DeliveryState.SENDING
         )
+        # Delivery-state monotonicity: a confirmation TIMEOUT exists only
+        # to answer "nothing conclusive arrived" -- SENT is already a
+        # genuine positive routing confirmation (see this method's own
+        # docstring above), so it must never be scheduled for later
+        # downgrade to UNCONFIRMED. Only genuine SENDING (still fully
+        # open) gets a deadline; _set_delivery_state's own retirement
+        # logic agrees (belt-and-suspenders -- see its docstring).
         entry.confirmation_deadline = (
             monotonic() + CHAT_CONFIRMATION_TIMEOUT_SECONDS
-            if state in (DeliveryState.SENDING, DeliveryState.SENT)
+            if state is DeliveryState.SENDING
             else None
         )
         self._set_delivery_state(entry, state, packet_id=event.sent.packet_id)
@@ -5321,13 +5365,24 @@ class MeshtasticPassApp(App[None]):
             SENDING_ARROW_FRAMES
         ) + 1
         now = monotonic()
-        for entry in self.chat_history:
-            if (
-                entry.delivery_state in (DeliveryState.SENDING, DeliveryState.SENT)
-                and entry.confirmation_deadline is not None
-                and now >= entry.confirmation_deadline
-            ):
-                self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
+        # Every channel's AND every DM conversation's entries, not just
+        # the currently-viewed one -- a send left in flight on a channel
+        # or DM the user has since switched away from must still
+        # correctly resolve to UNCONFIRMED on its own timeline, exactly
+        # as if it were still visible. Only genuine SENDING is eligible
+        # for the timeout at all (delivery-state monotonicity: SENT/
+        # HEARD/FAILED already retired their own deadline to None the
+        # instant they were reached -- see _set_delivery_state -- so
+        # this check is itself the second, redundant confirmation of
+        # that invariant, never the ONLY thing enforcing it).
+        for state in (*self._channel_states.values(), *self._dm_states.values()):
+            for entry in state.entries:
+                if (
+                    entry.delivery_state is DeliveryState.SENDING
+                    and entry.confirmation_deadline is not None
+                    and now >= entry.confirmation_deadline
+                ):
+                    self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
         for widget in self.query(ChatEntryWidget):
             widget.refresh_delivery_state(self._send_animation_frame)
 
@@ -6581,7 +6636,17 @@ class MeshtasticPassApp(App[None]):
             self._update_effective_transmission_time(entry)
         if packet_id is not None:
             entry.packet_id = packet_id
-        if state not in (DeliveryState.SENDING, DeliveryState.SENT):
+        # Delivery-state monotonicity (see _advance_delivery_states):
+        # the confirmation-timeout deadline exists ONLY to eventually
+        # produce UNCONFIRMED for a send that never got ANY conclusive
+        # evidence. The instant a send reaches SENT/HEARD/FAILED, it
+        # already IS conclusive -- the deadline is retired immediately
+        # so a late-firing timeout tick can never downgrade it. A later,
+        # genuinely STRONGER ack (SENT -> HEARD, or a real ack promoting
+        # an already-retired UNCONFIRMED -- see delivery_status_received)
+        # is a completely separate path from this timeout and is never
+        # blocked by retiring the deadline here.
+        if state is not DeliveryState.SENDING:
             entry.confirmation_deadline = None
         completed_at = (
             time()

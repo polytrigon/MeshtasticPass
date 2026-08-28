@@ -39,6 +39,7 @@ from app import (
     EndOfChatHistoryMarker,
     FlipScreenSelector,
     FontSizeSelector,
+    HopLimitSelector,
     LoadOlderControl,
     LongNameControl,
     ShortNameControl,
@@ -1318,6 +1319,178 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             radio.write_verified_config_field.assert_not_called()
             self.assertEqual(radio.sent_messages, ())
+
+    # ---- HOP LIMIT (lora.hop_limit) -------------------------------------
+
+    async def test_hop_limit_reads_actual_synced_radio_value(self) -> None:
+        """Never defaults the displayed value to 3 -- shows whatever the
+
+        CONNECTED radio actually reports, even when that is something
+        else entirely (item 21).
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["lora"]["hop_limit"] = 7
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            self.assertIn("[ 7 ▾ ]", str(dropdown.render()))
+            self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 7)
+
+    async def test_hop_limit_options_span_the_full_zero_to_seven_range(self) -> None:
+        """Item 20: the protocol's true maximum is 7 (3-bit wire field),
+
+        never an app-invented cap below the firmware limit -- every
+        value 0 through 7 must be a selectable option.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            self.assertEqual(
+                tuple(int(o.label) for o in dropdown.options), tuple(range(8))
+            )
+
+    async def test_hop_limit_seven_displays_normally_not_as_an_error(self) -> None:
+        """Item 15/24: 7 is a legitimate firmware-supported value, never
+
+        presented as DANGEROUS/INVALID/EXCESSIVE.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["lora"]["hop_limit"] = 7
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            rendered = str(dropdown.render())
+            self.assertIn("7", rendered)
+            for word in ("DANGER", "INVALID", "EXCESSIVE", "ERROR", "WARNING"):
+                self.assertNotIn(word, rendered)
+
+    async def test_hop_limit_write_uses_verified_pipeline_and_updates_snapshot(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.config_snapshot()
+            dropdown = app.query_one(HopLimitSelector)
+            self.assertIn("[ 3 ▾ ]", str(dropdown.render()))
+            dropdown.focus()
+            # 3 -> 4.
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "4" in str(dropdown.render()):
+                    break
+            self.assertIn("[ 4 ▾ ]", str(dropdown.render()))
+            self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 4)
+            after = radio.config_snapshot()
+            self.assertIsNot(after, before)
+
+    async def test_hop_limit_change_shows_no_success_status(self) -> None:
+        """PART E: no "HOP LIMIT SAVED" success noise -- the visibly
+
+        changed value is itself sufficient confirmation. A genuine write
+        failure must still surface an ERROR through the shared
+        #radio-status normally.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            status = app.query_one("#radio-status", Static)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "4" in str(dropdown.render()):
+                    break
+            self.assertNotIn("HOP LIMIT", str(status.render()))
+            self.assertFalse(status.has_class("setting-success"))
+
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, 5, None, "mismatch")
+            )
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT APPLIED" in str(status.render()):
+                    break
+            self.assertIn("HOP LIMIT NOT APPLIED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+
+    async def test_hop_limit_unsupported_schema_disables_dropdown_safely(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            del radio._config_sections["lora"]["hop_limit"]
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            self.assertIn("UNSUPPORTED", str(dropdown.render()))
+            self.assertTrue(dropdown.disabled)
+
+    async def test_opening_config_sends_zero_hop_limit_requests(self) -> None:
+        """PART F: opening CONNECTION/CONFIG must generate zero additional
+
+        requests -- the selector renders from the already-synchronized
+        config model, never a fresh read.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            app.query_one(HopLimitSelector).focus()
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
+    async def test_hop_limit_never_changes_automatically(self) -> None:
+        """PART E/F: MeshtasticPass must never auto-optimize hop limit --
+
+        not on connect, not reactively, not based on channel activity.
+        A fresh connection's value must be exactly whatever the radio
+        already had, completely unpolled/unmodified by the app itself.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["lora"]["hop_limit"] = 5
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            for _ in range(5):
+                await pilot.pause()
+            self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 5)
+            self.assertIn("[ 5 ▾ ]", str(app.query_one(HopLimitSelector).render()))
 
     # ---- Section headers use DIM, not ACCENT ---------------------------
 
@@ -4815,10 +4988,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         SENT renders as the checkmark (✓) -- the strongest truthful
         evidence of a successful local send without stronger remote
-        confirmation (see RadioService._parse_send_response). What must
-        also hold, with zero restart, is that once the confirmation window elapses,
-        _advance_delivery_states() promotes it to UNCONFIRMED and the
-        store/entry/widget move together again.
+        confirmation (see RadioService._parse_send_response). Delivery-
+        state monotonicity (see _set_delivery_state's own docstring):
+        once SENT is reached, its confirmation_deadline is immediately
+        retired to None, so a later _advance_delivery_states() tick --
+        even one that would otherwise be well past the ordinary
+        confirmation window -- can never downgrade it to UNCONFIRMED.
+        ✓ once genuinely confirmed must stay ✓.
         """
         radio = SimulatedRadioService(
             connect_delay=0,
@@ -4854,15 +5030,21 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             raw.close()
             self.assertEqual(row["delivery_state"], "SENT")
             self.assertEqual(str(widget.delivery_label.render()), "✓")
+            # SENT retires its own confirmation_deadline the instant it
+            # is reached (see _set_delivery_state) -- confirmed directly.
+            self.assertIsNone(entry.confirmation_deadline)
 
+            # Even forcing a deadline artificially into the past changes
+            # nothing: _advance_delivery_states only ever times out a
+            # genuinely still-open SENDING attempt.
             entry.confirmation_deadline = monotonic() - 1
             app._advance_delivery_states()
             await pilot.pause()
 
-            self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
             self.assertIs(widget.entry, entry)
-            self.assertIn("⟐", str(widget.delivery_label.render()))
-            self.assertNotIn("✓", str(widget.delivery_label.render()))
+            self.assertEqual(str(widget.delivery_label.render()), "✓")
+            self.assertNotIn("⟐", str(widget.delivery_label.render()))
 
             raw = sqlite3.connect(f"file:{self.chat_db_path}?mode=ro", uri=True)
             raw.row_factory = sqlite3.Row
@@ -4870,7 +5052,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT delivery_state FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
             raw.close()
-            self.assertEqual(row["delivery_state"], "UNCONFIRMED")
+            self.assertEqual(row["delivery_state"], "SENT")
 
     async def test_live_resend_terminal_transitions_stay_in_sync(self) -> None:
         """For every terminal state a live RESEND can reach, the store,
@@ -6735,18 +6917,22 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(failed.delivery_state, DeliveryState.FAILED)
 
+            # Delivery-state monotonicity: SENT is already a genuine
+            # positive confirmation and must never be downgraded by a
+            # later timeout tick, even a deliberately stale one forced
+            # here (see _set_delivery_state's own docstring).
             immediate.delivery_state = DeliveryState.SENT
             immediate.confirmation_deadline = monotonic() - 1
             before = len(radio.sent_messages)
             app._advance_delivery_states()
-            self.assertEqual(immediate.delivery_state, DeliveryState.UNCONFIRMED)
+            self.assertEqual(immediate.delivery_state, DeliveryState.SENT)
             self.assertEqual(len(radio.sent_messages), before)
 
         reopened = ChatStore.open(self.chat_db_path)
         self.addCleanup(reopened.close)
         stored_messages = reopened.load_recent()
         self.assertEqual(len(stored_messages), 2)
-        self.assertEqual(stored_messages[0].delivery_state, "UNCONFIRMED")
+        self.assertEqual(stored_messages[0].delivery_state, "SENT")
         self.assertEqual(stored_messages[1].delivery_state, "FAILED")
         self.assertEqual(
             len(reopened.load_send_attempts(stored_messages[0].id)),

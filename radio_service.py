@@ -85,6 +85,35 @@ def _node_number_from_id(node_id: str | None) -> int | None:
         return None
 
 
+def traversed_hops(hop_start: int | None, hop_limit: int | None) -> int | None:
+    """Packet-level hops traveled so far: hop_start - hop_limit.
+
+    PROTOBUF-SOURCE-VERIFIED (mesh_pb2.pyi): MeshPacket.hop_start is
+    "Hop limit with which the original packet started ... the
+    difference between hop_start and hop_limit gives how many hops it
+    traveled." Both fields are a 3-bit wire value (0-7) -- there is no
+    3-hop cap, and this deliberately never clamps its result.
+
+    This is NOT wired into the live "N HOPS" MESH display: that display
+    already shows the SDK/firmware-computed NodeInfo.hops_away field
+    directly (see get_node_metadata/get_known_nodes), which the SDK
+    never derives from hop_start/hop_limit anywhere -- the two are
+    independent pieces of hop information. This function exists for
+    any PACKET-level (not NodeDB-level) caller that genuinely has both
+    fields from one received MeshPacket.
+
+    Returns None -- an honest "indeterminate", never a fabricated 0 --
+    whenever either input is missing or the packet's hop_limit exceeds
+    its own hop_start (impossible for a single packet that only ever
+    traveled forward, so not a trustworthy observation).
+    """
+    if hop_start is None or hop_limit is None:
+        return None
+    if hop_limit > hop_start:
+        return None
+    return hop_start - hop_limit
+
+
 class RadioState(Enum):
     """Connection states that callers can display without knowing SDK details."""
 
