@@ -281,6 +281,21 @@ def message_mentions_short_name(text: str, short_name: str | None) -> bool:
     )
 
 
+def _dm_dropdown_label(
+    node_id: str, long_name: str | None, short_name: str | None
+) -> str:
+    """"LONG NAME / SHORT NAME" presentation for one DM dropdown row
+
+    (PR #46 follow-up Part B item 9), falling back to whichever single
+    name is known, then the canonical node ID -- names are presentation
+    only, never conversation identity (that is always the dropdown
+    option's own `value`, the node_id itself).
+    """
+    if long_name and short_name and long_name != short_name:
+        return f"{long_name} / {short_name}"
+    return long_name or short_name or node_id
+
+
 class ThinScrollBarRender(ScrollBarRender):
     """Use one aligned narrow glyph for both track and draggable thumb.
 
@@ -698,14 +713,24 @@ class ChannelSelector(KeyboardDropdown):
 class DMModeSelector(KeyboardDropdown):
     """CHAT's RIGHT peer selector: [ DM(N) ▾ ] -- N is the unread DM
 
-    count (see MeshtasticPassApp._recount_dm_unread). Visually peer to
-    ChannelSelector (same KeyboardDropdown grammar/focus styling), but
-    there is nothing to pick FROM: activating it (ENTER, click, or the
-    D hotkey) switches CHAT straight into DMS mode -- see open_menu's
-    override below and MeshtasticPassApp._switch_chat_mode. It carries
-    exactly one DropdownOption purely so KeyboardDropdown's normal
-    render/selected-label machinery has a label to show; that option's
-    own `value` is never meaningfully "selected" from a popup.
+    count (see MeshtasticPassApp._recount_dm_unread). A TRUE dropdown,
+    peer to ChannelSelector (PR #46 follow-up Part B): opening it
+    (ENTER, click, or the D hotkey) shows existing DM conversations
+    directly, most-recent-activity first -- never immediately
+    switching into DMS mode/the full conversation list the way the
+    original PR #46 pass did. Opening this dropdown alone is zero-RF
+    and never clears DM(N) -- only actually opening a conversation
+    does (see MeshtasticPassApp._open_dm_conversation).
+
+    `self.options`/`self.value` hold exactly one entry -- the CLOSED
+    heading's own DropdownOption("DM(N)", "dms") -- and are restored
+    after every close (see close_menu); they are NOT what the open
+    popup shows. The open popup's real conversation rows live in
+    `self._conversation_items`, a completely separate list rebuilt
+    fresh on every open_menu() call (never cached/persisted), because
+    KeyboardDropdown's own on_key navigation math (`% len(self.
+    options)`) would otherwise misbehave against a "DM(N)"-only
+    options list of length 1.
     """
 
     def __init__(self, unread_count: int) -> None:
@@ -717,14 +742,64 @@ class DMModeSelector(KeyboardDropdown):
             widget_id="chat-dm-selector",
             prefix="",
         )
+        self._closed_options = self.options
+        self._conversation_items: tuple[DropdownOption, ...] = ()
+
+    def set_unread_count(self, unread_count: int) -> None:
+        option = DropdownOption(f"DM({unread_count})", "dms")
+        self._closed_options = (option,)
+        if not self.is_open:
+            self.set_options((option,), value="dms")
 
     def open_menu(self) -> None:
-        # Never actually opens a popup -- there is nothing to choose
-        # from. Posting Selected directly is what dropdown_selected
-        # (setting_name == "chat_dm_mode") reacts to by switching CHAT
-        # into DMS mode, exactly mirroring what picking a real option
-        # would otherwise do.
-        self.post_message(self.Selected(self, "dms"))
+        conversations = self.app.dm_dropdown_conversations()
+        empty = not conversations
+        self._conversation_items = conversations or (DropdownOption("NO DMS", None),)
+        # Swapped in only so KeyboardDropdown's own on_key navigation
+        # math (`% len(self.options)`) operates against the REAL
+        # conversation count while open -- restored by close_menu.
+        self.options = self._conversation_items
+        self.value = self._conversation_items[0].value
+        self.is_open = True
+        self._highlighted_index = 0
+        self.add_class("open")
+        items = tuple(
+            PopupItem(option.label, option.value, actionable=not empty)
+            for option in self._conversation_items
+        )
+        self.popup = ViewportMenu(
+            items,
+            highlighted_index=self._highlighted_index,
+            on_activate=self._activate_popup_item,
+        )
+        width = max(len(option.label) for option in self._conversation_items) + 4
+        self.screen.mount(self.popup)
+        self.popup.place(self.region, self.screen.region, width)
+        self._render_dropdown()
+
+    def close_menu(self) -> None:
+        super().close_menu()
+        self.options = self._closed_options
+        self.value = "dms"
+        self._render_dropdown()
+
+    def _activate_popup_item(self, index: int, _item: PopupItem) -> None:
+        if not 0 <= index < len(self._conversation_items):
+            self.close_menu()
+            return
+        option = self._conversation_items[index]
+        node_id = option.value
+        self.close_menu()
+        if node_id is None:
+            # "NO DMS" -- item 14: safely closes without opening or
+            # fabricating a conversation, whether reached by mouse
+            # click (ViewportMenu.activate's own actionable=False
+            # guard already no-ops it) or by keyboard ENTER
+            # (KeyboardDropdown.on_key calls _activate_popup_item
+            # directly, bypassing that actionable check -- so this
+            # explicit guard is the one that actually matters there).
+            return
+        self.post_message(self.Selected(self, node_id))
 
 
 # The first-pass emoji set -- see the CHAT delivery/menu/emoji task.
@@ -3574,15 +3649,43 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
         if self._user_menu is not None:
+            # Real-hardware regression (PR #46 follow-up Part A): the
+            # node/user menu never steals Textual focus (ViewportMenu.
+            # can_focus = False, by design -- see its own docstring),
+            # so the ORIGINATING ChatEntryWidget/#chat-log stays
+            # focused the entire time the menu is open. event.stop()
+            # alone only blocks this event from bubbling PAST the App
+            # -- it does NOT stop Textual's own separate, always-
+            # present App._on_key handler (inherited from the base App
+            # class) from ALSO running in the SAME dispatch pass. That
+            # handler independently walks the bindings of every widget
+            # from the still-focused ChatEntryWidget up to the Screen,
+            # finds ChatTranscript's OWN inherited ScrollableContainer
+            # bindings ("up"->scroll_up, "down"->scroll_down), and
+            # fires them regardless -- silently scrolling the
+            # transcript underneath the menu on every arrow press. In
+            # ordinary (menu-closed) navigation this same double-fire
+            # happens too, but _move_chat_focus's own scroll_visible()
+            # call immediately re-settles the correct position
+            # afterward, masking it; nothing re-settles it while the
+            # menu owns navigation, which is what actually exposed the
+            # bug. event.prevent_default() is the one call that
+            # actually suppresses that second, independent handler
+            # (see Message._no_default_action / _get_dispatch_methods
+            # in Textual's own message_pump.py) -- event.stop() is not
+            # enough on its own here.
             if event.key in ("up", "down"):
                 self._user_menu.move_highlight(-1 if event.key == "up" else 1)
                 event.stop()
+                event.prevent_default()
             elif event.key == "enter":
                 self._user_menu.activate()
                 event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 self._close_user_menu()
                 event.stop()
+                event.prevent_default()
             return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
@@ -3628,8 +3731,15 @@ class MeshtasticPassApp(App[None]):
                 event.stop()
                 return
             if event.key.lower() == "d":
-                self._switch_chat_mode("dms")
-                self._focus_chat_mode("dms")
+                # PR #46 follow-up Part B item 7: D mirrors C -- it
+                # opens the DM DROPDOWN, never immediately switches
+                # into DMS mode/the full conversation list. The user
+                # picks a conversation from the dropdown to actually
+                # enter DMS mode (see DMModeSelector.open_menu/
+                # dropdown_selected's "chat_dm_mode" handling).
+                selector = self.query_one(DMModeSelector)
+                selector.focus()
+                selector.open_menu()
                 event.stop()
                 return
             if event.key == "left":
@@ -3712,6 +3822,12 @@ class MeshtasticPassApp(App[None]):
                     self._focus_chat_mode("channel", open_dropdown=True)
                     event.stop()
                     return
+                if event.key.lower() == "d":
+                    selector = self.query_one(DMModeSelector)
+                    selector.focus()
+                    selector.open_menu()
+                    event.stop()
+                    return
             else:
                 if event.key == "escape":
                     self._close_dm_conversation()
@@ -3734,10 +3850,16 @@ class MeshtasticPassApp(App[None]):
                     self._focus_chat_mode("channel", open_dropdown=True)
                     event.stop()
                     return
+                if event.key.lower() == "d":
+                    selector = self.query_one(DMModeSelector)
+                    selector.focus()
+                    selector.open_menu()
+                    event.stop()
+                    return
                 if (
                     event.is_printable
                     and event.character
-                    and event.key not in ("1", "2", "3", "c")
+                    and event.key not in ("1", "2", "3", "c", "d")
                 ):
                     dm_input = self.query_one("#dm-input", Input)
                     if not dm_input.disabled:
@@ -4218,8 +4340,17 @@ class MeshtasticPassApp(App[None]):
             await self._switch_channel(int(event.value))
             return
         if event.setting_name == "chat_dm_mode":
+            # DMModeSelector's own Selected event ALWAYS carries a real
+            # conversation node_id here (never "dms" -- see its
+            # _activate_popup_item, which never posts Selected for the
+            # non-actionable "NO DMS" placeholder) -- PR #46 follow-up
+            # Part B item 11: ENTER on a highlighted conversation opens
+            # that EXACT conversation directly, the dropdown's whole
+            # point being to skip the generic list.
+            node_id = str(event.value)
             self._switch_chat_mode("dms")
-            self._focus_chat_mode("dms")
+            long_name, short_name = self._dm_identity(node_id)
+            self._open_dm_conversation(node_id, long_name=long_name, short_name=short_name)
             return
         if event.setting_name == "device_path":
             await self._switch_device(str(event.value))
@@ -5976,6 +6107,35 @@ class MeshtasticPassApp(App[None]):
                         short_name = entry.sender_short_name
                         break
         return long_name, short_name
+
+    def dm_dropdown_conversations(self) -> tuple[DropdownOption, ...]:
+        """Real DM conversations for the DM dropdown (PR #46 follow-up
+
+        Part B), most-recent-activity first -- the SAME ordering
+        _refresh_dm_list already derives from ChatStore.list_dm_
+        conversations() (item 10: no independent ordering system).
+        Zero RF: a pure SQLite read plus the same cached-NodeDB lookup
+        _dm_identity already uses. Each option's own value is the
+        canonical node_id -- never a display name or list position
+        (item 8/30), so duplicate presentation names never collapse
+        distinct conversations.
+        """
+        try:
+            conversations = (
+                self.chat_store.list_dm_conversations()
+                if self.chat_store is not None
+                else []
+            )
+        except ChatStoreError as error:
+            self._show_dm_send_error(str(error))
+            conversations = []
+        options = []
+        for node_id, _time in conversations:
+            long_name, short_name = self._dm_identity(node_id)
+            options.append(
+                DropdownOption(_dm_dropdown_label(node_id, long_name, short_name), node_id)
+            )
+        return tuple(options)
 
     def _refresh_dm_list(self) -> None:
         """Rebuild the conversation list from persisted history -- zero

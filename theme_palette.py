@@ -107,16 +107,17 @@ ERROR = NEON_RED
 
 THEME_PALETTES = {
     # SNOW: a bright-white terminal. ACCENT is neon green, ACCENT2 is a
-    # bright neon violet/purple (#9D00FF -- "Electric Violet": pure,
-    # fully-saturated blue-violet hue, brighter/higher-blue than the
-    # standard "dark violet" #9400D3, unmistakably purple rather than
-    # drifting toward magenta/hot pink), CONFIRM equals ACCENT's green
-    # (still a distinct semantic token in code -- see ThemePalette/
-    # module docstring).
+    # bright electric violet/purple (#B84DFF -- real-hardware follow-up
+    # to the original #9D00FF: same ~276 deg blue-violet hue family
+    # -- unmistakably purple, not pink/magenta, not blue -- but
+    # lightness raised from 0.5 to ~0.65 at full saturation for better
+    # visibility on the physical uConsole display, still nowhere near
+    # pastel). CONFIRM equals ACCENT's green (still a distinct semantic
+    # token in code -- see ThemePalette/module docstring).
     "snow": _palette(
         base="#F2F2F2",
         accent="#39FF14",
-        accent2="#9D00FF",
+        accent2="#B84DFF",
         error=NEON_RED,
         confirm="#39FF14",
     ),

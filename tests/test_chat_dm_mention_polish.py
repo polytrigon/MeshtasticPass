@@ -53,7 +53,11 @@ class ChatDmMentionAppTestsBase(unittest.IsolatedAsyncioTestCase):
 
 class SnowAccent2ColorTests(unittest.TestCase):
     def test_snow_accent2_is_the_exact_new_neon_purple(self) -> None:
-        self.assertEqual(THEME_PALETTES["snow"].accent2, "#9D00FF")
+        """PR #46 follow-up Part G: lightened from #9D00FF to #B84DFF
+
+        after real-hardware feedback that the original was too dark.
+        """
+        self.assertEqual(THEME_PALETTES["snow"].accent2, "#B84DFF")
 
     def test_amber_accent2_is_unchanged(self) -> None:
         self.assertEqual(THEME_PALETTES["amber"].accent2, "#40C4FF")
@@ -113,16 +117,23 @@ class ChatHeaderTests(ChatDmMentionAppTestsBase):
             await pilot.pause()
             self.assertIn("DM(0)", str(app.query_one(DMModeSelector).render()))
 
-    async def test_activating_dm_selector_switches_to_dms_mode(self) -> None:
+    async def test_activating_dm_selector_opens_dropdown_not_dms_mode(self) -> None:
+        """PR #46 follow-up Part B item 12: activating the header's
+
+        DM(N) control opens the DROPDOWN, exactly like pressing D --
+        it must NOT immediately switch CHAT into DMS mode on its own.
+        """
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             app.show_tab("chat")
             await pilot.pause()
-            app.query_one(DMModeSelector).focus()
+            selector = app.query_one(DMModeSelector)
+            selector.focus()
             await pilot.press("enter")
             await pilot.pause()
-            self.assertEqual(app._chat_mode, "dms")
+            self.assertTrue(selector.is_open)
+            self.assertEqual(app._chat_mode, "channel")
 
     async def test_selecting_a_channel_switches_back_to_channel_mode(self) -> None:
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
@@ -153,7 +164,13 @@ class ChatHotkeyTests(ChatDmMentionAppTestsBase):
             await pilot.pause()
             self.assertEqual(app._chat_mode, "channel")
 
-    async def test_d_switches_to_dms_mode(self) -> None:
+    async def test_d_opens_dm_dropdown_not_dms_mode_directly(self) -> None:
+        """PR #46 follow-up Part B item 7: D now mirrors C -- it opens
+
+        the DM dropdown; it must NOT immediately switch CHAT into DMS
+        mode/the full conversation list the way the original PR #46
+        pass did.
+        """
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
@@ -162,7 +179,42 @@ class ChatHotkeyTests(ChatDmMentionAppTestsBase):
             app.query_one("#chat-log").focus()
             await pilot.press("d")
             await pilot.pause()
+            self.assertTrue(app.query_one(DMModeSelector).is_open)
+            self.assertEqual(app._chat_mode, "channel")
+
+    async def test_selecting_from_dm_dropdown_enters_dms_mode(self) -> None:
+        """The DM dropdown reads from persisted conversations (the SAME
+
+        ChatStore.list_dm_conversations() source _refresh_dm_list
+        already uses -- item 10), so this test attaches a real
+        ChatStore rather than relying on in-memory-only state.
+        """
+        store = ChatStore.open(self.chat_db_path)
+        self.addCleanup(store.close)
+        app = MeshtasticPassApp(_simulated_radio(), self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._accept_received_message(
+                ReceivedMessage(
+                    sender_node_id="!b0b00002",
+                    sender_long_name="Bob",
+                    sender_short_name="BOB",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    is_direct=True,
+                )
+            )
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
             self.assertEqual(app._chat_mode, "dms")
+            self.assertEqual(app.current_dm_node_id, "!b0b00002")
 
     async def test_c_does_not_reset_channel_draft(self) -> None:
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
@@ -174,9 +226,11 @@ class ChatHotkeyTests(ChatDmMentionAppTestsBase):
             chat_input.value = "unfinished thought"
             await pilot.press("escape")
             await pilot.pause()
-            await pilot.press("d")
+            app.open_dm("!b0b00002", long_name="Bob")
             await pilot.pause()
             self.assertEqual(app._chat_mode, "dms")
+            await pilot.press("escape")
+            await pilot.pause()
             await pilot.press("c")
             await pilot.pause()
             self.assertEqual(app._chat_mode, "channel")
@@ -593,6 +647,282 @@ class ConnectionStatusAccentTests(ChatDmMentionAppTestsBase):
                     rendered.spans[-1].style.foreground.hex.upper(),
                     THEME_PALETTES[theme].accent.upper(),
                 )
+
+
+# ---- Overlay key ownership (PR #46 follow-up Part A/F) --------------------
+
+
+class NodeMenuKeyOwnershipTests(ChatDmMentionAppTestsBase):
+    """Real-hardware regression: opening the CHAT node/user menu left
+
+    the originating ChatEntryWidget focused (ViewportMenu.can_focus is
+    False by design), so UP/DOWN pressed to navigate the menu ALSO
+    reached Textual's own built-in App._on_key handler (co-resident on
+    the App class alongside our custom on_key -- see event.
+    prevent_default's docstring in on_key), which independently
+    re-walked the focused widget's ancestor bindings and fired
+    ChatTranscript's OWN inherited ScrollableContainer "up"/"down"
+    scroll bindings -- scrolling the transcript underneath the menu on
+    every arrow press, through the actual widget/app event path (not
+    an isolated helper).
+    """
+
+    async def test_node_menu_navigation_does_not_move_underlying_chat(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 20)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            for i in range(40):
+                app._accept_received_message(
+                    replace(
+                        SIMULATED_MESSAGES[0],
+                        packet_id=900000 + i,
+                        text=f"message {i} with enough padding text to force scrolling",
+                    )
+                )
+            for _ in range(5):
+                await pilot.pause()
+            widgets = list(app.query(ChatEntryWidget))
+            target = widgets[20]
+            target.focus()
+            for _ in range(3):
+                await pilot.pause()
+            transcript = app.query_one("#chat-log")
+            scroll_before = transcript.scroll_y
+
+            await pilot.press("enter")
+            for _ in range(3):
+                await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            menu = app._user_menu
+            highlight_before = menu.highlighted_index
+
+            await pilot.press("up")
+            for _ in range(3):
+                await pilot.pause()
+            self.assertNotEqual(menu.highlighted_index, highlight_before)
+            self.assertIs(app.focused, target)
+            self.assertEqual(transcript.scroll_y, scroll_before)
+
+            await pilot.press("down")
+            for _ in range(3):
+                await pilot.pause()
+            self.assertIs(app.focused, target)
+            self.assertEqual(transcript.scroll_y, scroll_before)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsNone(app._user_menu)
+
+            await pilot.press("up")
+            for _ in range(3):
+                await pilot.pause()
+            self.assertIsNot(app.focused, target)
+
+    async def test_mesh_node_menu_does_not_move_mesh_board(self) -> None:
+        """Same shared fix, MESH's own node menu (item 4: audit other
+
+        overlays using the same _user_menu path).
+        """
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            focused_before = app.focused
+            await pilot.press("up", "down")
+            await pilot.pause()
+            self.assertIs(app.focused, focused_before)
+
+
+class ChannelDropdownOwnershipTests(ChatDmMentionAppTestsBase):
+    async def test_channel_dropdown_navigation_does_not_move_chat(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            transcript = app.query_one("#chat-log")
+            scroll_before = transcript.scroll_y
+            await pilot.press("c")
+            await pilot.pause()
+            selector = app.query_one(ChannelSelector)
+            self.assertTrue(selector.is_open)
+            await pilot.press("down", "down")
+            await pilot.pause()
+            self.assertEqual(transcript.scroll_y, scroll_before)
+            self.assertTrue(selector.is_open)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(selector.is_open)
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "channel")
+
+
+class DmDropdownTests(ChatDmMentionAppTestsBase):
+    async def test_d_opens_dropdown_with_real_conversations(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        self.addCleanup(store.close)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        app = MeshtasticPassApp(_simulated_radio(), self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            transcript = app.query_one("#chat-log")
+            scroll_before = transcript.scroll_y
+            await pilot.press("d")
+            await pilot.pause()
+            selector = app.query_one(DMModeSelector)
+            self.assertTrue(selector.is_open)
+            self.assertEqual(app._chat_mode, "channel")
+            # NodeDB (SIMULATED_NODES) already knows !a11ce001 as
+            # "Alice Trail"/"ALCE", which _dm_identity prefers over
+            # whatever this specific stored message happened to carry
+            # ("Alice"/"ALC") -- matching open_user_menu's own,
+            # already-established precedence.
+            self.assertEqual(
+                [item.label for item in selector.popup.items], ["Alice Trail / ALCE"]
+            )
+            self.assertEqual(transcript.scroll_y, scroll_before)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(selector.is_open)
+            self.assertEqual(app._chat_mode, "channel")
+            self.assertIsNone(app.current_dm_node_id)
+
+    async def test_dm_dropdown_orders_by_most_recent_activity(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        self.addCleanup(store.close)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!11111111",
+            sender_name="Older Chat",
+            sender_short_name="OLD",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!11111111",
+        )
+        store.add_incoming(
+            packet_id=2,
+            node_id="!22222222",
+            sender_name="Newer Chat",
+            sender_short_name="NEW",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=200.0,
+            received_at=200.0,
+            dm_node_id="!22222222",
+        )
+        app = MeshtasticPassApp(_simulated_radio(), self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            options = app.dm_dropdown_conversations()
+            self.assertEqual([option.value for option in options], ["!22222222", "!11111111"])
+
+    async def test_dm_dropdown_duplicate_long_names_stay_distinct(self) -> None:
+        """Item 40: Node A "!aaaaaaaa" Rover/RVA, Node B "!bbbbbbbb"
+
+        Rover/RVB must appear as two distinct dropdown rows, each
+        selecting its own exact node_id.
+        """
+        store = ChatStore.open(self.chat_db_path)
+        self.addCleanup(store.close)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!aaaaaaaa",
+            sender_name="Rover",
+            sender_short_name="RVA",
+            channel_index=0,
+            text="hi from a",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!aaaaaaaa",
+        )
+        store.add_incoming(
+            packet_id=2,
+            node_id="!bbbbbbbb",
+            sender_name="Rover",
+            sender_short_name="RVB",
+            channel_index=0,
+            text="hi from b",
+            radio_rx_at=200.0,
+            received_at=200.0,
+            dm_node_id="!bbbbbbbb",
+        )
+        app = MeshtasticPassApp(_simulated_radio(), self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            options = app.dm_dropdown_conversations()
+            self.assertEqual(len(options), 2)
+            values = {option.value for option in options}
+            self.assertEqual(values, {"!aaaaaaaa", "!bbbbbbbb"})
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(app.current_dm_node_id, "!bbbbbbbb")
+
+    async def test_empty_dm_dropdown_is_safe(self) -> None:
+        radio = ControllableSendRadioService()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.press("d")
+            await pilot.pause()
+            selector = app.query_one(DMModeSelector)
+            self.assertTrue(selector.is_open)
+            self.assertEqual([item.label for item in selector.popup.items], ["NO DMS"])
+            await pilot.press("up", "down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNone(app.current_dm_node_id)
+            self.assertEqual(app._chat_mode, "channel")
+            self.assertEqual(radio.sent_texts, [])
+
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertTrue(app.query_one(DMModeSelector).is_open)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app.query_one(DMModeSelector).is_open)
+
+    async def test_direct_dm_entry_points_bypass_dropdown(self) -> None:
+        """Item 18/42: explicit CHAT/MESH node-menu DM actions still
+
+        open the exact conversation directly -- never routed through
+        the dropdown, never requiring a second selection.
+        """
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!c0ffee01", long_name="Direct Target", short_name="DT")
+            await pilot.pause()
+            self.assertEqual(app._chat_mode, "dms")
+            self.assertEqual(app.current_dm_node_id, "!c0ffee01")
+            self.assertFalse(app.query_one(DMModeSelector).is_open)
 
 
 if __name__ == "__main__":

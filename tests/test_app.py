@@ -36,6 +36,7 @@ from app import (
     ChatEntryWidget,
     ColorSelector,
     DeviceSelector,
+    DMModeSelector,
     EndOfChatHistoryMarker,
     FlipScreenSelector,
     FontSizeSelector,
@@ -619,7 +620,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("d")
             await pilot.pause()
-            self.assertEqual(app._chat_mode, "dms")
+            # PR #46 follow-up Part B item 7: D opens the DM dropdown --
+            # it no longer immediately switches CHAT into DMS mode.
+            self.assertTrue(app.query_one(DMModeSelector).is_open)
+            self.assertEqual(app._chat_mode, "channel")
 
     async def test_footer_help_text_reflects_1_through_3(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
