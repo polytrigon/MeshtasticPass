@@ -55,7 +55,7 @@ from app import (
 )
 from app_settings import AppSettings
 from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
-from geo import KM_PER_MILE, GeoPosition, distance_between
+from geo import KM_PER_MILE, GeoPosition, distance_between, format_coordinates
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
     MESH_STALE_THRESHOLD_SECONDS,
@@ -85,7 +85,13 @@ from mesh_topology import _route_connector_alternate_elbow
 import mesh_topology as mesh_topology_module
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
 from relative_time import format_relative_age
-from radio_service import DISPLAY_UNITS_IMPERIAL, DISPLAY_UNITS_METRIC, NodeMetadata, RadioState
+from radio_service import (
+    DISPLAY_UNITS_IMPERIAL,
+    DISPLAY_UNITS_METRIC,
+    NodeMetadata,
+    RadioInfo,
+    RadioState,
+)
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
@@ -1471,6 +1477,126 @@ class BoardLabelFiveCellLimitTests(unittest.TestCase):
         self.assertLessEqual(cell_len(label), MESH_BOARD_LABEL_MAX_CELLS)
 
 
+class MeshNodeColorTests(unittest.TestCase):
+    """MESH FOLLOW-UP items 16-18, 26: YOU is ALWAYS ACCENT2, a persistent
+
+    identity anchor entirely independent of selection; a selected
+    remote node is ACCENT; an unselected remote node uses its existing
+    active/inactive BASE/DIM_BASE styling. Pure unit tests against
+    _mesh_node_color directly -- no app/theme rendering required.
+    """
+
+    NOW = 1_700_000_000.0
+
+    def _you_state(self, position=None) -> MeshNodeState:
+        return MeshNodeState(
+            node=NodeMetadata("!you", "Local", "ME", 0, self.NOW, True, position=position),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+
+    def _remote_state(self, *, last_heard: float | None) -> MeshNodeState:
+        return MeshNodeState(
+            node=NodeMetadata("!remote1", "Remote", "RMT", 1, last_heard),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=last_heard,
+        )
+
+    def test_you_is_accent2_when_unselected(self) -> None:
+        for theme in ("snow", "amber"):
+            with self.subTest(theme=theme):
+                palette = THEME_PALETTES[theme]
+                color = _mesh_node_color(
+                    self._you_state(), selected=False, theme=theme, now=self.NOW
+                )
+                self.assertEqual(color, palette.accent2)
+
+    def test_you_is_accent2_when_selected_never_accent(self) -> None:
+        for theme in ("snow", "amber"):
+            with self.subTest(theme=theme):
+                palette = THEME_PALETTES[theme]
+                color = _mesh_node_color(
+                    self._you_state(), selected=True, theme=theme, now=self.NOW
+                )
+                self.assertEqual(color, palette.accent2)
+                self.assertNotEqual(color, palette.accent)
+
+    def test_selecting_a_remote_node_never_recolors_you(self) -> None:
+        """Selection state is per-widget (see MeshNodeWidget.refresh_visual,
+
+        called once per node with ITS OWN selected flag) -- YOU's own
+        color call always passes selected=False whenever a DIFFERENT
+        node is selected, and must still resolve to ACCENT2, never BASE
+        or ACCENT.
+        """
+        palette = THEME_PALETTES["snow"]
+        color = _mesh_node_color(self._you_state(), selected=False, theme="snow", now=self.NOW)
+        self.assertEqual(color, palette.accent2)
+
+    def test_selected_remote_node_uses_accent(self) -> None:
+        for theme in ("snow", "amber"):
+            with self.subTest(theme=theme):
+                palette = THEME_PALETTES[theme]
+                color = _mesh_node_color(
+                    self._remote_state(last_heard=self.NOW - 5),
+                    selected=True,
+                    theme=theme,
+                    now=self.NOW,
+                )
+                self.assertEqual(color, palette.accent)
+
+    def test_unselected_active_remote_node_uses_base(self) -> None:
+        palette = THEME_PALETTES["snow"]
+        color = _mesh_node_color(
+            self._remote_state(last_heard=self.NOW - 5),
+            selected=False,
+            theme="snow",
+            now=self.NOW,
+        )
+        self.assertEqual(color, palette.base)
+
+    def test_unselected_inactive_remote_node_uses_dim_base(self) -> None:
+        palette = THEME_PALETTES["snow"]
+        color = _mesh_node_color(
+            self._remote_state(last_heard=self.NOW - ACTIVE_WINDOW_SECONDS * 2),
+            selected=False,
+            theme="snow",
+            now=self.NOW,
+        )
+        self.assertEqual(color, palette.dim_base)
+
+    def test_moving_remote_focus_restores_prior_remote_normal_style(self) -> None:
+        """Deselecting a remote node (selected=False on a later call)
+
+        returns it to its own ordinary active/inactive style -- proving
+        color is recomputed fresh per call, never sticky from a
+        previous selected=True render.
+        """
+        palette = THEME_PALETTES["snow"]
+        state = self._remote_state(last_heard=self.NOW - 5)
+        selected_color = _mesh_node_color(state, selected=True, theme="snow", now=self.NOW)
+        self.assertEqual(selected_color, palette.accent)
+        restored_color = _mesh_node_color(state, selected=False, theme="snow", now=self.NOW)
+        self.assertEqual(restored_color, palette.base)
+
+    def test_snow_and_amber_resolve_distinct_accent2_tokens(self) -> None:
+        """No hardcoded colors: each theme's own accent2 token is used,
+
+        never a shared/literal constant (item 18).
+        """
+        snow_color = _mesh_node_color(
+            self._you_state(), selected=False, theme="snow", now=self.NOW
+        )
+        amber_color = _mesh_node_color(
+            self._you_state(), selected=False, theme="amber", now=self.NOW
+        )
+        self.assertEqual(snow_color, THEME_PALETTES["snow"].accent2)
+        self.assertEqual(amber_color, THEME_PALETTES["amber"].accent2)
+        self.assertNotEqual(snow_color, amber_color)
+
+
 class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
     """Headless app tests proving MESH is now driven by real passive data:
 
@@ -2185,9 +2311,17 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     selected_widget = next(
                         w for w in app.query(MeshNodeWidget) if w.node_id == expected_id
                     )
+                    # YOU is always ACCENT2 (persistent identity anchor),
+                    # even while selected; a selected remote node is
+                    # ACCENT (see MESH FOLLOW-UP item 16).
+                    expected_color = (
+                        THEME_PALETTES[app._current_theme].accent2
+                        if expected_id == you_id
+                        else THEME_PALETTES[app._current_theme].accent
+                    )
                     self.assertEqual(
                         selected_widget.render().spans[0].style.foreground,
-                        Color.parse(THEME_PALETTES[app._current_theme].accent),
+                        Color.parse(expected_color),
                     )
                     # Bottom-left context reflects the new selection.
                     status = str(app.query_one("#mesh-context-status").render())
@@ -3684,7 +3818,37 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- Preserved visual contract -----------------------------------
 
-    async def test_selected_node_uses_accent_and_wider_composite(self) -> None:
+    async def test_selected_remote_node_uses_accent_and_wider_composite(self) -> None:
+        """A SELECTED REMOTE node uses ACCENT (see MESH FOLLOW-UP item
+
+        16 -- YOU's own persistent ACCENT2 is covered separately by
+        test_selected_you_uses_accent2_not_accent below).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            remote_id = SIMULATED_MESSAGES[0].sender_node_id
+            _mesh_select_node(app, remote_id)
+            await pilot.pause()
+            palette = THEME_PALETTES[app._current_theme]
+            remote_widget = next(
+                widget
+                for widget in app.query(MeshNodeWidget)
+                if widget.node_id == view.selected_node_id
+            )
+            rendered = remote_widget.render()
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent))
+            self.assertEqual(int(remote_widget.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
+
+    async def test_selected_you_uses_accent2_not_accent(self) -> None:
+        """YOU selected by default still gets the wider selected
+
+        composite (selection-width is identity-independent), but its
+        color is ACCENT2, never ACCENT (see MESH FOLLOW-UP item 16).
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
@@ -3696,7 +3860,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 if widget.node_id == view.selected_node_id
             )
             rendered = you_widget.render()
-            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent))
+            self.assertEqual(rendered.spans[0].style.foreground, Color.parse(palette.accent2))
+            self.assertNotEqual(
+                rendered.spans[0].style.foreground, Color.parse(palette.accent)
+            )
             self.assertEqual(int(you_widget.styles.width.value), MESH_SELECTED_GLYPH_WIDTH)
 
     async def test_stale_unselected_node_uses_dim_base(self) -> None:
@@ -6757,3 +6924,256 @@ class MeshYouIdentityCorrectionTests(unittest.IsolatedAsyncioTestCase):
                 NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
             )
             self.assertEqual(app._mesh_working_set()[0].node.position, LOCAL_GEO)
+
+
+class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """MESH FOLLOW-UP items 9-15, 20, 25-29: drive the App's REAL
+
+    connection lifecycle (_show_connection, exactly as RadioEvents from
+    app_controller do) through a physical-radio-swap scenario --
+    old V3 node A local -> disconnect -> new V4 node B local -- and
+    prove MESH(N), focused-YOU, GPS, the node menu, and rendering all
+    follow the CURRENTLY CONNECTED radio automatically, with no tab
+    switch or manual refresh required.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def _swap_to_v4(self, app, pilot, *, extra_nodes=()):
+        """Disconnect the (simulated) V3 and bring up a V4 with a
+
+        DIFFERENT node ID -- driven through the exact same
+        _show_connection calls app_controller's real RadioEvent stream
+        produces, never a direct helper-function shortcut.
+        """
+        v4_info = replace(
+            app.radio.info,
+            node_id="!bbbbbbbb",
+            long_name="V4 Radio",
+            short_name="V4",
+        )
+        app._show_connection(RadioState.OFFLINE, message="switching device")
+        await pilot.pause()
+        app.radio.get_known_nodes = lambda: (
+            NodeMetadata(
+                "!bbbbbbbb", "V4 Radio", "V4", 0, is_local=True, position=north_of_local(1)
+            ),
+            *extra_nodes,
+        )
+        app._show_connection(RadioState.ONLINE, v4_info)
+        await pilot.pause()
+
+    async def test_swap_rerenders_mesh_automatically_no_tab_switch_or_refresh(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            status_before = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status_before.startswith("YOU / Simulated Node"))
+
+            await self._swap_to_v4(app, pilot)
+
+            # No tab switch, no manual _refresh_mesh() call, no focus
+            # change -- _show_connection's own unconditional
+            # _refresh_mesh() call is the entire rerender mechanism.
+            status_after = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status_after.startswith("YOU / V4 Radio / V4"))
+            self.assertEqual(app.current_tab, "mesh")
+
+            view = app.query_one(MeshTopologyView)
+            you_widget = next(
+                w for w in app.query(MeshNodeWidget) if w.node_id == view.selected_node_id
+            )
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertEqual(
+                you_widget.render().spans[0].style.foreground,
+                Color.parse(palette.accent2),
+            )
+
+    async def test_mesh_n_excludes_current_local_not_old_local(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            now = time.time()
+            extra_nodes = (
+                NodeMetadata("!aaaaaaaa", "Old V3", "V3", 0, last_heard=now - 5),
+                NodeMetadata("!c0000001", "X", "X", 1, last_heard=now - 5),
+                NodeMetadata("!d0000001", "Y", "Y", 1, last_heard=now - 5),
+            )
+            await self._swap_to_v4(app, pilot, extra_nodes=extra_nodes)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            tab_bar = str(app.query_one("#tab-bar").render())
+            self.assertIn("MESH(3)", tab_bar)
+            view = app.query_one(MeshTopologyView)
+            remote_ids = {
+                state.node.node_id for state in view.working_set if not state.node.is_local
+            }
+            self.assertEqual(remote_ids, {"!aaaaaaaa", "!c0000001", "!d0000001"})
+            local_ids = {
+                state.node.node_id for state in view.working_set if state.node.is_local
+            }
+            self.assertEqual(local_ids, {"!bbbbbbbb"})
+
+    async def test_focused_you_gps_after_swap_uses_new_radio_never_old(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            now = time.time()
+            old_radio_with_position = NodeMetadata(
+                "!aaaaaaaa", "Old V3", "V3", 0, last_heard=now - 5, position=south_of_local(9)
+            )
+            await self._swap_to_v4(app, pilot, extra_nodes=(old_radio_with_position,))
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.startswith("YOU / V4 Radio / V4"))
+            self.assertNotIn(format_coordinates(south_of_local(9)), status)
+            you_position_text = status.rsplit(" / ", 1)[-1]
+            self.assertEqual(
+                you_position_text, format_coordinates(north_of_local(1))
+            )
+
+            # A's own remote line never shows raw coordinates (only YOU's
+            # line does) -- but its DISTANCE segment is real (not "?"),
+            # proving it was computed from B's ACTUAL current position,
+            # never a stale/zero/fabricated one.
+            view = app.query_one(MeshTopologyView)
+            _mesh_select_node(app, "!aaaaaaaa")
+            await pilot.pause()
+            remote_status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(remote_status.startswith("Old V3 / V3"))
+            distance_segment = remote_status.rsplit(" / ", 1)[-1]
+            self.assertNotEqual(distance_segment, "? km")
+            expected_km = distance_between(north_of_local(1), south_of_local(9)) * KM_PER_MILE
+            self.assertEqual(distance_segment, f"{expected_km:.1f} km")
+
+    async def test_you_has_no_gps_after_swap_even_if_old_radio_had_one(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            v4_info = replace(
+                app.radio.info, node_id="!bbbbbbbb", long_name="V4 Radio", short_name="V4"
+            )
+            app._show_connection(RadioState.OFFLINE, message="switching device")
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata("!bbbbbbbb", "V4 Radio", "V4", 0, is_local=True, position=None),
+                NodeMetadata(
+                    "!aaaaaaaa", "Old V3", "V3", 0, position=south_of_local(9)
+                ),
+            )
+            app._show_connection(RadioState.ONLINE, v4_info)
+            await pilot.pause()
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.endswith("NO GPS"))
+
+    async def test_menu_local_vs_remote_after_swap(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            now = time.time()
+            old_radio = NodeMetadata("!aaaaaaaa", "Old V3", "V3", 0, last_heard=now - 5)
+            await self._swap_to_v4(app, pilot, extra_nodes=(old_radio,))
+
+            # ENTER on B (selected by default) -> local informational menu.
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            labels = [item.label for item in app._user_menu.items]
+            self.assertIn("V4 Radio", labels)
+            self.assertTrue(all(not item.actionable for item in app._user_menu.items))
+            await pilot.press("escape")
+            await pilot.pause()
+
+            # ENTER on A (old radio) -> ordinary remote menu with FAVORITE.
+            _mesh_select_node(app, "!aaaaaaaa")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            labels = [item.label for item in app._user_menu.items]
+            self.assertIn("Old V3", labels)
+            self.assertIn("FAVORITE", labels)
+            self.assertFalse(app.settings.is_favorite("!aaaaaaaa"))
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.settings.is_favorite("!aaaaaaaa"))
+            self.assertFalse(app.settings.is_favorite("!bbbbbbbb"))
+
+    async def test_stale_selection_falls_back_when_invalid_after_swap(self) -> None:
+        """If the previously selected node no longer exists in the new
+
+        radio's working set, selection falls back deterministically via
+        EXISTING MeshTopologyView.set_nodes rules (to YOU) -- no new
+        navigation model introduced for this pass (item 15). Uses a
+        NodeDB-only node (no CHAT history) so it genuinely disappears
+        once get_known_nodes() stops reporting it -- a node that has
+        also sent a CHAT message stays admitted via that separate,
+        unrelated, deliberately-untouched CHAT-history admission path
+        (see build_mesh_working_set), which is not what this test is
+        about.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            gone_id = "!c0ffee09"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(gone_id, "Gone Node", "GON", 0, last_heard=time.time() - 5),
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, gone_id)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, gone_id)
+
+            await self._swap_to_v4(app, pilot)
+            self.assertEqual(view.selected_node_id, "!bbbbbbbb")
+
+    async def test_previously_selected_node_surviving_the_swap_may_stay_selected(
+        self,
+    ) -> None:
+        """If the previously selected node LEGITIMATELY still exists as a
+
+        remote node after the swap (the old radio itself), it may
+        remain selectable per existing focus rules -- but YOU semantics
+        move to the new radio regardless (item 15).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            now = time.time()
+            old_radio = NodeMetadata("!aaaaaaaa", "Old V3", "V3", 0, last_heard=now - 5)
+            await self._swap_to_v4(app, pilot, extra_nodes=(old_radio,))
+            view = app.query_one(MeshTopologyView)
+            _mesh_select_node(app, "!aaaaaaaa")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!aaaaaaaa")
+
+            # A second, unrelated refresh (same working set) must not
+            # evict a still-valid selection.
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, "!aaaaaaaa")
+            you_state = next(s for s in view.working_set if s.node.is_local)
+            self.assertEqual(you_state.node.node_id, "!bbbbbbbb")

@@ -1120,26 +1120,41 @@ MESH_BOARD_LABEL_MAX_CELLS = 5
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
-    """Selection (ACCENT) always overrides active/inactive styling.
+    """YOU is ALWAYS ACCENT2 -- a persistent identity anchor, entirely
 
-    A real remote node's brightness uses the EXACT SAME predicate as the
-    MESH header's "ACTIVE N" count -- node_activity.is_node_active,
-    keyed on RadioService's passive last_heard -- so the two always
-    visually agree: if the header says ACTIVE 4, exactly the working
-    set's real remote nodes satisfying this same predicate render BASE.
-    This is deliberately a different concept from MeshNodeState.
-    is_stale() (>24h since the last CHAT interaction), which decides
-    which nodes are worth ranking into the working set at all (see
-    mesh_state.build_mesh_working_set) -- not how bright an already-
-    displayed node looks. A node can therefore show a merely-old
-    interaction time ("2h") while still rendering dim, and that is
-    expected. YOU has no activity concept and always uses ordinary
-    ACCENT/BASE.
+    independent of selection (see MESH FOLLOW-UP items 16-18): selecting
+    YOU never recolors it to ACCENT, and selecting a remote node never
+    recolors YOU either. Checked FIRST, before selection, so it can
+    never be overridden.
+
+    For a remote node, selection (ACCENT) overrides active/inactive
+    styling. A remote node's brightness otherwise uses the EXACT SAME
+    predicate as the MESH header's "ACTIVE N" count --
+    node_activity.is_node_active, keyed on RadioService's passive
+    last_heard -- so the two always visually agree: if the header says
+    ACTIVE 4, exactly the working set's real remote nodes satisfying
+    this same predicate render BASE. This is deliberately a different
+    concept from MeshNodeState.is_stale() (>24h since the last CHAT
+    interaction), which decides which nodes are worth ranking into the
+    working set at all (see mesh_state.build_mesh_working_set) -- not
+    how bright an already-displayed node looks. A node can therefore
+    show a merely-old interaction time ("2h") while still rendering
+    dim, and that is expected.
+
+    Node identity color and selected-ROUTE color (see
+    MeshTopologyView's connector-painting logic) are deliberately
+    independent: YOU's own connector may still paint ACCENT when YOU is
+    the current selection, while the YOU glyph/label themselves stay
+    ACCENT2 throughout -- ACCENT2 is a persistent identity anchor,
+    ACCENT is current selection/route emphasis, and the two are allowed
+    to differ on the very same node.
     """
     palette = THEME_PALETTES[theme]
+    if state.node.is_local:
+        return palette.accent2
     if selected:
         return palette.accent
-    if not state.node.is_local and not is_node_active(state.node.last_heard, now):
+    if not is_node_active(state.node.last_heard, now):
         return palette.dim_base
     return palette.base
 

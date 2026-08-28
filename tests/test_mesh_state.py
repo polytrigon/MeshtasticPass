@@ -146,6 +146,41 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         result = build_mesh_working_set([], now=NOW, last_message_at={})
         self.assertEqual(result, ())
 
+    def test_radio_swap_new_local_node_becomes_you_old_becomes_remote(self) -> None:
+        """MESH FOLLOW-UP item 8/23: NodeDB carries BOTH the old radio's
+
+        node (still is_local=False now that RadioService itself only
+        ever flags the CURRENT radio) and the new one -- exactly one
+        YOU, and the old radio is an ordinary remote candidate, never
+        hidden or deleted.
+        """
+        old_radio = NodeMetadata("!aaaaaaaa", "Old V3", "V3", 0, NOW - 30, is_local=False)
+        new_radio = NodeMetadata("!bbbbbbbb", "New V4", "V4", 0, NOW - 5, is_local=True)
+        result = build_mesh_working_set(
+            [new_radio, old_radio], now=NOW, last_message_at={}
+        )
+        local_ids = {state.node.node_id for state in result if state.node.is_local}
+        self.assertEqual(local_ids, {"!bbbbbbbb"})
+        remote = next(state for state in result if state.node.node_id == "!aaaaaaaa")
+        self.assertFalse(remote.node.is_local)
+
+    def test_ambiguous_multiple_is_local_flags_prefer_no_you_over_guessing(self) -> None:
+        """Defense-in-depth (item 8): if the upstream data ever reports
+
+        MORE than one is_local=True node at once -- a data-consistency
+        violation that should not occur given RadioService's own single
+        -authoritative-source fix, but this function must never blindly
+        trust that -- neither becomes YOU. Both still surface as
+        ordinary remote candidates rather than one being arbitrarily
+        chosen or both vanishing.
+        """
+        first = NodeMetadata("!first000", "First", "FST", 0, NOW - 5, is_local=True)
+        second = NodeMetadata("!second00", "Second", "SND", 0, NOW - 5, is_local=True)
+        result = build_mesh_working_set([first, second], now=NOW, last_message_at={})
+        self.assertFalse(any(state.node.is_local for state in result))
+        remote_ids = {state.node.node_id for state in result}
+        self.assertEqual(remote_ids, {"!first000", "!second00"})
+
     def test_incoming_message_makes_a_node_client(self) -> None:
         alice = NodeMetadata("!alice", "Alice", "ALC", 1, NOW - 500)
         result = build_mesh_working_set(

@@ -243,6 +243,7 @@ def build_mesh_working_set(
         normalize_mesh_node_id(favorite_id) for favorite_id in (favorite_ids or ())
     }
     local: NodeMetadata | None = None
+    local_candidates: list[NodeMetadata] = []
     known_by_id: dict[str, NodeMetadata] = {}
     for node in nodes:
         key = normalize_mesh_node_id(node.node_id)
@@ -250,10 +251,26 @@ def build_mesh_working_set(
             continue
         normalized_node = node if node.node_id == key else replace(node, node_id=key)
         if node.is_local:
-            if local is None:
-                local = normalized_node
+            local_candidates.append(normalized_node)
             continue
         known_by_id.setdefault(key, normalized_node)
+
+    # Exactly one YOU: `nodes` (RadioService.get_known_nodes()) is the
+    # sole source of is_local flags, and should report at most one --
+    # but this function must never simply trust that and pick whichever
+    # candidate happened to appear first if it is ever violated (e.g. a
+    # transient inconsistency during a physical radio swap). Prefer NO
+    # confident YOU over guessing which candidate is genuinely current
+    # (see MESH FOLLOW-UP items 5/8): with more than one candidate,
+    # none is promoted to local, but each still becomes an ordinary
+    # remote candidate rather than vanishing outright -- an old radio's
+    # node may legitimately remain visible as a normal remote node
+    # (item 4), it just never doubles as YOU.
+    if len(local_candidates) == 1:
+        local = local_candidates[0]
+    else:
+        for candidate in local_candidates:
+            known_by_id.setdefault(candidate.node_id, replace(candidate, is_local=False))
 
     # Merge by normalized ID, keeping only the most recent timestamp per
     # node -- if the bug this normalizes against already split one
