@@ -146,6 +146,68 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         result = build_mesh_working_set([], now=NOW, last_message_at={})
         self.assertEqual(result, ())
 
+    def test_radio_swap_new_local_node_becomes_you_old_becomes_remote(self) -> None:
+        """MESH FOLLOW-UP item 8/23: NodeDB carries BOTH the old radio's
+
+        node (still is_local=False now that RadioService itself only
+        ever flags the CURRENT radio) and the new one -- exactly one
+        YOU, and the old radio is an ordinary remote candidate, never
+        hidden or deleted.
+        """
+        old_radio = NodeMetadata("!aaaaaaaa", "Old V3", "V3", 0, NOW - 30, is_local=False)
+        new_radio = NodeMetadata("!bbbbbbbb", "New V4", "V4", 0, NOW - 5, is_local=True)
+        result = build_mesh_working_set(
+            [new_radio, old_radio], now=NOW, last_message_at={}
+        )
+        local_ids = {state.node.node_id for state in result if state.node.is_local}
+        self.assertEqual(local_ids, {"!bbbbbbbb"})
+        remote = next(state for state in result if state.node.node_id == "!aaaaaaaa")
+        self.assertFalse(remote.node.is_local)
+
+    def test_self_heard_echo_never_admits_you_as_a_duplicate_remote(self) -> None:
+        """PR #43 FOLLOW-UP Part A: a self-heard echo of YOU's own
+
+        transmission (another node rebroadcasts it, or the SDK reports
+        a locally-originated packet as "received") must never leave
+        YOU's own ID ALSO sitting in the working set as a SECOND,
+        is_local=False entry -- that duplicate key is exactly what let
+        the MESH topology label widget pick the wrong (remote-shaped)
+        MeshNodeState via last-write-wins dict construction while the
+        bottom-left context (first-match via next()) kept showing the
+        correct one. Exactly one entry for YOU's ID, and it is local.
+        """
+        you = NodeMetadata("!bbbbbbbb", "V4 Radio", "V4", 0, NOW - 5, is_local=True)
+        remote = NodeMetadata("!c0ffee01", "Real Remote", "RMT", 1, NOW - 5)
+        result = build_mesh_working_set(
+            [you, remote],
+            now=NOW,
+            # Simulates a CHAT-received message whose sender_node_id is
+            # YOU's own ID -- a self-heard echo, never a real remote
+            # interaction.
+            last_message_at={"!bbbbbbbb": NOW - 2, "!c0ffee01": NOW - 2},
+        )
+        matches = [state for state in result if state.node.node_id == "!bbbbbbbb"]
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0].node.is_local)
+        self.assertEqual(matches[0].node.long_name, "V4 Radio")
+
+    def test_ambiguous_multiple_is_local_flags_prefer_no_you_over_guessing(self) -> None:
+        """Defense-in-depth (item 8): if the upstream data ever reports
+
+        MORE than one is_local=True node at once -- a data-consistency
+        violation that should not occur given RadioService's own single
+        -authoritative-source fix, but this function must never blindly
+        trust that -- neither becomes YOU. Both still surface as
+        ordinary remote candidates rather than one being arbitrarily
+        chosen or both vanishing.
+        """
+        first = NodeMetadata("!first000", "First", "FST", 0, NOW - 5, is_local=True)
+        second = NodeMetadata("!second00", "Second", "SND", 0, NOW - 5, is_local=True)
+        result = build_mesh_working_set([first, second], now=NOW, last_message_at={})
+        self.assertFalse(any(state.node.is_local for state in result))
+        remote_ids = {state.node.node_id for state in result}
+        self.assertEqual(remote_ids, {"!first000", "!second00"})
+
     def test_incoming_message_makes_a_node_client(self) -> None:
         alice = NodeMetadata("!alice", "Alice", "ALC", 1, NOW - 500)
         result = build_mesh_working_set(
@@ -366,15 +428,19 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
 
 
 class FormatMeshContextLineTests(unittest.TestCase):
-    def test_you_context_is_bare_literal_you(self) -> None:
-        """compact_node_label() always returns literal "YOU" for the local
+    def test_you_context_shows_identity_and_no_gps(self) -> None:
+        """YOU's line is "YOU / LONG NAME / SHORT NAME / GPS LOCATION" --
 
-        node regardless of its configured name -- see mesh_topology.py.
+        never the old bare "YOU" -- and GPS LOCATION reads exactly
+        "NO GPS" (never "UNKNOWN GPS"/"N/A"/"NO FIX") when the local
+        node carries no real position fix (see MESH VIEW PASS item 4).
         """
         state = MeshNodeState(
             node=YOU, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "YOU / Local / ME / NO GPS"
+        )
 
     def test_client_only_format(self) -> None:
         """Long Name / Short Name / ROLE / N HOPS / AGE / DISTANCE -- the
@@ -500,11 +566,13 @@ class FormatMeshContextLineTests(unittest.TestCase):
             format_mesh_context_line(state, now=NOW), "X / CLIENT / 1 HOPS / ? / ? mi"
         )
 
-    def test_you_context_never_gains_appended_segments(self) -> None:
-        """Section 28: YOU stays exactly "YOU" -- never a Short Name, role,
+    def test_you_context_shows_real_gps_but_never_role_hops_time_or_distance(self) -> None:
+        """YOU never gains a ROLE, hop count, interaction time, or
 
-        hop count, time, or distance, even if the local NodeMetadata
-        happens to carry a position (distance would otherwise be 0 mi).
+        DISTANCE segment -- those describe a remote node's relationship
+        to YOU, which YOU does not have to itself (distance would
+        otherwise be a nonsensical 0 mi). A real position fix DOES
+        render, as GPS LOCATION -- "40.7128, -74.0060" here.
         """
         you_with_position = NodeMetadata(
             "!you", "Local", "ME", 0, NOW, True, position=YOU_POSITION
@@ -512,7 +580,103 @@ class FormatMeshContextLineTests(unittest.TestCase):
         state = MeshNodeState(
             node=you_with_position, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW),
+            "YOU / Local / ME / 40.7128, -74.0060",
+        )
+
+    def test_you_gps_location_is_no_gps_not_a_fabricated_alternative(self) -> None:
+        """Exactly "NO GPS" -- never "UNKNOWN GPS"/"N/A"/"NO FIX" -- when
+
+        the local node has no real position fix (MESH VIEW PASS item 5).
+        """
+        state = MeshNodeState(
+            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertTrue(line.endswith("NO GPS"))
+        for forbidden in ("UNKNOWN GPS", "N/A", "NO FIX"):
+            self.assertNotIn(forbidden, line)
+
+    def test_you_short_name_omitted_when_absent(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!you", "Local Only", None, 0, NOW, True),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "YOU / Local Only / NO GPS"
+        )
+
+    def test_you_falls_back_to_node_id_when_no_names_at_all(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bareyou", is_local=True),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "YOU / !bareyou / NO GPS"
+        )
+
+
+class FormatMeshContextLineMetricTests(unittest.TestCase):
+    """MESH VIEW PASS item 11: DISTANCE honors the caller's `metric` flag,
+
+    always derived from the same underlying miles figure (see
+    FormatDistanceTests in test_geo.py for the conversion itself).
+    """
+
+    def test_defaults_to_imperial_when_metric_not_passed(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=4.23,
+        )
+        self.assertTrue(format_mesh_context_line(state, now=NOW).endswith("4.2 mi"))
+
+    def test_metric_true_renders_km(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=4.23,
+        )
+        line = format_mesh_context_line(state, now=NOW, metric=True)
+        self.assertTrue(line.endswith("km"))
+        self.assertFalse(line.endswith("mi"))
+
+    def test_unknown_distance_renders_question_mark_with_correct_unit_suffix(
+        self,
+    ) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=None,
+        )
+        self.assertTrue(
+            format_mesh_context_line(state, now=NOW, metric=False).endswith("? mi")
+        )
+        self.assertTrue(
+            format_mesh_context_line(state, now=NOW, metric=True).endswith("? km")
+        )
+
+    def test_you_line_never_gains_a_distance_segment_regardless_of_metric(
+        self,
+    ) -> None:
+        state = MeshNodeState(
+            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW, metric=True),
+            format_mesh_context_line(state, now=NOW, metric=False),
+        )
 
 
 class LastSeenConsistencyTests(unittest.TestCase):

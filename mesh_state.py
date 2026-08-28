@@ -11,8 +11,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Mapping
 
-from geo import distance_between
-from mesh_topology import compact_node_label
+from geo import distance_between, format_coordinates, format_distance
 from node_activity import is_node_active
 from radio_service import NodeMetadata
 from relative_time import format_relative_age
@@ -244,6 +243,7 @@ def build_mesh_working_set(
         normalize_mesh_node_id(favorite_id) for favorite_id in (favorite_ids or ())
     }
     local: NodeMetadata | None = None
+    local_candidates: list[NodeMetadata] = []
     known_by_id: dict[str, NodeMetadata] = {}
     for node in nodes:
         key = normalize_mesh_node_id(node.node_id)
@@ -251,10 +251,42 @@ def build_mesh_working_set(
             continue
         normalized_node = node if node.node_id == key else replace(node, node_id=key)
         if node.is_local:
-            if local is None:
-                local = normalized_node
+            local_candidates.append(normalized_node)
             continue
         known_by_id.setdefault(key, normalized_node)
+
+    # Exactly one YOU: `nodes` (RadioService.get_known_nodes()) is the
+    # sole source of is_local flags, and should report at most one --
+    # but this function must never simply trust that and pick whichever
+    # candidate happened to appear first if it is ever violated (e.g. a
+    # transient inconsistency during a physical radio swap). Prefer NO
+    # confident YOU over guessing which candidate is genuinely current
+    # (see MESH FOLLOW-UP items 5/8): with more than one candidate,
+    # none is promoted to local, but each still becomes an ordinary
+    # remote candidate rather than vanishing outright -- an old radio's
+    # node may legitimately remain visible as a normal remote node
+    # (item 4), it just never doubles as YOU.
+    if len(local_candidates) == 1:
+        local = local_candidates[0]
+        # A self-heard echo of YOU's own transmission (a real mesh
+        # phenomenon: another node rebroadcasts a packet and it reaches
+        # this radio again, or the SDK reports a locally-originated
+        # packet as "received") can otherwise leave YOU's own ID ALSO
+        # sitting in known_by_id/normalized_interactions below, which
+        # would admit a SECOND, is_local=False MeshNodeState carrying
+        # the identical node_id -- a duplicate key that a plain dict
+        # keyed by node_id (see app.py's MeshTopologyView.set_nodes:
+        # states_by_id) resolves by LAST-WRITE-WINS, silently handing
+        # the topology label widget the wrong (remote-shaped) state
+        # while callers using next()/first-match (e.g. the bottom-left
+        # context) keep seeing the correct one. YOU's own ID must never
+        # be admitted as a remote candidate at all, closing this at the
+        # source rather than relying on every consumer to pick the
+        # right duplicate.
+        known_by_id.pop(local.node_id, None)
+    else:
+        for candidate in local_candidates:
+            known_by_id.setdefault(candidate.node_id, replace(candidate, is_local=False))
 
     # Merge by normalized ID, keeping only the most recent timestamp per
     # node -- if the bug this normalizes against already split one
@@ -275,8 +307,14 @@ def build_mesh_working_set(
     # about, plus every node that has originated a CHAT message we
     # received even if NodeDB has no record for it (yet). Sorting and
     # bounding below keeps the OUTPUT small regardless of how large this
-    # candidate pool is.
+    # candidate pool is. YOU's own ID is excluded even if it reached
+    # normalized_interactions alone (see the self-heard-echo comment
+    # above) -- a bare, name-less NodeMetadata(node_id) fallback for
+    # YOU's own ID would be exactly as duplicate-key-dangerous as one
+    # sourced from known_by_id.
     candidate_ids = set(known_by_id) | set(normalized_interactions)
+    if local is not None:
+        candidate_ids.discard(local.node_id)
 
     local_position = local.position if local is not None else None
     candidates: list[MeshNodeState] = []
@@ -352,7 +390,7 @@ def _clean_text(value: object) -> str | None:
     return stripped or None
 
 
-def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
+def _name_segments(node: NodeMetadata) -> tuple[str, ...]:
     """Long Name first, then Short Name, per the context-line name rule.
 
     Short Name is included only when it is real and distinct from Long
@@ -360,6 +398,8 @@ def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
     never duplicated when the two happen to be the same displayed value.
     If Long Name is unavailable, the sole surviving segment falls back
     to Short Name, then to the node ID itself -- never a blank segment.
+    Used for both YOU and remote nodes -- the rule itself has nothing
+    node-local-specific about it.
     """
     long_name = _clean_text(node.long_name)
     short_name = _clean_text(node.short_name)
@@ -372,11 +412,15 @@ def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
     return (node.node_id,)
 
 
-def _format_distance(distance_miles: float | None) -> str:
-    return "? mi" if distance_miles is None else f"{distance_miles:.1f} mi"
+def _format_distance(distance_miles: float | None, *, metric: bool) -> str:
+    if distance_miles is None:
+        return "? km" if metric else "? mi"
+    return format_distance(distance_miles, metric=metric)
 
 
-def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
+def format_mesh_context_line(
+    state: MeshNodeState, *, now: float, metric: bool = False
+) -> str:
     """Build the bottom-left status text for a selected REAL MESH node.
 
     (An anonymous relay-stage placeholder is not a MeshNodeState at all
@@ -390,20 +434,42 @@ def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
     ROLE=RELAY.)
 
     YOU has no observed communication role, hop count, interaction
-    time, or distance of its own, so its line is just its compact label
-    ("YOU"). A remote node's line is:
+    time, or distance of its own -- its line is instead:
+
+        YOU / LONG NAME [/ SHORT NAME] / GPS LOCATION
+
+    GPS LOCATION is exactly "NO GPS" (never "UNKNOWN GPS"/"N/A"/"NO
+    FIX") when the local node has no real position fix -- see
+    MeshNodeState.node.position, a GeoPosition only ever constructed by
+    geo.make_geo_position's own validated lat/lon (the SAME "valid
+    position" rule this module already applies when computing distance
+    -- never a second, divergent notion of "does YOU have a fix").
+    Segments are ordered least-droppable first: the existing generic
+    cell-width truncation this line already goes through (see app.py's
+    _update_mesh_context_status) therefore drops GPS LOCATION first on
+    a narrow viewport, then SHORT NAME, before ever touching YOU or
+    LONG NAME -- no separate truncation logic needed here.
+
+    A remote node's line is:
 
         LONG NAME [/ SHORT NAME] / ROLE / N HOPS / AGE / DISTANCE
 
     ROLE is CLIENT, RELAY, or CLIENT+RELAY. Unknown hop count,
     interaction age, or distance each render as "?" rather than a
-    fabricated value -- see _remote_name_segments, MeshNodeState.
+    fabricated value -- see _name_segments, MeshNodeState.
     distance_miles, and build_mesh_working_set for how each is derived.
+    DISTANCE is shown in km/mi according to `metric` -- the connected
+    radio's own synchronized UNITS setting, read by the caller -- but
+    is always derived from the SAME underlying haversine-miles value
+    regardless (see geo.format_distance).
     """
     if state.node.is_local:
-        return compact_node_label(state.node)
+        segments = ["YOU", *_name_segments(state.node)]
+        position = state.node.position
+        segments.append(format_coordinates(position) if position is not None else "NO GPS")
+        return " / ".join(segments)
 
-    segments: list[str] = list(_remote_name_segments(state.node))
+    segments: list[str] = list(_name_segments(state.node))
 
     role = "+".join(
         name
@@ -436,6 +502,6 @@ def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
     else:
         segments.append(format_relative_age(now - last_seen_at))
 
-    segments.append(_format_distance(state.distance_miles))
+    segments.append(_format_distance(state.distance_miles, metric=metric))
 
     return " / ".join(segments)

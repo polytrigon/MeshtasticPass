@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Thread
 from time import monotonic, time
 from typing import Any, Callable
@@ -53,7 +53,7 @@ from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshActivityTier,
     MeshNodeState,
-    _remote_name_segments,
+    _name_segments,
     build_mesh_working_set,
     format_mesh_context_line,
 )
@@ -176,14 +176,40 @@ DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
 }
 # A single narrow glyph (U+25B7 WHITE RIGHT-POINTING TRIANGLE -- plain,
 # non-emoji, never double-width; confirmed via grapheme_text.cell_len
-# the same way every other delivery glyph in this module was) animated
-# by right-justifying it to a growing field width each frame: "▷",
-# " ▷", looping at exactly SENDING_ARROW_FRAMES' own cadence. Reads as
-# "in flight / still being resolved", never as success -- unlike the
-# checkmarks above, SENDING covers every outgoing message for which a
-# NAK is still a legitimate possible outcome (see send_was_submitted).
+# the same way every other delivery glyph in this module was). SENDING
+# always renders TWO of these, "▷ ▷", never moving horizontally --
+# only which one carries ACCENT (the "active" arrow) versus the
+# 25%-BASE-over-background "inactive" arrow alternates, at exactly
+# SENDING_ARROW_FRAMES' own pre-existing cadence (see
+# _sending_arrows_text/refresh_delivery_state). Reads as "in flight /
+# still being resolved", never as success -- unlike the checkmarks
+# above, SENDING covers every outgoing message for which a NAK is
+# still a legitimate possible outcome (see send_was_submitted).
 SENDING_ARROW_GLYPH = "▷"
 SENDING_ARROW_FRAMES = (1, 2)
+
+
+def _sending_arrows_text(animation_frame: int, theme: str) -> Text:
+    """Two permanently visible "▷ ▷" arrows -- COLOR alternates between
+
+    them each frame, never horizontal position/width (see MESH FOLLOW-
+    UP item 6-8): frame 1 is DIM25/ACCENT, frame 2 is ACCENT/DIM25,
+    matching the SAME 1/2 toggle _advance_delivery_states already
+    drives (see SENDING_ARROW_FRAMES) -- no second timer. DIM25 (25%
+    BASE-over-background -- deliberately weaker than the ordinary 50%
+    DIM token) is theme_palette.dim_base_quarter, derived the exact
+    same way DIM itself already is, so this needs no theme-specific
+    literal color and resolves correctly for both SNOW and AMBER.
+    """
+    palette = THEME_PALETTES[theme]
+    left_is_active = animation_frame == 2
+    left_color = palette.accent if left_is_active else palette.dim_quarter
+    right_color = palette.dim_quarter if left_is_active else palette.accent
+    text = Text()
+    text.append(SENDING_ARROW_GLYPH, style=Style(color=left_color))
+    text.append(" ")
+    text.append(SENDING_ARROW_GLYPH, style=Style(color=right_color))
+    return text
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
     (DeliveryState.UNCONFIRMED, DeliveryState.FAILED, DeliveryState.INTERRUPTED)
@@ -202,7 +228,7 @@ def _reply_mention_name(metadata: NodeMetadata) -> str:
     uses for a real node's display name, rather than a second,
     independently-defined fallback rule.
     """
-    return _remote_name_segments(metadata)[0]
+    return _name_segments(metadata)[0]
 
 
 class ThinScrollBarRender(ScrollBarRender):
@@ -1120,26 +1146,41 @@ MESH_BOARD_LABEL_MAX_CELLS = 5
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
-    """Selection (ACCENT) always overrides active/inactive styling.
+    """YOU is ALWAYS ACCENT2 -- a persistent identity anchor, entirely
 
-    A real remote node's brightness uses the EXACT SAME predicate as the
-    MESH header's "ACTIVE N" count -- node_activity.is_node_active,
-    keyed on RadioService's passive last_heard -- so the two always
-    visually agree: if the header says ACTIVE 4, exactly the working
-    set's real remote nodes satisfying this same predicate render BASE.
-    This is deliberately a different concept from MeshNodeState.
-    is_stale() (>24h since the last CHAT interaction), which decides
-    which nodes are worth ranking into the working set at all (see
-    mesh_state.build_mesh_working_set) -- not how bright an already-
-    displayed node looks. A node can therefore show a merely-old
-    interaction time ("2h") while still rendering dim, and that is
-    expected. YOU has no activity concept and always uses ordinary
-    ACCENT/BASE.
+    independent of selection (see MESH FOLLOW-UP items 16-18): selecting
+    YOU never recolors it to ACCENT, and selecting a remote node never
+    recolors YOU either. Checked FIRST, before selection, so it can
+    never be overridden.
+
+    For a remote node, selection (ACCENT) overrides active/inactive
+    styling. A remote node's brightness otherwise uses the EXACT SAME
+    predicate as the MESH header's "ACTIVE N" count --
+    node_activity.is_node_active, keyed on RadioService's passive
+    last_heard -- so the two always visually agree: if the header says
+    ACTIVE 4, exactly the working set's real remote nodes satisfying
+    this same predicate render BASE. This is deliberately a different
+    concept from MeshNodeState.is_stale() (>24h since the last CHAT
+    interaction), which decides which nodes are worth ranking into the
+    working set at all (see mesh_state.build_mesh_working_set) -- not
+    how bright an already-displayed node looks. A node can therefore
+    show a merely-old interaction time ("2h") while still rendering
+    dim, and that is expected.
+
+    Node identity color and selected-ROUTE color (see
+    MeshTopologyView's connector-painting logic) are deliberately
+    independent: YOU's own connector may still paint ACCENT when YOU is
+    the current selection, while the YOU glyph/label themselves stay
+    ACCENT2 throughout -- ACCENT2 is a persistent identity anchor,
+    ACCENT is current selection/route emphasis, and the two are allowed
+    to differ on the very same node.
     """
     palette = THEME_PALETTES[theme]
+    if state.node.is_local:
+        return palette.accent2
     if selected:
         return palette.accent
-    if not state.node.is_local and not is_node_active(state.node.last_heard, now):
+    if not is_node_active(state.node.last_heard, now):
         return palette.dim_base
     return palette.base
 
@@ -2347,10 +2388,12 @@ class ChatEntryWidget(Vertical):
         internal_state = self.entry.delivery_state or DeliveryState.SENT
         visible_state = internal_state
         if visible_state is DeliveryState.SENDING:
-            text = SENDING_ARROW_GLYPH.rjust(animation_frame)
+            self.delivery_label.update(
+                _sending_arrows_text(animation_frame, self.app._current_theme)
+            )
         else:
             text = DELIVERY_CHECKMARKS.get(visible_state, visible_state.value)
-        self.delivery_label.update(text)
+            self.delivery_label.update(text)
         for name in DeliveryState:
             self.set_class(
                 name is visible_state,
@@ -2865,10 +2908,16 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    /* Delivery color grammar (item 9/28): -> animated = ACCENT,
-       ✓ SENT = BASE, ✓✓ HEARD = ACCENT, ⟐ UNCONFIRMED = ACCENT2,
-       ✕ FAILED/INTERRUPTED = ERROR. Semantics (DeliveryState) are
-       unchanged -- only which token each visible glyph resolves to. */
+    /* Delivery color grammar (item 9/28): ✓✓ HEARD = ACCENT,
+       ✓ SENT = BASE, ⟐ UNCONFIRMED = ACCENT2, ✕ FAILED/INTERRUPTED =
+       ERROR. Semantics (DeliveryState) are unchanged -- only which
+       token each visible glyph resolves to. SENDING's own two "▷ ▷"
+       arrows are explicitly two-toned (ACCENT/DIM25, alternating -- see
+       app._sending_arrows_text), rendered as Rich Text spans that
+       override this single-color CSS rule for the actual glyphs; this
+       selector's own ACCENT is kept as delivery-sending's base/fallback
+       widget color only (e.g. before the very first refresh_delivery_
+       state call paints the spans). */
     .chat-entry.delivery-sending .chat-entry-delivery,
     .chat-entry.delivery-heard .chat-entry-delivery {
         color: $snow_accent;
@@ -3301,6 +3350,11 @@ class MeshtasticPassApp(App[None]):
             "right",
         ):
             self._move_mesh_focus(event.key)
+            event.stop()
+            return
+
+        if self.current_tab == "mesh" and event.key == "enter":
+            self._open_mesh_node_menu()
             event.stop()
             return
 
@@ -4789,12 +4843,34 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = time() if wall_now is None else wall_now
-        return build_mesh_working_set(
+        working_set = build_mesh_working_set(
             nodes,
             now=current_time,
             last_message_at=self._mesh_last_message_activity(),
             favorite_ids=self.settings.favorite_node_ids,
         )
+        # YOU's long_name/short_name from get_known_nodes() are NOT
+        # reliable (that NodeDB record is frequently a bare synthesized
+        # placeholder -- see RadioService.get_known_nodes' own trailing
+        # "local node never otherwise seen" fallback). self._radio_info
+        # is the SAME authoritative source CONNECTION's own identity
+        # controls already use, and is unconditionally cleared to None
+        # on every non-ONLINE transition (see _show_connection), so
+        # this can never leak a previous radio's stale identity across
+        # a reconnect/device switch. Corrects only the display fields;
+        # node_id/is_local/position are left exactly as the working set
+        # already computed them.
+        if working_set and working_set[0].node.is_local and self._radio_info is not None:
+            corrected_node = replace(
+                working_set[0].node,
+                long_name=self._radio_info.long_name,
+                short_name=self._radio_info.short_name,
+            )
+            working_set = (
+                replace(working_set[0], node=corrected_node),
+                *working_set[1:],
+            )
+        return working_set
 
     def _mesh_active_count(
         self,
@@ -4931,6 +5007,60 @@ class MeshtasticPassApp(App[None]):
             )
             self._update_mesh_context_status()
 
+    def _open_mesh_node_menu(self) -> None:
+        """ENTER on the currently focused MESH node opens the shared
+
+        CHAT/MESH node-options menu (see _open_node_menu) against that
+        SAME node -- never a fresh NodeDB lookup, so YOU's identity
+        fields stay whatever _mesh_working_set already corrected them
+        to. A no-op when there is nothing real to inspect: an empty
+        working set (view.selected_node_id == ""), or -- defensively,
+        though _move_mesh_focus's own relay_ids filtering means this
+        should not normally arise -- a selected_node_id that no longer
+        resolves to a working-set member or a mounted glyph widget
+        (anonymous relay stages are never selectable at all; see
+        MeshRelayWidget). allow_reply=False: MESH never gains a
+        messaging/DM action from this menu.
+        """
+        view = self.query_one(MeshTopologyView)
+        node_id = view.selected_node_id
+        if not node_id:
+            return
+        state = next(
+            (
+                candidate
+                for candidate in view.working_set
+                if candidate.node.node_id == node_id
+            ),
+            None,
+        )
+        if state is None:
+            return
+        origin = next(
+            (widget for widget in view.query(MeshNodeWidget) if widget.node_id == node_id),
+            None,
+        )
+        if origin is None:
+            return
+        self._open_node_menu(state.node, origin, None, allow_reply=False)
+
+    def _mesh_distance_is_metric(self) -> bool:
+        """Whether MESH's own geographic distance display should read as
+
+        km (METRIC) rather than mi (IMPERIAL) -- read directly off the
+        connected radio's own already-synced display.units config field
+        (read_synced_config_field is the SAME zero-RF cached read the
+        UNITS dropdown's own display already uses -- no new config
+        traffic, and MeshtasticPass never maintains a second, app-local
+        units preference of its own -- see MESH VIEW PASS item 11).
+        Unsupported schema/not connected/anything other than the exact
+        METRIC enum value all fall back to IMPERIAL, matching this
+        app's existing miles-only behavior before this pass.
+        """
+        return (
+            self.radio.read_synced_config_field("display", "units") == DISPLAY_UNITS_METRIC
+        )
+
     def _update_mesh_context_status(self) -> None:
         """Minimal truthful summary line for the currently selected MESH node.
 
@@ -4966,7 +5096,11 @@ class MeshtasticPassApp(App[None]):
         # for a genuinely stale/invalid ID, never a relay stage -- the
         # bottom-left context is always either YOU or a real node's full
         # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
-        text = format_mesh_context_line(state, now=time()) if state is not None else ""
+        text = (
+            format_mesh_context_line(state, now=time(), metric=self._mesh_distance_is_metric())
+            if state is not None
+            else ""
+        )
         available = status_widget.size.width
         if available > 0:
             text = truncate_to_cells(text, available)
@@ -5341,8 +5475,19 @@ class MeshtasticPassApp(App[None]):
         scroll_target: ScrollableContainer | None,
         *,
         include_rx_age: bool = False,
+        allow_reply: bool = True,
     ) -> None:
-        """Open the shared CHAT/MESH node-details menu."""
+        """Open the shared CHAT/MESH node-details menu.
+
+        allow_reply defaults to True, preserving CHAT's existing
+        REPLY-then-@mention gesture unchanged. MESH's own call site
+        passes allow_reply=False: the MESH VIEW PASS deliberately
+        keeps the node-options menu to informational rows plus
+        FAVORITE, with no messaging/DM action (DM does not exist in
+        this app) -- everything else about this shared menu (name/
+        hops rows, FAVORITE toggle, highlight/placement behavior)
+        stays exactly as CHAT already uses it.
+        """
 
         items: list[PopupItem] = []
         long_name = metadata.long_name.strip() if metadata.long_name else None
@@ -5377,7 +5522,8 @@ class MeshtasticPassApp(App[None]):
             items.append(PopupItem(metadata.node_id, actionable=False))
             highlighted = 0
         else:
-            items.append(PopupItem("REPLY", "reply", actionable=True))
+            if allow_reply:
+                items.append(PopupItem("REPLY", "reply", actionable=True))
             favorite = self.settings.is_favorite(metadata.node_id)
             action = "unfavorite" if favorite else "favorite"
             items.append(PopupItem(action.upper(), action, actionable=True))

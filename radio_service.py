@@ -45,6 +45,25 @@ def rx_debug_log(line: str) -> None:
     print(f"[RX] {line}", flush=True)
 
 
+def _canonical_node_number(number: Any) -> int | None:
+    """Canonical unsigned-32-bit form of a Meshtastic node number.
+
+    The wire format defines node numbers as uint32, but different SDK/
+    Python code paths can expose the identical bit pattern as either an
+    unsigned value or a negative Python int (any node number with bit
+    31 set can appear signed from one source and unsigned from
+    another). Masking to 32 bits here makes every downstream comparison
+    exact regardless of which representation a given caller happened to
+    read -- this is the canonical local-node-identity comparison used
+    throughout RadioService's is_local determination (see
+    _is_local_node); it never touches string node-ID normalization,
+    which mesh_state.normalize_mesh_node_id already owns.
+    """
+    if number is None or isinstance(number, bool) or not isinstance(number, int):
+        return None
+    return number & 0xFFFFFFFF
+
+
 class RadioState(Enum):
     """Connection states that callers can display without knowing SDK details."""
 
@@ -555,7 +574,7 @@ class RadioService:
             user = self._user_from_record(record)
             node_id = self._optional_string(user.get("id"))
             if node_id is None and number is not None:
-                node_id = f"!{number:08x}"
+                node_id = f"!{_canonical_node_number(number):08x}"
             if node_id is None or node_id.lower() in seen:
                 continue
             seen.add(node_id.lower())
@@ -674,13 +693,26 @@ class RadioService:
     def _is_local_node(self, node_id: str, node_number: int | None) -> bool:
         interface = self._interface
         my_info = getattr(interface, "myInfo", None)
-        local_number = getattr(my_info, "my_node_num", None)
+        local_number = _canonical_node_number(getattr(my_info, "my_node_num", None))
+        candidate_number = _canonical_node_number(node_number)
+        # The live interface's own my_node_num is the SOLE authoritative
+        # signal whenever both numbers are resolvable -- canonicalized
+        # first (see _canonical_node_number) so two representations of
+        # the identical wire node number can never mismatch merely from
+        # signed/unsigned interpretation. This is checked BEFORE, and
+        # instead of (not alongside) the string fallback below: a
+        # numeric mismatch must never be overridden by a stale
+        # _activity_local_node_id string that happens to still equal
+        # this node's ID from a PREVIOUS connection (see MESH FOLLOW-UP
+        # item 3 -- never determine YOU from stale connection-generation
+        # state). The string fallback exists only for the genuine
+        # no-number case (e.g. get_known_nodes()'s own synthetic
+        # local-node fallback, which has no node_number to offer).
+        if local_number is not None and candidate_number is not None:
+            return candidate_number == local_number
         return bool(
-            (node_number is not None and node_number == local_number)
-            or (
-                self._activity_local_node_id
-                and node_id.lower() == self._activity_local_node_id.lower()
-            )
+            self._activity_local_node_id
+            and node_id.lower() == self._activity_local_node_id.lower()
         )
 
     @staticmethod
@@ -1131,6 +1163,19 @@ class RadioService:
         # (disconnected, or a failed reconnect attempt) truthfully sees
         # None instead of the PREVIOUS radio's now-stale configuration.
         self._config_snapshot = None
+        # Same reasoning applies to local-node identity: a disconnect
+        # for ANY reason (lost connection, failed reconnect, explicit
+        # device-path change, or a physical radio swap) must not leave
+        # the PREVIOUS radio's node ID sitting in _activity_local_node_id
+        # for get_known_nodes()/_is_local_node() to keep comparing
+        # against during the gap before the next connect() succeeds --
+        # get_known_nodes() already returns () while self._interface is
+        # None, so there is no "wrong YOU" to show during that gap, only
+        # correctly no YOU at all (see MESH FOLLOW-UP item 5). The next
+        # successful connect() always re-establishes both fresh from
+        # that NEW radio's own reported identity.
+        self._activity_local_node_id = None
+        self._direct_observations.clear()
         if self._interface is not None:
             interface = self._interface
             self._interface = None
@@ -1551,12 +1596,23 @@ class RadioService:
             )
 
         node_number = getattr(my_info, "my_node_num", None)
-        local_record = self._interface.nodesByNum.get(node_number, {})
+        canonical_number = _canonical_node_number(node_number)
+        # nodesByNum may key its entries by the canonical unsigned form
+        # even when my_node_num itself surfaces as a signed Python int
+        # (any node number with bit 31 set) -- looking up the RAW,
+        # possibly-signed number here can silently miss the local
+        # node's own record. Try the raw key first (the common case,
+        # where both already agree), then the canonical form.
+        local_record = self._interface.nodesByNum.get(node_number) or (
+            self._interface.nodesByNum.get(canonical_number, {})
+            if canonical_number is not None
+            else {}
+        )
         user = local_record.get("user", {})
         metadata = self._interface.metadata
 
         node_id = user.get("id") or (
-            f"!{node_number:08x}" if isinstance(node_number, int) else "unknown"
+            f"!{canonical_number:08x}" if canonical_number is not None else "unknown"
         )
 
         return RadioInfo(

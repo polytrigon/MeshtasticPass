@@ -740,5 +740,200 @@ class RadioConfigSnapshotLifecycleTests(unittest.TestCase):
         self.assertIsNone(service.config_snapshot())
 
 
+def _make_swap_interface(node_id: str, node_number: int, others=None):
+    """A fake interface whose NodeDB may ALSO carry other nodes' records
+
+    (e.g. an old radio's own entry, still legitimately remembered by
+    the new radio's NodeDB -- see MESH FOLLOW-UP item 4). Only
+    `node_number` is ever the local node.
+    """
+    nodes_by_number = dict(others or {})
+    nodes_by_number[node_number] = {
+        "user": {"id": node_id, "longName": f"Radio {node_id}", "shortName": node_id[-4:]}
+    }
+    return SimpleNamespace(
+        myInfo=SimpleNamespace(my_node_num=node_number),
+        localNode=object(),
+        nodesByNum=nodes_by_number,
+        metadata=SimpleNamespace(firmware_version="2.7.11"),
+        close=Mock(),
+    )
+
+
+class LocalNodeIdentityRadioSwapTests(unittest.TestCase):
+    """MESH FOLLOW-UP items 2-13, 23-24: the local/YOU identity must
+
+    always be derived from the CURRENTLY CONNECTED radio, never a
+    previous physical radio's node ID -- exercised entirely through
+    RadioService's own public surface (connect/close/set_device_path/
+    get_known_nodes), the sole source of the is_local flag MESH's
+    working set relies on.
+    """
+
+    def test_radio_swap_on_same_path_makes_new_radio_local(self) -> None:
+        service = RadioService("/dev/ttyACM0")
+        a_number, b_number = 0xAAAAAAAA, 0xBBBBBBBB
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface("!aaaaaaaa", a_number),
+            ),
+        ):
+            service.connect()
+        nodes = {n.node_id: n for n in service.get_known_nodes()}
+        self.assertTrue(nodes["!aaaaaaaa"].is_local)
+
+        service.close()
+
+        # V4's own NodeDB still legitimately remembers the old V3 node
+        # (item 4) -- it must become an ordinary remote node, never YOU,
+        # never hidden, never deleted.
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface(
+                    "!bbbbbbbb", b_number, others={a_number: {
+                        "user": {"id": "!aaaaaaaa", "longName": "V3 Radio", "shortName": "V3"}
+                    }}
+                ),
+            ),
+        ):
+            service.connect()
+        nodes = {n.node_id: n for n in service.get_known_nodes()}
+        self.assertTrue(nodes["!bbbbbbbb"].is_local)
+        self.assertFalse(nodes["!aaaaaaaa"].is_local)
+        self.assertEqual(sum(1 for n in nodes.values() if n.is_local), 1)
+        # device_path was never changed -- same /dev/ttyACM0 throughout.
+        self.assertEqual(service.device_path, "/dev/ttyACM0")
+
+    def test_radio_swap_on_different_path_makes_new_radio_local(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        a_number, b_number = 0xAAAAAAAA, 0xBBBBBBBB
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface("!aaaaaaaa", a_number),
+            ),
+        ):
+            service.connect()
+        service.close()
+        service.set_device_path("/dev/ttyACM0")
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface("!bbbbbbbb", b_number),
+            ),
+        ):
+            service.connect()
+        nodes = {n.node_id: n for n in service.get_known_nodes()}
+        self.assertTrue(nodes["!bbbbbbbb"].is_local)
+        self.assertEqual(sum(1 for n in nodes.values() if n.is_local), 1)
+
+    def test_close_clears_stale_local_identity_before_reconnect(self) -> None:
+        """A disconnect for ANY reason invalidates the previous radio's
+
+        local identity immediately -- get_known_nodes() already returns
+        () while disconnected, so there is no "wrong YOU" to show
+        during the gap, only correctly no YOU at all (item 5).
+        """
+        service = RadioService("/dev/ttyACM0")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface("!aaaaaaaa", 0xAAAAAAAA),
+            ),
+        ):
+            service.connect()
+        self.assertIsNotNone(service._activity_local_node_id)
+        service.close()
+        self.assertIsNone(service._activity_local_node_id)
+        self.assertEqual(service.get_known_nodes(), ())
+
+    def test_node_number_with_high_bit_set_still_matches_as_local(self) -> None:
+        """Item 7: a node number with bit 31 set can surface as either a
+
+        negative or unsigned Python int from different code paths --
+        canonical masking (see radio_service._canonical_node_number)
+        must make the comparison exact regardless of which sign
+        representation myInfo.my_node_num happens to report.
+        """
+        service = RadioService("/dev/ttyACM0")
+        high_bit_number = 0xF0000001  # > 2**31, ambiguous as signed/unsigned
+        interface = _make_swap_interface("!f0000001", high_bit_number)
+        # Simulate a code path reporting my_node_num as the SIGNED
+        # 32-bit interpretation of the identical bit pattern.
+        interface.myInfo.my_node_num = high_bit_number - (1 << 32)
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        nodes = {n.node_id: n for n in service.get_known_nodes()}
+        self.assertTrue(nodes["!f0000001"].is_local)
+
+    def test_exactly_one_you_after_swap_with_extra_active_nodes(self) -> None:
+        """Full item 23 scenario at the RadioService layer: V4's NodeDB
+
+        contains the old V3 node A plus the new local B plus two other
+        real nodes X and Y -- exactly one is_local afterward, and A/X/Y
+        are all ordinary ('is_local=False') entries.
+        """
+        service = RadioService("/dev/ttyACM0")
+        a_number, b_number, x_number, y_number = (
+            0xAAAAAAAA,
+            0xBBBBBBBB,
+            0xC0000001,
+            0xD0000001,
+        )
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface("!aaaaaaaa", a_number),
+            ),
+        ):
+            service.connect()
+        service.close()
+
+        others = {
+            a_number: {
+                "user": {"id": "!aaaaaaaa", "longName": "V3 Radio", "shortName": "V3"}
+            },
+            x_number: {"user": {"id": "!c0000001", "longName": "X", "shortName": "X"}},
+            y_number: {"user": {"id": "!d0000001", "longName": "Y", "shortName": "Y"}},
+        }
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service,
+                "_open_interface",
+                return_value=_make_swap_interface("!bbbbbbbb", b_number, others=others),
+            ),
+        ):
+            service.connect()
+        nodes = {n.node_id: n for n in service.get_known_nodes()}
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(
+            {node_id for node_id, node in nodes.items() if node.is_local}, {"!bbbbbbbb"}
+        )
+        self.assertFalse(nodes["!aaaaaaaa"].is_local)
+        self.assertFalse(nodes["!c0000001"].is_local)
+        self.assertFalse(nodes["!d0000001"].is_local)
+
+
 if __name__ == "__main__":
     unittest.main()
