@@ -638,9 +638,9 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             picker = app._emoji_picker
 
             width_before = picker.region.width
-            app._apply_color_theme("green")
+            app._apply_color_theme("amber")
             await pilot.pause()
-            palette = THEME_PALETTES["green"]
+            palette = THEME_PALETTES["amber"]
             self.assertEqual(picker._base_color, palette.base)
             self.assertEqual(picker._accent_color, palette.accent)
             self.assertEqual(picker.region.width, width_before)

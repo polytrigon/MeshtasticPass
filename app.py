@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from threading import Thread
 from time import monotonic, time
 from typing import Any, Callable
 
@@ -131,25 +131,22 @@ ANIMATED_STATUS = {
 
 CONNECTION_LABEL_WIDTH = 12
 CONNECTION_ROW_PREFIX = "  "
+# Where a KeyboardDropdown's own "[ VALUE ▾ ]" begins on any RADIO/
+# STYLE row built with label_width=CONNECTION_LABEL_WIDTH -- its own
+# heading is "{marker} {label:<CONNECTION_LABEL_WIDTH}} [ ... ]", and
+# marker+space is exactly len(CONNECTION_ROW_PREFIX) wide, so this
+# stays correct automatically if either constant ever changes, rather
+# than hardcoding a column number. Reused by any status row that must
+# align under the control/value column instead of the label column
+# (see _set_font_size_status).
+CONNECTION_VALUE_COLUMN_INDENT = " " * (len(CONNECTION_ROW_PREFIX) + CONNECTION_LABEL_WIDTH + 1)
 
-
-def _format_time_of_day(epoch: float, is_24h: bool) -> str:
-    """Host-local wall-clock reading of one epoch moment.
-
-    Used only to show WHEN this app last successfully synced the
-    radio's clock (see _apply_sync_clock) -- never presented as the
-    radio's own live time, since no independent radio-time readback
-    exists (see ClockSyncResult's docstring). Respects the same 24
-    HOUR TIME preference as the RADIO section's own Clock24HSelector
-    (see item 13), never a separate, independently-configured setting.
-    """
-    moment = datetime.fromtimestamp(epoch)
-    if is_24h:
-        return moment.strftime("%H:%M")
-    return moment.strftime("%I:%M %p").lstrip("0")
 
 CHAT_CONFIRMATION_TIMEOUT_SECONDS = 300.0
 SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
+# Same lifecycle again for LONG NAME SAVED/SHORT NAME SAVED (see
+# _set_long_name_status/_set_short_name_status).
+IDENTITY_STATUS_AUTO_DISMISS_SECONDS = 10.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -164,18 +161,27 @@ SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # already theme-driven and untouched by this change. Does not change
 # what causes DeliveryState.FAILED, nor its meaning: a definitive
 # routing failure/NAK.
+# UNCONFIRMED/U+27D0 WHITE DIAMOND WITH CENTRED DOT: same reasoning as
+# the checkmarks/✕ above -- a plain, Narrow-width text glyph, never an
+# emoji-presentation one -- replacing the literal word "UNCONFIRMED" as
+# pure presentation. Means exactly what it always meant: no conclusive
+# positive or negative routing outcome arrived before the confirmation
+# timeout (see can_manual_resend/MANUAL_RESEND_STATES, unchanged).
 DELIVERY_CHECKMARKS: dict[DeliveryState, str] = {
     DeliveryState.SENT: "✓",
     DeliveryState.HEARD: "✓✓",
+    DeliveryState.UNCONFIRMED: "⟐",
     DeliveryState.FAILED: "✕",
 }
-# A single narrow glyph (U+2192 RIGHTWARDS ARROW -- plain, non-emoji,
-# never double-width) animated by right-justifying it to a growing
-# field width each frame: "→", " →", "  →", "   →", then loop. Reads as
+# A single narrow glyph (U+25B7 WHITE RIGHT-POINTING TRIANGLE -- plain,
+# non-emoji, never double-width; confirmed via grapheme_text.cell_len
+# the same way every other delivery glyph in this module was) animated
+# by right-justifying it to a growing field width each frame: "▷",
+# " ▷", looping at exactly SENDING_ARROW_FRAMES' own cadence. Reads as
 # "in flight / still being resolved", never as success -- unlike the
 # checkmarks above, SENDING covers every outgoing message for which a
 # NAK is still a legitimate possible outcome (see send_was_submitted).
-SENDING_ARROW_GLYPH = "→"
+SENDING_ARROW_GLYPH = "▷"
 SENDING_ARROW_FRAMES = (1, 2)
 CHAT_SCROLLBAR_THUMB_GLYPH = "▕"
 MANUAL_RESEND_STATES = frozenset(
@@ -331,6 +337,35 @@ AUTO_SYNC_CHOICES = (
     ("ON", True),
 )
 
+# device.tzdef -- a POSIX TZ environment-variable string, applied by
+# firmware via setenv("TZ", ...)/tzset() (confirmed against meshtastic/
+# firmware's src/main.cpp), so any valid POSIX TZ string is accepted;
+# these are only the friendly names this pass exposes. Classification,
+# reported honestly (see the completion report's own 5-way scheme):
+# NOT SET is the empty string firmware itself falls back to GMT0 for.
+# UTC="GMT0" is FIRMWARE-SOURCE-VERIFIED -- that exact fallback string,
+# confirmed in src/main.cpp. EASTERN="EST5EDT,M3.2.0,M11.1.0" is
+# REAL-HARDWARE-VERIFIED: observed correct on the user's own HELTEC_V4,
+# firmware 2.7.x, and this exact string must never be altered. The
+# other four US zones reuse that same already-verified M3.2.0/M11.1.0
+# DST transition rule (the standardized post-2007 US rule, not
+# Meshtastic-specific) with each zone's own standard textbook POSIX
+# offset/name -- INFERENCE, not independently hardware- or firmware-
+# doc-verified. No Olson-name mapping ships in the installed
+# meshtastic==2.7.11 package (grepped for "tzdef"/"timezone" across
+# it -- none found), ruling out an SDK-SOURCE-VERIFIED label for any
+# of these.
+TIMEZONE_CHOICES = (
+    ("NOT SET", ""),
+    ("UTC", "GMT0"),
+    ("EASTERN", "EST5EDT,M3.2.0,M11.1.0"),
+    ("CENTRAL", "CST6CDT,M3.2.0,M11.1.0"),
+    ("MOUNTAIN", "MST7MDT,M3.2.0,M11.1.0"),
+    ("PACIFIC", "PST8PDT,M3.2.0,M11.1.0"),
+    ("ALASKA", "AKST9AKDT,M3.2.0,M11.1.0"),
+    ("HAWAII", "HST10"),
+)
+
 
 @dataclass(frozen=True)
 class RadioSettingSpec:
@@ -360,7 +395,31 @@ RADIO_SETTINGS: dict[str, RadioSettingSpec] = {
         to_schema_value=lambda is_24h: not is_24h,
         from_schema_value=lambda use_12h_clock: not use_12h_clock,
     ),
+    "timezone": RadioSettingSpec("device", "tzdef"),
 }
+
+
+class TimezoneSelector(KeyboardDropdown):
+    """TIMEZONE -- backed by device.tzdef (see TIMEZONE_CHOICES for the
+
+    exact per-option POSIX TZ string and its sourcing). A CUSTOM option
+    is injected dynamically by _render_radio_settings (see
+    _timezone_options_for) whenever the connected radio's own tzdef
+    doesn't match any known mapping -- never a real, persisted choice
+    of its own, and the raw string is never otherwise shown in this
+    normal UI.
+    """
+
+    def __init__(self, tzdef: str) -> None:
+        super().__init__(
+            "timezone",
+            "TIMEZONE",
+            (DropdownOption(name, value) for name, value in TIMEZONE_CHOICES),
+            tzdef,
+            widget_id="radio-timezone-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
 
 
 class ScreenTimeoutSelector(KeyboardDropdown):
@@ -446,37 +505,6 @@ class AutoSyncSelector(KeyboardDropdown):
             label_width=CONNECTION_LABEL_WIDTH,
             classes="keyboard-dropdown connection-action-row",
         )
-
-
-class SyncClockControl(Static):
-    """Explicit, user-activated "[ SYNC CLOCK ]" action -- see
-
-    RadioService.sync_clock and _apply_sync_clock. Never triggers
-    anything on its own: only Enter while this is focused sends the
-    admin write. Uses Widget's own `disabled` (not `display`) for the
-    unsupported/offline/in-flight states, so it naturally drops out of
-    focus eligibility while still integrating with the CONNECTION
-    page's existing `not getattr(control, "disabled", False)`
-    UP/DOWN navigation filter with no separate list to maintain.
-    """
-
-    can_focus = True
-
-    class Activated(Message):
-        pass
-
-    def __init__(self) -> None:
-        super().__init__(
-            "[ SYNC CLOCK ]",
-            id="sync-clock-control",
-            classes="connection-action-row",
-            markup=False,
-        )
-
-    def on_key(self, event: Key) -> None:
-        if event.key == "enter" and not self.disabled:
-            self.post_message(self.Activated())
-            event.stop()
 
 
 class ChannelSelector(KeyboardDropdown):
@@ -593,7 +621,7 @@ class EmojiPicker(Static):
     def __init__(self) -> None:
         super().__init__(classes="emoji-picker", markup=False)
         self.highlighted_index = 0
-        default_palette = THEME_PALETTES["white"]
+        default_palette = THEME_PALETTES["snow"]
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
 
@@ -701,9 +729,10 @@ class IdentitySaved(Message):
 class IdentitySaveFailed(Message):
     """An identity-name update failed validation or radio submission."""
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, field_label: str) -> None:
         super().__init__()
         self.detail = detail
+        self.field_label = field_label
 
 
 class RadioSettingApplied(Message):
@@ -727,11 +756,19 @@ class RadioSettingApplied(Message):
 
 
 class ClockSyncApplied(Message):
-    """One RadioService.sync_clock() call finished (see _apply_sync_clock)."""
+    """One AUTO SYNC RadioService.sync_clock() call finished (see
 
-    def __init__(self, result: ClockSyncResult) -> None:
+    _apply_sync_clock_from_thread). `generation` identifies WHICH
+    attempt this is -- see clock_sync_applied's own guard: a completion
+    whose generation no longer matches the app's current one is stale
+    (a newer attempt started, or a disconnect/reconnect superseded it
+    -- see _reset_clock_sync_state) and is safely ignored.
+    """
+
+    def __init__(self, result: ClockSyncResult, generation: int) -> None:
         super().__init__()
         self.result = result
+        self.generation = generation
 
 
 class LoadOlderControl(Static):
@@ -764,14 +801,29 @@ class EndOfChatHistoryMarker(Static):
         )
 
 
+# U+27F2 ANTICLOCKWISE GAPPED CIRCLE ARROW -- a plain, Narrow-width
+# text glyph (never emoji-presentation), replacing the literal word
+# "RESEND". Bracketed exactly like DEL's own "[ DEL ]" -- the same
+# action-control grammar for both, "[ ⟲ ]" -- not a bare glyph.
+RESEND_GLYPH = "⟲"
 MESSAGE_ACTION_LABELS: dict[str, str] = {
-    "resend": "[ RESEND ]",
+    "resend": f"[ {RESEND_GLYPH} ]",
     "delete": "[ DEL ]",
 }
 
 
 class MessageActionControl(Static):
-    """A contextual action beneath a message; ready for future action kinds."""
+    """A contextual action beneath a message; ready for future action kinds.
+
+    Vertical CHAT navigation only ever stops on the "resend" control
+    (see MeshtasticPassApp._chat_navigation_targets) -- "delete" is
+    reachable only by an explicit horizontal move (see on_key below),
+    never a vertical one, so UP/DOWN can never land on DEL directly.
+    `paired_control` links the two action controls for one message to
+    each other (set once, right after both are constructed -- see
+    ChatEntryWidget.__init__), letting each one move focus to its
+    sibling with no separate lookup/query needed.
+    """
 
     can_focus = True
 
@@ -783,6 +835,7 @@ class MessageActionControl(Static):
     def __init__(self, entry: ChatEntry, action: str = "resend") -> None:
         self.entry = entry
         self.action = action
+        self.paired_control: "MessageActionControl | None" = None
         super().__init__(
             MESSAGE_ACTION_LABELS[action],
             classes="message-action chat-nav-target",
@@ -792,6 +845,18 @@ class MessageActionControl(Static):
     def on_key(self, event: Key) -> None:
         if event.key == "enter":
             self.post_message(self.Activated(self))
+            event.stop()
+        elif event.key == "right" and self.action == "resend":
+            # RIGHT from RESEND -> DEL, one deliberate move away --
+            # never triggered by navigation alone (see item 6). Stops
+            # here so the transcript's own RIGHT ("jump to present and
+            # type") never fires for this specific focus target.
+            if self.paired_control is not None:
+                self.paired_control.focus()
+            event.stop()
+        elif event.key == "left" and self.action == "delete":
+            if self.paired_control is not None:
+                self.paired_control.focus()
             event.stop()
 
 
@@ -1901,7 +1966,7 @@ class MeshTopologyView(Container):
         self._relay_stages = ()
         self._selected_node_id = ""
         self._edge_node_ids = frozenset()
-        self.board.query_one(MeshCanvas).render_scene(1, 1, (), "white")
+        self.board.query_one(MeshCanvas).render_scene(1, 1, (), "snow")
 
     def select_node(self, node_id: str) -> None:
         """Select a real working-set node by ID; anything else is a no-op.
@@ -2171,6 +2236,8 @@ class ChatEntryWidget(Vertical):
         self.action_control.display = False
         self.delete_control = MessageActionControl(entry, action="delete")
         self.delete_control.display = False
+        self.action_control.paired_control = self.delete_control
+        self.delete_control.paired_control = self.action_control
         classes = "chat-entry new-message" if is_new else "chat-entry"
         if self.favorite:
             classes += " favorite-sender"
@@ -2248,34 +2315,34 @@ class MeshtasticPassApp(App[None]):
 
     TITLE = "MeshtasticPass"
     CSS = f"""
-    $white_dim: {THEME_PALETTES["white"].dim_base};
-    $green_dim: {THEME_PALETTES["green"].dim_base};
-    $orange_dim: {THEME_PALETTES["orange"].dim_base};
-    $white_accent: {THEME_PALETTES["white"].accent};
-    $green_accent: {THEME_PALETTES["green"].accent};
-    $orange_accent: {THEME_PALETTES["orange"].accent};
+    $snow_base: {THEME_PALETTES["snow"].base};
+    $snow_accent: {THEME_PALETTES["snow"].accent};
+    $snow_accent2: {THEME_PALETTES["snow"].accent2};
+    $snow_dim: {THEME_PALETTES["snow"].dim};
+    $snow_confirm: {THEME_PALETTES["snow"].confirm};
+    $amber_base: {THEME_PALETTES["amber"].base};
+    $amber_accent: {THEME_PALETTES["amber"].accent};
+    $amber_accent2: {THEME_PALETTES["amber"].accent2};
+    $amber_dim: {THEME_PALETTES["amber"].dim};
+    $amber_confirm: {THEME_PALETTES["amber"].confirm};
     $error: {ERROR};
     $selection_background: #181818;
     """ + """
     Screen {
         background: #101010;
-        color: #d8d8d8;
+        color: $snow_base;
         layers: base popup;
     }
 
-    Screen.theme-green {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange {
-        color: #ff8c00;
+    Screen.theme-amber {
+        color: $amber_base;
     }
 
     #tab-bar {
         height: 3;
         padding: 1 1 0 1;
         background: #101010;
-        color: $white_dim;
+        color: $snow_dim;
     }
 
     #content {
@@ -2290,17 +2357,17 @@ class MeshtasticPassApp(App[None]):
     #connection {
         overflow-x: hidden;
         scrollbar-size: 1 1;
-        scrollbar-color: #d8d8d8;
-        scrollbar-color-hover: #d8d8d8;
-        scrollbar-color-active: #d8d8d8;
-        scrollbar-background: $white_dim;
-        scrollbar-background-hover: $white_dim;
-        scrollbar-background-active: $white_dim;
+        scrollbar-color: $snow_base;
+        scrollbar-color-hover: $snow_base;
+        scrollbar-color-active: $snow_base;
+        scrollbar-background: $snow_dim;
+        scrollbar-background-hover: $snow_dim;
+        scrollbar-background-active: $snow_dim;
     }
 
     .page-title {
         height: 2;
-        color: #f2f2f2;
+        color: $snow_accent;
         text-style: bold;
     }
 
@@ -2338,7 +2405,11 @@ class MeshtasticPassApp(App[None]):
     .identity-name-unavailable {
         width: auto;
         height: 1;
-        color: $white_dim;
+        color: $snow_dim;
+    }
+
+    Screen.theme-amber .identity-name-unavailable {
+        color: $amber_dim;
     }
 
     #long-name-input, #short-name-input {
@@ -2347,45 +2418,83 @@ class MeshtasticPassApp(App[None]):
         border: none;
         padding: 0;
         background: #101010;
-        color: #d8d8d8;
+        color: $snow_base;
+    }
+
+    Screen.theme-amber #long-name-input,
+    Screen.theme-amber #short-name-input {
+        color: $amber_base;
     }
 
     #long-name-input:disabled, #short-name-input:disabled {
-        color: $white_dim;
+        color: $snow_dim;
         opacity: 1;
     }
 
-    #identity-status {
+    Screen.theme-amber #long-name-input:disabled,
+    Screen.theme-amber #short-name-input:disabled {
+        color: $amber_dim;
+    }
+
+    #long-name-status, #short-name-status, #timezone-status,
+    #font-size-status, #color-status {
+        /* No min-height: display is toggled False when empty (see
+           _set_long_name_status/_set_short_name_status/_set_timezone_
+           status/_set_font_size_status/_set_color_status), so the row
+           collapses to zero height instead of reserving a permanent
+           blank line. */
         height: auto;
-        min-height: 1;
     }
 
-    #identity-status {
-        color: #39ff14;
+    #long-name-status, #short-name-status, #timezone-status, #font-size-status {
+        color: $snow_confirm;
     }
 
-    #identity-status.setting-error {
+    Screen.theme-amber #long-name-status,
+    Screen.theme-amber #short-name-status,
+    Screen.theme-amber #timezone-status,
+    Screen.theme-amber #font-size-status {
+        color: $amber_confirm;
+    }
+
+    #long-name-status.setting-error, #short-name-status.setting-error,
+    #timezone-status.setting-error, #font-size-status.setting-error,
+    #color-status.setting-error {
         color: $error;
     }
 
-    Screen.theme-green #long-name-input,
-    Screen.theme-green #short-name-input {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #long-name-input,
-    Screen.theme-orange #short-name-input {
-        color: #ff8c00;
+    /* Textual's own CSS specificity (id, class, type) otherwise lets
+       the theme-scoped CONFIRM override above win under AMBER, since
+       "Screen.theme-amber #widget" carries one more type-selector
+       component than "#widget.setting-error" -- these repeat the
+       error color with that SAME extra Screen.theme-amber qualifier
+       so ERROR always wins regardless of the active theme. $error is
+       already theme-independent (NEON_RED in both palettes); only the
+       selector's specificity needs raising here, not its value. */
+    Screen.theme-amber #long-name-status.setting-error,
+    Screen.theme-amber #short-name-status.setting-error,
+    Screen.theme-amber #timezone-status.setting-error,
+    Screen.theme-amber #font-size-status.setting-error,
+    Screen.theme-amber #color-status.setting-error {
+        color: $error;
     }
 
     .keyboard-dropdown {
         height: auto;
         min-height: 2;
-        color: #d8d8d8;
+        color: $snow_base;
+    }
+
+    Screen.theme-amber .keyboard-dropdown {
+        color: $amber_base;
     }
 
     .keyboard-dropdown:focus {
-        color: #f2f2f2;
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber .keyboard-dropdown:focus {
+        color: $amber_accent;
     }
 
     #connection .connection-action-row {
@@ -2401,24 +2510,12 @@ class MeshtasticPassApp(App[None]):
         background: $selection_background;
     }
 
-    Screen.theme-green .keyboard-dropdown,
-    Screen.theme-green #chat-input {
-        color: #39ff14;
+    Screen.theme-amber #chat-input {
+        color: $amber_base;
     }
 
-    Screen.theme-orange .keyboard-dropdown,
-    Screen.theme-orange #chat-input {
-        color: #ff8c00;
-    }
-
-    Screen.theme-green .keyboard-dropdown:focus,
-    Screen.theme-green .page-title {
-        color: #7cff6b;
-    }
-
-    Screen.theme-orange .keyboard-dropdown:focus,
-    Screen.theme-orange .page-title {
-        color: #ffb000;
+    Screen.theme-amber .page-title {
+        color: $amber_accent;
     }
 
     #chat-title {
@@ -2427,97 +2524,50 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    #style-status, #radio-status, #radio-clock-status {
+    #radio-status {
         height: 2;
     }
 
-    #style-status.setting-success, #radio-status.setting-success,
-    #radio-clock-status.setting-success {
-        color: $white_accent;
+    .setting-success {
+        color: $snow_confirm;
     }
 
-    Screen.theme-green #style-status.setting-success,
-    Screen.theme-green #radio-status.setting-success,
-    Screen.theme-green #radio-clock-status.setting-success {
-        color: $green_accent;
+    Screen.theme-amber .setting-success {
+        color: $amber_confirm;
     }
 
-    Screen.theme-orange #style-status.setting-success,
-    Screen.theme-orange #radio-status.setting-success,
-    Screen.theme-orange #radio-clock-status.setting-success {
-        color: $orange_accent;
-    }
-
-    #connection-error, #send-error, #style-status.setting-error,
-    #radio-status.setting-error, #radio-clock-status.setting-error {
+    #connection-error, #send-error, #radio-status.setting-error {
         height: auto;
         min-height: 1;
         color: $error;
     }
 
-    #sync-clock-control {
-        color: $white_accent;
-    }
-
-    Screen.theme-green #sync-clock-control {
-        color: $green_accent;
-    }
-
-    Screen.theme-orange #sync-clock-control {
-        color: $orange_accent;
-    }
-
-    #sync-clock-control:disabled {
-        color: $white_dim;
-    }
-
-    Screen.theme-green #sync-clock-control:disabled {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange #sync-clock-control:disabled {
-        color: $orange_dim;
-    }
-
     #send-error.older-message-notice {
-        color: #39ff14;
+        color: $snow_accent;
     }
 
-    Screen.theme-green #send-error.older-message-notice {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange #send-error.older-message-notice {
-        color: #d8d8d8;
+    Screen.theme-amber #send-error.older-message-notice {
+        color: $amber_accent;
     }
 
     #chat-log {
         height: 1fr;
         scrollbar-size: 1 1;
-        scrollbar-color: #d8d8d8;
-        scrollbar-color-hover: #d8d8d8;
-        scrollbar-color-active: #d8d8d8;
-        scrollbar-background: $white_dim;
-        scrollbar-background-hover: $white_dim;
-        scrollbar-background-active: $white_dim;
+        scrollbar-color: $snow_base;
+        scrollbar-color-hover: $snow_base;
+        scrollbar-color-active: $snow_base;
+        scrollbar-background: $snow_dim;
+        scrollbar-background-hover: $snow_dim;
+        scrollbar-background-active: $snow_dim;
     }
 
-    Screen.theme-green #chat-log, Screen.theme-green #connection {
-        scrollbar-color: #39ff14;
-        scrollbar-color-hover: #39ff14;
-        scrollbar-color-active: #39ff14;
-        scrollbar-background: $green_dim;
-        scrollbar-background-hover: $green_dim;
-        scrollbar-background-active: $green_dim;
-    }
-
-    Screen.theme-orange #chat-log, Screen.theme-orange #connection {
-        scrollbar-color: #ff8c00;
-        scrollbar-color-hover: #ff8c00;
-        scrollbar-color-active: #ff8c00;
-        scrollbar-background: $orange_dim;
-        scrollbar-background-hover: $orange_dim;
-        scrollbar-background-active: $orange_dim;
+    Screen.theme-amber #chat-log, Screen.theme-amber #connection {
+        scrollbar-color: $amber_base;
+        scrollbar-color-hover: $amber_base;
+        scrollbar-color-active: $amber_base;
+        scrollbar-background: $amber_dim;
+        scrollbar-background-hover: $amber_dim;
+        scrollbar-background-active: $amber_dim;
     }
 
     #mesh-status, #mesh-bottom-row {
@@ -2525,41 +2575,29 @@ class MeshtasticPassApp(App[None]):
     }
 
     #mesh-status {
-        color: $white_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green #mesh-status {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange #mesh-status {
-        color: $orange_dim;
+    Screen.theme-amber #mesh-status {
+        color: $amber_dim;
     }
 
     #mesh-context-status {
         width: 1fr;
-        color: #d8d8d8;
+        color: $snow_base;
     }
 
-    Screen.theme-green #mesh-context-status {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #mesh-context-status {
-        color: #ff8c00;
+    Screen.theme-amber #mesh-context-status {
+        color: $amber_base;
     }
 
     #mesh-last-update {
         width: auto;
-        color: #d8d8d8;
+        color: $snow_base;
     }
 
-    Screen.theme-green #mesh-last-update {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #mesh-last-update {
-        color: #ff8c00;
+    Screen.theme-amber #mesh-last-update {
+        color: $amber_base;
     }
 
     #mesh-view {
@@ -2590,100 +2628,75 @@ class MeshtasticPassApp(App[None]):
         content-align: center middle;
     }
 
-    Screen.theme-green .identity-name-unavailable {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange .identity-name-unavailable {
-        color: $orange_dim;
-    }
-
     .viewport-menu {
         layer: popup;
         position: absolute;
         background: #101010;
-        border: solid $white_dim;
+        border: solid $snow_dim;
         padding: 0;
         scrollbar-size: 1 1;
-        scrollbar-color: #d8d8d8;
-        scrollbar-background: $white_dim;
+        scrollbar-color: $snow_base;
+        scrollbar-background: $snow_dim;
     }
 
     .viewport-menu-row {
         height: 1;
         padding: 0 1;
-        color: #d8d8d8;
+        color: $snow_base;
     }
 
     .viewport-menu-row.highlighted {
-        color: #39ff14;
+        color: $snow_accent;
         text-style: bold reverse;
     }
 
     .viewport-menu-row.informational {
-        color: $white_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green .viewport-menu {
-        border: solid $green_dim;
-        scrollbar-color: #39ff14;
-        scrollbar-background: $green_dim;
+    Screen.theme-amber .viewport-menu {
+        border: solid $amber_dim;
+        scrollbar-color: $amber_base;
+        scrollbar-background: $amber_dim;
     }
 
-    Screen.theme-green .viewport-menu-row {
-        color: #39ff14;
+    Screen.theme-amber .viewport-menu-row {
+        color: $amber_base;
     }
 
-    Screen.theme-green .viewport-menu-row.highlighted {
-        color: #ff8c00;
+    Screen.theme-amber .viewport-menu-row.highlighted {
+        color: $amber_accent;
     }
 
-    Screen.theme-green .viewport-menu-row.informational {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange .viewport-menu {
-        border: solid $orange_dim;
-        scrollbar-color: #ff8c00;
-        scrollbar-background: $orange_dim;
-    }
-
-    Screen.theme-orange .viewport-menu-row {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .viewport-menu-row.highlighted {
-        color: #d8d8d8;
-    }
-
-    Screen.theme-orange .viewport-menu-row.informational {
-        color: $orange_dim;
+    Screen.theme-amber .viewport-menu-row.informational {
+        color: $amber_dim;
     }
 
     .emoji-picker {
         layer: popup;
         position: absolute;
         background: #101010;
-        border: solid $white_dim;
+        border: solid $snow_dim;
         height: 3;
         /* 1 cell left, 2 cells right -- see EMOJI_PICKER_PADDING_CELLS
            for why the right side carries an extra safety cell. */
         padding: 0 2 0 1;
     }
 
-    Screen.theme-green .emoji-picker {
-        border: solid $green_dim;
-    }
-
-    Screen.theme-orange .emoji-picker {
-        border: solid $orange_dim;
+    Screen.theme-amber .emoji-picker {
+        border: solid $amber_dim;
     }
 
     #load-older, .message-action {
         width: auto;
         height: 1;
-        color: #d8d8d8;
+        color: $snow_base;
         margin-bottom: 1;
+    }
+
+    Screen.theme-amber #load-older,
+    Screen.theme-amber .message-action {
+        color: $amber_base;
     }
 
     .message-action-row {
@@ -2695,30 +2708,16 @@ class MeshtasticPassApp(App[None]):
         width: 1fr;
         height: 1;
         margin-bottom: 1;
-        color: $white_dim;
+        color: $snow_dim;
         text-align: center;
     }
 
-    Screen.theme-green #end-of-chat-history {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange #end-of-chat-history {
-        color: $orange_dim;
+    Screen.theme-amber #end-of-chat-history {
+        color: $amber_dim;
     }
 
     #load-older:focus, .message-action:focus {
         text-style: reverse;
-    }
-
-    Screen.theme-green #load-older,
-    Screen.theme-green .message-action {
-        color: #39ff14;
-    }
-
-    Screen.theme-orange #load-older,
-    Screen.theme-orange .message-action {
-        color: #ff8c00;
     }
 
     .chat-entry {
@@ -2750,77 +2749,63 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    Screen.theme-white .chat-entry.favorite-sender .chat-entry-author {
-        color: #39ff14;
+    .chat-entry.favorite-sender .chat-entry-author {
+        color: $snow_accent;
     }
 
-    Screen.theme-green .chat-entry.favorite-sender .chat-entry-author {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .chat-entry.favorite-sender .chat-entry-author {
-        color: #d8d8d8;
+    Screen.theme-amber .chat-entry.favorite-sender .chat-entry-author {
+        color: $amber_accent;
     }
 
     .chat-entry-separator, .chat-entry-delivery {
         width: auto;
-        color: $white_dim;
+        color: $snow_dim;
     }
 
     .chat-entry-timestamp, .chat-entry-distance {
         width: auto;
-        color: $white_dim;
+        color: $snow_dim;
         text-style: dim;
     }
 
-    Screen.theme-green .chat-entry-timestamp,
-    Screen.theme-green .chat-entry-distance {
-        color: $green_dim;
+    Screen.theme-amber .chat-entry-timestamp,
+    Screen.theme-amber .chat-entry-distance {
+        color: $amber_dim;
     }
 
-    Screen.theme-orange .chat-entry-timestamp,
-    Screen.theme-orange .chat-entry-distance {
-        color: $orange_dim;
+    Screen.theme-amber .chat-entry-separator,
+    Screen.theme-amber .chat-entry-delivery {
+        color: $amber_dim;
     }
 
-    Screen.theme-green .chat-entry-separator,
-    Screen.theme-green .chat-entry-delivery {
-        color: $green_dim;
-    }
-
-    Screen.theme-orange .chat-entry-separator,
-    Screen.theme-orange .chat-entry-delivery {
-        color: $orange_dim;
-    }
-
+    /* Delivery color grammar (item 9/28): -> animated = ACCENT,
+       ✓ SENT = BASE, ✓✓ HEARD = ACCENT, ⟐ UNCONFIRMED = ACCENT2,
+       ✕ FAILED/INTERRUPTED = ERROR. Semantics (DeliveryState) are
+       unchanged -- only which token each visible glyph resolves to. */
     .chat-entry.delivery-sending .chat-entry-delivery,
-    .chat-entry.delivery-sent .chat-entry-delivery,
-    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #39ff14;
-    }
-
-    Screen.theme-green .chat-entry.delivery-sending .chat-entry-delivery,
-    Screen.theme-green .chat-entry.delivery-sent .chat-entry-delivery,
-    Screen.theme-green .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .chat-entry.delivery-sending .chat-entry-delivery,
-    Screen.theme-orange .chat-entry.delivery-sent .chat-entry-delivery,
-    Screen.theme-orange .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: #d8d8d8;
-    }
-
     .chat-entry.delivery-heard .chat-entry-delivery {
-        color: #d8d8d8;
+        color: $snow_accent;
     }
 
-    Screen.theme-green .chat-entry.delivery-heard .chat-entry-delivery {
-        color: #39ff14;
+    Screen.theme-amber .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-amber .chat-entry.delivery-heard .chat-entry-delivery {
+        color: $amber_accent;
     }
 
-    Screen.theme-orange .chat-entry.delivery-heard .chat-entry-delivery {
-        color: #ff8c00;
+    .chat-entry.delivery-sent .chat-entry-delivery {
+        color: $snow_base;
+    }
+
+    Screen.theme-amber .chat-entry.delivery-sent .chat-entry-delivery {
+        color: $amber_base;
+    }
+
+    .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: $snow_accent2;
+    }
+
+    Screen.theme-amber .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: $amber_accent2;
     }
 
     .chat-entry.delivery-failed .chat-entry-delivery,
@@ -2832,25 +2817,18 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
-    Screen.theme-white .chat-entry.new-message .chat-entry-author,
-    Screen.theme-white .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-white .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-white .chat-entry.new-message .chat-entry-text {
-        color: #39ff14;
+    .chat-entry.new-message .chat-entry-author,
+    .chat-entry.new-message .chat-entry-timestamp,
+    .chat-entry.new-message .chat-entry-distance,
+    .chat-entry.new-message .chat-entry-text {
+        color: $snow_accent;
     }
 
-    Screen.theme-green .chat-entry.new-message .chat-entry-author,
-    Screen.theme-green .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-green .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-green .chat-entry.new-message .chat-entry-text {
-        color: #ff8c00;
-    }
-
-    Screen.theme-orange .chat-entry.new-message .chat-entry-author,
-    Screen.theme-orange .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-orange .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-orange .chat-entry.new-message .chat-entry-text {
-        color: #d8d8d8;
+    Screen.theme-amber .chat-entry.new-message .chat-entry-author,
+    Screen.theme-amber .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-amber .chat-entry.new-message .chat-entry-distance,
+    Screen.theme-amber .chat-entry.new-message .chat-entry-text {
+        color: $amber_accent;
     }
 
     #chat-input {
@@ -2858,7 +2836,7 @@ class MeshtasticPassApp(App[None]):
         border: none;
         padding: 0;
         background: #101010;
-        color: #f2f2f2;
+        color: $snow_base;
     }
 
     #chat-input:focus {
@@ -2867,33 +2845,28 @@ class MeshtasticPassApp(App[None]):
 
     #chat-new-below {
         height: 1;
-        color: #ffb000;
+        color: $snow_accent;
         text-align: right;
+    }
+
+    Screen.theme-amber #chat-new-below {
+        color: $amber_accent;
     }
 
     #footer {
         height: 2;
         padding: 0 1;
-        border-top: solid $white_dim;
-        color: $white_dim;
+        border-top: solid $snow_dim;
+        color: $snow_dim;
     }
 
-    Screen.theme-green #tab-bar,
-    Screen.theme-green #footer {
-        color: $green_dim;
+    Screen.theme-amber #tab-bar,
+    Screen.theme-amber #footer {
+        color: $amber_dim;
     }
 
-    Screen.theme-orange #tab-bar,
-    Screen.theme-orange #footer {
-        color: $orange_dim;
-    }
-
-    Screen.theme-green #footer {
-        border-top: solid $green_dim;
-    }
-
-    Screen.theme-orange #footer {
-        border-top: solid $orange_dim;
+    Screen.theme-amber #footer {
+        border-top: solid $amber_dim;
     }
     """
 
@@ -2922,25 +2895,43 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
-        # Local wall-clock moment the last SYNC CLOCK in THIS session
-        # completed successfully -- never the radio's own time (see
-        # SyncClockControl/_apply_sync_clock: AdminMessage has no
-        # get-time RPC to read that back with, see ClockSyncResult).
-        # None until the first successful sync.
+        # Local wall-clock moment AUTO SYNC last completed a clock-set
+        # successfully in THIS session -- never the radio's own time
+        # (see RadioService.sync_clock: AdminMessage has no get-time
+        # RPC to read that back with, see ClockSyncResult). None until
+        # the first successful sync. Diagnostic only -- never rendered.
         self._last_clock_sync_at: float | None = None
+        # Whether an AUTO SYNC write is currently in flight -- guards
+        # against a reconnect loop launching an overlapping second
+        # write (see _maybe_auto_sync_clock).
         self._clock_sync_in_progress = False
+        # Identifies the CURRENT AUTO SYNC attempt -- see
+        # ClockSyncApplied/_reset_clock_sync_state: a completion for a
+        # stale (superseded, e.g. by a disconnect/reconnect) generation
+        # is ignored, so a late completion from an abandoned connection
+        # can never corrupt the new one's bookkeeping.
+        self._clock_sync_generation = 0
         # Whether AUTO SYNC has already run once for the CURRENT
-        # connection lifecycle (see _maybe_auto_sync_clock/item 17) --
-        # reset only when _show_connection sees a genuine non-ONLINE ->
+        # connection lifecycle (see _maybe_auto_sync_clock) -- reset
+        # only when _show_connection sees a genuine non-ONLINE ->
         # ONLINE transition, so a reconnect loop can never trigger more
         # than one sync per lifecycle.
         self._clock_auto_sync_done_this_connection = False
+        # One entry per named radio-write operation currently in flight
+        # (see _run_radio_worker) -- lets a new call in the SAME group
+        # be refused outright while the previous one is still running,
+        # without depending on Textual's own worker exclusivity (which
+        # cannot actually interrupt a blocking thread either way).
+        self._radio_workers: dict[str, Thread] = {}
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
         self._delivery_timer: Timer | None = None
         self._send_error_message = ""
         self._send_error_dismiss_timer: Timer | None = None
+        self._long_name_status_dismiss_timer: Timer | None = None
+        self._short_name_status_dismiss_timer: Timer | None = None
+        self._timezone_status_dismiss_timer: Timer | None = None
         self._arrival_sequence = 0
         self._send_animation_frame = 1
         self._has_older_history = False
@@ -2973,23 +2964,25 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
                 yield LongNameControl()
+                yield Static(id="long-name-status", markup=False)
                 yield ShortNameControl()
+                yield Static(id="short-name-status", markup=False)
                 yield Static(id="identity-values", markup=False)
-                yield Static(id="identity-status", markup=False)
                 yield Static("STYLE", id="style-title", classes="page-title")
                 yield FontSizeSelector(self.settings.font_size)
+                yield Static(id="font-size-status", markup=False)
                 yield ColorSelector(self.settings.color)
-                yield Static(id="style-status")
+                yield Static(id="color-status", markup=False)
                 yield Static("RADIO", id="radio-title", classes="page-title")
                 yield Static(id="radio-info", markup=False)
+                yield TimezoneSelector("")
+                yield Static(id="timezone-status", markup=False)
                 yield ScreenTimeoutSelector(300)
                 yield UnitsSelector(DISPLAY_UNITS_METRIC)
                 yield CompassSelector(True)
                 yield FlipScreenSelector(False)
                 yield Clock24HSelector(True)
-                yield Static(id="radio-clock-status", markup=False)
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
-                yield SyncClockControl()
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
                 yield ChannelSelector(self._channels, self.current_channel_index)
@@ -3030,6 +3023,12 @@ class MeshtasticPassApp(App[None]):
         self._terminal_cursor.hide()
         self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
+        # FONT SIZE/COLOR are local settings, independent of the radio
+        # connection lifecycle -- collapsed here once at startup, unlike
+        # the RADIO-section per-field rows _show_connection resets on
+        # every connection-state transition.
+        self._set_font_size_status("", None)
+        self._set_color_status("", None)
         self._show_connection(RadioState.CONNECTING)
         self._connection_animation_timer = self.set_interval(
             0.45,
@@ -3223,13 +3222,13 @@ class MeshtasticPassApp(App[None]):
                     self.query_one(ShortNameControl),
                     self.query_one(FontSizeSelector),
                     self.query_one(ColorSelector),
+                    self.query_one(TimezoneSelector),
                     self.query_one(ScreenTimeoutSelector),
                     self.query_one(UnitsSelector),
                     self.query_one(CompassSelector),
                     self.query_one(FlipScreenSelector),
                     self.query_one(Clock24HSelector),
                     self.query_one(AutoSyncSelector),
-                    self.query_one(SyncClockControl),
                 )
                 if not getattr(control, "disabled", False)
             ]
@@ -3262,31 +3261,197 @@ class MeshtasticPassApp(App[None]):
             self.show_tab(tab_for_key[event.key])
             event.stop()
 
+    def _set_long_name_status(self, text: str, css_class: str | None) -> None:
+        """LONG NAME's own status row -- see item ("RADIO — LONG NAME /
+
+        SHORT NAME STATUS LAYOUT"): aligned to the LONG NAME label's
+        own x-start (CONNECTION_ROW_PREFIX -- never the value/input
+        column), collapses to zero height when empty instead of
+        reserving a permanent blank row, and auto-dismisses a SAVED
+        confirmation after IDENTITY_STATUS_AUTO_DISMISS_SECONDS -- any
+        earlier pending dismiss is always stopped first, exactly like
+        _set_clock_status's own guard, so a stale timer can never
+        clear a newer status.
+        """
+        if self._long_name_status_dismiss_timer is not None:
+            self._long_name_status_dismiss_timer.stop()
+            self._long_name_status_dismiss_timer = None
+        status = self.query_one("#long-name-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_ROW_PREFIX}{text}" if text else "")
+        if css_class == "setting-success":
+            self._long_name_status_dismiss_timer = self.set_timer(
+                IDENTITY_STATUS_AUTO_DISMISS_SECONDS, self._dismiss_long_name_status
+            )
+
+    def _dismiss_long_name_status(self) -> None:
+        self._long_name_status_dismiss_timer = None
+        self._set_long_name_status("", None)
+
+    def _set_short_name_status(self, text: str, css_class: str | None) -> None:
+        """SHORT NAME's own status row -- see _set_long_name_status,
+
+        which this exactly mirrors for the other identity field.
+        """
+        if self._short_name_status_dismiss_timer is not None:
+            self._short_name_status_dismiss_timer.stop()
+            self._short_name_status_dismiss_timer = None
+        status = self.query_one("#short-name-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_ROW_PREFIX}{text}" if text else "")
+        if css_class == "setting-success":
+            self._short_name_status_dismiss_timer = self.set_timer(
+                IDENTITY_STATUS_AUTO_DISMISS_SECONDS, self._dismiss_short_name_status
+            )
+
+    def _dismiss_short_name_status(self) -> None:
+        self._short_name_status_dismiss_timer = None
+        self._set_short_name_status("", None)
+
+    def _set_timezone_status(self, text: str, css_class: str | None) -> None:
+        """TIMEZONE's own status row -- see _set_long_name_status, which
+
+        this exactly mirrors for the RADIO-section TIMEZONE control.
+        """
+        if self._timezone_status_dismiss_timer is not None:
+            self._timezone_status_dismiss_timer.stop()
+            self._timezone_status_dismiss_timer = None
+        status = self.query_one("#timezone-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_ROW_PREFIX}{text}" if text else "")
+        if css_class == "setting-success":
+            self._timezone_status_dismiss_timer = self.set_timer(
+                IDENTITY_STATUS_AUTO_DISMISS_SECONDS, self._dismiss_timezone_status
+            )
+
+    def _dismiss_timezone_status(self) -> None:
+        self._timezone_status_dismiss_timer = None
+        self._set_timezone_status("", None)
+
+    def _set_font_size_status(self, text: str, css_class: str | None) -> None:
+        """FONT SIZE's own status row -- aligned under FONT SIZE's own
+
+        control/value column (CONNECTION_VALUE_COLUMN_INDENT), not the
+        left label column, and collapses to zero height when empty. No
+        auto-dismiss timer: preserves FONT SIZE's existing lifetime --
+        the confirmation stays until the user changes FONT SIZE again,
+        exactly as before this row was split out of the shared STYLE
+        status.
+        """
+        status = self.query_one("#font-size-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
+
+    def _set_color_status(self, text: str, css_class: str | None) -> None:
+        """COLOR's own status row -- ERROR only. A successful color
+
+        change needs no confirmation beyond the visible theme switch
+        and the dropdown's own new value, so this is only ever called
+        with text="" on success (see dropdown_selected's own "color"
+        branch) -- collapses to zero height, leaving no empty row or
+        extra spacing behind.
+        """
+        status = self.query_one("#color-status", Static)
+        status.remove_class("setting-success")
+        status.remove_class("setting-error")
+        if css_class is not None:
+            status.add_class(css_class)
+        status.display = bool(text)
+        status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
+
+    @staticmethod
+    def _timezone_options_for(tzdef: str) -> tuple[DropdownOption, ...]:
+        """TIMEZONE_CHOICES, plus a synthetic CUSTOM entry when `tzdef`
+
+        is a non-empty string that doesn't match any known mapping --
+        see TimezoneSelector's own docstring. Never mutates
+        TIMEZONE_CHOICES itself.
+        """
+        options = tuple(DropdownOption(name, value) for name, value in TIMEZONE_CHOICES)
+        known_values = {value for _label, value in TIMEZONE_CHOICES}
+        if tzdef and tzdef not in known_values:
+            return options + (DropdownOption("CUSTOM", tzdef),)
+        return options
+
+    def _run_radio_worker(self, group: str, target: Callable[[], None]) -> None:
+        """Run one radio admin-write/save/sync call on a dedicated daemon
+
+        thread, never through Textual's run_worker(thread=True).
+
+        Textual's thread-mode workers are ultimately dispatched via
+        asyncio's DEFAULT executor (loop.run_in_executor(None, ...) --
+        see Worker._run_threaded), and Python's own asyncio.run() --
+        which is exactly how Textual's own App.run() drives the event
+        loop -- unconditionally waits, with NO timeout, for every job
+        that executor has ever accepted before the interpreter may
+        exit at all (see BaseEventLoop.shutdown_default_executor(),
+        called from asyncio.run()'s own `finally` block). A genuinely
+        stalled SDK call -- a real, previously-documented failure mode:
+        a serial-layer stall can occur BEFORE the SDK's own
+        waitForAckNak timeout even starts ticking -- would therefore
+        hang the ENTIRE process at exit no matter what MeshtasticPass's
+        own shutdown code does. A plain daemon thread is never tracked
+        by that executor, so it can never block process termination:
+        Python simply abandons it once every non-daemon thread has
+        finished, exactly like RadioMonitor's own monitoring thread
+        already does. Correctness-neutral for every caller here: each
+        already treats its own result as best-effort, reacting only to
+        the Message it later posts (post_message is safe to call, and
+        simply returns False, even after this app has fully closed --
+        see MessagePump.post_message) -- never by blocking on this
+        thread's outcome directly.
+
+        `group` allows at most one in-flight thread per named
+        operation -- a second call for the SAME group while the first
+        is still running is refused outright, mirroring (and actually
+        strengthening) the exclusivity Textual's own
+        group=.../exclusive=True previously provided: that mechanism
+        could never truly stop an already-running blocking call either,
+        so two overlapping SDK calls could already race in practice.
+        """
+        existing = self._radio_workers.get(group)
+        if existing is not None and existing.is_alive():
+            return
+        thread = Thread(target=target, name=group, daemon=True)
+        self._radio_workers[group] = thread
+        thread.start()
+
     @on(Input.Submitted, "#long-name-input")
     def save_long_name(self, event: Input.Submitted) -> None:
         """Apply an identity edit through the active radio service."""
-        status = self.query_one("#identity-status", Static)
         control = self.query_one(LongNameControl)
         if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update("LONG NAME UNAVAILABLE — RADIO NOT CONNECTED")
+            self._set_long_name_status(
+                "LONG NAME UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+            )
             return
         try:
             long_name = validate_long_name(event.value)
         except RadioIdentityError as error:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update(str(error))
+            self._set_long_name_status(str(error), "setting-error")
             return
         control.finish_edit(long_name)
-        status.remove_class("setting-error")
-        status.update("SAVING NAME...")
-        self.run_worker(
-            lambda: self._save_long_name_from_thread(long_name),
-            thread=True,
-            name="save-radio-long-name",
-            exclusive=True,
+        self._set_long_name_status("SAVING NAME...", None)
+        self._run_radio_worker(
+            "save-radio-long-name", lambda: self._save_long_name_from_thread(long_name)
         )
 
     def _save_long_name_from_thread(self, long_name: str) -> None:
@@ -3294,38 +3459,35 @@ class MeshtasticPassApp(App[None]):
             info = self.radio.set_long_name(long_name)
         except (RadioIdentityError, AttributeError) as error:
             detail = str(error).strip() or "The radio identity could not be saved."
-            self.post_message(IdentitySaveFailed(detail))
+            self.post_message(IdentitySaveFailed(detail, "LONG NAME"))
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
-            self.post_message(IdentitySaveFailed(f"Could not save Long Name: {detail}"))
+            self.post_message(
+                IdentitySaveFailed(f"Could not save Long Name: {detail}", "LONG NAME")
+            )
         else:
             self.post_message(IdentitySaved(info, "LONG NAME"))
 
     @on(Input.Submitted, "#short-name-input")
     def save_short_name(self, event: Input.Submitted) -> None:
         """Apply a Short Name edit through the active radio service."""
-        status = self.query_one("#identity-status", Static)
         control = self.query_one(ShortNameControl)
         if self._radio_state is not RadioState.ONLINE or self._radio_info is None:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update("SHORT NAME UNAVAILABLE — RADIO NOT CONNECTED")
+            self._set_short_name_status(
+                "SHORT NAME UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+            )
             return
         try:
             short_name = validate_short_name(event.value)
         except RadioIdentityError as error:
             control.cancel_edit()
-            status.add_class("setting-error")
-            status.update(str(error))
+            self._set_short_name_status(str(error), "setting-error")
             return
         control.finish_edit(short_name)
-        status.remove_class("setting-error")
-        status.update("SAVING SHORT NAME...")
-        self.run_worker(
-            lambda: self._save_short_name_from_thread(short_name),
-            thread=True,
-            name="save-radio-short-name",
-            exclusive=True,
+        self._set_short_name_status("SAVING SHORT NAME...", None)
+        self._run_radio_worker(
+            "save-radio-short-name", lambda: self._save_short_name_from_thread(short_name)
         )
 
     def _save_short_name_from_thread(self, short_name: str) -> None:
@@ -3333,10 +3495,12 @@ class MeshtasticPassApp(App[None]):
             info = self.radio.set_short_name(short_name)
         except (RadioIdentityError, AttributeError) as error:
             detail = str(error).strip() or "The radio identity could not be saved."
-            self.post_message(IdentitySaveFailed(detail))
+            self.post_message(IdentitySaveFailed(detail, "SHORT NAME"))
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
-            self.post_message(IdentitySaveFailed(f"Could not save Short Name: {detail}"))
+            self.post_message(
+                IdentitySaveFailed(f"Could not save Short Name: {detail}", "SHORT NAME")
+            )
         else:
             self.post_message(IdentitySaved(info, "SHORT NAME"))
 
@@ -3345,16 +3509,18 @@ class MeshtasticPassApp(App[None]):
         self._radio_info = event.info
         self._render_identity(force_value=True)
         self._refresh_mesh()
-        status = self.query_one("#identity-status", Static)
-        status.remove_class("setting-error")
-        status.update(f"{event.field_label} SAVED")
+        if event.field_label == "LONG NAME":
+            self._set_long_name_status("LONG NAME SAVED", "setting-success")
+        else:
+            self._set_short_name_status("SHORT NAME SAVED", "setting-success")
 
     @on(IdentitySaveFailed)
     def identity_save_failed(self, event: IdentitySaveFailed) -> None:
         self._render_identity(force_value=True)
-        status = self.query_one("#identity-status", Static)
-        status.add_class("setting-error")
-        status.update(event.detail)
+        if event.field_label == "LONG NAME":
+            self._set_long_name_status(event.detail, "setting-error")
+        else:
+            self._set_short_name_status(event.detail, "setting-error")
 
     def show_tab(self, tab_id: str) -> None:
         if self.current_tab == "chat" and tab_id != "chat":
@@ -3414,39 +3580,39 @@ class MeshtasticPassApp(App[None]):
             self._apply_radio_setting(event.dropdown, event.setting_name, event.value)
             return
         if event.setting_name == "clock_auto_sync":
+            # Item 6 of "RADIO -- SIMPLIFY CLOCK SYNC UX": the changed
+            # dropdown value itself is sufficient confirmation -- no
+            # separate "AUTO SYNC ENABLED/DISABLED" status line.
             self.settings.set_clock_auto_sync(bool(event.value))
             self.settings.save()
-            clock_status = self.query_one("#radio-clock-status", Static)
-            clock_status.remove_class("setting-error")
-            clock_status.add_class("setting-success")
-            clock_status.update(
-                "AUTO SYNC ENABLED" if event.value else "AUTO SYNC DISABLED"
-            )
             return
 
-        status = self.query_one("#style-status", Static)
-        try:
-            if event.setting_name == "font_size":
+        if event.setting_name == "font_size":
+            try:
                 self.settings.set_font_size(int(event.value))
                 self.settings.save()
                 self.settings.update_lxterminal_profile()
-            elif event.setting_name == "color":
+            except (OSError, ValueError) as error:
+                self._set_font_size_status(f"FONT SIZE NOT SAVED — {error}", "setting-error")
+            else:
+                self._set_font_size_status(
+                    "FONT SIZE SAVED - RELAUNCH TO APPLY", "setting-success"
+                )
+            return
+        if event.setting_name == "color":
+            # Item ("RADIO POLISH -- REMOVE COLOR SAVED"): the visible
+            # theme switch and the selected COLOR value are themselves
+            # sufficient confirmation -- no success status is ever
+            # shown here, only a genuine persistence failure.
+            try:
                 self.settings.set_color(str(event.value))
                 self.settings.save()
                 self._apply_color_theme(self.settings.color)
-        except (OSError, ValueError) as error:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
-            status.update(f"SETTING NOT SAVED — {error}")
-        else:
-            status.remove_class("setting-error")
-            status.add_class("setting-success")
-            message = (
-                "FONT SIZE SAVED — APPLIES ON NEXT LAUNCH"
-                if event.setting_name == "font_size"
-                else "COLOR SAVED"
-            )
-            status.update(message)
+            except (OSError, ValueError) as error:
+                self._set_color_status(f"COLOR NOT SAVED — {error}", "setting-error")
+            else:
+                self._set_color_status("", None)
+            return
 
     async def _switch_device(self, device_path: str) -> None:
         if device_path == getattr(self.radio, "device_path", None):
@@ -3492,23 +3658,34 @@ class MeshtasticPassApp(App[None]):
         arrives. Never claims APPLIED merely because this call returned.
         """
         spec = RADIO_SETTINGS[setting_name]
-        status = self.query_one("#radio-status", Static)
-        if self._radio_state is not RadioState.ONLINE:
+        # TIMEZONE gets its own dedicated, aligned, auto-dismissing
+        # status row (see _set_timezone_status) instead of the shared
+        # #radio-status used by every other RADIO_SETTINGS dropdown --
+        # matching the LONG NAME/SHORT NAME per-field layout, per
+        # "SMALL MESHTASTICPASS FOLLOW-UP" item 10.
+        if setting_name == "timezone":
+            if self._radio_state is not RadioState.ONLINE:
+                self._set_timezone_status(
+                    f"{dropdown.label} UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+                )
+                return
+            self._set_timezone_status("SAVING TIMEZONE...", None)
+        else:
+            status = self.query_one("#radio-status", Static)
+            if self._radio_state is not RadioState.ONLINE:
+                status.remove_class("setting-success")
+                status.add_class("setting-error")
+                status.update(f"{dropdown.label} UNAVAILABLE — RADIO NOT CONNECTED")
+                return
+            status.remove_class("setting-error")
             status.remove_class("setting-success")
-            status.add_class("setting-error")
-            status.update(f"{dropdown.label} UNAVAILABLE — RADIO NOT CONNECTED")
-            return
-        status.remove_class("setting-error")
-        status.remove_class("setting-success")
-        status.update(f"APPLYING {dropdown.label}...")
+            status.update(f"APPLYING {dropdown.label}...")
         schema_value = spec.to_schema_value(dropdown_value)
-        self.run_worker(
+        self._run_radio_worker(
+            "apply-radio-setting",
             lambda: self._apply_radio_setting_from_thread(
                 dropdown, spec, setting_name, schema_value
             ),
-            thread=True,
-            name="apply-radio-setting",
-            exclusive=True,
         )
 
     def _apply_radio_setting_from_thread(
@@ -3535,74 +3712,76 @@ class MeshtasticPassApp(App[None]):
 
     @on(RadioSettingApplied)
     def radio_setting_applied(self, event: RadioSettingApplied) -> None:
-        status = self.query_one("#radio-status", Static)
         spec = RADIO_SETTINGS[event.setting_name]
+        is_timezone = event.setting_name == "timezone"
         if event.result.applied:
-            status.remove_class("setting-error")
-            status.add_class("setting-success")
-            status.update(f"{event.dropdown.label} APPLIED")
-            event.dropdown.set_options(
-                event.dropdown.options,
-                value=spec.from_schema_value(event.result.readback_value),
-            )
+            if is_timezone:
+                self._set_timezone_status("TIMEZONE SAVED", "setting-success")
+                event.dropdown.set_options(
+                    self._timezone_options_for(event.result.readback_value),
+                    value=event.result.readback_value,
+                )
+            else:
+                status = self.query_one("#radio-status", Static)
+                status.remove_class("setting-error")
+                status.add_class("setting-success")
+                status.update(f"{event.dropdown.label} APPLIED")
+                event.dropdown.set_options(
+                    event.dropdown.options,
+                    value=spec.from_schema_value(event.result.readback_value),
+                )
         else:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
             reason = self._RADIO_FAILURE_REASONS.get(
                 event.result.reason, event.result.reason.upper()
             )
-            status.update(f"{event.dropdown.label} NOT APPLIED — {reason}")
             # Return the row to the authoritative radio value rather than
             # leaving the user's rejected selection displayed as if it
             # had taken effect.
             authoritative = self.radio.read_synced_config_field(spec.section, spec.field)
-            if authoritative is not None:
-                event.dropdown.set_options(
-                    event.dropdown.options,
-                    value=spec.from_schema_value(authoritative),
-                )
+            if is_timezone:
+                self._set_timezone_status(f"TIMEZONE NOT SAVED — {reason}", "setting-error")
+                if authoritative is not None:
+                    event.dropdown.set_options(
+                        self._timezone_options_for(authoritative),
+                        value=authoritative,
+                    )
+            else:
+                status = self.query_one("#radio-status", Static)
+                status.remove_class("setting-success")
+                status.add_class("setting-error")
+                status.update(f"{event.dropdown.label} NOT APPLIED — {reason}")
+                if authoritative is not None:
+                    event.dropdown.set_options(
+                        event.dropdown.options,
+                        value=spec.from_schema_value(authoritative),
+                    )
 
-    @on(SyncClockControl.Activated)
-    def sync_clock_activated(self, _event: SyncClockControl.Activated) -> None:
-        """Begin an explicit SYNC CLOCK -- see RadioService.sync_clock.
+    def _reset_clock_sync_state(self) -> None:
+        """Invalidate whatever the OLD connection's in-flight AUTO SYNC
 
-        Only ever reached via SyncClockControl.on_key's own Enter
-        handling, itself only reachable while the control isn't
-        `disabled`. Shares _begin_sync_clock with AUTO SYNC's own
-        trigger (see _maybe_auto_sync_clock) -- one underlying
-        implementation, never a second protocol path (item 18).
+        write was doing -- called by _show_connection on every genuine
+        connection-state transition (disconnect, error, a fresh
+        (re)connect), never on a redundant "still ONLINE" event (see
+        its own call site). Bumping the generation makes a late
+        completion from an abandoned connection's worker thread safely
+        stale (see clock_sync_applied's own guard); clearing "in
+        progress" means a genuinely stuck old write can never block the
+        NEW connection's own one-time sync (see _maybe_auto_sync_clock).
         """
-        self._begin_sync_clock()
-
-    def _begin_sync_clock(self) -> None:
-        control = self.query_one(SyncClockControl)
-        status = self.query_one("#radio-clock-status", Static)
-        if self._clock_sync_in_progress or control.disabled:
-            return
-        if self._radio_state is not RadioState.ONLINE:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
-            status.update("SYNC CLOCK UNAVAILABLE — RADIO NOT CONNECTED")
-            return
-        self._clock_sync_in_progress = True
-        control.disabled = True
-        status.remove_class("setting-success")
-        status.remove_class("setting-error")
-        status.update("SYNCING CLOCK...")
-        self.run_worker(
-            self._apply_sync_clock_from_thread,
-            thread=True,
-            name="sync-clock",
-            exclusive=True,
-        )
+        self._clock_sync_in_progress = False
+        self._clock_sync_generation += 1
 
     def _maybe_auto_sync_clock(self) -> None:
-        """AUTO SYNC's own trigger -- see item 17: at most once per
+        """AUTO SYNC's only trigger -- at most once per qualifying
 
-        qualifying connection lifecycle (see _show_connection, the only
-        caller), never on tab/view/focus changes, never repeated
-        mid-lifecycle -- reusing the exact same _begin_sync_clock()
-        manual SYNC CLOCK uses (item 18).
+        connection lifecycle (see _show_connection, the only caller),
+        never on tab/view/focus/render/config-snapshot activity, never
+        repeated mid-lifecycle. Entirely silent (see "FINAL CLOCK UI
+        SIMPLIFICATION"): no UI reflects this call either way -- it
+        simply performs RadioService.sync_clock() during connection
+        establishment. A real failure here is only ever a silent
+        internal fact: it must never block app connection/startup (see
+        _apply_sync_clock_from_thread's own try/except).
 
         No trustworthy get-time/RTC-validity signal exists to sync
         "only when needed" instead (see ClockSyncResult's own
@@ -3621,59 +3800,57 @@ class MeshtasticPassApp(App[None]):
         if not self.settings.clock_auto_sync or self._clock_auto_sync_done_this_connection:
             return
         self._clock_auto_sync_done_this_connection = True
-        self._begin_sync_clock()
+        if self._clock_sync_in_progress:
+            return
+        self._clock_sync_generation += 1
+        generation = self._clock_sync_generation
+        self._clock_sync_in_progress = True
+        self._run_radio_worker(
+            "sync-clock", lambda: self._apply_sync_clock_from_thread(generation)
+        )
 
-    def _apply_sync_clock_from_thread(self) -> None:
+    def _apply_sync_clock_from_thread(self, generation: int) -> None:
         try:
             result = self.radio.sync_clock()
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
             result = ClockSyncResult(False, 0, None, f"error: {detail}")
-        self.post_message(ClockSyncApplied(result))
-
-    _CLOCK_SYNC_FAILURE_REASONS = {
-        "not_connected": "RADIO NOT CONNECTED",
-        "disconnected": "CONNECTION LOST",
-        "nak": "REJECTED BY RADIO",
-    }
+        self.post_message(ClockSyncApplied(result, generation))
 
     @on(ClockSyncApplied)
     def clock_sync_applied(self, event: ClockSyncApplied) -> None:
-        """Every SYNC CLOCK activation reaches exactly one terminal state
+        """One AUTO SYNC RadioService.sync_clock() call finished --
 
-        here (see item 21) -- never left stuck at "SYNCING CLOCK...".
-        "timeout" and "unconfirmed" both settle as UNCONFIRMED: neither
-        is negative evidence (a NAK), but AdminMessage has no get-time
-        RPC to positively confirm the write with either (see
-        ClockSyncResult's own docstring) -- this app never claims
-        stronger confirmation than it actually has.
+        purely internal bookkeeping now (see "FINAL CLOCK UI
+        SIMPLIFICATION"): no UI surfaces the outcome either way,
+        success or failure. A stale generation means a newer attempt
+        (or a disconnect/reconnect -- see _reset_clock_sync_state) has
+        since superseded this one, so it is safely ignored rather than
+        e.g. resurrecting an "in progress" flag the new connection no
+        longer cares about.
         """
-        status = self.query_one("#radio-clock-status", Static)
+        if event.generation != self._clock_sync_generation:
+            return
         self._clock_sync_in_progress = False
-        self._render_radio_settings()
         if event.result.applied:
             self._last_clock_sync_at = time()
-            status.remove_class("setting-error")
-            status.add_class("setting-success")
-            status.update(self._clock_status_text())
-        elif event.result.reason in self._CLOCK_SYNC_FAILURE_REASONS:
-            status.remove_class("setting-success")
-            status.add_class("setting-error")
-            reason = self._CLOCK_SYNC_FAILURE_REASONS[event.result.reason]
-            status.update(f"CLOCK SYNC FAILED — {reason}")
-        else:
-            # "timeout" (no ack/nak at all) or "unconfirmed" (a response
-            # arrived but didn't corroborate the write) -- see
-            # RadioService.sync_clock. Neither is negative evidence.
-            status.remove_class("setting-error")
-            status.remove_class("setting-success")
-            status.update("CLOCK SYNC UNCONFIRMED")
 
-    def _clock_status_text(self) -> str:
-        if self._last_clock_sync_at is None:
-            return "TIME UNKNOWN — SYNC TO SET"
-        is_24h = self.query_one(Clock24HSelector).value
-        return f"CLOCK SYNCED — LAST SYNC {_format_time_of_day(self._last_clock_sync_at, is_24h)}"
+    @staticmethod
+    def _snapshot_config_field(snapshot, section: str, field: str) -> str | None:
+        """One localConfig.<section>.<field> value out of an already-
+
+        built RadioConfigurationSnapshot's local_config sections
+        (already-stringified by radio_capabilities.describe_scalar_
+        fields -- secrets already redacted at that source, never read
+        here). None if the section/field isn't present on this
+        installed schema, exactly like RadioService.
+        read_synced_config_field's own "unavailable, never crash"
+        contract.
+        """
+        for report in snapshot.local_config:
+            if report.section == section:
+                return report.fields.get(field)
+        return None
 
     def _render_radio_settings(self) -> None:
         """Populate RADIO from the SDK's already-synced state (or mark
@@ -3686,6 +3863,7 @@ class MeshtasticPassApp(App[None]):
         just made.
         """
         info_widget = self.query_one("#radio-info", Static)
+        timezone_dropdown = self.query_one(TimezoneSelector)
         dropdowns: tuple[tuple[KeyboardDropdown, RadioSettingSpec], ...] = (
             (self.query_one(ScreenTimeoutSelector), RADIO_SETTINGS["screen_timeout"]),
             (self.query_one(UnitsSelector), RADIO_SETTINGS["units"]),
@@ -3696,16 +3874,11 @@ class MeshtasticPassApp(App[None]):
         palette = THEME_PALETTES[self._current_theme]
         online = self._radio_state is RadioState.ONLINE and self._radio_info is not None
 
-        sync_control = self.query_one(SyncClockControl)
-        supports_clock = bool(getattr(self.radio, "supports_clock_sync", lambda: False)())
-
         if not online:
             connecting = self._radio_state is RadioState.CONNECTING
             placeholder = "..." if connecting else "—"
             text = Text()
-            for index, label in enumerate(
-                ("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH", "TIMEZONE")
-            ):
+            for index, label in enumerate(("HARDWARE", "FIRMWARE", "ROLE", "BLUETOOTH")):
                 if index:
                     text.append("\n")
                 text.append(
@@ -3715,9 +3888,7 @@ class MeshtasticPassApp(App[None]):
                 text.append(" ", style=palette.base)
                 text.append(placeholder, style=palette.dim_base)
             info_widget.update(text)
-            unavailable = Text()
-            unavailable.append(placeholder, style=palette.dim_base)
-            for dropdown, _spec in dropdowns:
+            for dropdown, _spec in dropdowns + ((timezone_dropdown, RADIO_SETTINGS["timezone"]),):
                 override = Text()
                 override.append(
                     f"{CONNECTION_ROW_PREFIX}{dropdown.label:<{CONNECTION_LABEL_WIDTH}}",
@@ -3726,50 +3897,69 @@ class MeshtasticPassApp(App[None]):
                 override.append(" ", style=palette.base)
                 override.append(placeholder, style=palette.dim_base)
                 dropdown.set_status_override(override)
-            sync_control.disabled = True
             return
 
-        identity = self.radio.hardware_identity()
-        bluetooth_enabled = self.radio.read_synced_config_field("bluetooth", "enabled")
-        bluetooth_text = (
-            "—"
-            if bluetooth_enabled is None
-            else ("ON" if bluetooth_enabled else "OFF")
-        )
-        tzdef = self.radio.read_synced_config_field("device", "tzdef")
-        # Read-only display only -- see the item 16 audit: no CLI
-        # reference, firmware source, or protobuf comment in the
-        # installed meshtastic==2.7.11 package confirms tzdef's exact
-        # expected POSIX-TZ syntax, DST behavior, or sign convention,
-        # so editing it is deliberately NOT exposed this pass.
-        tzdef_text = "—" if tzdef is None else ("NOT SET" if tzdef == "" else tzdef)
-        text = Text()
-        rows = (
-            ("HARDWARE", format_hw_model_name(identity.hw_model_name)),
-            ("FIRMWARE", identity.firmware_version or "—"),
-            ("ROLE", identity.role_name or "—"),
-            ("BLUETOOTH", bluetooth_text),
-            ("TIMEZONE", tzdef_text),
-        )
-        for index, (label, value) in enumerate(rows):
-            if index:
-                text.append("\n")
+        # Item 4: HARDWARE/FIRMWARE/ROLE/BLUETOOTH read the cached
+        # RadioConfigurationSnapshot -- built once at connect time (see
+        # RadioService.connect/_rebuild_config_snapshot), never
+        # re-derived per render -- rather than calling hardware_
+        # identity()/read_synced_config_field() fresh here. Both are
+        # pure zero-RF reads of already-synced local objects either
+        # way, so this is an architecture choice (one cached,
+        # explicitly-invalidated source of truth), not a traffic fix.
+        # TIMEZONE reads from this SAME snapshot (see below) rather
+        # than read_synced_config_field, for the same reason.
+        snapshot = getattr(self.radio, "config_snapshot", lambda: None)()
+        if snapshot is None:
+            # Item 11: a real, if normally brief (see item 3 -- the
+            # real RadioService builds this synchronously inside
+            # connect(), before ONLINE is ever announced), transient
+            # state -- never a permanent one, and never a crash.
+            text = Text()
             text.append(
-                f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
+                f"{CONNECTION_ROW_PREFIX}LOADING RADIO CONFIG...",
+                style=palette.dim_base,
+            )
+            info_widget.update(text)
+            tzdef = None
+        else:
+            bluetooth_raw = self._snapshot_config_field(snapshot, "bluetooth", "enabled")
+            bluetooth_text = (
+                "—" if bluetooth_raw is None else ("ON" if bluetooth_raw == "True" else "OFF")
+            )
+            tzdef = self._snapshot_config_field(snapshot, "device", "tzdef")
+            text = Text()
+            rows = (
+                ("HARDWARE", format_hw_model_name(snapshot.hardware.hw_model_name)),
+                ("FIRMWARE", snapshot.hardware.firmware_version or "—"),
+                ("ROLE", snapshot.hardware.role_name or "—"),
+                ("BLUETOOTH", bluetooth_text),
+            )
+            for index, (label, value) in enumerate(rows):
+                if index:
+                    text.append("\n")
+                text.append(
+                    f"{CONNECTION_ROW_PREFIX}{label:<{CONNECTION_LABEL_WIDTH}}",
+                    style=palette.base,
+                )
+                text.append(" ", style=palette.base)
+                text.append(value, style=palette.base)
+            info_widget.update(text)
+
+        if tzdef is None:
+            override = Text()
+            override.append(
+                f"{CONNECTION_ROW_PREFIX}{timezone_dropdown.label:<{CONNECTION_LABEL_WIDTH}}",
                 style=palette.base,
             )
-            text.append(" ", style=palette.base)
-            text.append(value, style=palette.base)
-        info_widget.update(text)
-
-        sync_control.disabled = not supports_clock or self._clock_sync_in_progress
-        if not self._clock_sync_in_progress:
-            status = self.query_one("#radio-clock-status", Static)
-            status.remove_class("setting-success")
-            status.remove_class("setting-error")
-            status.update(
-                "TIME UNSUPPORTED" if not supports_clock else self._clock_status_text()
+            override.append(" ", style=palette.base)
+            override.append(
+                "LOADING..." if snapshot is None else "UNSUPPORTED", style=palette.dim_base
             )
+            timezone_dropdown.set_status_override(override)
+        else:
+            timezone_dropdown.set_status_override(None)
+            timezone_dropdown.set_options(self._timezone_options_for(tzdef), value=tzdef)
 
         for dropdown, spec in dropdowns:
             dropdown.set_status_override(None)
@@ -4612,13 +4802,31 @@ class MeshtasticPassApp(App[None]):
         )
 
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
+        """Vertical CHAT stops: every message is exactly ONE stop.
+
+        An actionable (FAILED/UNCONFIRMED) message's stop is its
+        RESEND control (⟲) -- the message's own ChatEntryWidget is
+        excluded so the message doesn't ALSO appear as a separate
+        stop, and DEL is excluded unconditionally (see item 5: "only
+        ⟲ participates in normal vertical message traversal"). An
+        ordinary message keeps its ChatEntryWidget as the stop, same
+        as always.
+        """
         targets: list[Static | ChatEntryWidget] = []
         transcript = self.query_one(ChatTranscript)
         for widget in transcript.walk_children():
-            if isinstance(
-                widget,
-                (LoadOlderControl, ChatEntryWidget, MessageActionControl),
-            ) and widget.display:
+            if isinstance(widget, MessageActionControl):
+                if widget.display and widget.action == "resend":
+                    targets.append(widget)
+                continue
+            if (
+                isinstance(widget, (LoadOlderControl, ChatEntryWidget))
+                and widget.display
+                and not (
+                    isinstance(widget, ChatEntryWidget)
+                    and can_manual_resend(widget.entry)
+                )
+            ):
                 targets.append(widget)
         return targets
 
@@ -4823,6 +5031,23 @@ class MeshtasticPassApp(App[None]):
         """
         if not can_manual_resend(entry):
             return
+        # Item 8: focus must never point at a destroyed widget, and
+        # should prefer landing on whatever remaining target now
+        # occupies DEL's own vertical slot (the next-older message, or
+        # the composer if this was the last one) over a generic
+        # "reset to the transcript" fallback. Captured BEFORE removal:
+        # DEL's own slot is the deleted message's RESEND control's
+        # position (delete_control is never itself a vertical target
+        # -- see _chat_navigation_targets), one past it.
+        targets_before = self._chat_navigation_targets()
+        focus_index = next(
+            (
+                index
+                for index, target in enumerate(targets_before)
+                if isinstance(target, MessageActionControl) and target.entry is entry
+            ),
+            None,
+        )
         entry.deleted = True
         if entry.packet_id is not None:
             pending_sends = getattr(self.radio, "_pending_sends", None)
@@ -4839,6 +5064,15 @@ class MeshtasticPassApp(App[None]):
                 self.chat_store.delete_message(entry.message_id)
             except ChatStoreError as error:
                 self._show_send_error(str(error))
+        if focus_index is not None:
+            remaining = self._chat_navigation_targets()
+            if remaining:
+                target = remaining[min(focus_index, len(remaining) - 1)]
+                target.focus()
+                target.scroll_visible(animate=False)
+                return
+            self._focus_chat_composer()
+            return
         self.query_one(ChatTranscript).focus()
 
     @on(ChatEntryWidget.UserMenuRequested)
@@ -5541,6 +5775,13 @@ class MeshtasticPassApp(App[None]):
         was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
+        # A genuine connection-state transition (anything except a
+        # redundant "still ONLINE" event) must never leave an AUTO
+        # SYNC write in flight/attributed to the OLD connection for the
+        # NEW one to inherit -- see _reset_clock_sync_state's own
+        # docstring.
+        if not (state is RadioState.ONLINE and was_online):
+            self._reset_clock_sync_state()
         if state is RadioState.ONLINE and info is not None and info.channels:
             self._channels = info.channels
             selector = self.query_one(ChannelSelector)
@@ -5567,9 +5808,9 @@ class MeshtasticPassApp(App[None]):
                 self._connection_animation_timer.pause()
             else:
                 self._connection_animation_timer.resume()
-        identity_status = self.query_one("#identity-status", Static)
-        identity_status.remove_class("setting-error")
-        identity_status.update("")
+        self._set_long_name_status("", None)
+        self._set_short_name_status("", None)
+        self._set_timezone_status("", None)
         self._render_connection_details()
         self._render_identity(force_value=True)
         self._render_radio_settings()

@@ -280,14 +280,30 @@ class RadioMonitor:
         )
         self._thread.start()
 
-    def stop(self, join_timeout: float = 2.0) -> None:
-        """Stop monitoring and close the radio. Safe to call repeatedly."""
+    def stop(self, join_timeout: float = 2.0, close_timeout: float = 3.0) -> None:
+        """Stop monitoring and close the radio. Safe to call repeatedly.
+
+        `self.radio.close()` ultimately calls into the third-party
+        Meshtastic SDK's own interface.close(), whose reader-thread
+        join has no timeout of its own (see meshtastic.stream_
+        interface.StreamInterface.close()) -- a genuine serial-layer
+        stall there must never be allowed to block the caller
+        (MeshtasticPassApp.on_unmount, on the main thread) indefinitely,
+        which is exactly the real-hardware uConsole exit hang this
+        guards against. Attempted on a dedicated daemon thread with a
+        bounded wait: best-effort, not guaranteed-complete -- if it
+        doesn't finish in time, the OS itself still reclaims the serial
+        file descriptor the moment this process actually exits, and
+        abandoning a daemon thread here does not prevent that exit.
+        """
         if self._stopped:
             return
         self._stopped = True
         self._stop_event.set()
         self.radio.remove_message_handler(self.on_message)
-        self.radio.close()
+        closer = Thread(target=self.radio.close, name="meshtastic-radio-close", daemon=True)
+        closer.start()
+        closer.join(timeout=close_timeout)
 
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)

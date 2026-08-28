@@ -74,10 +74,10 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/dev/ttyUSB0", str(device.render()))
             self.assertIsInstance(color, KeyboardDropdown)
             self.assertEqual(color._accent_color, "#39FF14")
-            app._apply_color_theme("green")
+            app._apply_color_theme("amber")
             self.assertTrue(
                 all(
-                    dropdown._accent_color == "#FF8C00"
+                    dropdown._accent_color == "#FFEA00"
                     for dropdown in app.query(KeyboardDropdown)
                 )
             )
@@ -216,16 +216,19 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertIs(app.focused, widgets[1])
             await pilot.press("down")
-            self.assertIs(app.focused, widgets[2])
-            await pilot.press("down")
+            # The actionable (UNCONFIRMED) 3rd message is ONE vertical
+            # stop, anchored on its RESEND control -- its own
+            # ChatEntryWidget is skipped entirely (item 5), so a single
+            # DOWN from widgets[1] reaches ⟲ directly.
             self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertEqual(app.focused.action, "resend")
 
             app._rebroadcast = Mock()
             await pilot.press("enter")
             app._rebroadcast.assert_called_once_with(entry)
-            widgets[-1].focus()
+            widgets[-1].action_control.focus()
             await pilot.press("down")
-            self.assertIsInstance(app.focused, MessageActionControl)
+            self.assertIs(app.focused, app.query_one("#chat-input"))
             app.transcript_new_count = 2
             app.query_one("#chat-log").focus()
             await pilot.press("end")

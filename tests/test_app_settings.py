@@ -72,7 +72,7 @@ class AppSettingsTests(unittest.TestCase):
             self.assertEqual(saved["future_setting"], {"value": 7})
 
     def test_persists_supported_colors(self) -> None:
-        for color in ("green", "orange"):
+        for color in ("snow", "amber"):
             with self.subTest(color=color), tempfile.TemporaryDirectory() as directory:
                 config = Path(directory) / "config.json"
                 settings = AppSettings.load(config_path=config)
@@ -81,6 +81,24 @@ class AppSettingsTests(unittest.TestCase):
                 settings.save()
 
                 self.assertEqual(AppSettings.load(config_path=config).color, color)
+
+    def test_legacy_theme_names_migrate_deterministically(self) -> None:
+        """Item 32: WHITE -> SNOW, ORANGE -> AMBER (base hue preserved),
+
+        GREEN -> SNOW (no base-hue equivalent survives -- SNOW is the
+        only remaining palette that still contains that exact neon
+        green at all, as its own ACCENT). Never discarded outright:
+        every legacy value resolves to a valid current one.
+        """
+        mapping = {"white": "snow", "green": "snow", "orange": "amber"}
+        for legacy, migrated in mapping.items():
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.json"
+                config.write_text(json.dumps({"color": legacy}), encoding="utf-8")
+
+                settings = AppSettings.load(config_path=config)
+
+                self.assertEqual(settings.color, migrated)
 
     def test_favorites_persist_by_normalized_node_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -99,7 +117,7 @@ class AppSettingsTests(unittest.TestCase):
                 AppSettings.load(config_path=config).is_favorite("!a11ce001")
             )
 
-    def test_existing_config_without_color_uses_white(self) -> None:
+    def test_existing_config_without_color_uses_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             config = Path(temporary_directory) / "config.json"
             config.write_text(json.dumps({"font_size": 16}), encoding="utf-8")
@@ -108,7 +126,7 @@ class AppSettingsTests(unittest.TestCase):
 
             self.assertEqual(settings.color, DEFAULT_COLOR)
 
-    def test_invalid_color_falls_back_to_white(self) -> None:
+    def test_invalid_color_falls_back_to_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             config = Path(temporary_directory) / "config.json"
             config.write_text(

@@ -537,5 +537,208 @@ class RadioServiceTests(unittest.TestCase):
         interface.localNode.setOwner.assert_called_once_with(short_name="éé")
 
 
+def _make_config_interface(node_id: str, node_number: int = 0x12345678) -> SimpleNamespace:
+    """Like make_interface(), plus enough localConfig/channels shape
+
+    for RadioConfigurationSnapshot to have something concrete to read.
+    """
+    from meshtastic.protobuf import localonly_pb2
+
+    local_config = localonly_pb2.LocalConfig()
+    local_config.display.screen_on_secs = 30
+    return SimpleNamespace(
+        myInfo=SimpleNamespace(my_node_num=node_number),
+        localNode=SimpleNamespace(
+            localConfig=local_config,
+            moduleConfig=localonly_pb2.LocalModuleConfig(),
+            channels=[],
+        ),
+        nodesByNum={
+            node_number: {"user": {"id": node_id, "longName": "Test", "shortName": "TST"}}
+        },
+        metadata=SimpleNamespace(firmware_version="2.7.11"),
+        close=Mock(),
+    )
+
+
+class RadioConfigSnapshotLifecycleTests(unittest.TestCase):
+    """Item 13: the connect-time config-snapshot cache/invalidation
+
+    lifecycle, tested entirely through RadioService's own public
+    surface (connect/close/set_device_path/config_snapshot/
+    refresh_config_snapshot/write_verified_config_field).
+    """
+
+    def test_no_snapshot_before_connecting(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        self.assertIsNone(service.config_snapshot())
+
+    def test_snapshot_built_once_per_successful_connect(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        snapshot = service.config_snapshot()
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.node_id, "!12345678")
+        self.assertEqual(snapshot.connection_generation, 1)
+        display = next(s for s in snapshot.local_config if s.section == "display")
+        self.assertEqual(display.fields["screen_on_secs"], "30")
+
+    def test_opening_config_repeatedly_sends_zero_additional_requests(self) -> None:
+        """config_snapshot() is a pure cache read -- calling it many
+
+        times must never touch the interface again.
+        """
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        first = service.config_snapshot()
+        for _ in range(20):
+            self.assertIs(service.config_snapshot(), first)
+
+    def test_reconnect_to_same_radio_rebuilds_the_snapshot(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+            first = service.config_snapshot()
+            service.close()
+            self.assertIsNone(service.config_snapshot())
+            service.connect()
+            second = service.config_snapshot()
+        self.assertIsNot(first, second)
+        self.assertEqual(second.node_id, first.node_id)
+        self.assertEqual(second.connection_generation, first.connection_generation + 1)
+
+    def test_different_node_id_invalidates_the_old_snapshot(self) -> None:
+        """The V3 -> V4 transition: connecting to a DIFFERENT radio must
+
+        never show the previous radio's stale settings.
+        """
+        service = RadioService("/dev/ttyUSB0")
+        v3_interface = _make_config_interface("!aaaaaaaa", node_number=0xAAAAAAAA)
+        v4_interface = _make_config_interface("!bbbbbbbb", node_number=0xBBBBBBBB)
+        v4_interface.localNode.localConfig.display.screen_on_secs = 999
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=v3_interface),
+        ):
+            service.connect()
+        v3_snapshot = service.config_snapshot()
+        self.assertEqual(v3_snapshot.node_id, "!aaaaaaaa")
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=v4_interface),
+        ):
+            service.connect()
+        v4_snapshot = service.config_snapshot()
+
+        self.assertEqual(v4_snapshot.node_id, "!bbbbbbbb")
+        self.assertNotEqual(v4_snapshot.node_id, v3_snapshot.node_id)
+        display = next(s for s in v4_snapshot.local_config if s.section == "display")
+        self.assertEqual(display.fields["screen_on_secs"], "999")
+        self.assertGreater(v4_snapshot.connection_generation, v3_snapshot.connection_generation)
+
+    def test_device_path_is_not_used_to_infer_capability(self) -> None:
+        """Item 8: ttyUSB0 vs ttyACM0 must never determine what the
+
+        snapshot reports -- only the interface's own reported state
+        does. Two connections through DIFFERENT device paths but
+        IDENTICAL interface state must produce identical config.
+        """
+        service = RadioService("/dev/ttyUSB0")
+        interface_usb = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface_usb),
+        ):
+            service.connect()
+        usb_snapshot = service.config_snapshot()
+
+        service2 = RadioService("/dev/ttyACM0")
+        interface_acm = _make_config_interface("!12345678")
+        with (
+            patch.object(service2, "_check_device"),
+            patch.object(service2, "_open_interface", return_value=interface_acm),
+        ):
+            service2.connect()
+        acm_snapshot = service2.config_snapshot()
+
+        self.assertEqual(usb_snapshot.hardware.hw_model_name, acm_snapshot.hardware.hw_model_name)
+        self.assertEqual(usb_snapshot.local_config, acm_snapshot.local_config)
+        self.assertEqual(usb_snapshot.device_path, "/dev/ttyUSB0")
+        self.assertEqual(acm_snapshot.device_path, "/dev/ttyACM0")
+
+    def test_refresh_only_rebuilds_when_explicitly_activated(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        first = service.config_snapshot()
+        for _ in range(5):
+            self.assertIs(service.config_snapshot(), first)
+
+        interface.localNode.localConfig.display.screen_on_secs = 60
+        refreshed = service.refresh_config_snapshot()
+        self.assertIsNot(refreshed, first)
+        display = next(s for s in refreshed.local_config if s.section == "display")
+        self.assertEqual(display.fields["screen_on_secs"], "60")
+
+    def test_unconfirmed_write_does_not_touch_the_snapshot(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        before = service.config_snapshot()
+
+        result = service.write_verified_config_field("display", "screen_on_secs", 999, timeout=0.1)
+
+        self.assertFalse(result.applied)
+        self.assertIs(service.config_snapshot(), before)
+
+    def test_close_invalidates_the_snapshot(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        self.assertIsNotNone(service.config_snapshot())
+        service.close()
+        self.assertIsNone(service.config_snapshot())
+
+    def test_set_device_path_invalidates_the_snapshot(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = _make_config_interface("!12345678")
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(service, "_open_interface", return_value=interface),
+        ):
+            service.connect()
+        self.assertIsNotNone(service.config_snapshot())
+        service.set_device_path("/dev/ttyACM0")
+        self.assertIsNone(service.config_snapshot())
+
+
 if __name__ == "__main__":
     unittest.main()

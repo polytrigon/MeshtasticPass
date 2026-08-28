@@ -40,15 +40,20 @@ class ChatDeleteTests(unittest.IsolatedAsyncioTestCase):
     async def _navigate_to_action(
         self, pilot, app: MeshtasticPassApp, entry, action: str
     ) -> None:
+        """RESEND (⟲) is the message's one vertical stop; DEL is one
+
+        deliberate RIGHT move away from it (item 6) -- never itself a
+        vertical target (item 5), so this focuses ⟲ directly and moves
+        right only when DEL is actually the target.
+        """
         widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
-        widget.focus()
+        widget.action_control.focus()
         await pilot.pause()
-        for _ in range(3):
-            if getattr(app.focused, "action", None) == action:
-                return
-            await pilot.press("down")
+        if action != "resend":
+            await pilot.press("right")
             await pilot.pause()
-        self.fail(f"never reached the {action!r} action control")
+        if getattr(app.focused, "action", None) != action:
+            self.fail(f"never reached the {action!r} action control")
 
     async def test_del_removes_exactly_the_selected_entry(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)

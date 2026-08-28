@@ -235,6 +235,73 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         with self.assertRaises(RadioIdentityError):
             service.set_short_name("OFF")
 
+    def test_no_snapshot_before_connect(self) -> None:
+        service = self.make_service()
+        self.assertIsNone(service.config_snapshot())
+
+    def test_snapshot_built_once_and_cached(self) -> None:
+        service = self.make_service()
+        service.connect()
+        first = service.config_snapshot()
+        self.assertIsNotNone(first)
+        self.assertEqual(first.node_id, service.info.node_id)
+        for _ in range(10):
+            self.assertIs(service.config_snapshot(), first)
+
+    def test_close_invalidates_the_snapshot(self) -> None:
+        service = self.make_service()
+        service.connect()
+        self.assertIsNotNone(service.config_snapshot())
+        service.close()
+        self.assertIsNone(service.config_snapshot())
+
+    def test_reconnect_rebuilds_with_a_newer_generation(self) -> None:
+        service = self.make_service()
+        service.connect()
+        first = service.config_snapshot()
+        service.close()
+        service.connect()
+        second = service.config_snapshot()
+        self.assertIsNot(second, first)
+        self.assertGreater(second.connection_generation, first.connection_generation)
+
+    def test_confirmed_write_rebuilds_the_snapshot(self) -> None:
+        service = self.make_service()
+        service.connect()
+        before = service.config_snapshot()
+        result = service.write_verified_config_field("display", "flip_screen", True)
+        self.assertTrue(result.applied)
+        after = service.config_snapshot()
+        self.assertIsNot(after, before)
+        display = next(s for s in after.local_config if s.section == "display")
+        self.assertEqual(display.fields["flip_screen"], "True")
+
+    def test_refresh_only_rebuilds_when_explicitly_activated(self) -> None:
+        service = self.make_service()
+        service.connect()
+        first = service.config_snapshot()
+        for _ in range(5):
+            self.assertIs(service.config_snapshot(), first)
+        refreshed = service.refresh_config_snapshot()
+        self.assertIsNot(refreshed, first)
+
+    def test_secrets_are_absent_from_channel_reports(self) -> None:
+        service = self.make_service()
+        service.connect()
+        snapshot = service.config_snapshot()
+        self.assertTrue(snapshot.channels)
+        for channel in snapshot.channels:
+            self.assertIn(channel.psk, ("configured", "not configured"))
+
+    def test_gps_position_has_no_fix_by_default(self) -> None:
+        service = self.make_service()
+        service.connect()
+        position = service.config_snapshot().position
+        self.assertTrue(position.gps_capable)
+        self.assertFalse(position.has_fix)
+        self.assertIsNone(position.latitude)
+        self.assertIsNone(position.longitude)
+
 
 if __name__ == "__main__":
     unittest.main()
