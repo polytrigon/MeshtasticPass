@@ -106,13 +106,17 @@ NEON_RED = "#FF1744"
 ERROR = NEON_RED
 
 THEME_PALETTES = {
-    # SNOW: a bright-white terminal. ACCENT is neon green, ACCENT2 is
-    # neon orange, CONFIRM equals ACCENT's green (still a distinct
-    # semantic token in code -- see ThemePalette/module docstring).
+    # SNOW: a bright-white terminal. ACCENT is neon green, ACCENT2 is a
+    # bright neon violet/purple (#9D00FF -- "Electric Violet": pure,
+    # fully-saturated blue-violet hue, brighter/higher-blue than the
+    # standard "dark violet" #9400D3, unmistakably purple rather than
+    # drifting toward magenta/hot pink), CONFIRM equals ACCENT's green
+    # (still a distinct semantic token in code -- see ThemePalette/
+    # module docstring).
     "snow": _palette(
         base="#F2F2F2",
         accent="#39FF14",
-        accent2="#FF8C00",
+        accent2="#9D00FF",
         error=NEON_RED,
         confirm="#39FF14",
     ),

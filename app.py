@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from threading import Thread
@@ -53,7 +54,7 @@ from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshActivityTier,
     MeshNodeState,
-    _name_segments,
+    _clean_text,
     build_mesh_working_set,
     format_mesh_context_line,
 )
@@ -118,15 +119,18 @@ install_flag_pair_protection()
 # unreachable via any digit key -- see tab_for_key below. This is a
 # navigation/UI-only change, not a deletion; restoring PROFILE to the
 # nav later only requires re-adding it to this dict and to tab_for_key.
+#
+# DM is likewise intentionally absent as its own top-level entry (CHAT/
+# DM/MENTION UX Part A): it is no longer a fourth top-level view -- it
+# is now a MODE inside CHAT (see MeshtasticPassApp._chat_mode/
+# _switch_chat_mode), reached via the header's DM(N) peer selector or
+# the D hotkey. The DM feature itself (persistence/identity/delivery/
+# resend/delete/draft architecture) is completely unchanged -- only how
+# the user NAVIGATES to it changed.
 TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
     "mesh": "MESH",
-    # No unread-count badge here (unlike CHAT's own) -- item 8: "Do not
-    # use unread counts unless actual unread state is implemented
-    # correctly", and this pass deliberately does not implement one for
-    # DM conversations.
-    "dm": "DM",
 }
 
 ANIMATED_STATUS = {
@@ -227,13 +231,54 @@ def can_manual_resend(entry: ChatEntry) -> bool:
 
 
 def _reply_mention_name(metadata: NodeMetadata) -> str:
-    """Long Name -> Short Name -> compact Node ID, reusing the exact same
+    """SHORTNAME -> LONG NAME -> canonical node ID (CHAT/DM MENTION UX
 
-    name-fallback precedence mesh_state.format_mesh_context_line already
-    uses for a real node's display name, rather than a second,
-    independently-defined fallback rule.
+    item 21) -- the OPPOSITE precedence from MESH's own _name_segments
+    (Long Name first, used for on-screen display elsewhere): an inline
+    @mention exists to compactly and unambiguously address one sender
+    in running composer text, where a real SHORTNAME is short by
+    firmware convention while a Long Name can be arbitrarily long/
+    spaced. Resolved from the sender's stable node ID via already-
+    synced NodeDB metadata -- never from display-name equality (item
+    20): two different nodes that happen to share a Long Name still
+    resolve to their own distinct SHORTNAMEs (or node IDs).
     """
-    return _name_segments(metadata)[0]
+    short_name = _clean_text(metadata.short_name)
+    if short_name:
+        return short_name
+    long_name = _clean_text(metadata.long_name)
+    if long_name:
+        return long_name
+    return metadata.node_id
+
+
+# @SHORTNAME token boundary (CHAT/DM/MENTION UX Part H item 29):
+# "@" not itself preceded by "@" or a word character (rejects
+# "foo@POLYbar" -- an embedded/email-like "@", never a real mention
+# start), followed by one-or-more word characters captured greedily
+# (so "@POLYGON" captures the WHOLE word "POLYGON", which then simply
+# fails the exact-match comparison below rather than partially
+# matching "POLY"), with an implicit \b boundary from \w+ naturally
+# stopping at the next non-word character (so "@POLY," / "@POLY!" /
+# "(@POLY)" all correctly capture just "POLY"). Case-insensitive
+# comparison is applied by the caller, not baked into this pattern.
+_MENTION_TOKEN_PATTERN = re.compile(r"(?<![@\w])@(\w+)")
+
+
+def message_mentions_short_name(text: str, short_name: str | None) -> bool:
+    """Whether `text` contains an explicit @SHORTNAME token addressing
+
+    `short_name` (item 26/29) -- case-insensitive, word-bounded. A
+    missing/blank `short_name` (item 27: no usable current local
+    identity) always returns False rather than guessing.
+    """
+    normalized_target = (short_name or "").strip().lower()
+    if not normalized_target:
+        return False
+    return any(
+        match.group(1).lower() == normalized_target
+        for match in _MENTION_TOKEN_PATTERN.finditer(text)
+    )
 
 
 class ThinScrollBarRender(ScrollBarRender):
@@ -648,6 +693,38 @@ class ChannelSelector(KeyboardDropdown):
             widget_id="chat-title",
             prefix="",
         )
+
+
+class DMModeSelector(KeyboardDropdown):
+    """CHAT's RIGHT peer selector: [ DM(N) ▾ ] -- N is the unread DM
+
+    count (see MeshtasticPassApp._recount_dm_unread). Visually peer to
+    ChannelSelector (same KeyboardDropdown grammar/focus styling), but
+    there is nothing to pick FROM: activating it (ENTER, click, or the
+    D hotkey) switches CHAT straight into DMS mode -- see open_menu's
+    override below and MeshtasticPassApp._switch_chat_mode. It carries
+    exactly one DropdownOption purely so KeyboardDropdown's normal
+    render/selected-label machinery has a label to show; that option's
+    own `value` is never meaningfully "selected" from a popup.
+    """
+
+    def __init__(self, unread_count: int) -> None:
+        super().__init__(
+            "chat_dm_mode",
+            "",
+            (DropdownOption(f"DM({unread_count})", "dms"),),
+            "dms",
+            widget_id="chat-dm-selector",
+            prefix="",
+        )
+
+    def open_menu(self) -> None:
+        # Never actually opens a popup -- there is nothing to choose
+        # from. Posting Selected directly is what dropdown_selected
+        # (setting_name == "chat_dm_mode") reacts to by switching CHAT
+        # into DMS mode, exactly mirroring what picking a real option
+        # would otherwise do.
+        self.post_message(self.Selected(self, "dms"))
 
 
 # The first-pass emoji set -- see the CHAT delivery/menu/emoji task.
@@ -2322,9 +2399,14 @@ class ChatEntryWidget(Vertical):
         entry: ChatEntry,
         now: float | None = None,
         favorite: bool = False,
+        mention: bool = False,
     ) -> None:
         self.entry = entry
         self.favorite = favorite and not entry.outgoing
+        # @mention highlighting (Part H) is CHANNEL-incoming only
+        # (item 32/31) -- never DM, never an outgoing entry's own
+        # delivery glyph semantics.
+        self.mention = mention and not entry.outgoing and entry.dm_node_id is None
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
         self.timestamp_label = Static(
@@ -2387,6 +2469,8 @@ class ChatEntryWidget(Vertical):
         classes = "chat-entry new-message" if is_new else "chat-entry"
         if self.favorite:
             classes += " favorite-sender"
+        if self.mention:
+            classes += " mention"
         super().__init__(
             Horizontal(
                 self.selection_marker,
@@ -2417,6 +2501,10 @@ class ChatEntryWidget(Vertical):
     def set_favorite(self, favorite: bool) -> None:
         self.favorite = favorite and not self.entry.outgoing
         self.set_class(self.favorite, "favorite-sender")
+
+    def set_mention(self, mention: bool) -> None:
+        self.mention = mention and not self.entry.outgoing and self.entry.dm_node_id is None
+        self.set_class(self.mention, "mention")
 
     def refresh_delivery_state(self, animation_frame: int) -> None:
         if self.delivery_label is None:
@@ -2684,10 +2772,34 @@ class MeshtasticPassApp(App[None]):
         color: $amber_accent;
     }
 
-    #chat-title {
+    #chat-header {
+        height: auto;
+        min-height: 2;
+    }
+
+    #chat-title, #chat-dm-selector {
+        width: auto;
+        max-width: 70%;
         height: auto;
         min-height: 2;
         text-style: bold;
+        text-overflow: ellipsis;
+    }
+
+    #chat-header-bullet {
+        width: 3;
+        height: auto;
+        min-height: 2;
+        content-align: center middle;
+        color: $snow_dim;
+    }
+
+    Screen.theme-amber #chat-header-bullet {
+        color: $amber_dim;
+    }
+
+    #chat-content, #chat-channel, #chat-dms {
+        height: 1fr;
     }
 
     #radio-status {
@@ -3067,6 +3179,30 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
+    /* @mention highlighting (CHAT/DM/MENTION UX Part H): the ENTIRE
+       incoming CHANNEL CHAT block, not merely the "@SHORTNAME"
+       characters (item 30) -- a background wash in ACCENT2, so
+       stronger nested semantics (ERROR text, delivery glyphs,
+       resend/delete controls) keep their own explicit color
+       unaffected. Textual CSS has no :not() pseudo-class, so
+       ".chat-entry.mention:focus" below is an explicit, HIGHER-
+       specificity (3 selectors vs. this rule's 2, and vs.
+       ".chat-entry:focus" alone) override that guarantees the
+       existing focus/selection background always wins outright when
+       both apply, regardless of declaration order (item 31) -- never
+       a real ambiguous tie. */
+    .chat-entry.mention {
+        background: $snow_accent2 20%;
+    }
+
+    Screen.theme-amber .chat-entry.mention {
+        background: $amber_accent2 20%;
+    }
+
+    .chat-entry.mention:focus {
+        background: $selection_background;
+    }
+
     .chat-entry.new-message .chat-entry-author,
     .chat-entry.new-message .chat-entry-timestamp,
     .chat-entry.new-message .chat-entry-distance,
@@ -3158,12 +3294,21 @@ class MeshtasticPassApp(App[None]):
         # by the remote party's canonical node ID (never a display
         # name -- item 2), each reusing the SAME ChannelChatState shape
         # (entries/draft/etc.) channel CHAT already uses. current_dm_
-        # node_id is None while the DM tab shows its conversation LIST;
-        # set to a specific conversation's node ID once opened.
+        # node_id is None while CHAT's DMS mode shows its conversation
+        # LIST; set to a specific conversation's node ID once opened.
         self._dm_states: dict[str, ChannelChatState] = {}
         self.current_dm_node_id: str | None = None
         self._dm_conversation_order: list[str] = []
         self._dm_list_highlighted_index = 0
+        # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
+        # tab -- it is a MODE inside CHAT, alongside "channel" (the
+        # default). current_tab stays "chat" for both; only this and
+        # the inner #chat-content ContentSwitcher change (see
+        # _switch_chat_mode). dm_unread_count is the DM(N) header
+        # badge's count -- see _recount_dm_unread's own docstring for
+        # the exact chosen unread model.
+        self._chat_mode = "channel"
+        self.dm_unread_count = 0
         self.chat_store = chat_store
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
@@ -3263,15 +3408,50 @@ class MeshtasticPassApp(App[None]):
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
                 yield Static(id="radio-status")
             with Vertical(id="chat", classes="tab-page"):
-                yield ChannelSelector(self._channels, self.current_channel_index)
-                yield ChatTranscript(id="chat-log")
-                yield Static(id="chat-new-below")
-                yield Static(id="send-error")
-                yield ChatMessageInput(
-                    placeholder="> message",
-                    id="chat-input",
-                    select_on_focus=False,
-                )
+                # Peer selectors (CHAT/DM/MENTION UX Part B): LEFT is the
+                # configured Meshtastic channel selector (unchanged
+                # ChannelSelector); RIGHT is the DM(N) mode selector --
+                # opening it switches CHAT into DMS mode instead of
+                # picking from a normal dropdown popup (see
+                # DMModeSelector.open_menu). The bullet between them is
+                # a plain, non-focusable Static -- purely a visual
+                # separator (item 6).
+                with Horizontal(id="chat-header"):
+                    yield ChannelSelector(self._channels, self.current_channel_index)
+                    yield Static(
+                        "•",
+                        id="chat-header-bullet",
+                        classes="chat-header-bullet",
+                        markup=False,
+                    )
+                    yield DMModeSelector(0)
+                with ContentSwitcher(initial="chat-channel", id="chat-content"):
+                    with Vertical(id="chat-channel"):
+                        yield ChatTranscript(id="chat-log")
+                        yield Static(id="chat-new-below")
+                        yield Static(id="send-error")
+                        yield ChatMessageInput(
+                            placeholder="> message",
+                            id="chat-input",
+                            select_on_focus=False,
+                        )
+                    with Vertical(id="chat-dms"):
+                        yield Static(
+                            id="dm-connection-status",
+                            classes="page-title",
+                            markup=False,
+                        )
+                        with ContentSwitcher(initial="dm-list", id="dm-content"):
+                            yield VerticalScroll(id="dm-list")
+                            with Vertical(id="dm-conversation"):
+                                yield Static(id="dm-header", markup=False)
+                                yield ChatTranscript(id="dm-log")
+                                yield Static(id="dm-send-error")
+                                yield ChatMessageInput(
+                                    placeholder="> message",
+                                    id="dm-input",
+                                    select_on_focus=False,
+                                )
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
@@ -3295,20 +3475,7 @@ class MeshtasticPassApp(App[None]):
                 with Horizontal(id="mesh-bottom-row"):
                     yield Static(id="mesh-context-status", markup=False)
                     yield Static(id="mesh-last-update", markup=False)
-            with Vertical(id="dm", classes="tab-page"):
-                yield Static(id="dm-connection-status", classes="page-title", markup=False)
-                with ContentSwitcher(initial="dm-list", id="dm-content"):
-                    yield VerticalScroll(id="dm-list")
-                    with Vertical(id="dm-conversation"):
-                        yield Static(id="dm-header", markup=False)
-                        yield ChatTranscript(id="dm-log")
-                        yield Static(id="dm-send-error")
-                        yield ChatMessageInput(
-                            placeholder="> message",
-                            id="dm-input",
-                            select_on_focus=False,
-                        )
-        yield Static("1-4 switch tabs    F4 quit", id="footer")
+        yield Static("1-3 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -3440,7 +3607,7 @@ class MeshtasticPassApp(App[None]):
                 event.stop()
             return
 
-        if self.current_tab == "chat":
+        if self.current_tab == "chat" and self._chat_mode == "channel":
             transcript = self.query_one("#chat-log", ChatTranscript)
             if event.key in ("up", "down"):
                 self._move_chat_focus(-1 if event.key == "up" else 1)
@@ -3460,6 +3627,11 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
+            if event.key.lower() == "d":
+                self._switch_chat_mode("dms")
+                self._focus_chat_mode("dms")
+                event.stop()
+                return
             if event.key == "left":
                 self._focus_oldest_new_message()
                 event.stop()
@@ -3475,14 +3647,19 @@ class MeshtasticPassApp(App[None]):
             if (
                 event.is_printable
                 and event.character
-                # "1"/"2"/"3"/"4" must still reach the tab-switch dispatch
+                # "1"/"2"/"3" must still reach the tab-switch dispatch
                 # below even from CHAT's neutral state -- see
                 # tab_for_key -- or the keyboard could never leave CHAT
                 # once on it (they only ever type into the composer when
                 # it is ALREADY focused, via the isinstance(self.focused,
                 # Input) branch above, which returns before this code
-                # even runs).
-                and event.key not in ("1", "2", "3", "4")
+                # even runs). "c"/"d" are excluded for the identical
+                # reason -- they are CHANNEL/DMS mode hotkeys handled
+                # above, never typed into the composer from this neutral
+                # state (typing them while the composer IS already
+                # focused goes through the isinstance(self.focused,
+                # Input) branch instead, unaffected by this exclusion).
+                and event.key not in ("1", "2", "3", "c", "d")
             ):
                 # Any other printable character begins composing: focus
                 # the input and insert exactly what was typed, appending
@@ -3515,12 +3692,12 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
 
-        if self.current_tab == "dm":
+        if self.current_tab == "chat" and self._chat_mode == "dms":
             if self.current_dm_node_id is None:
                 # Conversation LIST mode: UP/DOWN move the highlight,
                 # ENTER opens the highlighted conversation. Any other
-                # key (notably the "1"-"4" tab-switch digits) falls
-                # through unhandled, exactly like CHAT's own neutral
+                # key (notably the "1"-"3" tab-switch digits) falls
+                # through unhandled, exactly like CHANNEL's own neutral
                 # state does, so the keyboard is never trapped here.
                 if event.key in ("up", "down"):
                     self._move_dm_list_highlight(-1 if event.key == "up" else 1)
@@ -3528,6 +3705,11 @@ class MeshtasticPassApp(App[None]):
                     return
                 if event.key == "enter":
                     self._activate_dm_list_selection()
+                    event.stop()
+                    return
+                if event.key.lower() == "c":
+                    self._switch_chat_mode("channel")
+                    self._focus_chat_mode("channel", open_dropdown=True)
                     event.stop()
                     return
             else:
@@ -3547,10 +3729,15 @@ class MeshtasticPassApp(App[None]):
                     )
                     event.stop()
                     return
+                if event.key.lower() == "c":
+                    self._switch_chat_mode("channel")
+                    self._focus_chat_mode("channel", open_dropdown=True)
+                    event.stop()
+                    return
                 if (
                     event.is_printable
                     and event.character
-                    and event.key not in ("1", "2", "3", "4")
+                    and event.key not in ("1", "2", "3", "c")
                 ):
                     dm_input = self.query_one("#dm-input", Input)
                     if not dm_input.disabled:
@@ -3597,14 +3784,14 @@ class MeshtasticPassApp(App[None]):
                 return
 
         # PROFILE is intentionally absent: hidden from the visible top
-        # nav (see TAB_NAMES), so no digit key may reach it -- key "4"
-        # is simply not mapped to anything, rather than falling through
-        # to the now-hidden tab.
+        # nav (see TAB_NAMES), so no digit key may reach it. DM is
+        # likewise absent here -- it is a MODE inside CHAT now (see
+        # TAB_NAMES/_switch_chat_mode), reached via "2" + the D hotkey
+        # or the header's DM(N) selector, never its own digit key.
         tab_for_key = {
             "1": "connection",
             "2": "chat",
             "3": "mesh",
-            "4": "dm",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -3882,6 +4069,7 @@ class MeshtasticPassApp(App[None]):
         self._radio_info = event.info
         self._render_identity(force_value=True)
         self._refresh_mesh()
+        self._refresh_chat_mentions()
         if event.field_label == "LONG NAME":
             self._set_long_name_status("LONG NAME SAVED", "setting-success")
         else:
@@ -3896,10 +4084,17 @@ class MeshtasticPassApp(App[None]):
             self._set_short_name_status(event.detail, "setting-error")
 
     def show_tab(self, tab_id: str) -> None:
+        # DM is a MODE inside CHAT now, not its own tab (see
+        # _switch_chat_mode) -- leaving "chat" for a different
+        # top-level tab must still run whichever of CHANNEL's or DMS's
+        # own "I was actively being viewed" bookkeeping applies,
+        # exactly matching what leaving the old standalone "chat"/"dm"
+        # tabs used to do individually.
         if self.current_tab == "chat" and tab_id != "chat":
-            self._mark_new_messages_read()
-        if self.current_tab == "dm" and tab_id != "dm":
-            self._capture_current_dm_state()
+            if self._chat_mode == "channel":
+                self._mark_new_messages_read()
+            else:
+                self._capture_current_dm_state()
         if self._emoji_picker is not None:
             # Reachable only from the composer of whichever of CHAT/DM
             # is currently active (Ctrl+E requires that Input to be
@@ -3907,25 +4102,37 @@ class MeshtasticPassApp(App[None]):
             # with no tab-specific branching needed.
             self._close_emoji_picker()
         self.current_tab = tab_id
-        if tab_id == "chat":
-            self._mark_unread_messages_viewed()
-            self._recount_unread()
-            self._refresh_chat_timestamps()
         self.query_one("#content", ContentSwitcher).current = tab_id
         self._update_tab_bar()
         if tab_id == "chat":
-            # Neutral navigation state -- NOT the message composer. The
-            # user must explicitly begin composing, either by pressing a
-            # printable character (focuses #chat-input and inserts it --
-            # see on_key's chat branch) or DOWN (focuses it without
-            # inserting anything -- see _move_chat_focus's fallback).
-            # #chat-log is the same neutral destination Escape already
-            # returns to from the composer, so entering CHAT and
-            # escaping out of a draft land in the identical state.
-            self.query_one("#chat-log", ChatTranscript).focus()
-            if self._chat_open_scroll_pending:
-                self._chat_open_scroll_pending = False
-                self.call_after_refresh(self._jump_to_newest)
+            if self._chat_mode == "channel":
+                # Neutral navigation state -- NOT the message composer.
+                # The user must explicitly begin composing, either by
+                # pressing a printable character (focuses #chat-input
+                # and inserts it -- see on_key's chat branch) or DOWN
+                # (focuses it without inserting anything -- see
+                # _move_chat_focus's fallback). #chat-log is the same
+                # neutral destination Escape already returns to from
+                # the composer, so entering CHAT and escaping out of a
+                # draft land in the identical state.
+                self._mark_unread_messages_viewed()
+                self._recount_unread()
+                self._refresh_chat_timestamps()
+                self.query_one("#chat-log", ChatTranscript).focus()
+                if self._chat_open_scroll_pending:
+                    self._chat_open_scroll_pending = False
+                    self.call_after_refresh(self._jump_to_newest)
+            else:
+                if self.current_dm_node_id is None:
+                    self._refresh_dm_list()
+                    self.query_one("#dm-list", VerticalScroll).focus()
+                else:
+                    self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+                    dm_input = self.query_one("#dm-input", Input)
+                    if not dm_input.disabled:
+                        dm_input.focus()
+                    else:
+                        self.query_one("#dm-log", ChatTranscript).focus()
         elif tab_id == "connection":
             self._refresh_device_options()
             self.query_one(FontSizeSelector).focus()
@@ -3943,25 +4150,76 @@ class MeshtasticPassApp(App[None]):
             # below, is what CONNECTION and CHAT already do for
             # themselves by claiming their own widget's focus.
             self.set_focus(None)
-        elif tab_id == "dm":
-            if self.current_dm_node_id is None:
-                self._refresh_dm_list()
-                self.query_one("#dm-list", VerticalScroll).focus()
-            else:
-                self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
-                dm_input = self.query_one("#dm-input", Input)
-                if not dm_input.disabled:
-                    dm_input.focus()
-                else:
-                    self.query_one("#dm-log", ChatTranscript).focus()
         else:
             self.set_focus(None)
         self._update_footer()
+
+    def _switch_chat_mode(self, mode: str) -> None:
+        """Switch CHAT between its CHANNEL and DMS peer modes (CHAT/DM/
+
+        MENTION UX Part B/C) -- the header's peer selectors and the
+        C/D hotkeys all funnel through here. current_tab stays "chat"
+        throughout; only the inner #chat-content ContentSwitcher and
+        the leave/enter bookkeeping below change. A no-op if already in
+        the requested mode, matching every other selector's own
+        already-selected short-circuit -- callers that also want to
+        (re)focus the mode's own widget do so separately via
+        _focus_chat_mode, so re-focusing still works even when the
+        mode itself doesn't change.
+        """
+        if self._chat_mode == mode:
+            return
+        if self._chat_mode == "channel":
+            self._mark_new_messages_read()
+        else:
+            self._capture_current_dm_state()
+        self._chat_mode = mode
+        self.query_one("#chat-content", ContentSwitcher).current = (
+            "chat-channel" if mode == "channel" else "chat-dms"
+        )
+        if mode == "channel":
+            self._mark_unread_messages_viewed()
+            self._recount_unread()
+            self._refresh_chat_timestamps()
+        elif self.current_dm_node_id is None:
+            self._refresh_dm_list()
+        self._update_tab_bar()
+        self._update_footer()
+
+    def _focus_chat_mode(self, mode: str, *, open_dropdown: bool = False) -> None:
+        """Focus the appropriate widget for CHAT's given mode -- shared
+
+        by the C/D hotkeys, the header selectors, and show_tab("chat")'s
+        own entry behavior (which calls this only implicitly, via the
+        equivalent inline logic above, since it must also run the
+        mode's read/list-refresh bookkeeping every time the tab is
+        re-entered, not only when the mode actually changes).
+        """
+        if mode == "channel":
+            if open_dropdown:
+                selector = self.query_one(ChannelSelector)
+                selector.focus()
+                selector.open_menu()
+            else:
+                self.query_one("#chat-log", ChatTranscript).focus()
+        elif self.current_dm_node_id is None:
+            self.query_one("#dm-list", VerticalScroll).focus()
+        else:
+            self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+            dm_input = self.query_one("#dm-input", Input)
+            if not dm_input.disabled:
+                dm_input.focus()
+            else:
+                self.query_one("#dm-log", ChatTranscript).focus()
 
     @on(KeyboardDropdown.Selected)
     async def dropdown_selected(self, event: KeyboardDropdown.Selected) -> None:
         if event.setting_name == "channel_index":
             await self._switch_channel(int(event.value))
+            return
+        if event.setting_name == "chat_dm_mode":
+            self._switch_chat_mode("dms")
+            self._focus_chat_mode("dms")
             return
         if event.setting_name == "device_path":
             await self._switch_device(str(event.value))
@@ -4712,6 +4970,7 @@ class MeshtasticPassApp(App[None]):
         monotonic_now = monotonic()
         chat_is_visible = (
             self.current_tab == "chat"
+            and self._chat_mode == "channel"
             and channel_index == self.current_channel_index
         )
         entry = received_chat_entry(
@@ -4858,9 +5117,17 @@ class MeshtasticPassApp(App[None]):
         return state
 
     async def _switch_channel(self, channel_index: int) -> None:
+        # Selecting a channel always switches CHAT into CHANNEL mode
+        # (CHAT/DM/MENTION UX item 4) -- even when the target index is
+        # already the current one (the user may be sitting in DMS mode
+        # and re-picking the already-selected channel purely to get
+        # back to it), so this mode switch runs unconditionally, before
+        # the early-return below.
+        if self.current_tab == "chat":
+            self._switch_chat_mode("channel")
         if channel_index == self.current_channel_index:
             return
-        if self.current_tab == "chat":
+        if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_new_messages_read()
         self._capture_current_channel_state()
         state = self._restore_channel_state(channel_index)
@@ -4878,7 +5145,7 @@ class MeshtasticPassApp(App[None]):
         widgets.extend(self._chat_entry_widget(entry) for entry in state.entries)
         if widgets:
             await transcript.mount(*widgets)
-        if self.current_tab == "chat":
+        if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_unread_messages_viewed()
             self._recount_unread()
         selector = self.query_one(ChannelSelector)
@@ -4904,7 +5171,7 @@ class MeshtasticPassApp(App[None]):
         transcript = self.query_one("#chat-log", ChatTranscript)
         if not self._has_older_history and self.chat_store is not None:
             self._ensure_end_history_marker(transcript)
-        if self.current_tab != "chat":
+        if self.current_tab != "chat" or self._chat_mode != "channel":
             following = self._following_chat_widget(insert_index)
             transcript.mount(self._chat_entry_widget(entry), before=following)
             self._trim_mounted_chat_window(transcript)
@@ -5407,7 +5674,49 @@ class MeshtasticPassApp(App[None]):
         return ChatEntryWidget(
             entry,
             favorite=self.settings.is_favorite(entry.node_id),
+            mention=(
+                entry.dm_node_id is None
+                and not entry.outgoing
+                and message_mentions_short_name(entry.text, self.chat_local_short_name)
+            ),
         )
+
+    @property
+    def chat_local_short_name(self) -> str | None:
+        """The CONNECTED radio's own current SHORTNAME, zero-RF (item
+
+        27/33) -- self._radio_info is the exact same radio-swap-safe
+        cached identity source already used elsewhere (see YOU/MESH):
+        it is set fresh from event.info on every ONLINE transition and
+        cleared to None on every non-ONLINE state (see
+        _radio_event_from_thread), so a reconnect with a DIFFERENT
+        radio can never leak the PREVIOUS radio's SHORTNAME here, and
+        "not genuinely connected" naturally returns None -- callers
+        must then disable mention highlighting entirely rather than
+        guess (see message_mentions_short_name).
+        """
+        if self._radio_info is None:
+            return None
+        short_name = (self._radio_info.short_name or "").strip()
+        return short_name or None
+
+    def _refresh_chat_mentions(self) -> None:
+        """Recompute @mention highlighting for every currently-mounted
+
+        CHAT entry against whatever local SHORTNAME is now current
+        (item 28) -- called whenever the connected radio's own
+        identity changes, so a swap (e.g. OLD1 -> NEW1) updates
+        already-visible messages immediately rather than waiting for
+        the user to leave and re-enter the channel.
+        """
+        short_name = self.chat_local_short_name
+        for widget in self.query(ChatEntryWidget):
+            entry = widget.entry
+            widget.set_mention(
+                entry.dm_node_id is None
+                and not entry.outgoing
+                and message_mentions_short_name(entry.text, short_name)
+            )
 
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         """Vertical CHAT stops: every message is exactly ONE stop.
@@ -5733,10 +6042,13 @@ class MeshtasticPassApp(App[None]):
     ) -> None:
         """Public DM entry point: open/create this node's conversation and
 
-        switch to the DM tab -- used by the CHAT sender menu and the
-        MESH node menu (item 7/16), and directly by tests.
+        switch CHAT into DMS mode (CHAT/DM/MENTION UX item 7/16/14) --
+        used by the CHAT sender menu and the MESH node menu, and
+        directly by tests. Opens the EXACT conversation directly, never
+        merely the generic DM list.
         """
-        self.show_tab("dm")
+        self.show_tab("chat")
+        self._switch_chat_mode("dms")
         self._open_dm_conversation(node_id, long_name=long_name, short_name=short_name)
 
     def _open_dm_conversation(
@@ -5748,6 +6060,7 @@ class MeshtasticPassApp(App[None]):
     ) -> None:
         if self.current_dm_node_id == node_id:
             self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+            self._mark_dm_conversation_read(node_id)
             return
         self._capture_current_dm_state()
         state = self._ensure_dm_loaded(node_id)
@@ -5764,6 +6077,7 @@ class MeshtasticPassApp(App[None]):
         dm_input.value = state.draft
         dm_input.cursor_position = len(state.draft)
         self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+        self._mark_dm_conversation_read(node_id)
         self._update_tab_bar()
         self.call_after_refresh(transcript.scroll_end, animate=False)
         if not dm_input.disabled:
@@ -5880,14 +6194,25 @@ class MeshtasticPassApp(App[None]):
         into channel history merely because packet.channel is present
         (item 12): this is only reached when RadioService's own
         packet-destination classification (message.is_direct) already
-        said so (see _accept_received_message).
+        said so (see _accept_received_message). Unread model (item
+        15/16): an incoming DM increments DM(N) unless this EXACT
+        conversation is actively visible right now (CHAT tab, DMS
+        mode, this node_id open) -- see _recount_dm_unread's own
+        docstring for the full chosen model, including why it is
+        deliberately session-local, never persisted.
         """
         node_id = message.sender_node_id
         state = self._ensure_dm_loaded(node_id)
+        dm_visible = (
+            self.current_tab == "chat"
+            and self._chat_mode == "dms"
+            and self.current_dm_node_id == node_id
+        )
         entry = received_chat_entry(
             message,
             app_received_at=time(),
             monotonic_now=monotonic(),
+            unread=not dm_visible,
             is_new=True,
         )
         self._assign_arrival_order(entry)
@@ -5895,13 +6220,68 @@ class MeshtasticPassApp(App[None]):
         if not inserted:
             return
         state.entries.append(entry)
-        is_open = self.current_tab == "dm" and self.current_dm_node_id == node_id
-        if is_open:
+        if entry.message_id is not None and not dm_visible:
+            state.unread_message_ids.add(entry.message_id)
+        if not dm_visible:
+            state.unread_count += 1
+            self._recount_dm_unread()
+        if dm_visible:
             transcript = self.query_one("#dm-log", ChatTranscript)
             transcript.mount(self._chat_entry_widget(entry))
             transcript.scroll_end(animate=False)
-        if self.current_tab == "dm" and self.current_dm_node_id is None:
+        if (
+            self.current_tab == "chat"
+            and self._chat_mode == "dms"
+            and self.current_dm_node_id is None
+        ):
             self._refresh_dm_list()
+        self._update_tab_bar()
+
+    def _mark_dm_conversation_read(self, node_id: str) -> None:
+        """Clear unread state for exactly this DM conversation (item
+
+        15/16) -- mirrors _mark_unread_messages_viewed's channel
+        equivalent, purely in-memory (see _recount_dm_unread).
+        """
+        state = self._dm_state_for(node_id)
+        for entry in state.entries:
+            if entry.unread:
+                entry.unread = False
+                if entry.message_id is not None:
+                    state.unread_message_ids.discard(entry.message_id)
+        state.unread_count = 0
+        self._recount_dm_unread()
+
+    def _recount_dm_unread(self) -> None:
+        """Sum every DM conversation's own unread_count into DM(N)'s
+
+        badge (item 15). Chosen unread model, documented per the
+        task's own request to decide and report it: reuses the EXACT
+        same in-memory, session-local, non-persisted mechanism channel
+        CHAT's own unread_count/unread_message_ids already use (see
+        _accept_received_message/_recount_unread) -- deliberately NOT
+        backed by a chat.db column/migration. Two reasons: (1) channel
+        CHAT's own unread state is ALREADY not persisted today (it
+        resets to 0 every restart, rebuilt only from messages that
+        arrive DURING the running session -- see _accept_received_
+        message's chat_is_visible/unread wiring), so a persisted DM
+        model would be a second, divergent unread architecture living
+        alongside a non-persisted one for the exact same conceptual
+        feature -- precisely the "fragile parallel state system" this
+        task's own Part E/item 17 warns against; (2) restart behavior
+        is still fully deterministic under this model: every unread
+        count -- channel AND DM alike -- resets to 0 on every restart,
+        consistently, not silently/accidentally.
+        """
+        self.dm_unread_count = sum(
+            state.unread_count for state in self._dm_states.values()
+        )
+        selectors = list(self.query(DMModeSelector))
+        if selectors:
+            selectors[0].set_options(
+                (DropdownOption(f"DM({self.dm_unread_count})", "dms"),),
+                value="dms",
+            )
 
     def _reposition_dm_entry(self, entry: ChatEntry) -> None:
         if entry.dm_node_id is None:
@@ -5911,7 +6291,11 @@ class MeshtasticPassApp(App[None]):
             return
         state.entries.remove(entry)
         self._insert_entry_in_order(state.entries, entry)
-        if self.current_dm_node_id != entry.dm_node_id or self.current_tab != "dm":
+        if (
+            self.current_dm_node_id != entry.dm_node_id
+            or self.current_tab != "chat"
+            or self._chat_mode != "dms"
+        ):
             return
         widget = next(
             (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
@@ -6246,6 +6630,8 @@ class MeshtasticPassApp(App[None]):
         chat_input.value = new_value
         if self.current_tab != "chat":
             self.show_tab("chat")
+        if self._chat_mode != "channel":
+            self._switch_chat_mode("channel")
         chat_input.focus()
         chat_input.cursor_position = new_cursor
 
@@ -6723,7 +7109,7 @@ class MeshtasticPassApp(App[None]):
             return
         self.chat_history.remove(entry)
         new_index = self._insert_entry_in_order(self.chat_history, entry)
-        if self.current_tab != "chat":
+        if self.current_tab != "chat" or self._chat_mode != "channel":
             return
         widget = next(
             (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
@@ -6774,19 +7160,17 @@ class MeshtasticPassApp(App[None]):
     def _update_footer(self) -> None:
         if self.current_tab == "chat" and isinstance(self.focused, Input):
             text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
+        elif self.current_tab == "chat" and self._chat_mode == "channel":
+            text = "↑↓ navigate    C channel    D dms    ENTER action    F4 quit"
+        elif self.current_tab == "chat" and self.current_dm_node_id is None:
+            text = "↑↓ select    ENTER open    C channel    1-3 tabs    F4 quit"
         elif self.current_tab == "chat":
-            text = "↑↓ navigate    C channel    ENTER action    F4 quit"
-        elif self.current_tab == "dm" and isinstance(self.focused, Input):
-            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
-        elif self.current_tab == "dm" and self.current_dm_node_id is None:
-            text = "↑↓ select    ENTER open    1-4 tabs    F4 quit"
-        elif self.current_tab == "dm":
-            text = "↑↓ navigate    ENTER action    ESC back    F4 quit"
+            text = "↑↓ navigate    C channel    ENTER action    ESC back    F4 quit"
         else:
             text = (
-                "↑↓←→ select    1-4 tabs    F4 quit"
+                "↑↓←→ select    1-3 tabs    F4 quit"
                 if self.current_tab == "mesh"
-                else "1-4 switch tabs    F4 quit"
+                else "1-3 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 
@@ -6808,6 +7192,12 @@ class MeshtasticPassApp(App[None]):
         was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
+        # Radio-swap safety (item 28): a reconnect (or a drop) that
+        # changes -- or clears -- the current local SHORTNAME must
+        # update already-mounted CHAT entries' mention highlighting
+        # immediately, never leave a PREVIOUS radio's stale identity
+        # highlighted or a NEWLY-matching one dark.
+        self._refresh_chat_mentions()
         # A genuine connection-state transition (anything except a
         # redundant "still ONLINE" event) must never leave an AUTO
         # SYNC write in flight/attributed to the OLD connection for the
@@ -7036,7 +7426,7 @@ class MeshtasticPassApp(App[None]):
         )
         palette = THEME_PALETTES[self._current_theme]
         status_style = (
-            palette.base
+            palette.accent
             if self._radio_state is RadioState.ONLINE
             else self._connection_status_color()
         )

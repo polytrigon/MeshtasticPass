@@ -527,8 +527,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         assert its exact order/membership directly, the same source
         _update_tab_bar() renders from.
         """
-        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh", "dm"])
+        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh"])
         self.assertNotIn("profile", TAB_NAMES)
+        self.assertNotIn("dm", TAB_NAMES)
 
     async def test_nav_bar_renders_connection_chat_mesh_with_active_count(
         self,
@@ -579,10 +580,17 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("3")
             self.assertEqual(app.current_tab, "mesh")
 
-    async def test_key_4_selects_dm_not_mesh_or_hidden_profile(self) -> None:
-        """"4" is now the legitimate DM tab (PART A item 1) -- PROFILE
+    async def test_key_4_does_nothing_dm_is_a_chat_mode_not_a_tab(self) -> None:
+        """"4" is unmapped -- DM is a MODE inside CHAT now (CHAT/DM/
 
-        remains hidden/unreachable via any digit key, unchanged.
+        MENTION UX Part A), reached via "2" + the D hotkey or the
+        header's DM(N) selector, never its own digit key. Unmapped
+        exactly like any other ordinary character, "4" pressed from
+        CHAT's neutral state simply begins composing (types itself)
+        rather than switching anything -- it is NOT excluded from the
+        printable-character fallback the way "1"/"2"/"3"/"c"/"d" are.
+        PROFILE remains hidden/unreachable via any digit key too,
+        unchanged.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
@@ -590,26 +598,42 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
             await pilot.press("4")
-            self.assertEqual(app.current_tab, "dm")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+            self.assertNotEqual(app.current_tab, "dm")
             self.assertNotEqual(app.current_tab, "profile")
 
             await pilot.press("2")
+            await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            await pilot.press("escape", "4")
-            self.assertEqual(app.current_tab, "dm")
+            self.assertEqual(app._chat_mode, "channel")
 
-    async def test_footer_help_text_reflects_1_through_4(self) -> None:
+            await pilot.press("4")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "channel")
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(chat_input.value, "4")
+
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertEqual(app._chat_mode, "dms")
+
+    async def test_footer_help_text_reflects_1_through_3(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-4", footer_text)
+            self.assertIn("1-3", footer_text)
+            self.assertNotIn("1-4", footer_text)
 
             await pilot.press("3")
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-4", footer_text)
+            self.assertIn("1-3", footer_text)
 
     async def test_composer_hint_shows_enter_send_ctrl_e_emoji_esc_cancel(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -2778,7 +2802,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 app._apply_color_theme(theme)
                 for state, expected in (
                     (RadioState.CONNECTING, palette.accent),
-                    (RadioState.ONLINE, palette.base),
+                    # CONNECTED renders in ACCENT, not BASE (CHAT/DM/
+                    # MENTION UX Part I item 34) -- presentation only,
+                    # the connection logic/detection itself is
+                    # unchanged.
+                    (RadioState.ONLINE, palette.accent),
                     (RadioState.OFFLINE, palette.accent),
                     (RadioState.ERROR, palette.error),
                 ):
