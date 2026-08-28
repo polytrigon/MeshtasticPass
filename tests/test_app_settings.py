@@ -174,40 +174,41 @@ class AppSettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     settings.set_font_size(invalid)  # type: ignore[arg-type]
 
-    # ---- First-run default text size = XL (item 4) -----------------------
+    # ---- First-run default text size = LARGE ("UI SCALE" follow-up) ------
 
-    def test_fresh_install_with_no_config_file_defaults_to_xl(self) -> None:
+    def test_fresh_install_with_no_config_file_defaults_to_large(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             config = Path(temporary_directory) / "config.json"
 
             settings = AppSettings.load(config_path=config)
 
-            self.assertEqual(settings.font_size, 18)
-            self.assertEqual(DEFAULT_FONT_SIZE, 18)
+            self.assertEqual(settings.font_size, 16)
+            self.assertEqual(DEFAULT_FONT_SIZE, 16)
 
-    def test_config_file_missing_font_size_key_defaults_to_xl(self) -> None:
+    def test_config_file_missing_font_size_key_defaults_to_large(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             config = Path(temporary_directory) / "config.json"
             config.write_text(json.dumps({"color": "green"}), encoding="utf-8")
 
             settings = AppSettings.load(config_path=config)
 
-            self.assertEqual(settings.font_size, 18)
+            self.assertEqual(settings.font_size, 16)
 
-    def test_config_file_with_invalid_font_size_defaults_to_xl(self) -> None:
+    def test_config_file_with_invalid_font_size_defaults_to_large(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             config = Path(temporary_directory) / "config.json"
             config.write_text(json.dumps({"font_size": 999}), encoding="utf-8")
 
             settings = AppSettings.load(config_path=config)
 
-            self.assertEqual(settings.font_size, 18)
+            self.assertEqual(settings.font_size, 16)
 
     def test_each_existing_saved_font_size_survives_reload_unreset(self) -> None:
-        """A user who already saved ANY size -- including the ones that
+        """A user who already saved ANY size -- including ones that are
 
-        are not XL -- must never be silently bumped to the new XL
-        default on their next load.
+        not the current default -- must never be silently bumped to a
+        new default on their next load (e.g. the XL->LARGE default
+        change made in the "UI SCALE" follow-up).
         """
         for name, size in FONT_SIZE_CHOICES:
             with self.subTest(size=name), tempfile.TemporaryDirectory() as directory:

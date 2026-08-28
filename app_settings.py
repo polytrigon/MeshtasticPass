@@ -18,13 +18,16 @@ FONT_SIZE_CHOICES = (
     ("XXL", 22),
 )
 VALID_FONT_SIZES = tuple(size for _name, size in FONT_SIZE_CHOICES)
-# XL, not MEDIUM: this is the fallback used only when no saved font_size
-# preference exists at all (missing file, unreadable file, or a file
-# with no valid font_size key) -- see AppSettings.load. An existing
-# user's already-saved SMALL/MEDIUM/LARGE/XL/XXL choice always wins,
-# since load() only ever falls back to this constant, never overwrites
-# a value found in the config file.
-DEFAULT_FONT_SIZE = 18
+# LARGE, not MEDIUM: this is the fallback used only when no saved
+# font_size preference exists at all (missing file, unreadable file, or
+# a file with no valid font_size key) -- see AppSettings.load. An
+# existing user's already-saved SMALL/MEDIUM/LARGE/XL/XXL choice always
+# wins, since load() only ever falls back to this constant, never
+# overwrites a value found in the config file. The user-facing label
+# for this setting is "UI SCALE" (see app.py's FontSizeSelector); the
+# underlying "font_size" config key/JSON field name is kept as-is for
+# backward compatibility with already-saved settings files.
+DEFAULT_FONT_SIZE = 16
 COLOR_CHOICES = (
     ("SNOW", "snow"),
     ("AMBER", "amber"),

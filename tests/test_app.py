@@ -26,6 +26,7 @@ from app import (
     CONNECTION_VALUE_COLUMN_INDENT,
     TAB_NAMES,
     AutoSyncSelector,
+    BluetoothSelector,
     ChannelSelector,
     Clock24HSelector,
     ClockSyncApplied,
@@ -43,6 +44,7 @@ from app import (
     ShortNameControl,
     MessageActionControl,
     MeshtasticPassApp,
+    RoleSelector,
     ScreenTimeoutSelector,
     ThinScrollBarRender,
     TimezoneSelector,
@@ -53,7 +55,9 @@ from app_controller import received_chat_entry
 from app_settings import AppSettings
 from chat_store import ChatStore
 from geo import format_distance_miles
+from host_timezone import HostTimezone
 from keyboard_dropdown import KeyboardDropdown
+from radio_capabilities import role_choices
 from radio_service import (
     ClockSyncResult,
     ConfigWriteResult,
@@ -400,6 +404,22 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             config_path=root / "meshtasticpass" / "config.json",
             profile_path=root / "lxterminal" / "lxterminal-meshtasticpass.conf",
         )
+        # Host timezone detection is real Linux filesystem/subprocess
+        # introspection (see host_timezone.detect_host_timezone) --
+        # tests must never depend on the ACTUAL machine running them
+        # having any particular (or even any) timezone configured.
+        # Defaults to "nothing detected" so CLOCK SYNC's epoch-only
+        # behavior stays deterministic everywhere; tests that exercise
+        # the host-timezone integration itself re-patch this
+        # explicitly for their own duration.
+        self._host_timezone_patcher = patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(
+                None, None, "none", "no host timezone in tests by default"
+            ),
+        )
+        self._host_timezone_patcher.start()
+        self.addCleanup(self._host_timezone_patcher.stop)
         self.chat_db_path = root / "data" / "chat.db"
 
     async def test_connection_tabs_input_and_send(self) -> None:
@@ -655,8 +675,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             selector = app.query_one(FontSizeSelector)
-            # A fresh install's default is XL (item 4), not MEDIUM.
-            self.assertEqual(selector.font_size, 18)
+            # A fresh install's default is LARGE (see "UI SCALE"
+            # follow-up), not MEDIUM.
+            self.assertEqual(selector.font_size, 16)
             self.assertIn(
                 "CONNECTION/CONFIG",
                 str(app.query_one("#tab-bar", Static).render()),
@@ -665,10 +686,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
-            self.assertEqual(selector.font_size, 22)
-            self.assertEqual(self.settings.font_size, 22)
+            self.assertEqual(selector.font_size, 18)
+            self.assertEqual(self.settings.font_size, 18)
             self.assertIn(
-                "FONT SIZE SAVED - RELAUNCH TO APPLY",
+                "UI SCALE SAVED - RELAUNCH TO APPLY",
                 str(app.query_one("#font-size-status", Static).render()),
             )
 
@@ -676,9 +697,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             config_path=self.settings.config_path,
             profile_path=self.settings.profile_path,
         )
-        self.assertEqual(reloaded.font_size, 22)
+        self.assertEqual(reloaded.font_size, 18)
         self.assertIn(
-            "fontname=Monospace 22",
+            "fontname=Monospace 18",
             self.settings.profile_path.read_text(encoding="utf-8"),
         )
 
@@ -695,10 +716,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             info_text = str(app.query_one("#radio-info", Static).render())
             self.assertIn("HARDWARE     HELTEC V3", info_text)
             self.assertIn("FIRMWARE     sim-1.0.0", info_text)
-            self.assertIn("ROLE         CLIENT", info_text)
-            self.assertIn("BLUETOOTH    ON", info_text)
+            self.assertNotIn("ROLE", info_text)
+            self.assertNotIn("BLUETOOTH", info_text)
             self.assertNotIn("TIMEZONE", info_text)
 
+            self.assertIn("[ CLIENT ▾ ]", str(app.query_one(RoleSelector).render()))
+            self.assertIn("[ ON ▾ ]", str(app.query_one(BluetoothSelector).render()))
             self.assertIn("[ NOT SET ▾ ]", str(app.query_one(TimezoneSelector).render()))
             self.assertIn("5 MIN", str(app.query_one(ScreenTimeoutSelector).render()))
             self.assertIn("METRIC", str(app.query_one(UnitsSelector).render()))
@@ -707,6 +730,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ON", str(app.query_one(Clock24HSelector).render()))
 
             for control in (
+                app.query_one(RoleSelector),
+                app.query_one(BluetoothSelector),
                 app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
                 app.query_one(UnitsSelector),
@@ -734,6 +759,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("HELTEC", info_text)
 
             for control in (
+                app.query_one(RoleSelector),
+                app.query_one(BluetoothSelector),
                 app.query_one(TimezoneSelector),
                 app.query_one(ScreenTimeoutSelector),
                 app.query_one(UnitsSelector),
@@ -764,7 +791,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 if "APPLIED" in str(status.render()):
                     break
-            self.assertIn("SCREEN TIMEOUT APPLIED", str(status.render()))
+            self.assertIn("SCREEN SLP APPLIED", str(status.render()))
             self.assertIn("10 MIN", str(selector.render()))
             self.assertEqual(
                 radio.read_synced_config_field("display", "screen_on_secs"), 600
@@ -996,6 +1023,299 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             radio.write_verified_config_field.assert_not_called()
             self.assertEqual(radio.sent_messages, ())
 
+    # ---- ROLE (device.role) -------------------------------------------
+
+    async def test_role_options_are_derived_from_the_protobuf_enum(self) -> None:
+        """"ADDITIONAL RADIO CONFIG CHANGES" item 1: never a hardcoded
+
+        role list -- the dropdown's own options must come directly
+        from role_choices(), which introspects the installed protobuf
+        schema.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            expected = tuple(role_choices())
+            self.assertEqual(
+                tuple((o.label, o.value) for o in dropdown.options), expected
+            )
+            self.assertGreaterEqual(len(expected), 10)  # a real, non-trivial enum
+
+    async def test_role_never_automatically_selects_a_role(self) -> None:
+        """A fresh connection must show exactly whatever the radio itself
+
+        reports -- never silently defaulted/upgraded to ROUTER or any
+        other "recommended" role.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            self.assertIn("[ CLIENT ▾ ]", str(app.query_one(RoleSelector).render()))
+            self.assertEqual(radio.read_synced_config_field("device", "role"), 0)
+
+    async def test_role_write_uses_verified_pipeline_and_updates_snapshot(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.config_snapshot()
+            dropdown = app.query_one(RoleSelector)
+            status = app.query_one("#role-status", Static)
+            dropdown.focus()
+            # CLIENT -> CLIENT MUTE.
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "SAVED" in str(status.render()):
+                    break
+            self.assertIn("ROLE SAVED", str(status.render()))
+            self.assertTrue(status.has_class("setting-success"))
+            self.assertEqual(radio.read_synced_config_field("device", "role"), 1)
+            self.assertIn("[ CLIENT MUTE ▾ ]", str(dropdown.render()))
+
+            after = radio.config_snapshot()
+            self.assertIsNot(after, before)
+
+            self._role_status_dismiss_check(app, status)
+
+    def _role_status_dismiss_check(self, app, status) -> None:
+        app._dismiss_role_status()
+        self.assertEqual(str(status.render()), "")
+
+    async def test_role_failed_write_reverts_to_authoritative_value(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            status = app.query_one("#role-status", Static)
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, 1, None, "mismatch")
+            )
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT SAVED" in str(status.render()):
+                    break
+            self.assertIn("ROLE NOT SAVED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+            self.assertIn("[ CLIENT ▾ ]", str(dropdown.render()))
+
+    async def test_role_unsupported_schema_disables_dropdown_safely(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            del radio._config_sections["device"]["role"]
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            self.assertIn("UNSUPPORTED", str(dropdown.render()))
+            self.assertTrue(dropdown.disabled)
+
+    async def test_role_preserves_an_unrecognized_enum_value_safely(self) -> None:
+        """A live role number this installed schema's enum doesn't
+
+        declare (e.g. a newer firmware) must render safely -- never
+        crash, never get silently coerced to a known role.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["device"]["role"] = 999
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(RoleSelector)
+            self.assertIn("999", str(dropdown.render()))
+            self.assertEqual(radio.read_synced_config_field("device", "role"), 999)
+
+    # ---- BLUETOOTH (bluetooth.enabled, on the RADIO, not the host) -----
+
+    async def test_bluetooth_write_uses_verified_pipeline_and_updates_snapshot(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            before = radio.config_snapshot()
+            dropdown = app.query_one(BluetoothSelector)
+            self.assertIn("[ ON ▾ ]", str(dropdown.render()))
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "OFF" in str(dropdown.render()):
+                    break
+            self.assertIn("[ OFF ▾ ]", str(dropdown.render()))
+            self.assertEqual(radio.read_synced_config_field("bluetooth", "enabled"), False)
+            after = radio.config_snapshot()
+            self.assertIsNot(after, before)
+
+    async def test_bluetooth_change_shows_no_success_status(self) -> None:
+        """Item 2: the changed ON/OFF value is itself sufficient --
+
+        no redundant "BLUETOOTH APPLIED" status noise on success. A
+        genuine write failure still surfaces through the shared
+        #radio-status normally.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(BluetoothSelector)
+            status = app.query_one("#radio-status", Static)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "OFF" in str(dropdown.render()):
+                    break
+            self.assertNotIn("BLUETOOTH", str(status.render()))
+            self.assertFalse(status.has_class("setting-success"))
+
+            radio.write_verified_config_field = Mock(
+                return_value=ConfigWriteResult(False, True, None, "mismatch")
+            )
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "NOT APPLIED" in str(status.render()):
+                    break
+            self.assertIn("BLUETOOTH NOT APPLIED", str(status.render()))
+            self.assertIn("READBACK MISMATCH", str(status.render()))
+            self.assertTrue(status.has_class("setting-error"))
+
+    async def test_bluetooth_unsupported_schema_disables_dropdown_safely(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            del radio._config_sections["bluetooth"]["enabled"]
+            app._render_radio_settings()
+            await pilot.pause()
+            dropdown = app.query_one(BluetoothSelector)
+            self.assertIn("UNSUPPORTED", str(dropdown.render()))
+            self.assertTrue(dropdown.disabled)
+
+    async def test_disabling_radio_bluetooth_keeps_the_usb_connection_online(
+        self,
+    ) -> None:
+        """Item 2: disabling the CONNECTED RADIO's Bluetooth must not
+
+        drop the USB/serial link this app is talking over.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(BluetoothSelector)
+            dropdown.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "OFF" in str(dropdown.render()):
+                    break
+            self.assertEqual(app._radio_state, RadioState.ONLINE)
+            self.assertEqual(radio.read_synced_config_field("bluetooth", "enabled"), False)
+
+    async def test_opening_config_sends_zero_role_or_bluetooth_requests(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            app.query_one(RoleSelector).focus()
+            await pilot.pause()
+            app.query_one(BluetoothSelector).focus()
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
+    # ---- Section headers use DIM, not ACCENT ---------------------------
+
+    async def test_section_headers_use_dim_not_accent(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            for theme in THEME_PALETTES:
+                app._apply_color_theme(theme)
+                await pilot.pause()
+                palette = THEME_PALETTES[theme]
+                for widget_id in ("connection-title", "style-title", "radio-title"):
+                    widget = app.query_one(f"#{widget_id}", Static)
+                    self.assertEqual(
+                        widget.visual_style.foreground.hex6, palette.dim.upper()
+                    )
+                    self.assertNotEqual(
+                        widget.visual_style.foreground.hex6, palette.accent.upper()
+                    )
+
+    async def test_screen_slp_label_rename_preserves_behavior(self) -> None:
+        """"SCREEN LABEL RENAME": presentation only -- the underlying
+
+        screen_on_secs field, choices, and write/readback behavior are
+        all unchanged.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            selector = app.query_one(ScreenTimeoutSelector)
+            self.assertIn("SCREEN SLP", str(selector.render()))
+            self.assertNotIn("SCREEN TIMEOUT", str(selector.render()))
+            self.assertIn("5 MIN", str(selector.render()))
+
+            status = app.query_one("#radio-status", Static)
+            selector.focus()
+            await pilot.press("enter", "down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if "APPLIED" in str(status.render()):
+                    break
+            self.assertIn("SCREEN SLP APPLIED", str(status.render()))
+            self.assertEqual(
+                radio.read_synced_config_field("display", "screen_on_secs"), 600
+            )
+
     async def test_radio_dropdowns_reachable_by_keyboard_navigation(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0,
@@ -1007,6 +1327,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
             app.query_one(ColorSelector).focus()
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(RoleSelector))
+            await pilot.press("down")
+            self.assertIs(app.focused, app.query_one(BluetoothSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(TimezoneSelector))
             await pilot.press("down")
@@ -1022,20 +1346,61 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(AutoSyncSelector))
 
-    async def test_auto_sync_never_changes_timezone(self) -> None:
+    async def test_auto_sync_epoch_call_itself_never_touches_timezone(self) -> None:
+        """RadioService.sync_clock() (the epoch-only SDK call) never
+
+        writes device.tzdef by itself -- CLOCK SYNC's host-timezone
+        write is a SEPARATE, independent step (see
+        _sync_host_timezone_from_thread), gated entirely on its own
+        host-detection outcome. With detection unavailable here, tzdef
+        must stay exactly as it started.
+        """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
         )
         app = MeshtasticPassApp(radio, self.settings)
         self.settings.set_clock_auto_sync(True)
-        async with app.run_test(size=(100, 45)) as pilot:
-            await pilot.pause()
-            before = radio.read_synced_config_field("device", "tzdef")
-            for _ in range(10):
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(None, None, "none", "unavailable in this test"),
+        ):
+            async with app.run_test(size=(100, 45)) as pilot:
                 await pilot.pause()
-                if not app._clock_sync_in_progress:
-                    break
-            self.assertEqual(radio.read_synced_config_field("device", "tzdef"), before)
+                before = radio.read_synced_config_field("device", "tzdef")
+                for _ in range(10):
+                    await pilot.pause()
+                    if not app._clock_sync_in_progress:
+                        break
+                self.assertEqual(radio.read_synced_config_field("device", "tzdef"), before)
+
+    async def test_clock_sync_never_touches_24_hour_time(self) -> None:
+        """24 HOUR TIME is a pure display-format preference, independent
+
+        of both CLOCK SYNC's epoch write and its host-timezone write.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(
+                "America/New_York", "EST5EDT,M3.2.0,M11.1.0", "/etc/timezone", "ok"
+            ),
+        ):
+            async with app.run_test(size=(100, 45)) as pilot:
+                before = radio.read_synced_config_field("display", "use_12h_clock")
+                for _ in range(10):
+                    await pilot.pause()
+                    if radio.read_synced_config_field("device", "tzdef"):
+                        break
+                self.assertEqual(
+                    radio.read_synced_config_field("display", "use_12h_clock"), before
+                )
 
     # ---- Connect-time CONFIG snapshot (RADIO/CONFIG audit) ----------------
 
@@ -1153,6 +1518,28 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
             radio.refresh_config_snapshot.assert_not_called()
 
+    async def test_clock_sync_is_the_user_facing_label_not_auto_sync(self) -> None:
+        """"ADDITIONAL RADIO CONFIG CHANGES" item 2: the control renders
+
+        as "CLOCK SYNC     [ OFF/ON ]" -- "AUTO SYNC" must not appear
+        anywhere in the rendered RADIO section. Internal identifiers
+        (clock_auto_sync, AutoSyncSelector) are unaffected -- only the
+        DISPLAYED text changed.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(AutoSyncSelector)
+            rendered = str(dropdown.render())
+            self.assertIn("CLOCK SYNC", rendered)
+            self.assertIn("[ OFF ▾ ]", rendered)
+            self.assertNotIn("AUTO SYNC", rendered)
+            info_text = str(app.query_one("#radio-info", Static).render())
+            self.assertNotIn("AUTO SYNC", info_text)
+
     async def test_auto_sync_defaults_off_and_generates_no_automatic_write(self) -> None:
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
@@ -1269,12 +1656,172 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(reloaded.clock_auto_sync)
 
-    async def test_auto_sync_setting_change_produces_no_transient_status(self) -> None:
-        """Item 5 of "FINAL CLOCK UI SIMPLIFICATION": toggling AUTO SYNC
+    # ---- CLOCK SYNC host-timezone integration --------------------------
 
-        ON or OFF shows no "AUTO SYNC ENABLED"/"SAVED" confirmation line
-        anywhere -- the changed dropdown value itself is sufficient.
-        There is no clock-sync status row left to show one in at all.
+    async def test_clock_sync_writes_host_timezone_alongside_epoch(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(
+                "America/New_York", "EST5EDT,M3.2.0,M11.1.0", "/etc/timezone", "ok"
+            ),
+        ):
+            async with app.run_test(size=(100, 45)) as pilot:
+                for _ in range(10):
+                    await pilot.pause()
+                    if radio.read_synced_config_field("device", "tzdef") == (
+                        "EST5EDT,M3.2.0,M11.1.0"
+                    ):
+                        break
+                self.assertEqual(radio.sync_clock.call_count, 1)
+                self.assertEqual(
+                    radio.read_synced_config_field("device", "tzdef"),
+                    "EST5EDT,M3.2.0,M11.1.0",
+                )
+                # Item 4: TIMEZONE reflects the actual confirmed radio
+                # state promptly, not merely the detected host value.
+                for _ in range(10):
+                    await pilot.pause()
+                    if "[ EASTERN ▾ ]" in str(app.query_one(TimezoneSelector).render()):
+                        break
+                self.assertIn(
+                    "[ EASTERN ▾ ]", str(app.query_one(TimezoneSelector).render())
+                )
+
+    async def test_clock_sync_still_syncs_epoch_when_host_timezone_detection_fails(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        radio.write_verified_config_field = Mock(
+            wraps=radio.write_verified_config_field
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(None, None, "none", "could not detect"),
+        ):
+            async with app.run_test(size=(100, 45)) as pilot:
+                await pilot.pause()
+                self.assertEqual(radio.sync_clock.call_count, 1)
+                radio.write_verified_config_field.assert_not_called()
+                self.assertEqual(radio.read_synced_config_field("device", "tzdef"), "")
+
+    async def test_clock_sync_preserves_existing_tzdef_when_conversion_fails(
+        self,
+    ) -> None:
+        """Critical failure behavior: an existing (including CUSTOM)
+
+        device.tzdef must never be silently destroyed just because
+        host detection/conversion could not proceed safely.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["device"]["tzdef"] = "WEIRD1,M1.1.1,M2.2.2"
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(
+                "Some/Zone", None, "/etc/timezone", "unsafe shape"
+            ),
+        ):
+            async with app.run_test(size=(100, 45)) as pilot:
+                await pilot.pause()
+                self.assertEqual(radio.sync_clock.call_count, 1)
+                self.assertEqual(
+                    radio.read_synced_config_field("device", "tzdef"),
+                    "WEIRD1,M1.1.1,M2.2.2",
+                )
+
+    async def test_clock_sync_skips_tzdef_write_when_schema_unsupported(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        del radio._config_sections["device"]["tzdef"]
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        radio.write_verified_config_field = Mock(
+            wraps=radio.write_verified_config_field
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(
+                "America/New_York", "EST5EDT,M3.2.0,M11.1.0", "/etc/timezone", "ok"
+            ),
+        ):
+            async with app.run_test(size=(100, 45)) as pilot:
+                await pilot.pause()
+                self.assertEqual(radio.sync_clock.call_count, 1)
+                radio.write_verified_config_field.assert_not_called()
+
+    async def test_host_timezone_detection_never_fires_when_clock_sync_off(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        with patch("app.detect_host_timezone") as detect:
+            async with app.run_test(size=(100, 45)) as pilot:
+                await pilot.pause()
+                detect.assert_not_called()
+
+    async def test_host_timezone_sync_does_not_recur_from_tab_or_render_activity(
+        self,
+    ) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.sync_clock = Mock(
+            return_value=ClockSyncResult(True, 1_700_000_000, 1_700_000_000, "")
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        self.settings.set_clock_auto_sync(True)
+        with patch(
+            "app.detect_host_timezone",
+            return_value=HostTimezone(
+                "America/New_York", "EST5EDT,M3.2.0,M11.1.0", "/etc/timezone", "ok"
+            ),
+        ) as detect:
+            async with app.run_test(size=(100, 45)) as pilot:
+                await pilot.pause()
+                self.assertEqual(detect.call_count, 1)
+                app.show_tab("chat")
+                await pilot.pause()
+                app.show_tab("connection")
+                await pilot.pause()
+                app._render_radio_settings()
+                await pilot.pause()
+                self.assertEqual(detect.call_count, 1)
+
+    async def test_auto_sync_setting_change_produces_no_transient_status(self) -> None:
+        """Item 5 of "FINAL CLOCK UI SIMPLIFICATION": toggling the
+
+        user-facing CLOCK SYNC control (internally still
+        "clock_auto_sync"/AutoSyncSelector -- see its own docstring) ON
+        or OFF shows no "ENABLED"/"SAVED" confirmation line anywhere --
+        the changed dropdown value itself is sufficient. There is no
+        clock-sync status row left to show one in at all.
         """
         radio = SimulatedRadioService(
             connect_delay=0, message_interval=0, scripted_messages=()
@@ -1282,12 +1829,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
-            app.query_one(AutoSyncSelector).focus()
+            dropdown = app.query_one(AutoSyncSelector)
+            self.assertIn("[ OFF ▾ ]", str(dropdown.render()))
+            dropdown.focus()
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
             self.assertTrue(self.settings.clock_auto_sync)
+            self.assertIn("CLOCK SYNC", str(dropdown.render()))
+            self.assertIn("[ ON ▾ ]", str(dropdown.render()))
             status = app.query_one("#radio-status", Static)
-            self.assertNotIn("AUTO SYNC", str(status.render()))
+            self.assertNotIn("SYNC", str(status.render()))
             self.assertFalse(app.query("#radio-clock-status"))
 
     async def test_no_periodic_clock_sync_timer_exists(self) -> None:
@@ -2114,7 +2665,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertTrue(color_selector.has_focus)
             self.assertTrue(str(color_selector.render()).startswith("> COLOR"))
-            self.assertTrue(str(font_selector.render()).startswith("  FONT SIZE"))
+            self.assertTrue(str(font_selector.render()).startswith("  UI SCALE"))
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
@@ -2132,9 +2683,8 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up", "enter", "down", "enter")
             await pilot.pause()
             self.assertTrue(font_selector.has_focus)
-            # A fresh install's default is XL (item 4), one DOWN from
-            # which is XXL.
-            self.assertEqual(font_selector.font_size, 22)
+            # A fresh install's default is LARGE, one DOWN from which is XL.
+            self.assertEqual(font_selector.font_size, 18)
             self.assertEqual(color_selector.color, "snow")
 
         reloaded = AppSettings.load(config_path=self.settings.config_path)
@@ -2158,7 +2708,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await pilot.pause()
                 self.assertIn(
-                    "FONT SIZE SAVED - RELAUNCH TO APPLY", str(status.render())
+                    "UI SCALE SAVED - RELAUNCH TO APPLY", str(status.render())
                 )
                 self.assertTrue(status.has_class("setting-success"))
                 self.assertEqual(
@@ -2182,7 +2732,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_font_size_status_aligns_to_the_control_value_column(self) -> None:
         """"RADIO POLISH -- FONT SIZE STATUS": the status begins at the
 
-        same horizontal position as FONT SIZE's own "[ ... ]" control,
+        same horizontal position as UI SCALE's own "[ ... ]" control,
         not the left label column -- computed from the same shared
         CONNECTION_LABEL_WIDTH/CONNECTION_ROW_PREFIX layout math every
         other RADIO/STYLE row uses (CONNECTION_VALUE_COLUMN_INDENT),
@@ -2203,7 +2753,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             rendered = str(status.render())
             control_rendered = str(font.render())
             self.assertNotEqual(rendered, "")
-            # Directly beneath FONT SIZE (not the shared style status).
+            # Directly beneath UI SCALE (not the shared style status).
             self.assertNotIn("style-status", [w.id for w in app.query("Static")])
             indent = len(rendered) - len(rendered.lstrip(" "))
             self.assertEqual(indent, control_rendered.index("["))
