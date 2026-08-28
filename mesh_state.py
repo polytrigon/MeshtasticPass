@@ -11,8 +11,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Mapping
 
-from geo import distance_between
-from mesh_topology import compact_node_label
+from geo import distance_between, format_coordinates, format_distance
 from node_activity import is_node_active
 from radio_service import NodeMetadata
 from relative_time import format_relative_age
@@ -352,7 +351,7 @@ def _clean_text(value: object) -> str | None:
     return stripped or None
 
 
-def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
+def _name_segments(node: NodeMetadata) -> tuple[str, ...]:
     """Long Name first, then Short Name, per the context-line name rule.
 
     Short Name is included only when it is real and distinct from Long
@@ -360,6 +359,8 @@ def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
     never duplicated when the two happen to be the same displayed value.
     If Long Name is unavailable, the sole surviving segment falls back
     to Short Name, then to the node ID itself -- never a blank segment.
+    Used for both YOU and remote nodes -- the rule itself has nothing
+    node-local-specific about it.
     """
     long_name = _clean_text(node.long_name)
     short_name = _clean_text(node.short_name)
@@ -372,11 +373,15 @@ def _remote_name_segments(node: NodeMetadata) -> tuple[str, ...]:
     return (node.node_id,)
 
 
-def _format_distance(distance_miles: float | None) -> str:
-    return "? mi" if distance_miles is None else f"{distance_miles:.1f} mi"
+def _format_distance(distance_miles: float | None, *, metric: bool) -> str:
+    if distance_miles is None:
+        return "? km" if metric else "? mi"
+    return format_distance(distance_miles, metric=metric)
 
 
-def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
+def format_mesh_context_line(
+    state: MeshNodeState, *, now: float, metric: bool = False
+) -> str:
     """Build the bottom-left status text for a selected REAL MESH node.
 
     (An anonymous relay-stage placeholder is not a MeshNodeState at all
@@ -390,20 +395,42 @@ def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
     ROLE=RELAY.)
 
     YOU has no observed communication role, hop count, interaction
-    time, or distance of its own, so its line is just its compact label
-    ("YOU"). A remote node's line is:
+    time, or distance of its own -- its line is instead:
+
+        YOU / LONG NAME [/ SHORT NAME] / GPS LOCATION
+
+    GPS LOCATION is exactly "NO GPS" (never "UNKNOWN GPS"/"N/A"/"NO
+    FIX") when the local node has no real position fix -- see
+    MeshNodeState.node.position, a GeoPosition only ever constructed by
+    geo.make_geo_position's own validated lat/lon (the SAME "valid
+    position" rule this module already applies when computing distance
+    -- never a second, divergent notion of "does YOU have a fix").
+    Segments are ordered least-droppable first: the existing generic
+    cell-width truncation this line already goes through (see app.py's
+    _update_mesh_context_status) therefore drops GPS LOCATION first on
+    a narrow viewport, then SHORT NAME, before ever touching YOU or
+    LONG NAME -- no separate truncation logic needed here.
+
+    A remote node's line is:
 
         LONG NAME [/ SHORT NAME] / ROLE / N HOPS / AGE / DISTANCE
 
     ROLE is CLIENT, RELAY, or CLIENT+RELAY. Unknown hop count,
     interaction age, or distance each render as "?" rather than a
-    fabricated value -- see _remote_name_segments, MeshNodeState.
+    fabricated value -- see _name_segments, MeshNodeState.
     distance_miles, and build_mesh_working_set for how each is derived.
+    DISTANCE is shown in km/mi according to `metric` -- the connected
+    radio's own synchronized UNITS setting, read by the caller -- but
+    is always derived from the SAME underlying haversine-miles value
+    regardless (see geo.format_distance).
     """
     if state.node.is_local:
-        return compact_node_label(state.node)
+        segments = ["YOU", *_name_segments(state.node)]
+        position = state.node.position
+        segments.append(format_coordinates(position) if position is not None else "NO GPS")
+        return " / ".join(segments)
 
-    segments: list[str] = list(_remote_name_segments(state.node))
+    segments: list[str] = list(_name_segments(state.node))
 
     role = "+".join(
         name
@@ -436,6 +463,6 @@ def format_mesh_context_line(state: MeshNodeState, *, now: float) -> str:
     else:
         segments.append(format_relative_age(now - last_seen_at))
 
-    segments.append(_format_distance(state.distance_miles))
+    segments.append(_format_distance(state.distance_miles, metric=metric))
 
     return " / ".join(segments)

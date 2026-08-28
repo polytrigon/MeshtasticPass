@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Thread
 from time import monotonic, time
 from typing import Any, Callable
@@ -53,7 +53,7 @@ from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshActivityTier,
     MeshNodeState,
-    _remote_name_segments,
+    _name_segments,
     build_mesh_working_set,
     format_mesh_context_line,
 )
@@ -202,7 +202,7 @@ def _reply_mention_name(metadata: NodeMetadata) -> str:
     uses for a real node's display name, rather than a second,
     independently-defined fallback rule.
     """
-    return _remote_name_segments(metadata)[0]
+    return _name_segments(metadata)[0]
 
 
 class ThinScrollBarRender(ScrollBarRender):
@@ -3304,6 +3304,11 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
 
+        if self.current_tab == "mesh" and event.key == "enter":
+            self._open_mesh_node_menu()
+            event.stop()
+            return
+
         if self.current_tab == "connection" and event.key in ("up", "down"):
             controls = [
                 control
@@ -4789,12 +4794,34 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = time() if wall_now is None else wall_now
-        return build_mesh_working_set(
+        working_set = build_mesh_working_set(
             nodes,
             now=current_time,
             last_message_at=self._mesh_last_message_activity(),
             favorite_ids=self.settings.favorite_node_ids,
         )
+        # YOU's long_name/short_name from get_known_nodes() are NOT
+        # reliable (that NodeDB record is frequently a bare synthesized
+        # placeholder -- see RadioService.get_known_nodes' own trailing
+        # "local node never otherwise seen" fallback). self._radio_info
+        # is the SAME authoritative source CONNECTION's own identity
+        # controls already use, and is unconditionally cleared to None
+        # on every non-ONLINE transition (see _show_connection), so
+        # this can never leak a previous radio's stale identity across
+        # a reconnect/device switch. Corrects only the display fields;
+        # node_id/is_local/position are left exactly as the working set
+        # already computed them.
+        if working_set and working_set[0].node.is_local and self._radio_info is not None:
+            corrected_node = replace(
+                working_set[0].node,
+                long_name=self._radio_info.long_name,
+                short_name=self._radio_info.short_name,
+            )
+            working_set = (
+                replace(working_set[0], node=corrected_node),
+                *working_set[1:],
+            )
+        return working_set
 
     def _mesh_active_count(
         self,
@@ -4931,6 +4958,60 @@ class MeshtasticPassApp(App[None]):
             )
             self._update_mesh_context_status()
 
+    def _open_mesh_node_menu(self) -> None:
+        """ENTER on the currently focused MESH node opens the shared
+
+        CHAT/MESH node-options menu (see _open_node_menu) against that
+        SAME node -- never a fresh NodeDB lookup, so YOU's identity
+        fields stay whatever _mesh_working_set already corrected them
+        to. A no-op when there is nothing real to inspect: an empty
+        working set (view.selected_node_id == ""), or -- defensively,
+        though _move_mesh_focus's own relay_ids filtering means this
+        should not normally arise -- a selected_node_id that no longer
+        resolves to a working-set member or a mounted glyph widget
+        (anonymous relay stages are never selectable at all; see
+        MeshRelayWidget). allow_reply=False: MESH never gains a
+        messaging/DM action from this menu.
+        """
+        view = self.query_one(MeshTopologyView)
+        node_id = view.selected_node_id
+        if not node_id:
+            return
+        state = next(
+            (
+                candidate
+                for candidate in view.working_set
+                if candidate.node.node_id == node_id
+            ),
+            None,
+        )
+        if state is None:
+            return
+        origin = next(
+            (widget for widget in view.query(MeshNodeWidget) if widget.node_id == node_id),
+            None,
+        )
+        if origin is None:
+            return
+        self._open_node_menu(state.node, origin, None, allow_reply=False)
+
+    def _mesh_distance_is_metric(self) -> bool:
+        """Whether MESH's own geographic distance display should read as
+
+        km (METRIC) rather than mi (IMPERIAL) -- read directly off the
+        connected radio's own already-synced display.units config field
+        (read_synced_config_field is the SAME zero-RF cached read the
+        UNITS dropdown's own display already uses -- no new config
+        traffic, and MeshtasticPass never maintains a second, app-local
+        units preference of its own -- see MESH VIEW PASS item 11).
+        Unsupported schema/not connected/anything other than the exact
+        METRIC enum value all fall back to IMPERIAL, matching this
+        app's existing miles-only behavior before this pass.
+        """
+        return (
+            self.radio.read_synced_config_field("display", "units") == DISPLAY_UNITS_METRIC
+        )
+
     def _update_mesh_context_status(self) -> None:
         """Minimal truthful summary line for the currently selected MESH node.
 
@@ -4966,7 +5047,11 @@ class MeshtasticPassApp(App[None]):
         # for a genuinely stale/invalid ID, never a relay stage -- the
         # bottom-left context is always either YOU or a real node's full
         # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
-        text = format_mesh_context_line(state, now=time()) if state is not None else ""
+        text = (
+            format_mesh_context_line(state, now=time(), metric=self._mesh_distance_is_metric())
+            if state is not None
+            else ""
+        )
         available = status_widget.size.width
         if available > 0:
             text = truncate_to_cells(text, available)
@@ -5341,8 +5426,19 @@ class MeshtasticPassApp(App[None]):
         scroll_target: ScrollableContainer | None,
         *,
         include_rx_age: bool = False,
+        allow_reply: bool = True,
     ) -> None:
-        """Open the shared CHAT/MESH node-details menu."""
+        """Open the shared CHAT/MESH node-details menu.
+
+        allow_reply defaults to True, preserving CHAT's existing
+        REPLY-then-@mention gesture unchanged. MESH's own call site
+        passes allow_reply=False: the MESH VIEW PASS deliberately
+        keeps the node-options menu to informational rows plus
+        FAVORITE, with no messaging/DM action (DM does not exist in
+        this app) -- everything else about this shared menu (name/
+        hops rows, FAVORITE toggle, highlight/placement behavior)
+        stays exactly as CHAT already uses it.
+        """
 
         items: list[PopupItem] = []
         long_name = metadata.long_name.strip() if metadata.long_name else None
@@ -5377,7 +5473,8 @@ class MeshtasticPassApp(App[None]):
             items.append(PopupItem(metadata.node_id, actionable=False))
             highlighted = 0
         else:
-            items.append(PopupItem("REPLY", "reply", actionable=True))
+            if allow_reply:
+                items.append(PopupItem("REPLY", "reply", actionable=True))
             favorite = self.settings.is_favorite(metadata.node_id)
             action = "unfavorite" if favorite else "favorite"
             items.append(PopupItem(action.upper(), action, actionable=True))

@@ -114,6 +114,39 @@ def distance_between(
     return haversine_miles(local_position, sender_position)
 
 
+KM_PER_MILE = 1.609344
+
+
+def format_distance(distance_miles: float, *, metric: bool) -> str:
+    """One shared MESH distance formatter -- a single underlying
+
+    haversine-miles value (see distance_between/haversine_miles),
+    converted and suffixed per the connected radio's own UNITS
+    setting. METRIC is always derived from that SAME miles figure via
+    KM_PER_MILE, never a second independent great-circle calculation,
+    so the two presentations can never drift apart (see MESH VIEW
+    PASS item 12). Deliberately never more than one decimal place --
+    at typical LoRa mesh range (meters to tens of kilometers), finer
+    precision would read as false confidence, not real accuracy.
+    """
+    if not isfinite(distance_miles) or distance_miles < 0:
+        raise ValueError("Distance must be a finite non-negative number.")
+    if metric:
+        return f"{distance_miles * KM_PER_MILE:.1f} km"
+    return f"{distance_miles:.1f} mi"
+
+
+def format_coordinates(position: GeoPosition) -> str:
+    """Compact "lat, lon" text for a real GPS fix -- 4 decimal places
+
+    (roughly 11m of resolution), the readable precision GPS
+    coordinates are conventionally shown at. Distinct from
+    format_distance_miles/format_distance's own rounding rules, which
+    describe a distance, not a position.
+    """
+    return f"{position.latitude:.4f}, {position.longitude:.4f}"
+
+
 def format_distance_miles(distance: float) -> str:
     """Format a non-negative mile distance for a compact CHAT header."""
     if not isfinite(distance) or distance < 0:

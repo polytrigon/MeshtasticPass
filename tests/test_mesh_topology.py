@@ -10,6 +10,7 @@ trustworthy per-packet relay evidence, which this app does not have).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import time
@@ -54,7 +55,7 @@ from app import (
 )
 from app_settings import AppSettings
 from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
-from geo import GeoPosition, distance_between
+from geo import KM_PER_MILE, GeoPosition, distance_between
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
     MESH_STALE_THRESHOLD_SECONDS,
@@ -84,7 +85,7 @@ from mesh_topology import _route_connector_alternate_elbow
 import mesh_topology as mesh_topology_module
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
 from relative_time import format_relative_age
-from radio_service import NodeMetadata, RadioState
+from radio_service import DISPLAY_UNITS_IMPERIAL, DISPLAY_UNITS_METRIC, NodeMetadata, RadioState
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
@@ -1930,11 +1931,17 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
     # ---- Context (spec section 25) -----------------------------------
 
     async def test_context_line_for_you(self) -> None:
+        """YOU / LONG NAME / SHORT NAME / GPS LOCATION (MESH VIEW PASS
+
+        item 4) -- SimulatedRadioService reports the connected radio's
+        own identity as "Simulated Node"/"SIM" (see RadioInfo) and its
+        local node record carries SIMULATED_LOCAL_POSITION, a real fix.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "YOU")
+            self.assertEqual(status, "YOU / Simulated Node / SIM / 40.7128, -74.0060")
 
     async def test_context_line_for_client(self) -> None:
         app = self._make_app()
@@ -2185,9 +2192,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     # Bottom-left context reflects the new selection.
                     status = str(app.query_one("#mesh-context-status").render())
                     if expected_id == you_id:
-                        self.assertEqual(status, "YOU")
+                        self.assertTrue(status.startswith("YOU / "))
                     else:
-                        self.assertNotEqual(status, "YOU")
+                        self.assertFalse(status.startswith("YOU / "))
                     # The mesh recentered: the selected node's own base
                     # position is now the CURRENT viewport's own center
                     # anchor (see MeshTopologyView.current_grid_dimensions).
@@ -2519,7 +2526,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, you_id)
-            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
+            self.assertTrue(
+                str(app.query_one("#mesh-context-status").render()).startswith("YOU / ")
+            )
 
             self.assertEqual(view.board.styles.offset, board_offset_before)
             self.assertFalse(view.show_vertical_scrollbar)
@@ -2597,7 +2606,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
             self.assertEqual(int(relay_widget.styles.width.value), 1)
-            self.assertEqual(str(app.query_one("#mesh-context-status").render()), "YOU")
+            self.assertTrue(
+                str(app.query_one("#mesh-context-status").render()).startswith("YOU / ")
+            )
 
     async def test_select_node_accepts_only_real_working_set_nodes(self) -> None:
         """MeshTopologyView.select_node() is authoritative: only a real
@@ -3503,9 +3514,19 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             segments = status.split(" / ")
             self.assertEqual(len(segments), 6)
             expected_distance = distance_between(LOCAL_GEO, target_position)
+            # SimulatedRadioService's default synced display.units is
+            # DISPLAY_UNITS_METRIC (see MESH VIEW PASS item 11 / spec
+            # section 37: distance now honestly reflects the connected
+            # radio's own UNITS setting rather than a hardcoded "mi").
             self.assertEqual(
                 [segments[0], segments[1], segments[2], segments[3], segments[5]],
-                ["Bob Basecamp", "BOB", "CLIENT", "1 HOPS", f"{expected_distance:.1f} mi"],
+                [
+                    "Bob Basecamp",
+                    "BOB",
+                    "CLIENT",
+                    "1 HOPS",
+                    f"{expected_distance * KM_PER_MILE:.1f} km",
+                ],
             )
             self.assertNotEqual(segments[4], "?")
 
@@ -3516,7 +3537,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             target_id = "!c0ffee02"
             app.radio.get_known_nodes = lambda: (
-                NodeMetadata(you_id, is_local=True),  # no position -> "? mi"
+                NodeMetadata(you_id, is_local=True),  # no position -> "? km"
                 NodeMetadata(target_id, "No Short Name", None, 1),
             )
             app._accept_received_message(
@@ -3537,7 +3558,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             status = str(app.query_one("#mesh-context-status").render())
             self.assertEqual(len(status.split(" / ")), 5)  # no Short Name segment
-            self.assertTrue(status.endswith("? mi"))
+            # SimulatedRadioService's default synced display.units is
+            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
+            self.assertTrue(status.endswith("? km"))
             self.assertTrue(status.startswith("No Short Name / CLIENT"))
 
     async def test_distance_unchanged_by_recentering(self) -> None:
@@ -4420,7 +4443,9 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            self.assertTrue(str(app.query_one("#mesh-context-status").render()).endswith("? mi"))
+            # SimulatedRadioService's default synced display.units is
+            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
+            self.assertTrue(str(app.query_one("#mesh-context-status").render()).endswith("? km"))
 
             gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
             app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
@@ -4429,7 +4454,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, alice_id)
             await pilot.pause()
             status = str(app.query_one("#mesh-context-status").render())
-            self.assertFalse(status.endswith("? mi"))
+            self.assertFalse(status.endswith("? km"))
 
     async def test_you_losing_gps_returns_to_remote_relative_mode(self) -> None:
         """Case D: YOU loses GPS -- returns cleanly to remote-relative
@@ -4455,7 +4480,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, alice_id)
             await pilot.pause()
             self.assertFalse(
-                str(app.query_one("#mesh-context-status").render()).endswith("? mi")
+                str(app.query_one("#mesh-context-status").render()).endswith("? km")
             )
 
             no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
@@ -4468,8 +4493,10 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             _mesh_select_node(app, alice_id)
             await pilot.pause()
+            # SimulatedRadioService's default synced display.units is
+            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
             self.assertTrue(
-                str(app.query_one("#mesh-context-status").render()).endswith("? mi")
+                str(app.query_one("#mesh-context-status").render()).endswith("? km")
             )
 
     async def test_gps_cluster_coexists_with_fallback_nodes_without_collision(
@@ -6198,3 +6225,535 @@ class MeshResponsiveResizeAndFocusPersistenceTests(unittest.IsolatedAsyncioTestC
             shrunk_rows, shrunk_columns, _, _ = view.current_grid_dimensions()
             self.assertEqual((shrunk_rows, shrunk_columns), (small_rows, small_columns))
             self.assertEqual(view.selected_node_id, you_id)
+
+
+class MeshNodeMenuTests(unittest.IsolatedAsyncioTestCase):
+    """MESH VIEW PASS item 8-10: ENTER on a focused real MESH node opens
+
+    the shared CHAT/MESH node-options menu (app._open_node_menu),
+    reused unchanged apart from the new allow_reply=False MESH never
+    passes REPLY along for. YOU's ENTER reuses that same function's
+    existing is_local branch (informational rows only) -- a deliberate
+    decision, not a new code path (see app._open_mesh_node_menu).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_enter_on_remote_node_opens_menu_without_reply(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee03"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Target Node", "TGT", 1, position=north_of_local(1)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Target Node",
+                    sender_short_name="TGT",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            labels = [item.label for item in app._user_menu.items]
+            self.assertIn("Target Node", labels)
+            self.assertIn("TGT", labels)
+            self.assertIn("1 HOP AWAY", labels)
+            self.assertNotIn("REPLY", labels)
+            values = [item.value for item in app._user_menu.items]
+            self.assertNotIn("reply", values)
+
+    async def test_enter_on_you_opens_informational_only_menu(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            self.assertEqual(app.query_one(MeshTopologyView).selected_node_id, you_id)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            self.assertTrue(all(not item.actionable for item in app._user_menu.items))
+            labels = [item.label for item in app._user_menu.items]
+            self.assertIn(you_id, labels)
+
+    async def test_enter_does_nothing_when_working_set_is_empty(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.radio.get_known_nodes = lambda: ()
+            await self._open_mesh(pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNone(app._user_menu)
+
+    async def test_favorite_action_toggles_and_closes_menu(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee04"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Fave Target", "FAV", 1),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Fave Target",
+                    sender_short_name="FAV",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            self.assertFalse(app.settings.is_favorite(target_id))
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.settings.is_favorite(target_id))
+            self.assertIsNone(app._user_menu)
+
+    async def test_escape_closes_menu_and_preserves_selection(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee05"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Escape Target", "ESC", 1),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Escape Target",
+                    sender_short_name="ESC",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsNone(app._user_menu)
+            self.assertEqual(view.selected_node_id, target_id)
+
+    async def test_arrow_keys_move_menu_highlight_not_mesh_selection_while_open(
+        self,
+    ) -> None:
+        """The existing global "if self._user_menu is not None" interception
+
+        (shared with CHAT) already suspends MESH's own arrow-key
+        navigation for free once a node menu is open -- proving that
+        holds for MESH too, with zero new plumbing.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee06"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    target_id, "Arrow Target", "ARO", 0, position=north_of_local(2)
+                ),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Arrow Target",
+                    sender_short_name="ARO",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, target_id)
+
+    async def test_click_on_relay_stage_glyph_never_reaches_enter_path(self) -> None:
+        """Defensive: MeshRelayWidget has no on_click and can_focus is
+
+        False (see test_relay_stage_cannot_be_selected_and_always_
+        renders_dim), so an anonymous relay stage can never become
+        view.selected_node_id in the first place -- ENTER can therefore
+        never open a menu "for" a relay stage; this proves the
+        precondition _open_mesh_node_menu relies on still holds.
+        """
+        self.assertFalse(hasattr(MeshRelayWidget, "on_click"))
+        self.assertFalse(MeshRelayWidget.can_focus)
+
+
+class MeshFocusAndNavigationAuditTests(unittest.IsolatedAsyncioTestCase):
+    """MESH VIEW PASS item 15-17: audit-level proof that YOU is a normal
+
+    selectable focus target and existing arrow-navigation continues to
+    function exactly as before this pass -- no rewrite, only the
+    ENTER-menu addition layered on top (see MeshNodeMenuTests above).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_you_is_selected_by_default_and_navigable_away_from(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            north_id = "!f0000001"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(north_id, "North", "N", 0, position=north_of_local(2)),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=north_id,
+                    sender_long_name="North",
+                    sender_short_name="N",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, you_id)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, north_id)
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(view.selected_node_id, you_id)
+
+    async def test_switching_away_and_back_to_mesh_preserves_selection(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!c0ffee07"
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(target_id, "Persisted", "PER", 1),
+            )
+            app._accept_received_message(
+                SIMULATED_MESSAGES[0].__class__(
+                    sender_node_id=target_id,
+                    sender_long_name="Persisted",
+                    sender_short_name="PER",
+                    channel_index=0,
+                    text="hi",
+                    rssi=None,
+                    snr=None,
+                    packet_id=1,
+                    radio_rx_at=time.time(),
+                )
+            )
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.selected_node_id, target_id)
+
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertEqual(view.selected_node_id, target_id)
+
+    async def test_tab_switch_is_structurally_blocked_while_menu_open(self) -> None:
+        """The existing global on_key "if self._user_menu is not None"
+
+        interception consumes every key (including the digit tab-switch
+        keys) while a node menu is open, and the only way to reach
+        show_tab() with a menu open would be through that same branch --
+        so a tab switch can never actually happen while a menu is
+        showing; ESC (already proven to close safely) is the only exit.
+        This documents that "safe on tab-switch" holds by construction,
+        not via new dismissal code (see MESH VIEW PASS item 10).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_mesh(pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNotNone(app._user_menu)
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "mesh")
+            self.assertIsNotNone(app._user_menu)
+
+
+class MeshDistanceUnitsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """MESH VIEW PASS item 11-12: distance honors the connected radio's
+
+    own synced display.units setting via app._mesh_distance_is_metric,
+    the SAME zero-RF read_synced_config_field read every RADIO_SETTINGS
+    dropdown already uses -- no new polling. It picks up a units change
+    on the NEXT already-scheduled _refresh_mesh cycle, never a second,
+    MESH-specific poll of its own.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def _select_target_with_distance(self, app, pilot) -> str:
+        you_id = app.radio.info.node_id
+        target_id = "!d15ce001"
+        app.radio.get_known_nodes = lambda: (
+            NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+            NodeMetadata(target_id, "Distant", "DST", 1, position=north_of_local(5)),
+        )
+        app._accept_received_message(
+            SIMULATED_MESSAGES[0].__class__(
+                sender_node_id=target_id,
+                sender_long_name="Distant",
+                sender_short_name="DST",
+                channel_index=0,
+                text="hi",
+                rssi=None,
+                snr=None,
+                packet_id=1,
+                radio_rx_at=time.time(),
+            )
+        )
+        await self._open_mesh(pilot)
+        _mesh_select_node(app, target_id)
+        await pilot.pause()
+        return target_id
+
+    async def test_metric_by_default_via_simulated_radio(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._select_target_with_distance(app, pilot)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.endswith("km"))
+
+    async def test_imperial_when_radio_reports_imperial(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.radio._config_sections["display"]["units"] = DISPLAY_UNITS_IMPERIAL
+            await self._select_target_with_distance(app, pilot)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.endswith("mi"))
+
+    async def test_disconnected_radio_defaults_to_imperial(self) -> None:
+        app = self._make_app()
+        self.assertFalse(app._mesh_distance_is_metric())
+
+    async def test_switching_units_mid_session_updates_on_next_refresh_no_new_poll(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            target_id = await self._select_target_with_distance(app, pilot)
+            status_before = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status_before.endswith("km"))
+
+            app.radio._config_sections["display"]["units"] = DISPLAY_UNITS_IMPERIAL
+            app._refresh_mesh(wall_now=time.time())
+            await pilot.pause()
+            status_after = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status_after.endswith("mi"))
+            self.assertEqual(
+                app.query_one(MeshTopologyView).selected_node_id, target_id
+            )
+
+    async def test_unsupported_schema_field_defaults_to_imperial(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            del app.radio._config_sections["display"]["units"]
+            await self._select_target_with_distance(app, pilot)
+            status = str(app.query_one("#mesh-context-status").render())
+            self.assertTrue(status.endswith("mi"))
+
+
+class MeshYouIdentityCorrectionTests(unittest.IsolatedAsyncioTestCase):
+    """MESH VIEW PASS item 1-2: YOU's displayed long/short name always
+
+    comes from the CONNECTED radio's own authoritative identity
+    (app._radio_info, the same source CONNECTION's own controls use),
+    never NodeDB's own local-node record -- which real hardware has
+    been observed to report as a bare placeholder (see app._mesh_
+    working_set's own docstring). Never leaks a previous radio's
+    identity across a reconnect/device switch either.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def test_you_uses_radio_info_not_nodedb_placeholder(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, "Meshtastic ab59", "ab59", 0, is_local=True),
+            )
+            working_set = app._mesh_working_set()
+            self.assertEqual(working_set[0].node.long_name, app.radio.info.long_name)
+            self.assertEqual(working_set[0].node.short_name, app.radio.info.short_name)
+            self.assertNotEqual(working_set[0].node.long_name, "Meshtastic ab59")
+
+    async def test_you_identity_never_leaks_across_reconnect(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            first_you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(first_you_id, is_local=True),
+            )
+            first_working_set = app._mesh_working_set()
+            self.assertEqual(first_working_set[0].node.long_name, "Simulated Node")
+
+            new_info = replace(
+                app.radio.info,
+                node_id="!newdevice",
+                long_name="Second Radio",
+                short_name="SEC",
+            )
+            app._show_connection(RadioState.OFFLINE, message="switching device")
+            app._show_connection(RadioState.ONLINE, new_info)
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata("!newdevice", is_local=True),
+            )
+            second_working_set = app._mesh_working_set()
+            self.assertEqual(second_working_set[0].node.long_name, "Second Radio")
+            self.assertEqual(second_working_set[0].node.short_name, "SEC")
+
+    async def test_you_position_reflects_live_get_known_nodes_not_a_cached_snapshot(
+        self,
+    ) -> None:
+        """The local node's position comes from the SAME live
+
+        get_known_nodes() call as everything else in the working set --
+        never a connect-time-only cached snapshot (see
+        RadioConfigurationSnapshot.position, which is deliberately NOT
+        used here) -- so a position that appears mid-session is picked
+        up on the very next call, no reconnect required.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=None),
+            )
+            self.assertIsNone(app._mesh_working_set()[0].node.position)
+
+            app.radio.get_known_nodes = lambda: (
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+            )
+            self.assertEqual(app._mesh_working_set()[0].node.position, LOCAL_GEO)

@@ -366,15 +366,19 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
 
 
 class FormatMeshContextLineTests(unittest.TestCase):
-    def test_you_context_is_bare_literal_you(self) -> None:
-        """compact_node_label() always returns literal "YOU" for the local
+    def test_you_context_shows_identity_and_no_gps(self) -> None:
+        """YOU's line is "YOU / LONG NAME / SHORT NAME / GPS LOCATION" --
 
-        node regardless of its configured name -- see mesh_topology.py.
+        never the old bare "YOU" -- and GPS LOCATION reads exactly
+        "NO GPS" (never "UNKNOWN GPS"/"N/A"/"NO FIX") when the local
+        node carries no real position fix (see MESH VIEW PASS item 4).
         """
         state = MeshNodeState(
             node=YOU, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "YOU / Local / ME / NO GPS"
+        )
 
     def test_client_only_format(self) -> None:
         """Long Name / Short Name / ROLE / N HOPS / AGE / DISTANCE -- the
@@ -500,11 +504,13 @@ class FormatMeshContextLineTests(unittest.TestCase):
             format_mesh_context_line(state, now=NOW), "X / CLIENT / 1 HOPS / ? / ? mi"
         )
 
-    def test_you_context_never_gains_appended_segments(self) -> None:
-        """Section 28: YOU stays exactly "YOU" -- never a Short Name, role,
+    def test_you_context_shows_real_gps_but_never_role_hops_time_or_distance(self) -> None:
+        """YOU never gains a ROLE, hop count, interaction time, or
 
-        hop count, time, or distance, even if the local NodeMetadata
-        happens to carry a position (distance would otherwise be 0 mi).
+        DISTANCE segment -- those describe a remote node's relationship
+        to YOU, which YOU does not have to itself (distance would
+        otherwise be a nonsensical 0 mi). A real position fix DOES
+        render, as GPS LOCATION -- "40.7128, -74.0060" here.
         """
         you_with_position = NodeMetadata(
             "!you", "Local", "ME", 0, NOW, True, position=YOU_POSITION
@@ -512,7 +518,103 @@ class FormatMeshContextLineTests(unittest.TestCase):
         state = MeshNodeState(
             node=you_with_position, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(format_mesh_context_line(state, now=NOW), "YOU")
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW),
+            "YOU / Local / ME / 40.7128, -74.0060",
+        )
+
+    def test_you_gps_location_is_no_gps_not_a_fabricated_alternative(self) -> None:
+        """Exactly "NO GPS" -- never "UNKNOWN GPS"/"N/A"/"NO FIX" -- when
+
+        the local node has no real position fix (MESH VIEW PASS item 5).
+        """
+        state = MeshNodeState(
+            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        line = format_mesh_context_line(state, now=NOW)
+        self.assertTrue(line.endswith("NO GPS"))
+        for forbidden in ("UNKNOWN GPS", "N/A", "NO FIX"):
+            self.assertNotIn(forbidden, line)
+
+    def test_you_short_name_omitted_when_absent(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!you", "Local Only", None, 0, NOW, True),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "YOU / Local Only / NO GPS"
+        )
+
+    def test_you_falls_back_to_node_id_when_no_names_at_all(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bareyou", is_local=True),
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW), "YOU / !bareyou / NO GPS"
+        )
+
+
+class FormatMeshContextLineMetricTests(unittest.TestCase):
+    """MESH VIEW PASS item 11: DISTANCE honors the caller's `metric` flag,
+
+    always derived from the same underlying miles figure (see
+    FormatDistanceTests in test_geo.py for the conversion itself).
+    """
+
+    def test_defaults_to_imperial_when_metric_not_passed(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=4.23,
+        )
+        self.assertTrue(format_mesh_context_line(state, now=NOW).endswith("4.2 mi"))
+
+    def test_metric_true_renders_km(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=4.23,
+        )
+        line = format_mesh_context_line(state, now=NOW, metric=True)
+        self.assertTrue(line.endswith("km"))
+        self.assertFalse(line.endswith("mi"))
+
+    def test_unknown_distance_renders_question_mark_with_correct_unit_suffix(
+        self,
+    ) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=None,
+        )
+        self.assertTrue(
+            format_mesh_context_line(state, now=NOW, metric=False).endswith("? mi")
+        )
+        self.assertTrue(
+            format_mesh_context_line(state, now=NOW, metric=True).endswith("? km")
+        )
+
+    def test_you_line_never_gains_a_distance_segment_regardless_of_metric(
+        self,
+    ) -> None:
+        state = MeshNodeState(
+            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        self.assertEqual(
+            format_mesh_context_line(state, now=NOW, metric=True),
+            format_mesh_context_line(state, now=NOW, metric=False),
+        )
 
 
 class LastSeenConsistencyTests(unittest.TestCase):
