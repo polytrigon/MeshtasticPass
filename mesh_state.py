@@ -398,7 +398,7 @@ def _clean_text(value: object) -> str | None:
 
 # UI POLISH Part C: MESH's passive LINK quality display, for the
 # currently selected REMOTE node only (see app.py's
-# _update_mesh_status_line -- YOU and "nothing selected" never call
+# _update_mesh_node_bar -- YOU and "nothing selected" never call
 # any of this, since a radio has no RF link to itself).
 #
 # SNR, not RSSI, drives the meter: PROTOBUF-SOURCE-VERIFIED

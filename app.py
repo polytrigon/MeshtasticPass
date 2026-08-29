@@ -70,8 +70,8 @@ from mesh_topology import (
     TopologyLayout,
     assign_grid_slots,
     build_relay_stages,
-    compact_node_label,
     directional_target,
+    mesh_board_marker_label,
     place_within_bounds,
     project_to_viewport,
     route_chain_avoiding,
@@ -97,6 +97,9 @@ from radio_service import (
     ReceivedMessage,
     SendStatus,
     SentMessage,
+    TracerouteResult,
+    TracerouteState,
+    TracerouteStatus,
     rx_debug_enabled,
     rx_debug_log,
     validate_long_name,
@@ -1005,6 +1008,39 @@ class DeliveryStatusReceived(Message):
         self.generation = generation
 
 
+class TracerouteStatusReceived(Message):
+    """A real traceroute outcome arrived (TRACE ROUTE Part C).
+
+    `request_token` (an app-local sequence number, assigned BEFORE the
+    RF request is even sent -- see MeshtasticPassApp._start_traceroute)
+    is what the handler correlates against _active_traceroute, never
+    RadioService's own SDK packet_id: the token is known synchronously,
+    before the background worker even starts, so it can never race a
+    same-thread/synchronous status_handler call (e.g. SimulatedRadioService)
+    that fires before the worker's own return value would otherwise be
+    recorded.
+    """
+
+    def __init__(self, request_token: int, status: TracerouteStatus) -> None:
+        super().__init__()
+        self.request_token = request_token
+        self.status = status
+
+
+class TracerouteRequestFailed(Message):
+    """send_traceroute() itself raised (e.g. the radio disconnected
+
+    between the menu press and the worker thread actually running) --
+    never a routing NAK/timeout, which arrive as TracerouteStatusReceived
+    instead.
+    """
+
+    def __init__(self, request_token: int, detail: str) -> None:
+        super().__init__()
+        self.request_token = request_token
+        self.detail = detail
+
+
 class IdentitySaved(Message):
     """The radio accepted an advertised identity-name update."""
 
@@ -1333,9 +1369,70 @@ MESH_SELECTED_HALO_GLYPH = "·"
 # mesh_state.format_mesh_node_bar_fields, which always has the full Long
 # Name/Short Name, uncapped). Capped in DISPLAY CELLS (cell_len()), not
 # Python len(), so wide/CJK/emoji glyphs are counted by their actual
-# terminal width -- see mesh_topology.compact_node_label/_truncate for
-# the grapheme-safe truncation this limit is applied through.
+# terminal width -- see mesh_topology.mesh_board_marker_label/_truncate
+# for the grapheme-safe truncation this limit is applied through (this
+# is the NAME portion's own budget -- TRACE ROUTE's "<marker> " prefix
+# adds two more cells on top, never shrinking the name itself).
 MESH_BOARD_LABEL_MAX_CELLS = 5
+
+
+@dataclass(frozen=True)
+class ActiveTraceroute:
+    """TRACE ROUTE Part C: the ONE currently in-flight traceroute (v1
+
+    allows exactly one at a time). `request_token` -- an app-local
+    sequence number assigned synchronously in _start_traceroute, BEFORE
+    any RF request is even sent -- is the sole correlation key: it is
+    known before the background worker starts, so a response (or a
+    same-thread/synchronous simulated one) can never race its own
+    assignment. `destination_short_name` is captured once, at request
+    time, for the "TRACING ROUTE TO <name>" status text -- never a live
+    re-lookup, so it can never go stale/blank if the destination's own
+    NodeDB record changes or the node temporarily drops out of the
+    working set mid-trace.
+    """
+
+    request_token: int
+    destination_node_id: str
+    destination_short_name: str
+
+
+@dataclass(frozen=True)
+class TracerouteBanner:
+    """The terminal TRACE SUCCEEDED/TRACE FAILED status text, shown in
+
+    #mesh-status for TRACEROUTE_BANNER_SECONDS before the normal status
+    (NO MESH DATA / blank) automatically returns -- see
+    MeshtasticPassApp._show_traceroute_banner/_dismiss_traceroute_banner.
+    """
+
+    text: str
+    style_kind: str  # "accent" (TRACE SUCCEEDED) or "error" (TRACE FAILED)
+
+
+# TRACE ROUTE's "TRACING ROUTE TO SHN  > > >" animation reuses the
+# EXACT visual language of CHAT's own SENDING arrows (see
+# SENDING_ARROW_FRAMES/_sending_arrows_text above): active = ACCENT,
+# inactive = the SAME dim_quarter token SENDING's own inactive arrow
+# uses. Three positions (not two, unlike SENDING) -- one active arrow
+# cycles 0 -> 1 -> 2 -> 0, advanced by the SAME pre-existing 0.45s
+# _delivery_timer/_advance_delivery_states tick SENDING already uses,
+# never a new timer (see _advance_delivery_states' own extension).
+TRACEROUTE_ARROW_GLYPH = ">"
+TRACEROUTE_ARROW_POSITIONS = 3
+# A UI-appropriate hard ceiling -- deliberately NOT the Meshtastic SDK's
+# own sendTraceRoute/waitForTraceRoute helper's blocking timeout (up to
+# hopLimit+1 multiples of a 300s base -- see RadioService.
+# send_traceroute's own docstring), which is designed for a CLI script
+# willing to wait indefinitely, not an interactive TUI. Long enough for
+# a real multi-hop LoRa round trip, short enough that "TRACING ROUTE"
+# never appears stuck.
+TRACEROUTE_TIMEOUT_SECONDS = 30.0
+# "Only an actual successful traceroute response counts as success... in
+# ACCENT for 10 seconds, then restore the normal top-left status" -- the
+# literal duration the spec gives, for both TRACE SUCCEEDED and TRACE
+# FAILED.
+TRACEROUTE_BANNER_SECONDS = 10.0
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
@@ -1615,10 +1712,26 @@ class MeshNodeLabelWidget(Static):
         self.node_id = state.node.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+    def refresh_visual(
+        self, *, selected: bool, theme: str, now: float, traced: bool = False
+    ) -> None:
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
-        label = compact_node_label(self.state.node, MESH_BOARD_LABEL_MAX_CELLS)
-        self.update(Text(label, style=Style(color=color)))
+        node = self.state.node
+        label = mesh_board_marker_label(
+            node, traced=traced, max_name_cells=MESH_BOARD_LABEL_MAX_CELLS
+        )
+        if node.is_local:
+            self.update(Text(label, style=Style(color=color)))
+            return
+        # TRACE ROUTE: only the "*" marker itself carries ACCENT -- the
+        # rest of the label (the "•" bullet, and the name) keeps this
+        # node's own ordinary ACTIVE/STALE/selected color, exactly as
+        # before this pass (see _mesh_node_color).
+        text = Text()
+        marker_color = THEME_PALETTES[theme].accent if traced else color
+        text.append(label[0], style=Style(color=marker_color))
+        text.append(label[1:], style=Style(color=color))
+        self.update(text)
 
     def on_click(self, _event: Click) -> None:
         _mesh_select_node(self.app, self.node_id)
@@ -1806,6 +1919,14 @@ class MeshTopologyView(Container):
         self._relay_stages: tuple[RelayStage, ...] = ()
         self._edge_node_ids: frozenset[str] = frozenset()
         self._last_now: float = 0.0
+        # TRACE ROUTE (Part C): canonical node IDs with successful
+        # traceroute evidence during THIS app session -- persistent
+        # view-level state, exactly like _selected_node_id, so it
+        # survives every ordinary set_nodes() refresh and every tab
+        # switch, and is never cleared except by an app restart (never
+        # erased by a later FAILED trace -- see MeshtasticPassApp.
+        # _finish_traceroute_success, this set's only writer).
+        self._traced_node_ids: frozenset[str] = frozenset()
 
     @property
     def board(self) -> Container:
@@ -2150,14 +2271,22 @@ class MeshTopologyView(Container):
         # label widget -- never by resizing or repositioning the glyph.
         for widget in label_widgets:
             grid_x, grid_y = centers[widget.node_id]
+            traced = widget.node_id in self._traced_node_ids
             label_width = max(
-                1, cell_len(compact_node_label(widget.state.node, MESH_BOARD_LABEL_MAX_CELLS))
+                1,
+                cell_len(
+                    mesh_board_marker_label(
+                        widget.state.node,
+                        traced=traced,
+                        max_name_cells=MESH_BOARD_LABEL_MAX_CELLS,
+                    )
+                ),
             )
             widget.styles.width = label_width
             widget.styles.height = 1
             widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
             selected = widget.node_id == self._selected_node_id
-            widget.refresh_visual(selected=selected, theme=theme, now=now)
+            widget.refresh_visual(selected=selected, theme=theme, now=now, traced=traced)
 
         # Connector semantics: a YOU-to-node path means "we currently
         # believe this node is active in the mesh" -- CLIENT history
@@ -2335,6 +2464,22 @@ class MeshTopologyView(Container):
         )
         if local_id is not None:
             self.select_node(local_id)
+
+    @property
+    def traced_node_ids(self) -> frozenset[str]:
+        return self._traced_node_ids
+
+    def mark_traced(self, node_id: str) -> None:
+        """Record session-local successful-traceroute evidence for
+
+        `node_id` (TRACE ROUTE Part C) -- additive only (a later failed
+        trace against a DIFFERENT node, or a later failed retry of THIS
+        SAME node, never removes a prior success; see
+        MeshtasticPassApp._finish_traceroute_failure, which never calls
+        this). Takes effect the next time a label is rendered
+        (set_nodes/refresh_visual), not immediately.
+        """
+        self._traced_node_ids = self._traced_node_ids | {node_id}
 
 
 class IdentityNameControl(Horizontal):
@@ -3513,6 +3658,22 @@ class MeshtasticPassApp(App[None]):
             "left": 0,
             "right": 0,
         }
+        # TRACE ROUTE (Part C): the ONE currently in-flight explicit
+        # traceroute (v1 -- see _start_traceroute's own one-active-at-a-
+        # time guard), the session-local ledger of successful results
+        # (keyed by canonical destination node ID, replaced not
+        # duplicated on a repeat trace), the terminal TRACE SUCCEEDED/
+        # TRACE FAILED banner (if one is currently showing), and the
+        # 3-position arrow-animation frame (see TRACEROUTE_ARROW_
+        # POSITIONS/_advance_delivery_states). None of this is ever
+        # persisted to disk -- an app restart clears it completely.
+        self._active_traceroute: ActiveTraceroute | None = None
+        self._traceroute_results: dict[str, TracerouteResult] = {}
+        self._traceroute_banner: TracerouteBanner | None = None
+        self._traceroute_banner_timer: Timer | None = None
+        self._traceroute_timeout_timer: Timer | None = None
+        self._traceroute_animation_frame = 0
+        self._traceroute_request_seq = 0
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -5687,12 +5848,18 @@ class MeshtasticPassApp(App[None]):
             return
         view = views[0]
         status = statuses[0]
+        # TRACE ROUTE (Part C): a pending trace's animated "TRACING
+        # ROUTE TO SHN > > >" status, or a just-finished TRACE
+        # SUCCEEDED/TRACE FAILED banner, takes over this SAME top-left
+        # widget -- never a second one -- so it must win over whatever
+        # this method would otherwise show here, in EITHER branch below.
+        override = self._mesh_status_override_text()
         if not working_set:
             view.clear_nodes()
-            status.update("NO MESH DATA")
+            status.update("NO MESH DATA" if override is None else override)
             self._update_mesh_node_bar(working_set, current_time)
             return
-        status.update("")
+        status.update("" if override is None else override)
         # A real CLIENT with a truthful nonzero hop count is placed at
         # least hops_away+1 grid steps out -- never closer -- so its own
         # anonymous relay-stage placeholders have genuinely interior
@@ -5836,7 +6003,10 @@ class MeshtasticPassApp(App[None]):
         REPLY/@mention-into-CHAT-composer -- but DM (open/create that
         node's own conversation, item 16) IS offered here, since
         _open_node_menu's allow_dm defaults to True and MESH does not
-        override it.
+        override it. allow_traceroute=True: TRACE ROUTE (Part C) is
+        offered ONLY from this MESH menu, never CHAT's own node-details
+        popup (open_user_menu's call site does not pass it, so it keeps
+        its own default of False).
         """
         view = self.query_one(MeshTopologyView)
         node_id = view.selected_node_id
@@ -5858,7 +6028,9 @@ class MeshtasticPassApp(App[None]):
         )
         if origin is None:
             return
-        self._open_node_menu(state.node, origin, None, allow_reply=False)
+        self._open_node_menu(
+            state.node, origin, None, allow_reply=False, allow_traceroute=True
+        )
 
     def _mesh_distance_is_metric(self) -> bool:
         """Whether MESH's own geographic distance display should read as
@@ -5958,6 +6130,195 @@ class MeshtasticPassApp(App[None]):
         palette = THEME_PALETTES[self._current_theme]
         widget.update(Text(text, style=palette.accent2 if fields.accent2 else palette.base))
 
+    def _mesh_status_override_text(self) -> Text | None:
+        """TRACE ROUTE (Part C): whatever must override the ordinary
+
+        #mesh-status content (NO MESH DATA / blank) this cycle, or None
+        if nothing does. A just-expired banner is cleared here (lazily,
+        on the next read) rather than needing its own extra timer beyond
+        the one that already schedules _dismiss_traceroute_banner --
+        this only matters for a caller that reads this directly without
+        going through that timer (none currently do, but it keeps this
+        function correct standalone).
+        """
+        if self._traceroute_banner is not None:
+            palette = THEME_PALETTES[self._current_theme]
+            color = (
+                palette.accent
+                if self._traceroute_banner.style_kind == "accent"
+                else palette.error
+            )
+            return Text(self._traceroute_banner.text, style=Style(color=color))
+        if self._active_traceroute is not None:
+            return self._traceroute_status_text()
+        return None
+
+    def _traceroute_status_text(self) -> Text:
+        """"TRACING ROUTE TO SHN  > > >", one active ACCENT arrow cycling
+
+        across TRACEROUTE_ARROW_POSITIONS positions -- reusing the exact
+        CHAT SENDING visual language (active=ACCENT, inactive=dim_quarter,
+        advanced by the SAME 0.45s _delivery_timer tick; see
+        _advance_delivery_states/SENDING_ARROW_FRAMES).
+        """
+        active = self._active_traceroute
+        assert active is not None
+        palette = THEME_PALETTES[self._current_theme]
+        text = Text(f"TRACING ROUTE TO {active.destination_short_name}  ", style=palette.dim)
+        for index in range(TRACEROUTE_ARROW_POSITIONS):
+            if index:
+                text.append(" ")
+            color = (
+                palette.accent
+                if index == self._traceroute_animation_frame
+                else palette.dim_quarter
+            )
+            text.append(TRACEROUTE_ARROW_GLYPH, style=Style(color=color))
+        return text
+
+    def _render_mesh_top_status(self) -> None:
+        """Force an immediate #mesh-status repaint for TRACE ROUTE state
+
+        changes that must appear right away -- never waiting for the
+        next periodic _refresh_mesh() tick (up to ~1s later). Safe to
+        call regardless of the current tab (the widget simply repaints
+        invisibly off-tab, exactly like [3] MESH (N) already does) and
+        regardless of ONLINE state (harmless to update a currently-
+        hidden widget; _refresh_mesh's own ONLINE gate is what actually
+        controls this widget's meaningful visibility).
+        """
+        widgets = list(self.query("#mesh-status"))
+        if not widgets:
+            return
+        override = self._mesh_status_override_text()
+        if override is not None:
+            widgets[0].update(override)
+
+    def _start_traceroute(self, node: NodeMetadata) -> None:
+        """TRACE ROUTE menu action (MESH's selected REMOTE node ENTER
+
+        menu only -- never offered/attempted for YOU). Explicit,
+        user-triggered RF traffic ONLY -- never called from MESH open,
+        selection, refresh, a timer, or a topology update.
+
+        V1 allows exactly one active trace at a time: a repeated
+        attempt while one is already pending is a deterministic no-op
+        (silently ignored), never queued or stacked.
+        """
+        if node.is_local or self._radio_state is not RadioState.ONLINE:
+            return
+        if self._active_traceroute is not None:
+            return
+        if self._traceroute_banner_timer is not None:
+            self._traceroute_banner_timer.stop()
+            self._traceroute_banner_timer = None
+        self._traceroute_banner = None
+        self._traceroute_request_seq += 1
+        request_token = self._traceroute_request_seq
+        destination_node_id = node.node_id
+        self._active_traceroute = ActiveTraceroute(
+            request_token=request_token,
+            destination_node_id=destination_node_id,
+            destination_short_name=_reply_mention_name(node),
+        )
+        self._traceroute_animation_frame = 0
+        self._render_mesh_top_status()
+        self._traceroute_timeout_timer = self.set_timer(
+            TRACEROUTE_TIMEOUT_SECONDS,
+            lambda: self._traceroute_timed_out(request_token),
+        )
+
+        def status_handler(status: TracerouteStatus) -> None:
+            self.post_message(TracerouteStatusReceived(request_token, status))
+
+        def send_from_thread() -> None:
+            try:
+                self.radio.send_traceroute(destination_node_id, status_handler)
+            except RadioSendError as error:
+                self.post_message(TracerouteRequestFailed(request_token, str(error)))
+
+        self.run_worker(send_from_thread, thread=True)
+
+    @on(TracerouteStatusReceived)
+    def traceroute_status_received(self, event: TracerouteStatusReceived) -> None:
+        active = self._active_traceroute
+        if active is None or active.request_token != event.request_token:
+            # Stale/late (this attempt already timed out, was superseded,
+            # or -- impossible in v1's one-at-a-time model, but checked
+            # anyway -- belongs to a different attempt entirely): ignored
+            # deterministically, never misattributed to whatever IS
+            # currently active/selected.
+            return
+        status = event.status
+        if status.state is TracerouteState.SUCCEEDED and status.result is not None:
+            self._finish_traceroute_success(status.result)
+        else:
+            self._finish_traceroute_failure(status.detail or "Traceroute failed.")
+
+    @on(TracerouteRequestFailed)
+    def traceroute_request_failed(self, event: TracerouteRequestFailed) -> None:
+        active = self._active_traceroute
+        if active is None or active.request_token != event.request_token:
+            return
+        self._finish_traceroute_failure(event.detail)
+
+    def _traceroute_timed_out(self, request_token: int) -> None:
+        active = self._active_traceroute
+        if active is None or active.request_token != request_token:
+            # Already resolved (success/failure/a disconnect) by the
+            # time this fires -- never overwrite a real outcome with a
+            # stale timeout (see _clear_active_traceroute, which always
+            # stops this SAME timer the instant a real outcome lands).
+            return
+        self._finish_traceroute_failure("Traceroute timed out.")
+
+    def _clear_active_traceroute(self) -> None:
+        if self._traceroute_timeout_timer is not None:
+            self._traceroute_timeout_timer.stop()
+            self._traceroute_timeout_timer = None
+        self._active_traceroute = None
+
+    def _finish_traceroute_success(self, result: TracerouteResult) -> None:
+        """Real protocol evidence only -- never "request sent" alone.
+
+        Stores the result keyed by canonical destination (replacing,
+        never duplicating, an earlier result for the SAME destination),
+        marks that node's board label with the ACCENT "*" (session
+        evidence only -- never a claim about currently-rendered
+        connectors; see mesh_topology.mesh_board_marker_label), and
+        never steals focus.
+        """
+        destination = result.destination_node_id
+        self._clear_active_traceroute()
+        self._traceroute_results[destination] = result
+        self.query_one(MeshTopologyView).mark_traced(destination)
+        self._show_traceroute_banner("TRACE SUCCEEDED", "accent")
+        # Repaints the board (for the new "*" marker) AND the top status
+        # (for the banner) in one pass -- see _mesh_status_override_text.
+        self._refresh_mesh()
+
+    def _finish_traceroute_failure(self, _detail: str) -> None:
+        """A failed/timed-out trace never creates a "*" marker and never
+
+        erases an EARLIER successful one for the same (or any other)
+        destination -- this never touches _traceroute_results/
+        mark_traced at all.
+        """
+        self._clear_active_traceroute()
+        self._show_traceroute_banner("TRACE FAILED", "error")
+        self._render_mesh_top_status()
+
+    def _show_traceroute_banner(self, text: str, style_kind: str) -> None:
+        self._traceroute_banner = TracerouteBanner(text, style_kind)
+        self._traceroute_banner_timer = self.set_timer(
+            TRACEROUTE_BANNER_SECONDS, self._dismiss_traceroute_banner
+        )
+
+    def _dismiss_traceroute_banner(self) -> None:
+        self._traceroute_banner = None
+        self._traceroute_banner_timer = None
+        self._render_mesh_top_status()
+
     def _advance_delivery_states(self) -> None:
         self._send_animation_frame = self._send_animation_frame % len(
             SENDING_ARROW_FRAMES
@@ -5983,6 +6344,17 @@ class MeshtasticPassApp(App[None]):
                     self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
         for widget in self.query(ChatEntryWidget):
             widget.refresh_delivery_state(self._send_animation_frame)
+        # TRACE ROUTE (Part C): reuses this SAME pre-existing 0.45s tick
+        # for its own one-active-arrow-of-three animation -- never a
+        # second timer (see TRACEROUTE_ARROW_POSITIONS). A no-op
+        # (neither branch below runs) whenever no trace is pending, so
+        # this adds no work at all outside an active trace.
+        if self._active_traceroute is not None:
+            self._traceroute_animation_frame = (
+                self._traceroute_animation_frame + 1
+            ) % TRACEROUTE_ARROW_POSITIONS
+            if self._radio_state is RadioState.ONLINE:
+                self._render_mesh_top_status()
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)
@@ -6861,6 +7233,7 @@ class MeshtasticPassApp(App[None]):
         include_rx_age: bool = False,
         allow_reply: bool = True,
         allow_dm: bool = True,
+        allow_traceroute: bool = False,
     ) -> None:
         """Open the shared CHAT/MESH node-details menu.
 
@@ -6878,6 +7251,13 @@ class MeshtasticPassApp(App[None]):
         says it cannot receive messages (metadata.is_unmessagable --
         see RadioService/NodeMetadata). Never offered for YOU (the
         is_local branch below has no actionable rows at all).
+
+        allow_traceroute defaults to False; TRACE ROUTE (Part C) is
+        explicit, user-triggered RF traffic offered ONLY from MESH's own
+        ENTER menu (see _open_mesh_node_menu), never CHAT's. Omitted
+        entirely (not merely shown-and-ignored) while a trace is already
+        pending -- v1 allows exactly one active trace at a time, and an
+        absent option is clearer feedback than a silent no-op.
         """
 
         items: list[PopupItem] = []
@@ -6925,6 +7305,8 @@ class MeshtasticPassApp(App[None]):
             # newly added item, reached with one extra arrow press, not
             # a change to what pressing Enter immediately does.
             highlighted = len(items) - 1
+            if allow_traceroute and self._active_traceroute is None:
+                items.append(PopupItem("TRACE ROUTE", "traceroute", actionable=True))
         menu = ViewportMenu(
             items,
             highlighted_index=highlighted,
@@ -6955,6 +7337,10 @@ class MeshtasticPassApp(App[None]):
         """
         if action == "reply":
             self._activate_reply(metadata)
+            return
+        if action == "traceroute":
+            self._close_user_menu(restore_focus=False)
+            self._start_traceroute(metadata)
             return
         if action == "dm":
             self._close_user_menu(restore_focus=False)
@@ -7561,6 +7947,30 @@ class MeshtasticPassApp(App[None]):
         was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
+        # TRACE ROUTE (Part C): a disconnect (for any reason -- dropped
+        # connection, explicit device-path change, radio swap) leaves
+        # NOTHING behind to genuinely resolve a pending trace against
+        # (the interface object generating any real response is gone) --
+        # cancelled immediately rather than left to eventually expire via
+        # its own TRACEROUTE_TIMEOUT_SECONDS timer, so "TRACING ROUTE"
+        # never lingers stale through a visible reconnect. Silent (no
+        # TRACE FAILED banner): the disconnect itself is already
+        # communicated elsewhere (#mesh-connection-status).
+        if state is not RadioState.ONLINE and self._active_traceroute is not None:
+            self._clear_active_traceroute()
+            # Explicit blank (never left showing the just-cancelled
+            # "TRACING ROUTE..." text): _refresh_mesh's own status.update()
+            # calls are unreachable while not ONLINE (see its own
+            # early-return), so nothing else would ever clear this stale
+            # text otherwise. _mesh_status_override_text() is still
+            # consulted -- if a banner somehow ALSO exists, it wins
+            # (never true in practice: starting a trace already clears
+            # any banner -- see _start_traceroute -- so this branch
+            # never actually observes both set at once).
+            widgets = list(self.query("#mesh-status"))
+            if widgets:
+                override = self._mesh_status_override_text()
+                widgets[0].update(override if override is not None else "")
         # Radio-swap safety (item 28): a reconnect (or a drop) that
         # changes -- or clears -- the current local SHORTNAME must
         # update already-mounted CHAT entries' mention highlighting

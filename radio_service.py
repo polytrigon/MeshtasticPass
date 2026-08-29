@@ -208,6 +208,60 @@ class SendStatus:
     detail: str = ""
 
 
+class TracerouteState(Enum):
+    """Truthful, terminal outcome of one explicit TRACEROUTE_APP request.
+
+    Only ever reported by RadioService.send_traceroute's own status_handler
+    -- never inferred, never a "request sent" placeholder (see
+    TracerouteStatus).
+    """
+
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class TracerouteResult:
+    """Real protocol evidence from one successful traceroute response.
+
+    PROTOBUF-SOURCE-VERIFIED (mesh_pb2.RouteDiscovery): `route`/
+    `route_back` are the REAL intermediate node numbers a MeshPacket
+    accumulates as it physically travels forward (towards the
+    destination) and back (the response's own return trip) -- never
+    including the two endpoints (the local radio, the destination)
+    themselves, and never a fabricated/inferred hop; an empty tuple
+    means a genuinely direct connection with zero relays, not "unknown".
+    forward_snr/return_snr are PARALLEL, dB, one entry per hop of the
+    corresponding route PLUS one extra final entry for the last hop
+    into the endpoint (so len == len(route) + 1) -- None wherever the
+    firmware's own UNK_SNR (-128, prescaled by 4) sentinel marks that
+    one hop's reading as unavailable, never a fabricated number.
+    """
+
+    destination_node_id: str
+    forward_route: tuple[str, ...]
+    forward_snr: tuple[float | None, ...]
+    return_route: tuple[str, ...]
+    return_snr: tuple[float | None, ...]
+    completed_at: float
+
+
+@dataclass(frozen=True)
+class TracerouteStatus:
+    """An asynchronous traceroute outcome, reported once per request.
+
+    `packet_id` is the SAME id send_traceroute() returned -- a caller
+    correlates a status_handler invocation against a specific attempt
+    by comparing this field, exactly like SendStatus.packet_id already
+    lets send_text callers do for ordinary sends.
+    """
+
+    state: TracerouteState
+    packet_id: int | None
+    result: TracerouteResult | None = None
+    detail: str = ""
+
+
 @dataclass(frozen=True)
 class ChannelInfo:
     """One enabled application-facing Meshtastic channel."""
@@ -1294,6 +1348,160 @@ class RadioService:
         except (AttributeError, ImportError, ValueError):
             return None
         return reason
+
+    # Node numbers on the wire are always unsigned 32-bit (route/
+    # route_back are protobuf `fixed32`, never sign-extended) -- this
+    # mask is purely defensive symmetry with _node_number_from_id's own
+    # convention, not a correction of anything the SDK gets wrong.
+    _NODE_NUMBER_MASK = 0xFFFFFFFF
+    # PROTOBUF-SOURCE-VERIFIED (mesh_pb2.pyi RouteDiscovery.snr_towards/
+    # snr_back): "SNR of the received packet, 1 = 0.25dB, -128 = invalid".
+    _TRACEROUTE_UNKNOWN_SNR = -128
+
+    def send_traceroute(
+        self,
+        destination_node_id: str,
+        status_handler: Callable[[TracerouteStatus], None],
+    ) -> int:
+        """Send one explicit TRACEROUTE_APP request; report the outcome
+
+        exactly once via `status_handler`, asynchronously, whenever a
+        real response arrives (never for "request sent" alone -- see
+        TracerouteState). This is genuine RF traffic, only ever
+        triggered by an explicit caller action (never from here).
+
+        Uses the SAME zero-RF-cost lora.hop_limit the app's own HOP
+        LIMIT setting already reads/writes (read_synced_config_field) --
+        never a second, independent hop-limit concept.
+
+        Correlation is by `requestId` via the SDK's own one-shot
+        sendData(onResponse=...) response-handler registry (Meshtastic
+        2.7.11 mesh_interface.py) -- the SAME mechanism send_text uses
+        for delivery ACKs/NAKs, reused here rather than the SDK's own
+        sendTraceRoute/waitForTraceRoute helpers, which BLOCK the
+        calling thread for up to `hopLimit + 1` multiples of a 300s base
+        timeout (see meshtastic.util.Timeout.waitForTraceRoute) --
+        entirely unsuitable for this app's async UI. This method never
+        blocks; if the destination never responds at all, the SDK's own
+        response-handler entry simply lingers unfired (the SAME
+        characteristic already true of any unanswered wantResponse
+        send) -- the caller is responsible for its own UI-appropriate
+        timeout and for ignoring a callback it no longer cares about
+        (see MeshtasticPassApp._active_traceroute's own packet_id guard).
+
+        Returns the outgoing packet's own id, letting the caller
+        correlate a later status_handler call against exactly this
+        attempt via TracerouteStatus.packet_id -- critical because
+        selection/navigation must never affect which attempt a response
+        belongs to.
+        """
+        if self._interface is None:
+            raise RadioSendError("The radio is not connected.")
+        from meshtastic.protobuf import mesh_pb2, portnums_pb2
+
+        hop_limit = self._optional_int(
+            self.read_synced_config_field("lora", "hop_limit")
+        )
+
+        def onResponse(packet: dict[str, Any]) -> None:
+            status = self._parse_traceroute_response(
+                packet,
+                destination_node_id=destination_node_id,
+                now=time.time(),
+            )
+            if status is not None:
+                status_handler(status)
+
+        try:
+            sdk_packet = self._interface.sendData(
+                mesh_pb2.RouteDiscovery(),
+                destinationId=destination_node_id,
+                portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                wantResponse=True,
+                onResponse=onResponse,
+                hopLimit=hop_limit,
+            )
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            raise RadioSendError(f"Could not send traceroute: {detail}") from error
+
+        packet_id = self._optional_int(getattr(sdk_packet, "id", None))
+        if packet_id is None:
+            raise RadioSendError("Traceroute request was not assigned a packet ID.")
+        return packet_id
+
+    @staticmethod
+    def _parse_traceroute_response(
+        packet: Any,
+        *,
+        destination_node_id: str,
+        now: float,
+    ) -> TracerouteStatus | None:
+        """Convert one raw response packet into a TracerouteStatus, or
+
+        None when this packet carries no conclusive evidence yet (e.g.
+        a bare ACK on ROUTING_APP that is not itself a NAK -- the real
+        RouteDiscovery reply is always a separate, later packet).
+
+        Two portnums legitimately arrive under the SAME requestId:
+        ROUTING_APP (a NAK means the request could not be routed/
+        delivered at all -- FAILED) or TRACEROUTE_APP (the destination's
+        own real RouteDiscovery reply -- SUCCEEDED, carrying the actual
+        route). Only these two ever resolve to a terminal status here.
+        """
+        if not isinstance(packet, dict):
+            return None
+        decoded = packet.get("decoded")
+        if not isinstance(decoded, dict):
+            return None
+        packet_id = RadioService._optional_int(decoded.get("requestId"))
+        portnum = decoded.get("portnum")
+
+        if portnum == "ROUTING_APP":
+            routing = decoded.get("routing")
+            reason = (
+                RadioService._normalize_routing_error(routing)
+                if isinstance(routing, dict)
+                else None
+            )
+            if reason is not None and reason != "NONE":
+                return TracerouteStatus(
+                    TracerouteState.FAILED,
+                    packet_id,
+                    detail=f"Meshtastic routing failure: {reason}",
+                )
+            return None
+
+        if portnum != "TRACEROUTE_APP":
+            return None
+        traceroute_dict = decoded.get("traceroute")
+        raw = traceroute_dict.get("raw") if isinstance(traceroute_dict, dict) else None
+        if raw is None:
+            return None
+
+        def node_ids(numbers: Any) -> tuple[str, ...]:
+            return tuple(
+                f"!{number & RadioService._NODE_NUMBER_MASK:08x}" for number in numbers
+            )
+
+        def snr_values(values: Any) -> tuple[float | None, ...]:
+            return tuple(
+                None if value == RadioService._TRACEROUTE_UNKNOWN_SNR else value / 4.0
+                for value in values
+            )
+
+        return TracerouteStatus(
+            TracerouteState.SUCCEEDED,
+            packet_id,
+            result=TracerouteResult(
+                destination_node_id=destination_node_id,
+                forward_route=node_ids(raw.route),
+                forward_snr=snr_values(raw.snr_towards),
+                return_route=node_ids(raw.route_back),
+                return_snr=snr_values(raw.snr_back),
+                completed_at=now,
+            ),
+        )
 
     def close(self) -> None:
         """Close the serial connection if it is open."""

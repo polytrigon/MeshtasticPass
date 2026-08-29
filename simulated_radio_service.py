@@ -27,6 +27,9 @@ from radio_service import (
     ReceivedMessage,
     SentMessage,
     SendStatus,
+    TracerouteResult,
+    TracerouteState,
+    TracerouteStatus,
     validate_send_request,
     validate_long_name,
     validate_short_name,
@@ -47,6 +50,19 @@ class SimulatedSendOutcome(Enum):
     HEARD = "heard"
     UNCONFIRMED = "unconfirmed"
     FAILED = "failed"
+
+
+class SimulatedTracerouteOutcome(Enum):
+    """Explicit deterministic result for one simulated traceroute attempt.
+
+    NO_RESPONSE never calls the status_handler at all -- for exercising
+    the app's own TRACEROUTE_TIMEOUT_SECONDS path without an artificial
+    real-time wait.
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    NO_RESPONSE = "no_response"
 
 
 @dataclass(frozen=True)
@@ -193,6 +209,11 @@ class SimulatedRadioService:
         message_interval: float = 0.75,
         scripted_messages: tuple[ReceivedMessage, ...] = SIMULATED_MESSAGES,
         send_outcomes: tuple[SimulatedSendOutcome, ...] = (),
+        traceroute_outcomes: tuple[SimulatedTracerouteOutcome, ...] = (),
+        traceroute_forward_route: tuple[str, ...] = (),
+        traceroute_forward_snr: tuple[float | None, ...] = (),
+        traceroute_return_route: tuple[str, ...] = (),
+        traceroute_return_snr: tuple[float | None, ...] = (),
     ) -> None:
         if device_path not in SIMULATED_DEVICE_PATHS:
             device_path = SIMULATED_DEVICE_PATHS[0]
@@ -210,6 +231,12 @@ class SimulatedRadioService:
         self.message_interval = message_interval
         self.scripted_messages = scripted_messages
         self.send_outcomes = send_outcomes
+        self.traceroute_outcomes = traceroute_outcomes
+        self.traceroute_forward_route = traceroute_forward_route
+        self.traceroute_forward_snr = traceroute_forward_snr
+        self.traceroute_return_route = traceroute_return_route
+        self.traceroute_return_snr = traceroute_return_snr
+        self._traceroute_count = 0
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._state_events: Queue[RadioEvent] = Queue()
         self._stop_event = Event()
@@ -669,6 +696,57 @@ class SimulatedRadioService:
         )
         self._sent_messages.append(sent)
         return sent
+
+    def send_traceroute(
+        self,
+        destination_node_id: str,
+        status_handler: Callable[[TracerouteStatus], None],
+    ) -> int:
+        """Record a traceroute using the next explicitly scripted outcome.
+
+        Calls `status_handler` synchronously, before returning, exactly
+        like RadioService's own async callback eventually would -- the
+        caller (MeshtasticPassApp._start_traceroute) never relies on
+        that ordering: its own request_token is captured in the
+        status_handler closure BEFORE this method is even called, so a
+        synchronous callback here can never race anything (see
+        TracerouteStatusReceived's own docstring).
+        """
+        if not self._online or self._stop_event.is_set():
+            raise RadioSendError("The simulated radio is not connected.")
+        outcome = (
+            self.traceroute_outcomes[self._traceroute_count]
+            if self._traceroute_count < len(self.traceroute_outcomes)
+            else SimulatedTracerouteOutcome.SUCCEEDED
+        )
+        self._traceroute_count += 1
+        packet_id = 460000000 + self._traceroute_count
+        if outcome is SimulatedTracerouteOutcome.NO_RESPONSE:
+            return packet_id
+        if outcome is SimulatedTracerouteOutcome.FAILED:
+            status_handler(
+                TracerouteStatus(
+                    TracerouteState.FAILED,
+                    packet_id,
+                    detail="Simulated routing failure.",
+                )
+            )
+            return packet_id
+        status_handler(
+            TracerouteStatus(
+                TracerouteState.SUCCEEDED,
+                packet_id,
+                result=TracerouteResult(
+                    destination_node_id=destination_node_id,
+                    forward_route=self.traceroute_forward_route,
+                    forward_snr=self.traceroute_forward_snr,
+                    return_route=self.traceroute_return_route,
+                    return_snr=self.traceroute_return_snr,
+                    completed_at=time.time(),
+                ),
+            )
+        )
+        return packet_id
 
     def emit_message(self, message: ReceivedMessage) -> None:
         """Deliver one fake message to every registered consumer."""

@@ -93,13 +93,16 @@ from radio_service import (
     LinkObservation,
     NodeMetadata,
     RadioInfo,
+    RadioSendError,
     RadioState,
+    TracerouteState,
 )
 from simulated_radio_service import (
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
     SIMULATED_NODES,
     SimulatedRadioService,
+    SimulatedTracerouteOutcome,
 )
 from theme_palette import THEME_PALETTES
 
@@ -4095,9 +4098,11 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_board_label_five_cells_stays_centered_and_glyph_unmoved(
         self,
     ) -> None:
-        """A long name truncates to <= 5 display cells on the board label,
+        """A long name truncates to <= 5 display cells (plus TRACE
 
-        the label stays centered over the glyph's fixed grid anchor, and
+        ROUTE's own 2-cell "<marker> " prefix -- see
+        mesh_topology.mesh_board_marker_label) on the board label, the
+        label stays centered over the glyph's fixed grid anchor, and
         the glyph's own coordinate is completely unaffected by label
         length (spec: "label width never moves the glyph").
         """
@@ -4134,7 +4139,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             label = next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == long_id)
 
             label_text = str(label.render())
-            self.assertLessEqual(cell_len(label_text), MESH_BOARD_LABEL_MAX_CELLS)
+            self.assertLessEqual(cell_len(label_text), MESH_BOARD_LABEL_MAX_CELLS + 2)
+            self.assertTrue(label_text.startswith("• ") or label_text.startswith("* "))
             # The label sits exactly one row above the glyph, horizontally
             # centered on the SAME column anchor -- never the glyph's own
             # coordinate (see MeshNodeLabelWidget/set_nodes).
@@ -8569,7 +8575,9 @@ class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
                 w for w in app.query(MeshNodeLabelWidget) if w.node_id == "!aaaaaaaa"
             )
             old_text = str(old_label.render())
-            self.assertIn(old_text, ("Old V3", "V3"))
+            # SHORT NAME preferred (see mesh_topology.mesh_board_marker_label,
+            # unlike compact_node_label's own long-name-preferred choice).
+            self.assertEqual(old_text, "• V3")
             self.assertNotEqual(old_text, "YOU")
 
     async def test_self_heard_echo_of_own_transmission_still_renders_you(self) -> None:
@@ -8631,3 +8639,512 @@ class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(second_label.render()), "YOU")
             self.assertNotEqual(second_id, first_id)
             self.assertEqual(second_id, "!bbbbbbbb")
+
+
+class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
+    """MESHTASTICPASS TRACE ROUTE Part C: explicit, user-triggered
+
+    traceroute -- menu gating, the TRACING ROUTE animation, the
+    SUCCEEDED/FAILED lifecycle, the session-local "*" marker, and
+    correlation/async-safety (selection changes, disconnects, timeouts,
+    late responses, and repeated attempts must never misattribute a
+    result -- see MeshtasticPassApp._start_traceroute/
+    traceroute_status_received).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self, **radio_kwargs) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=(), **radio_kwargs
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    @staticmethod
+    def _two_remotes(you_id: str) -> tuple[NodeMetadata, ...]:
+        now = time.time()
+        return (
+            NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+            NodeMetadata(
+                "!a1111111", "Alice", "ALC", 1, last_heard=now - 5, position=north_of_local(2)
+            ),
+            NodeMetadata(
+                "!b2222222", "Bob", "BOB", 1, last_heard=now - 5, position=south_of_local(2)
+            ),
+        )
+
+    def _label_text(self, app: MeshtasticPassApp, node_id: str) -> str:
+        return str(
+            next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == node_id).render()
+        )
+
+    # ---- Menu gating ---------------------------------------------------
+
+    async def test_remote_menu_offers_trace_route_you_never_does(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+
+            _mesh_select_node(app, "!a1111111")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("TRACE ROUTE", [item.label for item in app._user_menu.items])
+            await pilot.press("escape")
+            await pilot.pause()
+
+            _mesh_select_node(app, you_id)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertNotIn("TRACE ROUTE", [item.label for item in app._user_menu.items])
+
+    async def test_trace_route_omitted_from_menu_while_one_is_pending(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, "!a1111111")
+            await pilot.pause()
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertNotIn("TRACE ROUTE", [item.label for item in app._user_menu.items])
+
+    # ---- No automatic tracing -------------------------------------------
+
+    async def test_never_traces_automatically(self) -> None:
+        """Opening MESH, selecting nodes, and periodic refreshes must
+
+        never call RadioService.send_traceroute on their own -- only an
+        explicit _start_traceroute (menu action) does.
+        """
+        calls: list[str] = []
+        app = self._make_app()
+        original = app.radio.send_traceroute
+
+        def spy(destination_node_id, status_handler):
+            calls.append(destination_node_id)
+            return original(destination_node_id, status_handler)
+
+        app.radio.send_traceroute = spy
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, "!a1111111")
+            await pilot.pause()
+            _mesh_select_node(app, "!b2222222")
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertEqual(calls, [])
+
+    # ---- Exactly one explicit RF request / pending animation -----------
+
+    async def test_explicit_trace_sends_exactly_one_rf_request(self) -> None:
+        calls: list[str] = []
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        original = app.radio.send_traceroute
+
+        def spy(destination_node_id, status_handler):
+            calls.append(destination_node_id)
+            return original(destination_node_id, status_handler)
+
+        app.radio.send_traceroute = spy
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, "!a1111111")
+            await pilot.pause()
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(calls, ["!a1111111"])
+
+    async def test_canonical_node_id_used_as_destination(self) -> None:
+        """LONG/SHORT NAME are presentation only -- the canonical node ID
+
+        is always what is actually sent as the RF destination.
+        """
+        calls: list[str] = []
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        original = app.radio.send_traceroute
+        app.radio.send_traceroute = lambda dest, handler: (
+            calls.append(dest) or original(dest, handler)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = NodeMetadata("!a1111111", "Some Very Different Display Name", "XYZ", 1)
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(calls, ["!a1111111"])
+
+    async def test_pending_status_shows_animated_tracing_text(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            status = str(app.query_one("#mesh-status").render())
+            self.assertEqual(status, "TRACING ROUTE TO ALC  > > >")
+
+            first_frame = app._traceroute_animation_frame
+            app._advance_delivery_states()
+            self.assertNotEqual(app._traceroute_animation_frame, first_frame)
+
+    # ---- Success / failure lifecycle + marker ---------------------------
+
+    async def test_successful_trace_shows_banner_and_marks_the_node(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+            self.assertEqual(self._label_text(app, "!a1111111"), "• ALC")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE SUCCEEDED")
+            self.assertIsNone(app._active_traceroute)
+            self.assertIn("!a1111111", app._traceroute_results)
+            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+
+            # 10-second lifecycle: after the banner's own dismiss timer
+            # fires, the normal status returns.
+            app._dismiss_traceroute_banner()
+            self.assertIsNone(app._traceroute_banner)
+
+    async def test_failed_trace_shows_banner_without_marking_the_node(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.FAILED,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE FAILED")
+            self.assertIsNone(app._active_traceroute)
+            self.assertNotIn("!a1111111", app._traceroute_results)
+            self.assertEqual(self._label_text(app, "!a1111111"), "• ALC")
+
+    async def test_later_failure_never_erases_an_earlier_success(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.FAILED,
+            )
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE FAILED")
+            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+            self.assertIn("!a1111111", app._traceroute_results)
+
+    async def test_repeated_success_replaces_not_duplicates_the_stored_result(
+        self,
+    ) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.SUCCEEDED,
+            ),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app.radio.traceroute_forward_route = ("!ffff0002",)
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(len(app._traceroute_results), 1)
+            self.assertEqual(
+                app._traceroute_results["!a1111111"].forward_route, ("!ffff0002",)
+            )
+
+    # ---- One active trace at a time -------------------------------------
+
+    async def test_repeated_attempt_while_pending_is_a_deterministic_no_op(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        original = app.radio.send_traceroute
+        app.radio.send_traceroute = lambda dest, handler: (
+            calls.append(dest) or original(dest, handler)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            first_token = app._active_traceroute.request_token
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(calls, ["!a1111111"])
+            self.assertEqual(app._active_traceroute.request_token, first_token)
+
+    # ---- Correlation / async safety --------------------------------------
+
+    async def test_response_after_selection_change_still_resolves_the_original(
+        self,
+    ) -> None:
+        """select A -> TRACE A -> select B -> response for A arrives: the
+
+        result belongs to A, never B, and selection is untouched.
+        """
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,)
+        )
+        # Wide enough that recentering on B still keeps A's own label
+        # widget mounted (never an off-screen edge indicator) -- the
+        # marker check below needs A's real label, not just its
+        # session-local result-dict entry.
+        async with app.run_test(size=(300, 40)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            _mesh_select_node(app, "!a1111111")
+            await pilot.pause()
+            node_a = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node_a)
+            await pilot.pause()  # SimulatedRadioService resolves synchronously
+
+            _mesh_select_node(app, "!b2222222")
+            await pilot.pause()
+
+            self.assertIn("!a1111111", app._traceroute_results)
+            self.assertNotIn("!b2222222", app._traceroute_results)
+            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+            self.assertEqual(self._label_text(app, "!b2222222"), "• BOB")
+            self.assertEqual(view.selected_node_id, "!b2222222")
+
+    async def test_late_response_after_timeout_is_ignored(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            token = app._active_traceroute.request_token
+
+            app._traceroute_timed_out(token)
+            self.assertIsNone(app._active_traceroute)
+            self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE FAILED")
+
+            # A genuine (but late) success for the SAME, already-resolved
+            # token must never retroactively create a marker.
+            from radio_service import TracerouteResult, TracerouteStatus
+
+            late_status = TracerouteStatus(
+                TracerouteState.SUCCEEDED,
+                None,
+                result=TracerouteResult(
+                    destination_node_id="!a1111111",
+                    forward_route=(),
+                    forward_snr=(),
+                    return_route=(),
+                    return_snr=(),
+                    completed_at=time.time(),
+                ),
+            )
+
+            class FakeEvent:
+                request_token = token
+                status = late_status
+
+            app.traceroute_status_received(FakeEvent())
+            self.assertNotIn("!a1111111", app._traceroute_results)
+            self.assertEqual(self._label_text(app, "!a1111111"), "• ALC")
+
+    async def test_disconnect_during_trace_cancels_it_silently(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            self.assertIsNotNone(app._active_traceroute)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+
+            self.assertIsNone(app._active_traceroute)
+            self.assertIsNone(app._traceroute_banner)
+            self.assertEqual(str(app.query_one("#mesh-status").render()), "")
+
+    async def test_navigating_away_mid_trace_does_not_cancel_it(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            token = app._active_traceroute.request_token
+
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertIsNotNone(app._active_traceroute)
+            self.assertEqual(app._active_traceroute.request_token, token)
+
+    async def test_completion_never_steals_focus(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+            focused_before = app.focused
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertIs(app.focused, focused_before)
+
+    # ---- No visualization changes ----------------------------------------
+
+    async def test_traceroute_never_changes_connectors_or_placement(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            positions_before = dict(view.base_positions)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(view.base_positions, positions_before)
+
+    # ---- Requesting failure (radio not connected) -------------------------
+
+    async def test_send_failure_resolves_as_a_failed_trace(self) -> None:
+        app = self._make_app()
+
+        def raising_send(destination_node_id, status_handler):
+            raise RadioSendError("The simulated radio is not connected.")
+
+        app.radio.send_traceroute = raising_send
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE FAILED")
+            self.assertIsNone(app._active_traceroute)
