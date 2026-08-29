@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
@@ -385,6 +386,29 @@ class ConfigWriteResult:
     requested_value: Any
     readback_value: Any | None
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class RadioApplyResult:
+    """Outcome of apply_radio_config_preset() -- one controlled,
+
+    sequential, multi-field operation (LoRaConfig.use_preset/
+    modem_preset/channel_num, then the PRIMARY channel's name/psk),
+    each individually write-verified via the SAME ConfigWriteResult
+    model ordinary RADIO-section fields already use.
+
+    Stops at the FIRST failing step: `failed_step` names it
+    ("use_preset"/"modem_preset"/"frequency_slot"/"channel") and
+    `results` holds every ConfigWriteResult attempted so far (never a
+    step that was never reached). There is no transactional multi-
+    write primitive on real Meshtastic hardware to roll a partial
+    apply back with, so a partial apply is reported honestly rather
+    than silently retried, reordered, or hidden.
+    """
+
+    applied: bool
+    failed_step: str
+    results: dict[str, ConfigWriteResult]
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1106,117 @@ class RadioService:
             time.sleep(0.05)
 
         return ConfigWriteResult(False, value, None, "timeout")
+
+    def read_primary_channel_settings(self) -> tuple[str, bytes] | None:
+        """Zero-RF read of the PRIMARY channel's (index 0) name/psk from
+
+        the already-synced interface -- mirrors read_synced_config_field's
+        own contract exactly: no new radio request, None when
+        unavailable (not connected, or this installed schema/interface
+        doesn't expose it).
+        """
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if not channels:
+            return None
+        settings = getattr(channels[0], "settings", None)
+        if settings is None:
+            return None
+        name = getattr(settings, "name", "") or ""
+        psk = getattr(settings, "psk", b"") or b""
+        return (name, bytes(psk))
+
+    def write_verified_primary_channel(
+        self,
+        *,
+        name: str,
+        psk: bytes,
+        timeout: float = 15.0,
+    ) -> ConfigWriteResult:
+        """Write the PRIMARY channel's (index 0) name/psk and verify it
+
+        with a fresh radio-originated get_channel_response -- the same
+        verification MODEL write_verified_config_field uses for
+        localConfig fields (see its own docstring), adapted for a
+        Channel message: Channel settings live in their own
+        AdminMessage.set_channel/get_channel_request family, never
+        localConfig, so this is a distinct write path rather than a
+        call to write_verified_config_field with a different section
+        name. Never touches role, channel_num, uplink/downlink_enabled,
+        or any OTHER channel's settings -- only this one channel's
+        name/psk.
+        """
+        interface = self._interface
+        if interface is None:
+            return ConfigWriteResult(False, (name, psk), None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if local_node is None or not channels:
+            return ConfigWriteResult(False, (name, psk), None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2
+
+        target_interface = interface
+        primary = channels[0]
+        primary.settings.name = name
+        primary.settings.psk = psk
+
+        write_message = admin_pb2.AdminMessage()
+        write_message.set_channel.CopyFrom(primary)
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+            interface.waitForAckNak()
+        except Exception:
+            pass
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return ConfigWriteResult(False, (name, psk), None, "disconnected")
+        if nak_seen["nak"]:
+            return ConfigWriteResult(False, (name, psk), None, "nak")
+
+        read_request = admin_pb2.AdminMessage()
+        read_request.get_channel_request = 0
+        found: dict[str, Any] = {}
+
+        def on_response(packet: Any) -> None:
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            if not isinstance(admin, dict):
+                return
+            raw = admin.get("raw")
+            if raw is None or not raw.HasField("get_channel_response"):
+                return
+            response_channel = raw.get_channel_response
+            found["name"] = response_channel.settings.name
+            found["psk"] = bytes(response_channel.settings.psk)
+
+        try:
+            local_node._sendAdmin(read_request, onResponse=on_response)
+        except Exception:
+            return ConfigWriteResult(False, (name, psk), None, "timeout")
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                return ConfigWriteResult(False, (name, psk), None, "disconnected")
+            if "name" in found:
+                readback = (found["name"], found["psk"])
+                if readback == (name, psk):
+                    self._rebuild_config_snapshot()
+                    return ConfigWriteResult(True, (name, psk), readback, "")
+                return ConfigWriteResult(False, (name, psk), readback, "mismatch")
+            time.sleep(0.05)
+
+        return ConfigWriteResult(False, (name, psk), None, "timeout")
 
     def supports_clock_sync(self) -> bool:
         """Whether the installed SDK/protobuf schema exposes
@@ -2197,3 +2332,87 @@ class RadioService:
         except (ImportError, AttributeError, KeyError, TypeError, ValueError):
             return ""
         return "".join(part.title() for part in enum_name.split("_"))
+
+
+def apply_radio_config_preset(radio: Any, preset: Any) -> RadioApplyResult:
+    """Apply one saved radio/network configuration as a controlled,
+
+    sequential, individually-write-verified multi-field operation --
+    LoRaConfig.use_preset=True, then modem_preset, then channel_num
+    (frequency slot), then the PRIMARY channel's name/psk. Stops at
+    the first failing step (see RadioApplyResult's own docstring).
+
+    `radio` is duck-typed against RadioService/SimulatedRadioService's
+    identical write_verified_config_field/write_verified_primary_
+    channel methods (never imported/type-checked against either class
+    directly) -- this is a free function, not a RadioService method,
+    specifically so ADVANCED RADIO CONFIG's APPLY behaves IDENTICALLY
+    in --simulate and on real hardware, sharing this exact sequencing
+    and stop-at-first-failure reporting rather than two independently
+    maintained copies of it.
+
+    `preset` is duck-typed against app_settings.RadioConfigPreset's own
+    attributes (modem_preset/frequency_slot/channel_name/
+    channel_psk_base64) -- never imported from app_settings, to keep
+    this module's existing zero-dependency-on-app_settings boundary
+    intact.
+
+    use_preset=True (never manually inferring bandwidth/spread_factor/
+    coding_rate from the chosen modem_preset) matches the task's own
+    "Use preset mode" requirement -- those three raw LoRa physics
+    fields are left for the radio's own preset table to fill in.
+    """
+    try:
+        from meshtastic.protobuf import config_pb2
+
+        modem_preset_value = config_pb2.Config.LoRaConfig.ModemPreset.Value(
+            preset.modem_preset
+        )
+    except Exception:
+        return RadioApplyResult(
+            False,
+            "modem_preset",
+            {
+                "modem_preset": ConfigWriteResult(
+                    False, preset.modem_preset, None, "invalid"
+                )
+            },
+        )
+
+    results: dict[str, ConfigWriteResult] = {}
+
+    results["use_preset"] = radio.write_verified_config_field("lora", "use_preset", True)
+    if not results["use_preset"].applied:
+        return RadioApplyResult(False, "use_preset", results)
+
+    results["modem_preset"] = radio.write_verified_config_field(
+        "lora", "modem_preset", modem_preset_value
+    )
+    if not results["modem_preset"].applied:
+        return RadioApplyResult(False, "modem_preset", results)
+
+    results["frequency_slot"] = radio.write_verified_config_field(
+        "lora", "channel_num", preset.frequency_slot
+    )
+    if not results["frequency_slot"].applied:
+        return RadioApplyResult(False, "frequency_slot", results)
+
+    try:
+        psk_bytes = (
+            base64.b64decode(preset.channel_psk_base64)
+            if preset.channel_psk_base64
+            else b""
+        )
+    except Exception:
+        results["channel"] = ConfigWriteResult(
+            False, preset.channel_psk_base64, None, "invalid"
+        )
+        return RadioApplyResult(False, "channel", results)
+
+    results["channel"] = radio.write_verified_primary_channel(
+        name=preset.channel_name, psk=psk_bytes
+    )
+    if not results["channel"].applied:
+        return RadioApplyResult(False, "channel", results)
+
+    return RadioApplyResult(True, "", results)

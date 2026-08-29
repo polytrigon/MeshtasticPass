@@ -267,8 +267,20 @@ class SimulatedRadioService:
             # (Config.LoRaConfig.hop_limit docstring), but a fully valid
             # 0-7 range (see app.HOP_LIMIT_CHOICES) -- this fake radio's
             # own "current value" for the HOP LIMIT RADIO setting, never
-            # a display-side default.
-            "lora": {"hop_limit": 3},
+            # a display-side default. use_preset/modem_preset/
+            # channel_num (ADVANCED RADIO CONFIG) mirror LONG_FAST's own
+            # real default (Config.LoRaConfig.ModemPreset.LONG_FAST == 0,
+            # channel_num 0 == "radio auto-selects") -- these three MUST
+            # already exist here, never only appear once first written,
+            # since write_verified_config_field's own simulated
+            # implementation (below) refuses to write a field this dict
+            # doesn't already declare.
+            "lora": {
+                "hop_limit": 3,
+                "use_preset": True,
+                "modem_preset": 0,
+                "channel_num": 0,
+            },
             # A deterministic, always-present POSITION config section --
             # see item 9: "no current fix" is itself a real, common,
             # honest state, not an error, so the simulated snapshot
@@ -282,6 +294,13 @@ class SimulatedRadioService:
         }
         self._connection_generation = 0
         self._config_snapshot = None
+        # Deterministic fake PRIMARY channel state (ADVANCED RADIO
+        # CONFIG) -- mirrors a real freshly-flashed radio's own default
+        # open "LongFast" primary channel, PSK byte 0x01 (Meshtastic's
+        # own "default channel psk" sentinel -- see meshtastic.util.
+        # fromPSK("default")), matching base64 "AQ==" exactly.
+        self._primary_channel_name = "LongFast"
+        self._primary_channel_psk = bytes([1])
 
     def available_device_paths(self) -> tuple[str, ...]:
         """Return fake ports without asking the host operating system."""
@@ -515,6 +534,30 @@ class SimulatedRadioService:
         section_values[field] = value
         self._rebuild_config_snapshot()
         return ConfigWriteResult(True, value, value, "")
+
+    def read_primary_channel_settings(self) -> tuple[str, bytes] | None:
+        """Deterministic fake read, mirroring RadioService's real method."""
+        if not self._online:
+            return None
+        return (self._primary_channel_name, self._primary_channel_psk)
+
+    def write_verified_primary_channel(
+        self,
+        *,
+        name: str,
+        psk: bytes,
+        timeout: float = 15.0,
+    ) -> ConfigWriteResult:
+        """Deterministic fake write, mirroring RadioService's real method
+        (--simulate always succeeds while online -- see
+        write_verified_config_field's own docstring for why).
+        """
+        if not self._online:
+            return ConfigWriteResult(False, (name, psk), None, "not_connected")
+        self._primary_channel_name = name
+        self._primary_channel_psk = psk
+        self._rebuild_config_snapshot()
+        return ConfigWriteResult(True, (name, psk), (name, psk), "")
 
     def config_snapshot(self):
         """The current connection's cached fake RadioConfigurationSnapshot,

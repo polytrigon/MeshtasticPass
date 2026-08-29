@@ -4124,9 +4124,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_board_label_five_cells_stays_centered_and_glyph_unmoved(
         self,
     ) -> None:
-        """A long name truncates to <= 5 display cells (plus TRACE
+        """A long name truncates to <= 5 display cells (see
 
-        ROUTE's own 2-cell "<marker> " prefix -- see
         mesh_topology.mesh_board_marker_label) on the board label, the
         label stays centered over the glyph's fixed grid anchor, and
         the glyph's own coordinate is completely unaffected by label
@@ -4165,8 +4164,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             label = next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == long_id)
 
             label_text = str(label.render())
-            self.assertLessEqual(cell_len(label_text), MESH_BOARD_LABEL_MAX_CELLS + 2)
-            self.assertTrue(label_text.startswith("• ") or label_text.startswith("* "))
+            self.assertLessEqual(cell_len(label_text), MESH_BOARD_LABEL_MAX_CELLS)
+            self.assertNotIn("•", label_text)
+            self.assertFalse(label_text.startswith("* "))
             # The label sits exactly one row above the glyph, horizontally
             # centered on the SAME column anchor -- never the glyph's own
             # coordinate (see MeshNodeLabelWidget/set_nodes).
@@ -8603,7 +8603,7 @@ class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
             old_text = str(old_label.render())
             # SHORT NAME preferred (see mesh_topology.mesh_board_marker_label,
             # unlike compact_node_label's own long-name-preferred choice).
-            self.assertEqual(old_text, "• V3")
+            self.assertEqual(old_text, "V3")
             self.assertNotEqual(old_text, "YOU")
 
     async def test_self_heard_echo_of_own_transmission_still_renders_you(self) -> None:
@@ -8715,6 +8715,16 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
     def _label_text(self, app: MeshtasticPassApp, node_id: str) -> str:
         return str(
             next(w for w in app.query(MeshNodeLabelWidget) if w.node_id == node_id).render()
+        )
+
+    def _glyph_text(self, app: MeshtasticPassApp, node_id: str) -> str:
+        """The node's actual GRID GLYPH character (UI / CHANNEL / RADIO
+
+        CONFIG TUNING Part A: successful-traceroute evidence replaces
+        this, not the label -- see MeshNodeWidget.refresh_visual).
+        """
+        return str(
+            next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id).render()
         )
 
     # ---- Menu gating ---------------------------------------------------
@@ -8879,7 +8889,8 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             node = next(s.node for s in app.query_one(MeshTopologyView).working_set
                         if s.node.node_id == "!a1111111")
-            self.assertEqual(self._label_text(app, "!a1111111"), "• ALC")
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertNotEqual(self._glyph_text(app, "!a1111111"), "*")
 
             app._start_traceroute(node)
             await pilot.pause()
@@ -8887,7 +8898,10 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE SUCCEEDED")
             self.assertIsNone(app._active_traceroute)
             self.assertIn("!a1111111", app._traceroute_results)
-            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+            # The label never carries the marker (see mesh_board_marker_
+            # label) -- only the node's own GRID GLYPH becomes "*".
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertEqual(self._glyph_text(app, "!a1111111"), "*")
 
             # 10-second lifecycle: after the banner's own dismiss timer
             # fires, the normal status returns.
@@ -8911,7 +8925,8 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE FAILED")
             self.assertIsNone(app._active_traceroute)
             self.assertNotIn("!a1111111", app._traceroute_results)
-            self.assertEqual(self._label_text(app, "!a1111111"), "• ALC")
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertNotEqual(self._glyph_text(app, "!a1111111"), "*")
 
     async def test_later_failure_never_erases_an_earlier_success(self) -> None:
         app = self._make_app(
@@ -8929,12 +8944,14 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
             app._start_traceroute(node)
             await pilot.pause()
-            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertEqual(self._glyph_text(app, "!a1111111"), "*")
 
             app._start_traceroute(node)
             await pilot.pause()
             self.assertEqual(str(app.query_one("#mesh-status").render()), "TRACE FAILED")
-            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertEqual(self._glyph_text(app, "!a1111111"), "*")
             self.assertIn("!a1111111", app._traceroute_results)
 
     async def test_repeated_success_replaces_not_duplicates_the_stored_result(
@@ -9027,8 +9044,10 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("!a1111111", app._traceroute_results)
             self.assertNotIn("!b2222222", app._traceroute_results)
-            self.assertEqual(self._label_text(app, "!a1111111"), "* ALC")
-            self.assertEqual(self._label_text(app, "!b2222222"), "• BOB")
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertEqual(self._glyph_text(app, "!a1111111"), "*")
+            self.assertEqual(self._label_text(app, "!b2222222"), "BOB")
+            self.assertNotEqual(self._glyph_text(app, "!b2222222"), "*")
             self.assertEqual(view.selected_node_id, "!b2222222")
 
     async def test_late_response_after_timeout_is_ignored(self) -> None:
@@ -9073,7 +9092,8 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
             app.traceroute_status_received(FakeEvent())
             self.assertNotIn("!a1111111", app._traceroute_results)
-            self.assertEqual(self._label_text(app, "!a1111111"), "• ALC")
+            self.assertEqual(self._label_text(app, "!a1111111"), "ALC")
+            self.assertNotEqual(self._glyph_text(app, "!a1111111"), "*")
 
     async def test_disconnect_during_trace_cancels_it_silently(self) -> None:
         app = self._make_app(

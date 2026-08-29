@@ -276,38 +276,34 @@ def compact_node_label(node: NodeMetadata, max_cells: int = NODE_WIDTH - 2) -> s
     return f"…{node_id[-(max_cells - 1):]}"
 
 
-def mesh_board_marker_label(
-    node: NodeMetadata, *, traced: bool, max_name_cells: int = NODE_WIDTH - 2
-) -> str:
-    """The MESH board's per-node overlay label (TRACEROUTE Part C): YOU
+def mesh_board_marker_label(node: NodeMetadata, *, max_name_cells: int = NODE_WIDTH - 2) -> str:
+    """The MESH board's per-node label overlay: YOU renders as the
 
-    renders as the literal "YOU" (unchanged); a real remote renders as
-    "<marker> <short name>", where marker is "*" (successful traceroute
-    evidence exists for this destination during this app session -- see
-    MeshtasticPassApp._finish_traceroute_success) or the plain "•"
-    bullet (no such evidence yet) -- matching TRACE ROUTE's own literal
-    "* SHN"/"• SHN" spec text. SHORT NAME is preferred here (unlike
-    compact_node_label's own long-name-preferred choice, used
-    elsewhere for sorting) since the spec explicitly writes "SHN". A
-    compact hint only -- the unified bottom bar (mesh_state.
-    format_mesh_node_bar_fields) always has the full, uncapped identity
-    and the marker carries no claim about currently-rendered connectors
-    (see TRACE ROUTE's own "no visualization changes" scope).
+    literal "YOU" (unchanged); a real remote renders as its bare SHORT
+    NAME (falling back to long name, then node ID). SHORT NAME is
+    preferred here (unlike compact_node_label's own long-name-preferred
+    choice, used elsewhere for sorting) to keep the compact overlay
+    short. UI / CHANNEL / RADIO CONFIG TUNING Part A: this label no
+    longer carries a "•"/"*" marker prefix at all -- that was a SECOND,
+    redundant dot rendered right beside the node's own existing grid
+    glyph (see MeshNodeWidget.refresh_visual, one cell below this
+    label). Successful-traceroute evidence now replaces the GRID
+    GLYPH itself with "*" at the same grid position instead, so there
+    is exactly one glyph per node, never two.
     """
     if node.is_local:
         return "YOU"
-    marker = "*" if traced else "•"
     for candidate in (node.short_name, node.long_name):
         if candidate and cell_len(candidate) <= max_name_cells:
-            return f"{marker} {candidate}"
+            return candidate
     if node.short_name:
-        return f"{marker} {_truncate(node.short_name, max_name_cells)}"
+        return _truncate(node.short_name, max_name_cells)
     if node.long_name:
-        return f"{marker} {_truncate(node.long_name, max_name_cells)}"
+        return _truncate(node.long_name, max_name_cells)
     node_id = node.node_id.strip()
     if cell_len(node_id) <= max_name_cells:
-        return f"{marker} {node_id or 'UNKNOWN'}"
-    return f"{marker} …{node_id[-(max_name_cells - 1):]}"
+        return node_id or "UNKNOWN"
+    return f"…{node_id[-(max_name_cells - 1):]}"
 
 
 def _project_remote_gps_cluster(

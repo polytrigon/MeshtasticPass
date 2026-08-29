@@ -13,6 +13,7 @@ from app_settings import (
     DEFAULT_DEVICE_PATH,
     DEFAULT_FONT_SIZE,
     FONT_SIZE_CHOICES,
+    RadioConfigPreset,
     VALID_COLORS,
     VALID_FONT_SIZES,
 )
@@ -263,6 +264,124 @@ class AppSettingsTests(unittest.TestCase):
             self.assertIn("hidescrollbar=true", updated)
             self.assertIn("custom-setting=preserved", updated)
             self.assertIn("[other]\nvalue=untouched", updated)
+
+
+class RadioConfigPresetPersistenceTests(unittest.TestCase):
+    """ADVANCED RADIO CONFIG (UI / CHANNEL / RADIO CONFIG TUNING Part D):
+
+    saved presets round-trip through the same JSON config file as
+    every other setting, survive a restart, tolerate an older config
+    file with no presets at all, and never lose unrelated settings.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.config_path = Path(self.directory.name) / "config.json"
+
+    def test_existing_config_without_radio_config_presets_still_loads(self) -> None:
+        self.config_path.write_text(
+            json.dumps({"font_size": 18, "color": "amber"}), encoding="utf-8"
+        )
+
+        settings = AppSettings.load(config_path=self.config_path)
+
+        self.assertEqual(settings.radio_config_presets, [])
+        self.assertEqual(settings.font_size, 18)
+        self.assertEqual(settings.color, "amber")
+
+    def test_save_load_delete_round_trips_ms48_acceptance_case(self) -> None:
+        """The real hardware MS48 case: MEDIUM_SLOW, slot 48, a
+
+        legitimately BLANK channel name, and the standard AQ== key.
+        """
+        settings = AppSettings.load(config_path=self.config_path)
+        preset = RadioConfigPreset(
+            name="NYC MS48",
+            modem_preset="MEDIUM_SLOW",
+            frequency_slot=48,
+            channel_name="",
+            channel_psk_base64="AQ==",
+        )
+
+        settings.save_radio_config_preset(preset)
+        settings.save()
+
+        reloaded = AppSettings.load(config_path=self.config_path)
+        self.assertEqual(reloaded.radio_config_preset_names(), ("NYC MS48",))
+        restored = reloaded.get_radio_config_preset("NYC MS48")
+        self.assertEqual(restored.modem_preset, "MEDIUM_SLOW")
+        self.assertEqual(restored.frequency_slot, 48)
+        self.assertEqual(restored.channel_name, "")
+        self.assertEqual(restored.channel_psk_base64, "AQ==")
+
+        reloaded.delete_radio_config_preset("NYC MS48")
+        reloaded.save()
+        final = AppSettings.load(config_path=self.config_path)
+        self.assertEqual(final.radio_config_presets, [])
+
+    def test_saving_an_existing_name_updates_rather_than_duplicates(self) -> None:
+        settings = AppSettings.load(config_path=self.config_path)
+        settings.save_radio_config_preset(
+            RadioConfigPreset(name="Home", modem_preset="LONG_FAST", frequency_slot=0)
+        )
+        settings.save_radio_config_preset(
+            RadioConfigPreset(name="Home", modem_preset="MEDIUM_SLOW", frequency_slot=20)
+        )
+
+        self.assertEqual(len(settings.radio_config_presets), 1)
+        self.assertEqual(settings.get_radio_config_preset("Home").modem_preset, "MEDIUM_SLOW")
+
+    def test_empty_preset_name_is_rejected(self) -> None:
+        settings = AppSettings.load(config_path=self.config_path)
+        with self.assertRaises(ValueError):
+            settings.save_radio_config_preset(
+                RadioConfigPreset(name="  ", modem_preset="LONG_FAST")
+            )
+
+    def test_malformed_preset_entries_are_skipped_not_crashed_on(self) -> None:
+        self.config_path.write_text(
+            json.dumps(
+                {
+                    "radio_config_presets": [
+                        {"name": "Valid", "modem_preset": "LONG_FAST"},
+                        {"name": "", "modem_preset": "LONG_FAST"},
+                        {"modem_preset": "LONG_FAST"},
+                        {"name": "NoPreset"},
+                        "not even a dict",
+                        42,
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        settings = AppSettings.load(config_path=self.config_path)
+
+        self.assertEqual(settings.radio_config_preset_names(), ("Valid",))
+
+    def test_unrelated_settings_survive_a_preset_save(self) -> None:
+        settings = AppSettings.load(config_path=self.config_path)
+        settings.set_favorite("!a11ce001", True)
+        settings.set_font_size(22)
+        settings.save_radio_config_preset(
+            RadioConfigPreset(name="Home", modem_preset="LONG_FAST")
+        )
+        settings.save()
+
+        reloaded = AppSettings.load(config_path=self.config_path)
+        self.assertTrue(reloaded.is_favorite("!a11ce001"))
+        self.assertEqual(reloaded.font_size, 22)
+        self.assertEqual(reloaded.radio_config_preset_names(), ("Home",))
+
+    def test_hop_limit_has_no_place_in_the_preset_model(self) -> None:
+        """HOP LIMIT stays independent -- structural proof, not just
+
+        behavioral: RadioConfigPreset has no hop_limit field to move it
+        into in the first place.
+        """
+        preset = RadioConfigPreset(name="Home", modem_preset="LONG_FAST")
+        self.assertFalse(hasattr(preset, "hop_limit"))
 
 
 if __name__ == "__main__":

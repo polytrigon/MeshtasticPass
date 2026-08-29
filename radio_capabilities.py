@@ -96,6 +96,64 @@ def role_choices() -> tuple[tuple[str, int], ...]:
     )
 
 
+def modem_preset_choices() -> tuple[tuple[str, str], ...]:
+    """Every Config.LoRaConfig.ModemPreset value the installed protobuf
+
+    schema declares, as (friendly_label, enum_name) pairs -- discovered
+    from the schema itself (mirrors role_choices exactly), never a
+    hardcoded preset list. The enum NAME (e.g. "MEDIUM_SLOW"), not its
+    number, is the value here and the one persisted in
+    RadioConfigPreset.modem_preset -- names are stable across a
+    protobuf schema's own internal renumbering in a way raw numbers are
+    not, and read naturally in a saved-config file. Converted to the
+    actual enum number only at the radio-write boundary (see
+    radio_service.apply_radio_config_preset). Returns an empty tuple if
+    the installed package or this exact field is unavailable, rather
+    than raising.
+    """
+    try:
+        from meshtastic.protobuf import config_pb2
+    except ImportError:
+        return ()
+    preset_field = config_pb2.Config.LoRaConfig.DESCRIPTOR.fields_by_name.get(
+        "modem_preset"
+    )
+    if preset_field is None or preset_field.enum_type is None:
+        return ()
+    return tuple(
+        (value.name.replace("_", " "), value.name)
+        for value in preset_field.enum_type.values
+    )
+
+
+def modem_preset_enum_name(raw_value: Any) -> str | None:
+    """The raw LoRaConfig.modem_preset enum NUMBER's own symbolic NAME
+
+    (e.g. "MEDIUM_SLOW", read via RadioService.read_synced_config_field
+    ("lora", "modem_preset")) -- None if this installed schema does not
+    recognize it, never a raised exception.
+    """
+    try:
+        from meshtastic.protobuf import config_pb2
+
+        return config_pb2.Config.LoRaConfig.ModemPreset.Name(raw_value)
+    except Exception:
+        return None
+
+
+def modem_preset_friendly_label(raw_value: Any) -> str:
+    """Convert a raw modem_preset enum NUMBER into the same friendly
+
+    label modem_preset_choices() produces for it -- "UNKNOWN(n)" for a
+    value this installed schema does not recognize, matching
+    _enum_name's own never-raise convention.
+    """
+    name = modem_preset_enum_name(raw_value)
+    if name is None:
+        return f"UNKNOWN({raw_value!r})"
+    return name.replace("_", " ")
+
+
 def describe_scalar_fields(message: Any) -> dict[str, str]:
     """Flatten one protobuf message's own scalar fields (never
 
