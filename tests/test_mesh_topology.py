@@ -151,6 +151,30 @@ def _bar_field(text: str, field: str) -> str:
     return text[start:] if end == -1 else text[start:end]
 
 
+def _bar_long_name(text: str) -> str:
+    """The bar's first " • "-separated segment -- the long-name VALUE,
+
+    with no "LONG NAME" descriptor (removed in the FINAL MESHTASTIC
+    POLISH pass; see mesh_state.format_mesh_node_bar_line).
+    """
+    end = text.find(" • ")
+    return text if end == -1 else text[:end]
+
+
+def _bar_short_name(text: str) -> str:
+    """The bar's second " • "-separated segment -- the short-name VALUE,
+
+    with no "SHORT NAME" descriptor. Only meaningful at a width where
+    short name has not itself been dropped (see format_mesh_node_bar_
+    line's own degradation tiers) -- callers must pick a wide enough
+    available_width for this to mean what it says.
+    """
+    first_end = text.index(" • ")
+    second_end = text.find(" • ", first_end + 3)
+    start = first_end + 3
+    return text[start:] if second_end == -1 else text[start:second_end]
+
+
 def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
     nodes = [NodeMetadata("!00000000", "Local", "ME", 0, 1_000.0, True)]
     for index in range(1, count):
@@ -2420,9 +2444,11 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         """YOU's bar carries no literal "YOU" label, HOPS 0, real GPS
 
         (SimulatedRadioService's local node record carries
-        SIMULATED_LOCAL_POSITION, a real fix), DISTANCE "--", and TIME
+        SIMULATED_LOCAL_POSITION, a real fix), DISTANCE "--", and ELAPSE
         "NOW" -- SimulatedRadioService reports the connected radio's
-        own identity as "Simulated Node"/"SIM" (see RadioInfo).
+        own identity as "Simulated Node"/"SIM" (see RadioInfo). No
+        "LONG NAME"/"SHORT NAME" descriptor labels (FINAL MESHTASTIC
+        POLISH pass) -- just the bare values, long name first.
         """
         app = self._make_app()
         # A wide terminal so the bar renders its fullest (tier 1) form --
@@ -2434,9 +2460,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("YOU", status)
             self.assertEqual(
                 status,
-                "LONG NAME Simulated Node • SHORT NAME SIM • HOPS 0 • "
+                "Simulated Node • SIM • HOPS 0 • "
                 "GPS 40.7128, -74.0060 • DISTANCE -- • "
-                "LINK ---- -- / -- • TIME NOW",
+                "LINK ---- -- / -- • ELAPSE NOW",
             )
 
     async def test_node_bar_for_client(self) -> None:
@@ -2837,7 +2863,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!075bcd15")
             status = _bar_text(app)
-            self.assertTrue(status.startswith("LONG NAME North Node"))
+            self.assertTrue(status.startswith("North Node"))
 
     # ---- Anonymous relay-stage topology (hop-count based) --------------
 
@@ -2997,7 +3023,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(view.selected_node_id, target_id)
             self.assertNotIn(view.selected_node_id, relay_ids)
             status = _bar_text(app)
-            self.assertTrue(status.startswith("LONG NAME Target Node"))
+            self.assertTrue(status.startswith("Target Node"))
 
             # No wrapping: one more "up" from the real node changes nothing.
             await pilot.press("up")
@@ -3009,7 +3035,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(view.selected_node_id, you_id)
             status = _bar_text(app)
             self.assertIn("HOPS 0", status)
-            self.assertIn("TIME NOW", status)
+            self.assertIn("ELAPSE NOW", status)
 
             self.assertEqual(view.board.styles.offset, board_offset_before)
             self.assertFalse(view.show_vertical_scrollbar)
@@ -3089,7 +3115,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(int(relay_widget.styles.width.value), 1)
             status = _bar_text(app)
             self.assertIn("HOPS 0", status)
-            self.assertIn("TIME NOW", status)
+            self.assertIn("ELAPSE NOW", status)
 
     async def test_select_node_accepts_only_real_working_set_nodes(self) -> None:
         """MeshTopologyView.select_node() is authoritative: only a real
@@ -3542,7 +3568,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             status_widget = app.query_one("#mesh-connection-status")
             self.assertFalse(status_widget.display)
             text = _bar_text(app)
-            self.assertIn("TIME", text)
+            self.assertIn("ELAPSE", text)
             self.assertNotIn("STATUS", text)
 
     async def test_mesh_topology_not_rebuilt_by_connection_status_change(
@@ -3993,13 +4019,13 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             # DISPLAY_UNITS_METRIC (see MESH VIEW PASS item 11 / spec
             # section 37: distance now honestly reflects the connected
             # radio's own UNITS setting rather than a hardcoded "mi").
-            self.assertEqual(_bar_field(status, "LONG NAME"), "Bob Basecamp")
-            self.assertEqual(_bar_field(status, "SHORT NAME"), "BOB")
+            self.assertEqual(_bar_long_name(status), "Bob Basecamp")
+            self.assertEqual(_bar_short_name(status), "BOB")
             self.assertEqual(_bar_field(status, "HOPS"), "1")
             self.assertEqual(
                 _bar_field(status, "DISTANCE"), f"{expected_distance * KM_PER_MILE:.1f} km"
             )
-            self.assertNotEqual(_bar_field(status, "TIME"), "?")
+            self.assertNotEqual(_bar_field(status, "ELAPSE"), "?")
 
     async def test_selected_context_missing_short_name_and_distance(self) -> None:
         app = self._make_app()
@@ -4028,15 +4054,15 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, target_id)
             await pilot.pause()
             status = _bar_text(app)
-            # SHORT NAME always resolves to something displayable --
+            # short name always resolves to something displayable --
             # falls back to the node ID rather than being omitted (see
             # format_mesh_node_bar_fields).
-            self.assertEqual(_bar_field(status, "SHORT NAME"), target_id)
+            self.assertEqual(_bar_short_name(status), target_id)
             # No shared GPS fix (YOU has no position at all in this
             # fixture) -> DISTANCE is the honest "--", never a
             # fabricated/unit-suffixed unknown value.
             self.assertEqual(_bar_field(status, "DISTANCE"), "--")
-            self.assertEqual(_bar_field(status, "LONG NAME"), "No Short Name")
+            self.assertEqual(_bar_long_name(status), "No Short Name")
 
     async def test_distance_unchanged_by_recentering(self) -> None:
         app = self._make_app()
@@ -4772,7 +4798,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!qu1et000")
             status = _bar_text(app)
-            self.assertTrue(status.startswith("LONG NAME Quiet"))
+            self.assertTrue(status.startswith("Quiet"))
 
     async def test_no_orphan_relays_under_realistic_mixed_topology(self) -> None:
         """Reproduction of the hardware-observed "phantom relay" report:
@@ -5761,11 +5787,11 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!ag1ng001")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "5s")
+            self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "5s")
 
             app._refresh_mesh(wall_now=now + 30)
             await pilot.pause()
-            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "35s")
+            self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "35s")
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
@@ -5792,7 +5818,7 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             first_text = _bar_text(app)
-            self.assertEqual(_bar_field(first_text, "TIME"), "42s")
+            self.assertEqual(_bar_field(first_text, "ELAPSE"), "42s")
 
             for _ in range(3):
                 app._refresh_mesh(wall_now=now)
@@ -5817,13 +5843,13 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!upd00001")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "1m")
+            self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "1m")
 
             fresh_heard = NodeMetadata("!upd00001", "Updater", last_heard=now)
             app.radio.get_known_nodes = lambda nodes=(local, fresh_heard): nodes
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "0s")
+            self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "0s")
 
     async def test_returning_online_restores_the_bar(self) -> None:
         """CONNECTING shows the shared status in the TOP widget; the bar
@@ -5844,7 +5870,7 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!re1turn0")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("TIME", _bar_text(app))
+            self.assertIn("ELAPSE", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.CONNECTING)
@@ -5857,7 +5883,7 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             app._show_connection(RadioState.ONLINE, app.radio.info)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("TIME", _bar_text(app))
+            self.assertIn("ELAPSE", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
             self.assertEqual(len(list(app.query("#mesh-connection-status"))), 1)
             self.assertEqual(len(list(app.query("#mesh-node-bar"))), 1)
@@ -5885,7 +5911,7 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!stale002")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("TIME", _bar_text(app))
+            self.assertIn("ELAPSE", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.OFFLINE, message="lost")
@@ -5979,7 +6005,7 @@ class MeshNodeBarLayoutTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Golf Sierra Portable", text)
             self.assertNotIn("…", text)
             self.assertIn("LINK ---- -- / --", text)
-            self.assertIn("SHORT NAME GSP", text)
+            self.assertIn("Golf Sierra Portable • GSP", text)
             self.assertLessEqual(cell_len(text), bar_widget.size.width)
 
     async def test_bar_degrades_gracefully_at_narrow_width_without_wrapping(
@@ -6065,7 +6091,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             text = _bar_text(app)
             self.assertEqual(_bar_field(text, "LINK"), "▂▄▆█ -87 / +6")
-            self.assertEqual(_bar_field(text, "TIME"), "3s")
+            self.assertEqual(_bar_field(text, "ELAPSE"), "3s")
 
     async def test_selected_multi_hop_node_shows_honest_fallback_not_a_guess(
         self,
@@ -6093,7 +6119,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             text = _bar_text(app)
             self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
-            self.assertEqual(_bar_field(text, "TIME"), "3s")
+            self.assertEqual(_bar_field(text, "ELAPSE"), "3s")
 
     async def test_you_selected_never_queries_link(self) -> None:
         """A radio has no RF link to itself -- selecting YOU must show
@@ -6124,7 +6150,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             text = _bar_text(app)
             self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
-            self.assertEqual(_bar_field(text, "TIME"), "NOW")
+            self.assertEqual(_bar_field(text, "ELAPSE"), "NOW")
             self.assertNotIn(local.node_id, queried_ids)
 
     async def test_changing_selection_switches_link_data_immediately(self) -> None:
@@ -6210,7 +6236,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             text = _bar_text(app)
             self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
-            self.assertEqual(_bar_field(text, "TIME"), "3s")
+            self.assertEqual(_bar_field(text, "ELAPSE"), "3s")
 
 
 class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
@@ -8283,7 +8309,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
             status_before = _bar_text(app)
-            self.assertTrue(status_before.startswith("LONG NAME Simulated Node"))
+            self.assertTrue(status_before.startswith("Simulated Node"))
 
             await self._swap_to_v4(app, pilot)
 
@@ -8292,7 +8318,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             # _refresh_mesh() call is the entire rerender mechanism.
             status_after = _bar_text(app)
             self.assertTrue(
-                status_after.startswith("LONG NAME V4 Radio • SHORT NAME V4")
+                status_after.startswith("V4 Radio • V4")
             )
             self.assertEqual(app.current_tab, "mesh")
 
@@ -8342,7 +8368,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self._swap_to_v4(app, pilot, extra_nodes=(old_radio_with_position,))
             status = _bar_text(app)
             self.assertTrue(
-                status.startswith("LONG NAME V4 Radio • SHORT NAME V4")
+                status.startswith("V4 Radio • V4")
             )
             self.assertNotIn(format_coordinates(south_of_local(9)), status)
             you_gps_text = _bar_field(status, "GPS")
@@ -8356,7 +8382,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!aaaaaaaa")
             await pilot.pause()
             remote_status = _bar_text(app)
-            self.assertTrue(remote_status.startswith("LONG NAME Old V3 • SHORT NAME V3"))
+            self.assertTrue(remote_status.startswith("Old V3 • V3"))
             distance_segment = _bar_field(remote_status, "DISTANCE")
             self.assertNotEqual(distance_segment, "--")
             expected_km = distance_between(north_of_local(1), south_of_local(9)) * KM_PER_MILE
@@ -8532,7 +8558,7 @@ class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
 
             # The unified bar still correctly shows the real identity.
             status = _bar_text(app)
-            self.assertTrue(status.startswith("LONG NAME V4 Radio • SHORT NAME V4"))
+            self.assertTrue(status.startswith("V4 Radio • V4"))
 
     async def test_topology_label_renders_you_with_accent2_color(self) -> None:
         app = self._make_app()

@@ -498,12 +498,19 @@ def format_mesh_link_display(
 class MeshNodeBarFields:
     """Display-ready field values for MESH's single unified bottom bar
 
-    (MESH GPS + UNIFIED BAR Part B), replacing the previous separate
-    bottom-left node-context line and bottom-right LINK/LAST UPDATE
-    line. Every field independently resolves to something displayable
-    -- "?"/"--"/MESH_LINK_METER_UNKNOWN, never blank or fabricated --
-    so format_mesh_node_bar_line never needs a second per-field
-    missing-data branch.
+    (MESH GPS + UNIFIED BAR Part B; label cleanup in the FINAL MESHTASTIC
+    POLISH pass), replacing the previous separate bottom-left node-context
+    line and bottom-right LINK/LAST UPDATE line. Every field independently
+    resolves to something displayable -- "?"/"--"/MESH_LINK_METER_UNKNOWN,
+    never blank or fabricated -- so format_mesh_node_bar_line never needs
+    a second per-field missing-data branch.
+
+    format_mesh_node_bar_line renders long_name/short_name as bare
+    values with no "LONG NAME"/"SHORT NAME" descriptor prefix (removed
+    in the FINAL MESHTASTIC POLISH pass as redundant -- position alone
+    already establishes which is which, long name always first);
+    hops_text/gps_text/distance_text/link_*/elapse_text keep their own
+    descriptor prefixes unchanged.
     """
 
     long_name: str
@@ -515,7 +522,7 @@ class MeshNodeBarFields:
     link_meter: str
     link_rssi_text: str
     link_snr_text: str
-    time_text: str
+    elapse_text: str
     accent2: bool
 
 
@@ -531,7 +538,7 @@ def format_mesh_node_bar_fields(
     YOU (state.node.is_local): HOPS is literally "0" (YOU is zero hops
     from itself by definition, regardless of whatever raw hops_away a
     NodeDB record happens to carry for the local node), DISTANCE is
-    always "--" (no distance from yourself), TIME is literally "NOW",
+    always "--" (no distance from yourself), ELAPSE is literally "NOW",
     and `link` is expected to already be None from the caller (a radio
     has no RF link to itself -- see app.py's _update_mesh_node_bar,
     which never even calls get_link_quality for YOU); format_mesh_link_
@@ -539,14 +546,15 @@ def format_mesh_node_bar_fields(
     a real "never heard directly" remote gets, so no extra branch is
     needed here either way.
 
-    A remote's TIME is the more recent of CHAT interaction time and
-    NodeDB last_heard -- the SAME "freshest known signal" combination
-    build_mesh_working_set's own ranking already uses -- never CHAT
-    interaction time alone (which would wrongly show "?" for a NodeDB-
-    only node last_heard already knows is recent), and explicitly NOT
-    LINK's own observed_at (a directly-heard packet's timestamp is a
-    different fact than "when did we last hear anything at all from
-    this node").
+    A remote's ELAPSE (renamed from TIME in the FINAL MESHTASTIC POLISH
+    pass -- same underlying freshness source and formatting, label only)
+    is the more recent of CHAT interaction time and NodeDB last_heard --
+    the SAME "freshest known signal" combination build_mesh_working_set's
+    own ranking already uses -- never CHAT interaction time alone (which
+    would wrongly show "?" for a NodeDB-only node last_heard already
+    knows is recent), and explicitly NOT LINK's own observed_at (a
+    directly-heard packet's timestamp is a different fact than "when did
+    we last hear anything at all from this node").
     """
     node = state.node
     long_name = _clean_text(node.long_name) or _clean_text(node.short_name) or node.node_id
@@ -562,7 +570,7 @@ def format_mesh_node_bar_fields(
     if node.is_local:
         hops_text = "0"
         distance_text = "--"
-        time_text = "NOW"
+        elapse_text = "NOW"
     else:
         hops_text = f"{node.hops_away}" if node.hops_away is not None else "?"
         distance_text = (
@@ -577,9 +585,9 @@ def format_mesh_node_bar_fields(
         ]
         last_seen_at = max(last_seen_candidates) if last_seen_candidates else None
         if last_seen_at is None or last_seen_at > now:
-            time_text = "?"
+            elapse_text = "?"
         else:
-            time_text = format_relative_age(now - last_seen_at)
+            elapse_text = format_relative_age(now - last_seen_at)
 
     return MeshNodeBarFields(
         long_name=long_name,
@@ -591,7 +599,7 @@ def format_mesh_node_bar_fields(
         link_meter=link_display.meter,
         link_rssi_text=link_display.rssi_text,
         link_snr_text=link_display.snr_text,
-        time_text=time_text,
+        elapse_text=elapse_text,
         accent2=node.is_local,
     )
 
@@ -603,15 +611,23 @@ def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int
     precision first, then dropping lower-priority fields -- rather than
     ever wrapping onto a second line:
 
-    1. FULL: LONG NAME - SHORT NAME - HOPS - GPS (4dp) - DISTANCE - LINK
-       (spaced raw values) - TIME
+    1. FULL: long name - short name - HOPS - GPS (4dp) - DISTANCE - LINK
+       (spaced raw values) - ELAPSE
     2. COMPACT VALUES: same fields, GPS at 2dp and LINK's raw values
        tightened (no surrounding spaces)
     3. drop GPS
     4. drop GPS and DISTANCE
-    5. drop SHORT NAME too (LONG NAME - HOPS - LINK - TIME)
-    6. drop LINK too (LONG NAME - HOPS - TIME) -- the bare minimum that
-       still identifies the node and its two most essential facts
+    5. drop short name too (long name - HOPS - LINK - ELAPSE)
+    6. drop LINK too (long name - HOPS - ELAPSE) -- the bare minimum
+       that still identifies the node and its two most essential facts
+
+    long name/short name render as bare values (FINAL MESHTASTIC POLISH
+    pass: the "LONG NAME"/"SHORT NAME" descriptors were removed as
+    redundant -- position alone already establishes which is which,
+    long name always first); HOPS/GPS/DISTANCE/LINK/ELAPSE keep their
+    own descriptor prefixes unchanged (ELAPSE itself renamed from TIME,
+    same underlying freshness source and formatting -- see
+    format_mesh_node_bar_fields).
 
     `available_width <= 0` (not yet laid out) shows the fullest tier
     untouched, mirroring this MESH view's other width-aware lines
@@ -622,48 +638,48 @@ def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int
     link_compact = f"{fields.link_meter} {fields.link_rssi_text}/{fields.link_snr_text}"
     candidates = (
         " • ".join((
-            f"LONG NAME {fields.long_name}",
-            f"SHORT NAME {fields.short_name}",
+            fields.long_name,
+            fields.short_name,
             f"HOPS {fields.hops_text}",
             f"GPS {fields.gps_text}",
             f"DISTANCE {fields.distance_text}",
             f"LINK {link_full}",
-            f"TIME {fields.time_text}",
+            f"ELAPSE {fields.elapse_text}",
         )),
         " • ".join((
-            f"LONG NAME {fields.long_name}",
-            f"SHORT NAME {fields.short_name}",
+            fields.long_name,
+            fields.short_name,
             f"HOPS {fields.hops_text}",
             f"GPS {fields.gps_text_compact}",
             f"DISTANCE {fields.distance_text}",
             f"LINK {link_compact}",
-            f"TIME {fields.time_text}",
+            f"ELAPSE {fields.elapse_text}",
         )),
         " • ".join((
-            f"LONG NAME {fields.long_name}",
-            f"SHORT NAME {fields.short_name}",
+            fields.long_name,
+            fields.short_name,
             f"HOPS {fields.hops_text}",
             f"DISTANCE {fields.distance_text}",
             f"LINK {link_compact}",
-            f"TIME {fields.time_text}",
+            f"ELAPSE {fields.elapse_text}",
         )),
         " • ".join((
-            f"LONG NAME {fields.long_name}",
-            f"SHORT NAME {fields.short_name}",
+            fields.long_name,
+            fields.short_name,
             f"HOPS {fields.hops_text}",
             f"LINK {link_compact}",
-            f"TIME {fields.time_text}",
+            f"ELAPSE {fields.elapse_text}",
         )),
         " • ".join((
-            f"LONG NAME {fields.long_name}",
+            fields.long_name,
             f"HOPS {fields.hops_text}",
             f"LINK {link_compact}",
-            f"TIME {fields.time_text}",
+            f"ELAPSE {fields.elapse_text}",
         )),
         " • ".join((
-            f"LONG NAME {fields.long_name}",
+            fields.long_name,
             f"HOPS {fields.hops_text}",
-            f"TIME {fields.time_text}",
+            f"ELAPSE {fields.elapse_text}",
         )),
     )
     if available_width <= 0:

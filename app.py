@@ -960,6 +960,17 @@ class ChannelChatState:
     mounted_target: int = DEFAULT_HISTORY_LIMIT
     open_scroll_pending: bool = False
     loaded: bool = False
+    # The channel_key (ChannelInfo.stable_key) `entries` was actually
+    # queried with (FINAL MESHTASTIC POLISH -- CHAT channel-history
+    # isolation) -- None means "loaded before the radio's real channel
+    # identity was known" (this app's own pre-connection placeholder).
+    # _ensure_channel_loaded compares this against the CURRENT stable
+    # key on every access, never trusting `loaded` alone: a same-index
+    # radio reconfiguration (e.g. slot 0 LongFast -> MediumSlow between
+    # runs) must invalidate an already-"loaded" cache the instant the
+    # real identity resolves to something different than what it was
+    # last queried with, even though the index itself never changed.
+    loaded_key: str | None = None
     new_message_ids: set[int] = field(default_factory=set)
     unread_message_ids: set[int] = field(default_factory=set)
     pending_older_ids: set[tuple[str, int]] = field(default_factory=set)
@@ -1121,6 +1132,30 @@ class EndOfChatHistoryMarker(Static):
         super().__init__(
             "END OF CHAT HISTORY",
             id="end-of-chat-history",
+            markup=False,
+        )
+
+
+class StartOfChannelHistoryMarker(Static):
+    """Informational-only proof a channel has zero stored messages yet.
+
+    (FINAL MESHTASTIC POLISH -- CHAT channel-history isolation.) Purely
+    a rendered Static line, exactly like EndOfChatHistoryMarker: never
+    inserted into chat_history/state.entries, never given a message_id,
+    never counted toward unread/new, never a resend/delete/reply
+    target -- there is simply no ChatEntry for it to be. Removed
+    automatically (see _insert_chat_widget) the instant this channel's
+    first real message is inserted, and only ever mounted for a
+    CHANNEL (see _initial_chat_widgets) -- DM conversations use their
+    own separate empty-state handling, if any, untouched here.
+    """
+
+    can_focus = False
+
+    def __init__(self, channel_label: str) -> None:
+        super().__init__(
+            f"This is the start of {channel_label} channel history",
+            id="start-of-channel-history",
             markup=False,
         )
 
@@ -3352,6 +3387,18 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
+    #start-of-channel-history {
+        width: 1fr;
+        height: 1;
+        margin-bottom: 1;
+        color: $snow_dim;
+        text-align: center;
+    }
+
+    Screen.theme-amber #start-of-channel-history {
+        color: $amber_dim;
+    }
+
     #load-older:focus, .message-action:focus {
         text-style: reverse;
     }
@@ -5458,6 +5505,33 @@ class MeshtasticPassApp(App[None]):
     def _state_for(self, channel_index: int) -> ChannelChatState:
         return self._channel_states.setdefault(channel_index, ChannelChatState())
 
+    def _channel_key_for(self, channel_index: int) -> str | None:
+        """The live radio's own stable identity for this channel slot.
+
+        None means "unknown" (index not found, or the radio hasn't
+        reported a real ChannelSettings.id/psk for it yet -- e.g. the
+        pre-connection placeholder channel list) -- see
+        ChannelInfo.stable_key and ChannelChatState.loaded_key.
+        """
+        for channel in self._channels:
+            if channel.index == channel_index:
+                return channel.stable_key or None
+        return None
+
+    def _channel_label(self, channel_index: int) -> str:
+        """The current channel selector's own presentation label.
+
+        Falls back exactly like RadioService._read_channel_info's own
+        "Channel {index + 1}" convention when the index isn't in the
+        live list (e.g. not yet connected) -- so the empty-history
+        marker (StartOfChannelHistoryMarker) always shows something
+        sensible rather than a blank/placeholder name.
+        """
+        for channel in self._channels:
+            if channel.index == channel_index:
+                return channel.name
+        return f"Channel {channel_index + 1}"
+
     def _capture_current_channel_state(self) -> None:
         state = self._state_for(self.current_channel_index)
         state.entries = self.chat_history
@@ -5481,16 +5555,35 @@ class MeshtasticPassApp(App[None]):
         return state
 
     def _ensure_channel_loaded(self, channel_index: int) -> ChannelChatState:
+        """Load `channel_index` from the store the FIRST time it is
+
+        touched this app run, and never again after that (`state.loaded`
+        latches permanently true) -- this method deliberately never
+        re-queries or replaces `state.entries` for an already-loaded
+        state: doing so here (rather than through
+        _reconcile_current_channel_identity's own careful compare-then-
+        remount) would silently desync self.chat_history's objects from
+        whatever ChatEntryWidgets are already mounted for the CURRENT
+        channel (identity comparisons like _trim_mounted_chat_window's
+        `widget.entry is entry` would then never match). A same-slot
+        identity change discovered later is handled entirely by
+        _show_connection's own channel-sync block instead -- see
+        _reconcile_current_channel_identity (current channel) and
+        _invalidate_reassigned_channel_caches (every other channel).
+        """
         state = self._state_for(channel_index)
         if state.loaded:
             return state
         state.loaded = True
+        key = self._channel_key_for(channel_index)
+        state.loaded_key = key
         if self.chat_store is None:
             return state
         try:
             page = self.chat_store.load_recent_page(
                 channel_index=channel_index,
                 limit=DEFAULT_HISTORY_LIMIT,
+                channel_key=key,
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -5499,6 +5592,54 @@ class MeshtasticPassApp(App[None]):
         state.has_older_history = page.has_older
         state.open_scroll_pending = bool(page.messages)
         return state
+
+    def _invalidate_reassigned_channel_caches(
+        self, new_channels: tuple[ChannelInfo, ...]
+    ) -> None:
+        """Drop the cached state for any NON-CURRENT channel whose live
+
+        identity changed since it was last loaded (CHAT channel-history
+        isolation). Safe to simply discard entirely: unlike the
+        CURRENTLY-displayed channel there is no already-mounted
+        transcript here to keep in sync (see
+        _reconcile_current_channel_identity, which handles that harder,
+        remount-aware case for the current channel instead) -- the next
+        access just reloads from scratch, exactly like a channel
+        touched for the first time this run.
+        """
+        live_keys = {channel.index: channel.stable_key or None for channel in new_channels}
+        for index in list(self._channel_states):
+            if index == self.current_channel_index:
+                continue
+            state = self._channel_states[index]
+            if not state.loaded or state.loaded_key is None:
+                continue
+            live_key = live_keys.get(index)
+            if live_key is not None and live_key != state.loaded_key:
+                del self._channel_states[index]
+
+    def _initial_chat_widgets(
+        self, channel_index: int, state: ChannelChatState
+    ) -> list[Static | ChatEntryWidget]:
+        """The widget list a freshly (re)mounted transcript starts with.
+
+        Shared by _load_chat_history (startup), _switch_channel (user-
+        driven switch), and _show_connection's post-reconnect identity
+        reload -- one place decides between LOAD OLDER, END OF CHAT
+        HISTORY, and the new empty-channel marker (CHAT channel-history
+        isolation), so the three call sites can never drift apart.
+        """
+        widgets: list[Static | ChatEntryWidget] = []
+        if state.has_older_history:
+            widgets.append(LoadOlderControl())
+        elif state.entries and self.chat_store is not None:
+            widgets.append(EndOfChatHistoryMarker())
+        elif self.chat_store is not None:
+            widgets.append(
+                StartOfChannelHistoryMarker(self._channel_label(channel_index))
+            )
+        widgets.extend(self._chat_entry_widget(entry) for entry in state.entries)
+        return widgets
 
     async def _switch_channel(self, channel_index: int) -> None:
         # Selecting a channel always switches CHAT into CHANNEL mode
@@ -5515,18 +5656,25 @@ class MeshtasticPassApp(App[None]):
             self._mark_new_messages_read()
         self._capture_current_channel_state()
         state = self._restore_channel_state(channel_index)
+        await self._mount_channel_transcript(channel_index, state)
+
+    async def _mount_channel_transcript(
+        self, channel_index: int, state: ChannelChatState
+    ) -> None:
+        """Rebuild the mounted transcript to match `state` for `channel_index`.
+
+        The shared tail of a user-driven _switch_channel AND a
+        background identity-driven refresh of the ALREADY-displayed
+        channel (see _reconcile_current_channel_identity) -- both need
+        the exact same "clear, remount from state" behavior.
+        """
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
             chat_inputs[0].value = state.draft
             chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
         await transcript.remove_children()
-        widgets: list[Static | ChatEntryWidget] = []
-        if state.has_older_history:
-            widgets.append(LoadOlderControl())
-        elif state.entries and self.chat_store is not None:
-            widgets.append(EndOfChatHistoryMarker())
-        widgets.extend(self._chat_entry_widget(entry) for entry in state.entries)
+        widgets = self._initial_chat_widgets(channel_index, state)
         if widgets:
             await transcript.mount(*widgets)
         if self.current_tab == "chat" and self._chat_mode == "channel":
@@ -5541,6 +5689,66 @@ class MeshtasticPassApp(App[None]):
 
         self._render_chat_status()
 
+    async def _reconcile_current_channel_identity(self) -> None:
+        """Refresh the CURRENTLY-displayed channel if its live identity
+
+        changed since it was loaded (CHAT channel-history isolation).
+        Handles the one case _show_connection's own channel-sync block
+        cannot: a same-INDEX radio reconfiguration (e.g. slot 0
+        LongFast -> MediumSlow, whether discovered between app runs or
+        mid-session) never trips "selected_index != current_channel_
+        index", since the index itself never changes -- only what it
+        now MEANS does.
+
+        A no-op the overwhelming majority of the time (ordinary
+        reconnect, nothing reconfigured): only issues a second query
+        when the live channel_key actually differs from what is
+        currently mounted, and only remounts the transcript when that
+        query's result set is genuinely different content -- never a
+        visible refresh on every ordinary reconnect.
+        """
+        channel_index = self.current_channel_index
+        state = self._state_for(channel_index)
+        key = self._channel_key_for(channel_index)
+        if state.loaded_key == key:
+            return
+        if self.chat_store is None:
+            state.loaded_key = key
+            return
+        try:
+            page = self.chat_store.load_recent_page(
+                channel_index=channel_index,
+                limit=DEFAULT_HISTORY_LIMIT,
+                channel_key=key,
+            )
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+            return
+        fresh_ids = tuple(stored.id for stored in page.messages)
+        current_ids = tuple(entry.message_id for entry in state.entries)
+        # loaded_key is recorded regardless of whether content changed --
+        # this key has now been validated against the store either way,
+        # so the next reconcile has nothing left to re-check until the
+        # live identity changes again.
+        state.loaded_key = key
+        if fresh_ids == current_ids:
+            return
+        # A GENUINE difference: `state.entries`/self.chat_history are only
+        # ever replaced with fresh objects in THIS branch, never on the
+        # equal-content path above -- replacing them unconditionally would
+        # desync already-mounted ChatEntryWidgets (which hold references
+        # to the OLD entry objects) from self.chat_history's new objects,
+        # breaking every `widget.entry is entry` identity comparison
+        # elsewhere (e.g. _trim_mounted_chat_window) even though nothing
+        # actually needed to change.
+        state.entries = [stored_chat_entry(stored) for stored in page.messages]
+        state.has_older_history = page.has_older
+        state.open_scroll_pending = bool(page.messages)
+        state.loaded = True
+        self.chat_history = state.entries
+        self._has_older_history = state.has_older_history
+        await self._mount_channel_transcript(channel_index, state)
+
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         """Compatibility wrapper for callers that already appended an entry."""
         self._insert_chat_widget(entry, self.chat_history.index(entry), older=False)
@@ -5553,6 +5761,13 @@ class MeshtasticPassApp(App[None]):
         older: bool,
     ) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
+        # The empty-channel marker (StartOfChannelHistoryMarker) is only
+        # ever mounted when a channel has zero entries -- the first real
+        # entry inserted anywhere in the transcript makes it stale by
+        # definition, so it is removed unconditionally here rather than
+        # left for some later refresh to notice.
+        for marker in transcript.query(StartOfChannelHistoryMarker):
+            marker.remove()
         if not self._has_older_history and self.chat_store is not None:
             self._ensure_end_history_marker(transcript)
         if self.current_tab != "chat" or self._chat_mode != "channel":
@@ -7588,13 +7803,7 @@ class MeshtasticPassApp(App[None]):
     def _load_chat_history(self) -> None:
         state = self._restore_channel_state(self.current_channel_index)
         transcript = self.query_one("#chat-log", ChatTranscript)
-        widgets: list[Static | ChatEntryWidget] = []
-        if state.has_older_history:
-            widgets.append(LoadOlderControl())
-        elif state.entries and self.chat_store is not None:
-            widgets.append(EndOfChatHistoryMarker())
-        for entry in state.entries:
-            widgets.append(self._chat_entry_widget(entry))
+        widgets = self._initial_chat_widgets(self.current_channel_index, state)
         if widgets:
             transcript.mount(*widgets)
 
@@ -7613,6 +7822,7 @@ class MeshtasticPassApp(App[None]):
                 oldest_id,
                 channel_index=self.current_channel_index,
                 limit=OLDER_HISTORY_PAGE_SIZE,
+                channel_key=self._channel_key_for(self.current_channel_index),
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -7698,6 +7908,11 @@ class MeshtasticPassApp(App[None]):
                 radio_rx_at=entry.radio_rx_at,
                 received_at=entry.app_received_at,
                 dm_node_id=entry.dm_node_id,
+                channel_key=(
+                    None
+                    if entry.dm_node_id
+                    else self._channel_key_for(entry.channel_index)
+                ),
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -7715,6 +7930,11 @@ class MeshtasticPassApp(App[None]):
                 local_sent_at=entry.local_sent_at or entry.app_received_at,
                 delivery_state=(entry.delivery_state or DeliveryState.SENDING).value,
                 dm_node_id=entry.dm_node_id,
+                channel_key=(
+                    None
+                    if entry.dm_node_id
+                    else self._channel_key_for(entry.channel_index)
+                ),
             )
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
@@ -7985,6 +8205,7 @@ class MeshtasticPassApp(App[None]):
         if not (state is RadioState.ONLINE and was_online):
             self._reset_clock_sync_state()
         if state is RadioState.ONLINE and info is not None and info.channels:
+            self._invalidate_reassigned_channel_caches(info.channels)
             self._channels = info.channels
             selector = self.query_one(ChannelSelector)
             available_indexes = {channel.index for channel in self._channels}
@@ -8002,6 +8223,16 @@ class MeshtasticPassApp(App[None]):
                 self.run_worker(
                     self._switch_channel(selected_index),
                     name="select-available-channel",
+                )
+            else:
+                # selected_index == current_channel_index tells us
+                # nothing about whether the CHANNEL at that index is
+                # still the same one -- a same-slot reconfiguration
+                # (see CHAT channel-history isolation) needs its own
+                # check here.
+                self.run_worker(
+                    self._reconcile_current_channel_identity(),
+                    name="reconcile-current-channel-identity",
                 )
         self._refresh_device_options()
         self._status_dot_count = 1

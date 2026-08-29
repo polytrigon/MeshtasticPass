@@ -38,8 +38,8 @@ from radio_service import (
 
 SIMULATED_DEVICE_PATHS = ("/dev/ttyUSB0", "/dev/ttyUSB1")
 SIMULATED_CHANNELS = (
-    ChannelInfo(0, "LongFast"),
-    ChannelInfo(1, "Hiking"),
+    ChannelInfo(0, "LongFast", stable_key="sim-longfast"),
+    ChannelInfo(1, "Hiking", stable_key="sim-hiking"),
 )
 
 

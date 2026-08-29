@@ -264,10 +264,24 @@ class TracerouteStatus:
 
 @dataclass(frozen=True)
 class ChannelInfo:
-    """One enabled application-facing Meshtastic channel."""
+    """One enabled application-facing Meshtastic channel.
+
+    `stable_key` (FINAL MESHTASTIC POLISH pass -- CHAT channel-history
+    isolation) is this channel's own cryptographic/assigned identity --
+    NEVER derived from `index` (a mutable radio-assigned SLOT NUMBER
+    the user can freely reassign to a completely different channel,
+    e.g. reconfiguring slot 0 from "LongFast" to "MediumSlow") and
+    never from `name` alone either (a bare rename must not fabricate a
+    new identity out of thin air with no cryptographic backing -- see
+    _read_channel_info). Empty string means "not yet known" (e.g. this
+    app's own pre-connection placeholder channel list) -- CHAT history
+    isolation treats that as "unknown," never as a real identity to
+    compare against.
+    """
 
     index: int
     name: str
+    stable_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -2107,9 +2121,66 @@ class RadioService:
             name = raw_name.strip() if isinstance(raw_name, str) else ""
             if not name and index == 0:
                 name = RadioService._primary_channel_default_name(local_node)
-            result.append(ChannelInfo(index, name or f"Channel {index + 1}"))
+            resolved_name = name or f"Channel {index + 1}"
+            result.append(
+                ChannelInfo(
+                    index,
+                    resolved_name,
+                    stable_key=RadioService._channel_stable_key(settings, resolved_name),
+                )
+            )
             seen_indexes.add(index)
         return tuple(sorted(result, key=lambda channel: channel.index))
+
+    @staticmethod
+    def _channel_stable_key(settings: Any, resolved_name: str) -> str:
+        """This channel's own cryptographic/assigned identity (CHAT
+
+        channel-history isolation) -- NEVER the radio-assigned slot
+        index, which a user can freely reassign to a completely
+        different channel (e.g. reconfiguring slot 0 from "LongFast" to
+        "MediumSlow") while keeping the SAME index. Preference order:
+
+        1. Channel.settings.id -- PROTOBUF-SOURCE-VERIFIED (channel_pb2.pyi):
+           "Used to construct a globally unique channel ID... Any time
+           a non wire compatible change is made to a channel, this
+           field should be regenerated." The SDK's own purpose-built,
+           64-bit, collision-negligible answer to exactly this question
+           -- used whenever the connected firmware actually populates it
+           (0 is its unset/default value, never a real assigned id).
+        2. meshtastic.util.generate_channel_hash(name, psk) -- the SAME
+           8-bit "channel number" hash Meshtastic's own official tooling
+           (meshtastic.node) already computes for channel disambiguation,
+           paired with the resolved display name here specifically to
+           close the "two different names happen to hash the same" case
+           (the hash alone has a real, if small, 1-in-256 collision
+           floor for two independently-chosen PSKs -- not eliminated by
+           this pairing, just not made worse by name-only guessing).
+        3. The resolved display name alone, if `settings`/`psk` are
+           unavailable for some reason -- strictly better than the bare
+           index (a rename is at least a DELIBERATE, visible user
+           action, unlike a same-index slot reassignment), even though
+           it cannot detect a same-name-different-PSK reassignment.
+
+        Returns "" (never a fabricated key) only if `settings` itself
+        is entirely unavailable -- callers treat "" as "unknown," the
+        same honest default a pre-connection placeholder channel uses.
+        """
+        if settings is None:
+            return ""
+        settings_id = RadioService._optional_int(getattr(settings, "id", None))
+        if settings_id:
+            return f"id:{settings_id}"
+        psk = getattr(settings, "psk", None)
+        if isinstance(psk, (bytes, bytearray)) and psk:
+            try:
+                from meshtastic.util import generate_channel_hash
+
+                channel_hash = generate_channel_hash(resolved_name, bytes(psk))
+            except Exception:
+                return resolved_name
+            return f"hash:{resolved_name}:{channel_hash}"
+        return resolved_name
 
     @staticmethod
     def _primary_channel_default_name(local_node: Any) -> str:

@@ -180,10 +180,11 @@ class ChatStoreTests(unittest.TestCase):
             "SELECT version FROM schema_version"
         ).fetchone()[0]
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual([message.text for message in messages], ["preserved"])
         self.assertIsNone(messages[0].origin_sent_at)
         self.assertIsNone(messages[0].dm_node_id)
+        self.assertIsNone(messages[0].channel_key)
 
     def test_cursor_pages_are_bounded_and_chronological(self) -> None:
         for index in range(175):
@@ -1055,10 +1056,11 @@ class DirectMessagePersistenceTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v2 preserved"])
         self.assertIsNone(messages[0].dm_node_id)
+        self.assertIsNone(messages[0].channel_key)
         # The migrated store must correctly support new DM traffic too.
         reopened.add_incoming(
             packet_id=1,
@@ -1073,6 +1075,273 @@ class DirectMessagePersistenceTests(unittest.TestCase):
         )
         dm_messages = reopened.load_recent_dm_page("!newdm01").messages
         self.assertEqual([m.text for m in dm_messages], ["works after migration"])
+
+
+class ChannelKeyIsolationTests(unittest.TestCase):
+    """CHAT channel-history isolation (FINAL MESHTASTIC POLISH pass):
+
+    a same-slot radio reconfiguration (e.g. index 0 LongFast ->
+    MediumSlow) must not resurface the OTHER identity's history under
+    the new one, and grandfathered legacy (NULL channel_key) rows must
+    stay visible rather than silently vanish.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "chat.db"
+        self.store = ChatStore.open(self.path)
+        self.addCleanup(self.store.close)
+
+    def test_v3_database_without_channel_key_column_migrates_cleanly(self) -> None:
+        self.store.close()
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """
+            DROP TABLE IF EXISTS send_attempts;
+            DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS schema_version;
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (3);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                packet_id INTEGER,
+                node_id TEXT,
+                sender_name TEXT,
+                sender_short_name TEXT,
+                channel_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                origin_sent_at REAL,
+                radio_rx_at REAL,
+                received_at REAL NOT NULL,
+                local_sent_at REAL,
+                delivery_state TEXT,
+                created_at REAL NOT NULL,
+                dm_node_id TEXT
+            );
+            INSERT INTO messages VALUES (
+                1, 'incoming', 88, '!v3node', 'V3 Node', 'V3', 0,
+                'v3 preserved', 200, 201, 201, NULL, NULL, 201, NULL
+            );
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        reopened = ChatStore.open(self.path)
+        self.addCleanup(reopened.close)
+        version = reopened._connection.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        self.assertEqual(version, 4)
+        messages = reopened.load_recent()
+        self.assertEqual([m.text for m in messages], ["v3 preserved"])
+        self.assertIsNone(messages[0].channel_key)
+
+    def test_channel_key_none_returns_every_row_unfiltered(self) -> None:
+        """Identity not yet known -- e.g. before the radio connects --
+
+        must show whatever is already there, exactly like before this
+        column existed.
+        """
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!node001",
+            sender_name="Node",
+            sender_short_name="NODE",
+            channel_index=0,
+            text="key A message",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key="id:aaa",
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!node002",
+            sender_name="Node",
+            sender_short_name="NODE",
+            channel_index=0,
+            text="key B message",
+            radio_rx_at=101.0,
+            received_at=101.0,
+            channel_key="id:bbb",
+        )
+
+        page = self.store.load_recent_page(channel_index=0, channel_key=None)
+
+        self.assertEqual(
+            [m.text for m in page.messages],
+            ["key A message", "key B message"],
+        )
+
+    def test_channel_key_mismatch_excludes_the_other_identity(self) -> None:
+        """A same-slot reconfiguration's OLD history stays out of view
+
+        once the NEW identity's key is known -- the actual repro this
+        column exists to fix.
+        """
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!longfast1",
+            sender_name="LongFast Node",
+            sender_short_name="LF",
+            channel_index=0,
+            text="longfast history",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key="id:longfast",
+        )
+
+        page = self.store.load_recent_page(
+            channel_index=0, channel_key="id:mediumslow"
+        )
+
+        self.assertEqual(page.messages, ())
+
+    def test_channel_key_match_includes_only_that_identity(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!longfast1",
+            sender_name="LongFast Node",
+            sender_short_name="LF",
+            channel_index=0,
+            text="longfast history",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key="id:longfast",
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!mediumslow1",
+            sender_name="MediumSlow Node",
+            sender_short_name="MS",
+            channel_index=0,
+            text="mediumslow history",
+            radio_rx_at=101.0,
+            received_at=101.0,
+            channel_key="id:mediumslow",
+        )
+
+        page = self.store.load_recent_page(
+            channel_index=0, channel_key="id:mediumslow"
+        )
+
+        self.assertEqual(
+            [m.text for m in page.messages], ["mediumslow history"]
+        )
+
+    def test_legacy_null_channel_key_rows_are_grandfathered_in(self) -> None:
+        """A row written before this column existed has no recorded
+
+        identity to compare against -- it must stay visible rather than
+        be silently hidden by a later, unrelated channel_key filter.
+        """
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!legacy001",
+            sender_name="Legacy Node",
+            sender_short_name="LEG",
+            channel_index=0,
+            text="legacy row",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+
+        page = self.store.load_recent_page(
+            channel_index=0, channel_key="id:mediumslow"
+        )
+
+        self.assertEqual([m.text for m in page.messages], ["legacy row"])
+
+    def test_duplicate_display_names_stay_isolated_by_channel_key(self) -> None:
+        """Two channels sharing the same display NAME (e.g. both named
+
+        "LongFast" but with different PSKs) are still kept apart --
+        identity here is never the display name, only the stable key.
+        """
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!alice",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="first LongFast",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key="id:longfast-A",
+        )
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!bob",
+            sender_name="Bob",
+            sender_short_name="BOB",
+            channel_index=1,
+            text="second LongFast",
+            radio_rx_at=101.0,
+            received_at=101.0,
+            channel_key="id:longfast-B",
+        )
+
+        first = self.store.load_recent_page(channel_index=0, channel_key="id:longfast-A")
+        second = self.store.load_recent_page(channel_index=1, channel_key="id:longfast-B")
+
+        self.assertEqual([m.text for m in first.messages], ["first LongFast"])
+        self.assertEqual([m.text for m in second.messages], ["second LongFast"])
+
+    def test_outgoing_channel_key_round_trips(self) -> None:
+        self.store.add_outgoing(
+            text="outgoing on mediumslow",
+            channel_index=0,
+            local_sent_at=200.0,
+            delivery_state="SENT",
+            channel_key="id:mediumslow",
+        )
+
+        matching = self.store.load_recent_page(channel_index=0, channel_key="id:mediumslow")
+        mismatched = self.store.load_recent_page(channel_index=0, channel_key="id:longfast")
+
+        self.assertEqual(
+            [m.text for m in matching.messages], ["outgoing on mediumslow"]
+        )
+        self.assertEqual(mismatched.messages, ())
+
+    def test_load_older_page_also_respects_channel_key(self) -> None:
+        for index in range(60):
+            self.store.add_incoming(
+                packet_id=index + 1,
+                node_id="!node",
+                sender_name="Node",
+                sender_short_name="NODE",
+                channel_index=0,
+                text=f"mediumslow {index}",
+                radio_rx_at=100.0 + index,
+                received_at=100.0 + index,
+                channel_key="id:mediumslow",
+            )
+        self.store.add_incoming(
+            packet_id=9999,
+            node_id="!oldnode",
+            sender_name="Old Node",
+            sender_short_name="OLD",
+            channel_index=0,
+            text="stale longfast",
+            radio_rx_at=1.0,
+            received_at=1.0,
+            channel_key="id:longfast",
+        )
+
+        recent = self.store.load_recent_page(
+            channel_index=0, channel_key="id:mediumslow", limit=50
+        )
+        older = self.store.load_older_page(
+            recent.messages[0].id,
+            channel_index=0,
+            channel_key="id:mediumslow",
+            limit=50,
+        )
+
+        self.assertNotIn("stale longfast", [m.text for m in older.messages])
 
 
 if __name__ == "__main__":

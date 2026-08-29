@@ -442,14 +442,14 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
 class FormatMeshNodeBarFieldsTests(unittest.TestCase):
     """MESH GPS + UNIFIED BAR Part B: per-field resolution for the single
 
-    unified bottom bar (LONG NAME / SHORT NAME / HOPS / GPS / DISTANCE /
-    LINK / TIME), replacing the old format_mesh_context_line.
+    unified bottom bar (long name / short name / HOPS / GPS / DISTANCE /
+    LINK / ELAPSE), replacing the old format_mesh_context_line.
     """
 
     def test_you_fields_have_no_you_label_and_no_self_link(self) -> None:
         """YOU gets no literal "YOU" anywhere, HOPS "0", DISTANCE "--",
 
-        TIME "NOW", accent2=True, and the honest no-link placeholder --
+        ELAPSE "NOW", accent2=True, and the honest no-link placeholder --
         never a fabricated self-observation.
         """
         state = MeshNodeState(
@@ -462,7 +462,7 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
         self.assertNotIn("YOU", fields.short_name)
         self.assertEqual(fields.hops_text, "0")
         self.assertEqual(fields.distance_text, "--")
-        self.assertEqual(fields.time_text, "NOW")
+        self.assertEqual(fields.elapse_text, "NOW")
         self.assertTrue(fields.accent2)
         self.assertEqual(fields.link_meter, MESH_LINK_METER_UNKNOWN)
         self.assertEqual(fields.link_rssi_text, "--")
@@ -503,7 +503,7 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
         self.assertEqual(fields.short_name, "BOB")
         self.assertEqual(fields.hops_text, "1")
         self.assertEqual(fields.distance_text, "--")
-        self.assertEqual(fields.time_text, "30m")
+        self.assertEqual(fields.elapse_text, "30m")
         self.assertFalse(fields.accent2)
 
     def test_remote_with_known_distance(self) -> None:
@@ -592,10 +592,12 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
 
 
 class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
-    """TIME is the selected NODE's own freshness/last-heard age -- NOT
+    """ELAPSE (renamed from TIME in the FINAL MESHTASTIC POLISH pass --
 
-    LINK-observation age (see format_mesh_node_bar_fields' TIME
-    computation, ported verbatim from the old format_mesh_context_line).
+    same underlying source/formatting) is the selected NODE's own
+    freshness/last-heard age -- NOT LINK-observation age (see
+    format_mesh_node_bar_fields' elapse_text computation, ported
+    verbatim from the old format_mesh_context_line).
     """
 
     def test_active_nodedb_only_node_shows_concrete_time(self) -> None:
@@ -605,7 +607,7 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
         )
         self.assertTrue(is_node_active(node.last_heard, NOW))
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.time_text, "2m")
+        self.assertEqual(fields.elapse_text, "2m")
 
     def test_stale_nodedb_only_node_shows_concrete_older_time(self) -> None:
         stale_heard = NOW - ACTIVE_WINDOW_SECONDS - 3 * 60
@@ -615,7 +617,7 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
         )
         self.assertFalse(is_node_active(node.last_heard, NOW))
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.time_text, format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60))
+        self.assertEqual(fields.elapse_text, format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60))
 
     def test_missing_last_heard_and_chat_history_stays_question_mark(self) -> None:
         node = NodeMetadata("!nodata001", "No Data", "ND", 1, last_heard=None)
@@ -623,7 +625,7 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.time_text, "?")
+        self.assertEqual(fields.elapse_text, "?")
 
     def test_chat_history_does_not_substitute_when_last_heard_is_fresher(self) -> None:
         node = NodeMetadata("!fresh0001", "Fresher", "FR", 1, last_heard=NOW - 10)
@@ -631,7 +633,7 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
             node=node, is_client=True, is_relay=False, last_interaction_at=NOW - 5000
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.time_text, "10s")
+        self.assertEqual(fields.elapse_text, "10s")
 
     def test_last_heard_does_not_substitute_when_chat_is_fresher(self) -> None:
         node = NodeMetadata("!fresh0002", "ChatFresh", "CF", 1, last_heard=NOW - 5000)
@@ -639,15 +641,15 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
             node=node, is_client=True, is_relay=False, last_interaction_at=NOW - 20
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.time_text, "20s")
+        self.assertEqual(fields.elapse_text, "20s")
 
     def test_wall_time_advancing_ages_time_without_new_data(self) -> None:
         node = NodeMetadata("!aging0001", "Ager", "AG", 1, last_heard=NOW - 5)
         state = MeshNodeState(
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW).time_text, "5s")
-        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW + 30).time_text, "35s")
+        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW).elapse_text, "5s")
+        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW + 30).elapse_text, "35s")
 
     def test_link_observation_age_never_substitutes_for_node_time(self) -> None:
         """A stale/irrelevant LINK observation must never influence TIME --
@@ -661,7 +663,7 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
         )
         stale_link = LinkObservation(rssi=-90, snr=-5, observed_at=NOW - 9999)
         fields = format_mesh_node_bar_fields(state, now=NOW, link=stale_link)
-        self.assertEqual(fields.time_text, "5s")
+        self.assertEqual(fields.elapse_text, "5s")
 
     def test_you_time_is_always_now_regardless_of_last_heard(self) -> None:
         you_with_stale_last_heard = NodeMetadata("!you", "Local", "ME", 0, NOW - 99999, True)
@@ -671,7 +673,7 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
             is_relay=False,
             last_interaction_at=None,
         )
-        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW).time_text, "NOW")
+        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW).elapse_text, "NOW")
 
 
 class FormatMeshLinkDisplayTests(unittest.TestCase):
@@ -772,7 +774,7 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
         link_meter="▂▄▆█",
         link_rssi_text="-87",
         link_snr_text="+6",
-        time_text="25s",
+        elapse_text="25s",
         accent2=False,
     )
 
@@ -780,9 +782,9 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=200)
         self.assertEqual(
             text,
-            "LONG NAME SomeNode • SHORT NAME NODE • HOPS 2 • "
+            "SomeNode • NODE • HOPS 2 • "
             "GPS 40.7634, -73.9508 • DISTANCE 3.2 km • "
-            "LINK ▂▄▆█ -87 / +6 • TIME 25s",
+            "LINK ▂▄▆█ -87 / +6 • ELAPSE 25s",
         )
 
     def test_unmeasured_width_shows_the_fullest_tier_untouched(self) -> None:
@@ -801,8 +803,8 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
 
     def test_dropping_gps_only_keeps_the_other_fields(self) -> None:
         tier3 = (
-            "LONG NAME SomeNode • SHORT NAME NODE • HOPS 2 • DISTANCE 3.2 km "
-            "• LINK ▂▄▆█ -87/+6 • TIME 25s"
+            "SomeNode • NODE • HOPS 2 • DISTANCE 3.2 km "
+            "• LINK ▂▄▆█ -87/+6 • ELAPSE 25s"
         )
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier3))
         self.assertEqual(text, tier3)
@@ -810,20 +812,20 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
         self.assertIn("DISTANCE", text)
 
     def test_narrow_width_drops_gps_and_distance(self) -> None:
-        tier4 = "LONG NAME SomeNode • SHORT NAME NODE • HOPS 2 • LINK ▂▄▆█ -87/+6 • TIME 25s"
+        tier4 = "SomeNode • NODE • HOPS 2 • LINK ▂▄▆█ -87/+6 • ELAPSE 25s"
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier4))
         self.assertEqual(text, tier4)
         self.assertNotIn("GPS", text)
         self.assertNotIn("DISTANCE", text)
 
     def test_very_narrow_width_drops_short_name_too(self) -> None:
-        tier5 = "LONG NAME SomeNode • HOPS 2 • LINK ▂▄▆█ -87/+6 • TIME 25s"
+        tier5 = "SomeNode • HOPS 2 • LINK ▂▄▆█ -87/+6 • ELAPSE 25s"
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier5))
         self.assertEqual(text, tier5)
-        self.assertNotIn("SHORT NAME", text)
+        self.assertNotIn("NODE", text)
 
     def test_narrowest_useful_width_drops_link_too(self) -> None:
-        tier6 = "LONG NAME SomeNode • HOPS 2 • TIME 25s"
+        tier6 = "SomeNode • HOPS 2 • ELAPSE 25s"
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier6))
         self.assertEqual(text, tier6)
         self.assertNotIn("LINK", text)
@@ -832,14 +834,26 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=5)
         self.assertLessEqual(cell_len(text), 5)
 
-    def test_you_bar_never_shows_a_you_label_and_uses_now_for_time(self) -> None:
+    def test_no_long_name_or_short_name_descriptor_labels(self) -> None:
+        """FINAL MESHTASTIC POLISH: the "LONG NAME"/"SHORT NAME" descriptor
+
+        words are gone -- only the bare values remain, long name first,
+        short name second. HOPS/GPS/DISTANCE/LINK keep their own
+        descriptors unchanged.
+        """
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=200)
+        self.assertNotIn("LONG NAME", text)
+        self.assertNotIn("SHORT NAME", text)
+        self.assertTrue(text.startswith("SomeNode • NODE • HOPS"))
+
+    def test_you_bar_never_shows_a_you_label_and_uses_now_for_elapse(self) -> None:
         state = MeshNodeState(
             node=YOU, is_client=False, is_relay=False, last_interaction_at=None
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
         text = format_mesh_node_bar_line(fields, available_width=200)
         self.assertNotIn("YOU", text)
-        self.assertIn("TIME NOW", text)
+        self.assertIn("ELAPSE NOW", text)
         self.assertIn("HOPS 0", text)
         self.assertIn("DISTANCE --", text)
         self.assertIn("LINK ---- -- / --", text)

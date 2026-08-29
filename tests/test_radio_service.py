@@ -94,7 +94,10 @@ class RadioServiceTests(unittest.TestCase):
 
         self.assertEqual(
             RadioService._read_channel_info(local_node),
-            (ChannelInfo(0, "LongFast"), ChannelInfo(1, "Hiking")),
+            (
+                ChannelInfo(0, "LongFast", stable_key="LongFast"),
+                ChannelInfo(1, "Hiking", stable_key="Hiking"),
+            ),
         )
 
     def test_duplicate_channel_names_remain_safe_identity_is_index(self) -> None:
@@ -114,7 +117,13 @@ class RadioServiceTests(unittest.TestCase):
 
         result = RadioService._read_channel_info(local_node)
 
-        self.assertEqual(result, (ChannelInfo(0, "Camp"), ChannelInfo(1, "Camp")))
+        self.assertEqual(
+            result,
+            (
+                ChannelInfo(0, "Camp", stable_key="Camp"),
+                ChannelInfo(1, "Camp", stable_key="Camp"),
+            ),
+        )
         self.assertEqual({channel.index for channel in result}, {0, 1})
 
     def test_three_enabled_channels_all_shown_not_just_primary(self) -> None:
@@ -137,9 +146,9 @@ class RadioServiceTests(unittest.TestCase):
         self.assertEqual(
             result,
             (
-                ChannelInfo(0, "LongFast"),
-                ChannelInfo(1, "Hiking"),
-                ChannelInfo(2, "Hoboken"),
+                ChannelInfo(0, "LongFast", stable_key="LongFast"),
+                ChannelInfo(1, "Hiking", stable_key="Hiking"),
+                ChannelInfo(2, "Hoboken", stable_key="Hoboken"),
             ),
         )
 
@@ -161,7 +170,7 @@ class RadioServiceTests(unittest.TestCase):
 
         result = RadioService._read_channel_info(local_node)
 
-        self.assertEqual(result, (ChannelInfo(0, "LongFast"),))
+        self.assertEqual(result, (ChannelInfo(0, "LongFast", stable_key="LongFast"),))
 
     def test_reading_channel_info_touches_only_already_synced_data(self) -> None:
         """Item 20/33: _read_channel_info is a pure function over the
@@ -181,7 +190,7 @@ class RadioServiceTests(unittest.TestCase):
 
         result = RadioService._read_channel_info(local_node)
 
-        self.assertEqual(result, (ChannelInfo(0, "LongFast"),))
+        self.assertEqual(result, (ChannelInfo(0, "LongFast", stable_key="LongFast"),))
 
     def test_close_does_not_crash_after_unplug(self) -> None:
         service = RadioService()
