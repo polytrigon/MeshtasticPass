@@ -61,7 +61,8 @@ from mesh_state import (
     MESH_STALE_THRESHOLD_SECONDS,
     MeshNodeState,
     build_mesh_working_set,
-    format_mesh_context_line,
+    format_mesh_node_bar_fields,
+    format_mesh_node_bar_line,
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
@@ -82,6 +83,7 @@ from mesh_topology import (
     route_connector_avoiding,
 )
 from mesh_topology import _route_connector_alternate_elbow
+from mesh_topology import _compress_distance_to_radius
 import mesh_topology as mesh_topology_module
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
 from relative_time import format_relative_age
@@ -122,6 +124,28 @@ def north_of_local(miles: float) -> GeoPosition:
 
 def south_of_local(miles: float) -> GeoPosition:
     return GeoPosition(-miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
+
+
+def _bar_text(app: MeshtasticPassApp) -> str:
+    """MESH GPS + UNIFIED BAR Part B: the single #mesh-node-bar widget's
+
+    rendered text -- replaces the old separate #mesh-context-status/
+    #mesh-last-update widgets this test module used to query directly.
+    """
+    return str(app.query_one("#mesh-node-bar").render())
+
+
+def _bar_field(text: str, field: str) -> str:
+    """Extract one " • "-separated "FIELD value" segment's value from a
+
+    unified-bar string (e.g. _bar_field(text, "DISTANCE") -> "3.2 km") --
+    tolerant of a value that itself contains " • " or "/" (LINK's raw
+    values), since it only ever splits on the FIELD-NAME boundaries.
+    """
+    marker = f"{field} "
+    start = text.index(marker) + len(marker)
+    end = text.find(" • ", start)
+    return text[start:] if end == -1 else text[start:end]
 
 
 def sample_nodes(count: int = 8) -> tuple[NodeMetadata, ...]:
@@ -169,16 +193,22 @@ def client_state(
 
 class MeshTopologyModelTests(unittest.TestCase):
     def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
-        """The exact worked example: Jim < Alice < YOU < Bob on the x-axis."""
+        """MESH GPS PLACEMENT: real distance now genuinely differentiates
+
+        radius (see _compress_distance_to_radius) -- Jim < Alice < YOU
+        < Bob on the x-axis, with Bob's real ~40x-farther distance
+        compressed to a MODEST extra grid step, never a literal 40x
+        pixel gap.
+        """
         local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
         alice = NodeMetadata(
-            "!alice", "Alice", "ALCE", None, 1_000.0, False, position=west_of_local(1)
+            "!alice", "Alice", "ALCE", None, 1_000.0, False, position=west_of_local(0.5)
         )
         jim = NodeMetadata(
-            "!jim", "Jim", "JIM", None, 1_000.0, False, position=west_of_local(2)
+            "!jim", "Jim", "JIM", None, 1_000.0, False, position=west_of_local(3)
         )
         bob = NodeMetadata(
-            "!bob", "Bob", "BOB", None, 1_000.0, False, position=east_of_local(4)
+            "!bob", "Bob", "BOB", None, 1_000.0, False, position=east_of_local(20)
         )
         layout = build_topology([local, alice, jim, bob])
         by_id = {item.node.node_id: item for item in layout.nodes}
@@ -190,11 +220,18 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertLess(by_id["!alice"].x, by_id["!local"].x)
         self.assertLess(by_id["!local"].x, by_id["!bob"].x)
 
-        # Bob is 4x farther than Alice but must not sit 4x farther visually:
-        # one grid step per rank, regardless of the real-world mile gap.
+        # Jim (radius 2) sits genuinely farther from Alice (radius 1)
+        # than Alice sits from local -- distance-informed, not a
+        # uniform one-step-per-node ladder irrespective of the real
+        # gap -- but Bob's own ~40x-farther real distance (radius 3,
+        # the same cap any non-GPS/hop-based node already respects)
+        # never produces anywhere close to a 40x pixel gap.
         alice_gap = by_id["!local"].x - by_id["!alice"].x
         jim_gap = by_id["!alice"].x - by_id["!jim"].x
-        self.assertEqual(alice_gap, jim_gap)
+        bob_gap = by_id["!bob"].x - by_id["!local"].x
+        self.assertGreater(jim_gap, 0)
+        self.assertGreater(bob_gap, alice_gap)
+        self.assertLess(bob_gap, alice_gap * 40)
 
     def test_north_and_south_nodes_placed_up_and_down(self) -> None:
         local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
@@ -213,9 +250,15 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertLess(by_id["!local"].y, by_id["!sam"].y)
 
     def test_distance_orders_outward_without_proportional_spacing(self) -> None:
+        """far is genuinely ~500x farther than near in the real world --
+
+        MESH GPS PLACEMENT compresses that gap onto a couple of extra
+        grid steps (see _compress_distance_to_radius), never a literal
+        500x pixel gap, while still placing far genuinely farther out.
+        """
         local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
         near = NodeMetadata(
-            "!near", "Near", "N", None, 1_000.0, False, position=west_of_local(1)
+            "!near", "Near", "N", None, 1_000.0, False, position=west_of_local(0.5)
         )
         far = NodeMetadata(
             "!far", "Far", "F", None, 1_000.0, False, position=west_of_local(500)
@@ -225,7 +268,8 @@ class MeshTopologyModelTests(unittest.TestCase):
         self.assertLess(by_id["!far"].x, by_id["!near"].x)
         near_gap = by_id["!local"].x - by_id["!near"].x
         far_gap = by_id["!near"].x - by_id["!far"].x
-        self.assertEqual(near_gap, far_gap)
+        self.assertGreater(far_gap, 0)
+        self.assertLess(far_gap, near_gap * 500)
 
     def test_grid_radius_is_clamped_and_never_explodes_the_board(self) -> None:
         local = NodeMetadata("!local", "YOU", None, 0, 1_000.0, True, position=LOCAL_GEO)
@@ -841,16 +885,22 @@ class MeshGridPlacementTests(unittest.TestCase):
         self.assertEqual(row, 2)  # center_row(5) - full up_room(3)
 
     def test_spread_does_not_shrink_when_room_is_already_fully_used(self) -> None:
-        """Three same-direction nodes already spanning the full 3-row
+        """Three same-direction nodes, at real distances landing on
 
-        headroom must land at exactly their original ranks (4, 3, 2) --
-        spreading only ever stretches outward when there is slack, never
-        compresses when the available room is already fully used.
+        MESH GPS PLACEMENT's own three distinct compression radii (1,
+        2, 3 -- see _compress_distance_to_radius), already spanning the
+        full 3-row headroom, must land at exactly their original ranks
+        (4, 3, 2) -- spreading only ever stretches outward when there
+        is slack, never compresses when the available room is already
+        fully used.
         """
         nodes = [YOU] + [
-            NodeMetadata(f"!n{i}", f"N{i}", position=north_of_local(i + 1)) for i in range(3)
+            NodeMetadata(f"!n{i}", f"N{i}", position=north_of_local(miles))
+            for i, miles in enumerate((0.5, 3.0, 50.0))
         ]
         slots = assign_grid_slots(nodes, max_radius=3)
+        radii = sorted({abs(item.y) for item in slots if item.node.node_id != "!you"})
+        self.assertEqual(radii, [1, 2, 3])
         positions = place_within_bounds(
             slots, center_row=5, center_column=11, row_count=8, column_count=21
         )
@@ -1088,6 +1138,156 @@ class MeshLayoutStabilityStickyPositionTests(unittest.TestCase):
                 min_extent=extent,
             )
             self.assertEqual(positions, first_positions)
+
+
+class CompressDistanceToRadiusTests(unittest.TestCase):
+    """Pure tests for MESH GPS PLACEMENT's own real-distance -> grid-
+
+    step-radius compression (see _compress_distance_to_radius's own
+    docstring for the exact breakpoint ladder and why it exists).
+    """
+
+    def test_under_first_breakpoint_is_radius_one(self) -> None:
+        self.assertEqual(_compress_distance_to_radius(0.0, 3), 1)
+        self.assertEqual(_compress_distance_to_radius(0.999, 3), 1)
+
+    def test_each_breakpoint_crossed_adds_one_radius_step(self) -> None:
+        self.assertEqual(_compress_distance_to_radius(1.0, 3), 1)
+        self.assertEqual(_compress_distance_to_radius(1.001, 3), 2)
+        self.assertEqual(_compress_distance_to_radius(4.999, 3), 2)
+        self.assertEqual(_compress_distance_to_radius(5.001, 3), 3)
+
+    def test_never_exceeds_max_radius(self) -> None:
+        for distance in (25.001, 1_000.0, 1_000_000.0):
+            with self.subTest(distance=distance):
+                self.assertEqual(_compress_distance_to_radius(distance, 3), 3)
+
+    def test_max_radius_is_respected_generically_not_hardcoded_to_three(self) -> None:
+        self.assertEqual(_compress_distance_to_radius(1_000.0, 5), 5)
+        self.assertEqual(_compress_distance_to_radius(1_000.0, 1), 1)
+
+    def test_monotonically_non_decreasing_in_distance(self) -> None:
+        previous = 0
+        for distance in (0.0, 0.5, 1.0, 2.0, 5.0, 6.0, 25.0, 26.0, 100.0):
+            radius = _compress_distance_to_radius(distance, 4)
+            self.assertGreaterEqual(radius, previous)
+            previous = radius
+
+
+class MeshGpsInformedPlacementTests(unittest.TestCase):
+    """MESH GPS PLACEMENT (pure-function level): bearing/distance now
+
+    genuinely inform a GPS-having remote's placement, sticky
+    (region-based) reuse absorbs ordinary GPS jitter, and a genuine
+    bearing-bucket change is the only thing that legitimately moves a
+    GPS node. See MeshGpsInformedPlacementAppTests below for the same
+    invariants wired through the real app.
+    """
+
+    def test_cardinal_and_intercardinal_bearings_land_in_the_expected_octant(self) -> None:
+        cases = (
+            (north_of_local(5), "N"),
+            (south_of_local(5), "S"),
+            (east_of_local(5), "E"),
+            (west_of_local(5), "W"),
+        )
+        for position, expected_region in cases:
+            with self.subTest(expected_region=expected_region):
+                node = NodeMetadata("!n", "N", position=position)
+                slots = assign_grid_slots([YOU, node])
+                placed = next(item for item in slots if item.node.node_id == "!n")
+                self.assertEqual(placed.region, expected_region)
+
+    def test_minor_gps_jitter_within_the_same_bucket_does_not_move_the_node(self) -> None:
+        """A slightly-updated GPS fix that stays within the SAME 45-degree
+
+        bearing bucket must reuse the exact previous cell -- see
+        _place_group_sticky_first, keyed on region (the bucket), not on
+        the freshly recomputed ideal coordinate.
+        """
+        node_v1 = NodeMetadata("!n", "N", position=north_of_local(5.0))
+        first = assign_grid_slots([YOU, node_v1])
+        sticky = _sticky_map(first)
+
+        node_v2 = NodeMetadata("!n", "N", position=north_of_local(5.3))
+        second = assign_grid_slots([YOU, node_v2], sticky_positions=sticky)
+        self.assertEqual(_sticky_map(first)["!n"], _sticky_map(second)["!n"])
+
+    def test_meaningful_bearing_change_is_allowed_to_move_the_node(self) -> None:
+        node_v1 = NodeMetadata("!n", "N", position=north_of_local(5.0))
+        first = assign_grid_slots([YOU, node_v1])
+        sticky = _sticky_map(first)
+        self.assertEqual(first[1].region, "N")
+
+        node_v2 = NodeMetadata("!n", "N", position=east_of_local(5.0))
+        second = assign_grid_slots([YOU, node_v2], sticky_positions=sticky)
+        placed = next(item for item in second if item.node.node_id == "!n")
+        self.assertEqual(placed.region, "E")
+        self.assertNotEqual((placed.x, placed.y), (first[1].x, first[1].y))
+
+    def test_meaningful_distance_change_within_the_same_bucket_is_allowed_to_move(
+        self,
+    ) -> None:
+        """Crossing a compression breakpoint (radius itself changes) is
+
+        real new topology information even though the bucket stays the
+        same -- sticky reuse only protects against jitter that doesn't
+        change the node's own placement inputs enough to matter; a
+        node's own genuinely-changed distance is exactly the kind of
+        update MESH GPS PLACEMENT says may legitimately move it. This
+        exercises the fresh (non-sticky) path directly, matching how a
+        real caller would feed only nodes whose own category is
+        unchanged as sticky candidates.
+        """
+        near = assign_grid_slots([YOU, NodeMetadata("!n", "N", position=north_of_local(0.5))])
+        far = assign_grid_slots([YOU, NodeMetadata("!n", "N", position=north_of_local(50.0))])
+        near_radius = next(item for item in near if item.node.node_id == "!n").y
+        far_radius = next(item for item in far if item.node.node_id == "!n").y
+        self.assertNotEqual(near_radius, far_radius)
+
+    def test_unrelated_node_is_not_moved_by_a_sibling_gps_update(self) -> None:
+        stable = NodeMetadata("!stable", "Stable", position=east_of_local(3))
+        moving_v1 = NodeMetadata("!moving", "Moving", position=north_of_local(2))
+        first = assign_grid_slots([YOU, stable, moving_v1])
+        sticky = _sticky_map(first)
+        stable_before = _sticky_map(first)["!stable"]
+
+        moving_v2 = NodeMetadata("!moving", "Moving", position=west_of_local(30))
+        second = assign_grid_slots([YOU, stable, moving_v2], sticky_positions=sticky)
+        self.assertEqual(_sticky_map(second)["!stable"], stable_before)
+
+    def test_invalid_or_missing_gps_falls_back_to_topology_placement(self) -> None:
+        no_position_node = NodeMetadata("!n", "N")
+        slots = assign_grid_slots([YOU, no_position_node])
+        placed = next(item for item in slots if item.node.node_id == "!n")
+        self.assertEqual(placed.region, "UNKNOWN")
+
+    def test_you_without_gps_falls_back_to_topology_for_a_lone_remote(self) -> None:
+        """A single GPS-having remote with no GPS-having peer to be
+
+        relative to (MODE B needs 2+) falls through to the SAME
+        UNKNOWN outer-ring placement a position-less remote would get
+        -- never a fabricated bearing from a YOU that has no fix.
+        """
+        you_no_gps = NodeMetadata("!you", "Local", "ME", 0, 1_000.0, True)
+        remote = NodeMetadata("!n", "N", position=north_of_local(5))
+        slots = assign_grid_slots([you_no_gps, remote])
+        placed = next(item for item in slots if item.node.node_id == "!n")
+        self.assertEqual(placed.region, "UNKNOWN")
+
+    def test_mixed_gps_and_non_gps_nodes_coexist_without_interference(self) -> None:
+        gps_node = NodeMetadata("!gps", "GPS Node", position=north_of_local(5))
+        no_gps_node = NodeMetadata("!nogps", "No GPS Node")
+        slots = assign_grid_slots([YOU, gps_node, no_gps_node])
+        by_id = {item.node.node_id: item for item in slots}
+        self.assertEqual(by_id["!gps"].region, "N")
+        self.assertEqual(by_id["!nogps"].region, "UNKNOWN")
+        # Both land on real, distinct, collision-free cells.
+        self.assertNotEqual((by_id["!gps"].x, by_id["!gps"].y), (0, 0))
+        self.assertNotEqual((by_id["!nogps"].x, by_id["!nogps"].y), (0, 0))
+        self.assertNotEqual(
+            (by_id["!gps"].x, by_id["!gps"].y), (by_id["!nogps"].x, by_id["!nogps"].y)
+        )
 
 
 class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
@@ -1589,8 +1789,8 @@ class BoardLabelFiveCellLimitTests(unittest.TestCase):
     grapheme-safe truncation, emoji/ZWJ/CJK safety, and the underlying
     compact_node_label() truncation convention are all unchanged; only
     the max_cells value app.py passes for the label physically above a
-    node's glyph is new. The rich bottom-left context (mesh_state.
-    format_mesh_context_line) is untouched and always uses the full,
+    node's glyph is new. The unified bottom bar (mesh_state.
+    format_mesh_node_bar_fields) is untouched and always uses the full,
     uncapped Long Name/Short Name -- proven separately in test_mesh_state.py.
     """
 
@@ -2211,22 +2411,32 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.base_positions, first_positions)
 
-    # ---- Context (spec section 25) -----------------------------------
+    # ---- Unified bottom bar (MESH GPS + UNIFIED BAR Part B) -----------
 
-    async def test_context_line_for_you(self) -> None:
-        """YOU / LONG NAME / SHORT NAME / GPS LOCATION (MESH VIEW PASS
+    async def test_node_bar_for_you(self) -> None:
+        """YOU's bar carries no literal "YOU" label, HOPS 0, real GPS
 
-        item 4) -- SimulatedRadioService reports the connected radio's
-        own identity as "Simulated Node"/"SIM" (see RadioInfo) and its
-        local node record carries SIMULATED_LOCAL_POSITION, a real fix.
+        (SimulatedRadioService's local node record carries
+        SIMULATED_LOCAL_POSITION, a real fix), DISTANCE "--", and TIME
+        "NOW" -- SimulatedRadioService reports the connected radio's
+        own identity as "Simulated Node"/"SIM" (see RadioInfo).
         """
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        # A wide terminal so the bar renders its fullest (tier 1) form --
+        # see FormatMeshNodeBarLineTests/MeshNodeBarResponsiveWidthTests
+        # for the width-tiered degradation itself.
+        async with app.run_test(size=(160, 28)) as pilot:
             await self._open_mesh(pilot)
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(status, "YOU / Simulated Node / SIM / 40.7128, -74.0060")
+            status = _bar_text(app)
+            self.assertNotIn("YOU", status)
+            self.assertEqual(
+                status,
+                "LONG NAME Simulated Node • SHORT NAME SIM • HOPS 0 • "
+                "GPS 40.7128, -74.0060 • DISTANCE -- • "
+                "LINK ---- -- / -- • TIME NOW",
+            )
 
-    async def test_context_line_for_client(self) -> None:
+    async def test_node_bar_for_client(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
@@ -2238,14 +2448,12 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             view.set_nodes(
                 view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
             )
-            app._update_mesh_context_status()
+            app._update_mesh_node_bar(view.working_set, 1_700_000_100.0)
             await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertIn("CLIENT", status)
-            self.assertIn("1 HOPS", status)
-            self.assertNotIn("CLIENT+RELAY", status)
+            status = _bar_text(app)
+            self.assertIn("HOPS 1", status)
 
-    async def test_context_line_unknown_hops_shows_question_mark(self) -> None:
+    async def test_node_bar_unknown_hops_shows_question_mark(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
@@ -2272,38 +2480,11 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             view.set_nodes(
                 view.working_set, view.base_positions, theme=app._current_theme, now=time.time()
             )
-            app._update_mesh_context_status()
+            app._update_mesh_node_bar(view.working_set, time.time())
             await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertIn("? HOPS", status)
-            self.assertNotIn("0 HOPS", status)
-
-    def test_context_line_supports_client_and_relay_and_relay_only_format(self) -> None:
-        """Formatting-level proof (see mesh_state tests): the live app's
-
-        role-to-glyph and context-line logic supports CLIENT+RELAY and
-        RELAY-only correctly even though no current real-data path can
-        produce them (see MeshNodeState's docstring on why is_relay is
-        always False today) -- so the code is truthfully ready without
-        the live app ever fabricating either state.
-        """
-        client_and_relay = MeshNodeState(
-            node=NodeMetadata("!cr", "ClientRelay", 0),
-            is_client=True,
-            is_relay=True,
-            last_interaction_at=1_700_000_000.0,
-        )
-        relay_only = MeshNodeState(
-            node=NodeMetadata("!ro", "RelayOnly", 2),
-            is_client=False,
-            is_relay=True,
-            last_interaction_at=1_700_000_000.0,
-        )
-        self.assertIn(
-            "CLIENT+RELAY", format_mesh_context_line(client_and_relay, now=1_700_000_100.0)
-        )
-        self.assertIn("RELAY", format_mesh_context_line(relay_only, now=1_700_000_100.0))
-        self.assertNotIn("CLIENT", format_mesh_context_line(relay_only, now=1_700_000_100.0))
+            status = _bar_text(app)
+            self.assertIn("HOPS ?", status)
+            self.assertNotIn("HOPS 0", status)
 
     # ---- Selection preservation / navigation (spec section 18/19) ----
 
@@ -2480,12 +2661,18 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                         selected_widget.render().spans[0].style.foreground,
                         Color.parse(expected_color),
                     )
-                    # Bottom-left context reflects the new selection.
-                    status = str(app.query_one("#mesh-context-status").render())
-                    if expected_id == you_id:
-                        self.assertTrue(status.startswith("YOU / "))
-                    else:
-                        self.assertFalse(status.startswith("YOU / "))
+                    # The unified bar reflects the new selection -- no
+                    # literal "YOU" label, but YOU's entire bar renders
+                    # in ACCENT2 (see MESH GPS + UNIFIED BAR Part B).
+                    status = _bar_text(app)
+                    self.assertNotIn("YOU", status)
+                    bar_style = app.query_one("#mesh-node-bar").render().spans[0].style
+                    expected_bar_style = (
+                        THEME_PALETTES[app._current_theme].accent2
+                        if expected_id == you_id
+                        else THEME_PALETTES[app._current_theme].base
+                    )
+                    self.assertEqual(bar_style, expected_bar_style)
                     # The mesh recentered: the selected node's own base
                     # position is now the CURRENT viewport's own center
                     # anchor (see MeshTopologyView.current_grid_dimensions).
@@ -2646,8 +2833,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!075bcd15")
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.startswith("North Node"))
+            status = _bar_text(app)
+            self.assertTrue(status.startswith("LONG NAME North Node"))
 
     # ---- Anonymous relay-stage topology (hop-count based) --------------
 
@@ -2806,8 +2993,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(view.selected_node_id, target_id)
             self.assertNotIn(view.selected_node_id, relay_ids)
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.startswith("Target Node"))
+            status = _bar_text(app)
+            self.assertTrue(status.startswith("LONG NAME Target Node"))
 
             # No wrapping: one more "up" from the real node changes nothing.
             await pilot.press("up")
@@ -2817,9 +3004,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, you_id)
-            self.assertTrue(
-                str(app.query_one("#mesh-context-status").render()).startswith("YOU / ")
-            )
+            status = _bar_text(app)
+            self.assertIn("HOPS 0", status)
+            self.assertIn("TIME NOW", status)
 
             self.assertEqual(view.board.styles.offset, board_offset_before)
             self.assertFalse(view.show_vertical_scrollbar)
@@ -2897,9 +3084,9 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 relay_widget.render().spans[0].style.foreground, Color.parse(palette.dim_base)
             )
             self.assertEqual(int(relay_widget.styles.width.value), 1)
-            self.assertTrue(
-                str(app.query_one("#mesh-context-status").render()).startswith("YOU / ")
-            )
+            status = _bar_text(app)
+            self.assertIn("HOPS 0", status)
+            self.assertIn("TIME NOW", status)
 
     async def test_select_node_accepts_only_real_working_set_nodes(self) -> None:
         """MeshTopologyView.select_node() is authoritative: only a real
@@ -3297,7 +3484,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(list(app.query("#mesh-title")), [])
             status_text = str(app.query_one("#mesh-status").render())
-            context_text = str(app.query_one("#mesh-context-status").render())
+            context_text = _bar_text(app)
             for text in (status_text, context_text):
                 self.assertNotIn("ACTIVE", text)
                 self.assertNotIn("> MESH", text)
@@ -3334,11 +3521,10 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         """The CONNECTING/RECONNECTING status text disappears once ONLINE
 
         -- the old top-of-view widget is hidden entirely (freeing its row
-        for the grid, see item 5), replaced by the persistent
-        "LAST UPDATE <age>" mesh-freshness indicator now anchored
-        bottom-right, never left blank, since the default
-        SimulatedRadioService fixture has real, known NodeDB last_heard
-        data as soon as it connects.
+        for the grid, see item 5), replaced by the unified bottom bar
+        (MESH GPS + UNIFIED BAR Part B), never left blank, since the
+        default SimulatedRadioService fixture has a real selected node
+        (YOU) as soon as it connects.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -3352,9 +3538,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             status_widget = app.query_one("#mesh-connection-status")
             self.assertFalse(status_widget.display)
-            last_update_widget = app.query_one("#mesh-last-update")
-            text = str(last_update_widget.render())
-            self.assertIn("LAST UPDATE", text)
+            text = _bar_text(app)
+            self.assertIn("TIME", text)
             self.assertNotIn("STATUS", text)
 
     async def test_mesh_topology_not_rebuilt_by_connection_status_change(
@@ -3767,7 +3952,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selected_context_full_format_with_distance(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             await pilot.pause()
             you_id = app.radio.info.node_id
             target_id = "!c0ffee01"
@@ -3794,36 +3979,28 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             _mesh_select_node(app, target_id)
             await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            # _update_mesh_context_status() formats AGE against real
-            # wall-clock time() (see app.py), so -- like the pre-existing
-            # test_context_line_for_client -- this cannot pin an exact
-            # AGE string; only the name/short-name/role/hops/distance
-            # segments, which are wall-clock-independent, are asserted
-            # exactly (spec section 37: no test may depend on
+            status = _bar_text(app)
+            # format_mesh_node_bar_fields' TIME formats AGE against real
+            # wall-clock time() (see app.py), so this cannot pin an exact
+            # TIME string; only the wall-clock-independent fields are
+            # asserted exactly (spec section 37: no test may depend on
             # uncontrolled wall-clock timing).
-            segments = status.split(" / ")
-            self.assertEqual(len(segments), 6)
             expected_distance = distance_between(LOCAL_GEO, target_position)
             # SimulatedRadioService's default synced display.units is
             # DISPLAY_UNITS_METRIC (see MESH VIEW PASS item 11 / spec
             # section 37: distance now honestly reflects the connected
             # radio's own UNITS setting rather than a hardcoded "mi").
+            self.assertEqual(_bar_field(status, "LONG NAME"), "Bob Basecamp")
+            self.assertEqual(_bar_field(status, "SHORT NAME"), "BOB")
+            self.assertEqual(_bar_field(status, "HOPS"), "1")
             self.assertEqual(
-                [segments[0], segments[1], segments[2], segments[3], segments[5]],
-                [
-                    "Bob Basecamp",
-                    "BOB",
-                    "CLIENT",
-                    "1 HOPS",
-                    f"{expected_distance * KM_PER_MILE:.1f} km",
-                ],
+                _bar_field(status, "DISTANCE"), f"{expected_distance * KM_PER_MILE:.1f} km"
             )
-            self.assertNotEqual(segments[4], "?")
+            self.assertNotEqual(_bar_field(status, "TIME"), "?")
 
     async def test_selected_context_missing_short_name_and_distance(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             await pilot.pause()
             you_id = app.radio.info.node_id
             target_id = "!c0ffee02"
@@ -3847,16 +4024,20 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             _mesh_select_node(app, target_id)
             await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertEqual(len(status.split(" / ")), 5)  # no Short Name segment
-            # SimulatedRadioService's default synced display.units is
-            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
-            self.assertTrue(status.endswith("? km"))
-            self.assertTrue(status.startswith("No Short Name / CLIENT"))
+            status = _bar_text(app)
+            # SHORT NAME always resolves to something displayable --
+            # falls back to the node ID rather than being omitted (see
+            # format_mesh_node_bar_fields).
+            self.assertEqual(_bar_field(status, "SHORT NAME"), target_id)
+            # No shared GPS fix (YOU has no position at all in this
+            # fixture) -> DISTANCE is the honest "--", never a
+            # fabricated/unit-suffixed unknown value.
+            self.assertEqual(_bar_field(status, "DISTANCE"), "--")
+            self.assertEqual(_bar_field(status, "LONG NAME"), "No Short Name")
 
     async def test_distance_unchanged_by_recentering(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             await pilot.pause()
             you_id = app.radio.info.node_id
             alice_id, bob_id = "!a1a1a1a1", "!b2b2b2b2"
@@ -3884,21 +4065,21 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            first_status = str(app.query_one("#mesh-context-status").render())
-            first_distance = first_status.rsplit(" / ", 1)[-1]
+            first_status = _bar_text(app)
+            first_distance = _bar_field(first_status, "DISTANCE")
 
             # Selecting Bob recenters the whole board on him.
             _mesh_select_node(app, bob_id)
             await pilot.pause()
             self.assertNotEqual(
-                str(app.query_one("#mesh-context-status").render()), first_status
+                _bar_text(app), first_status
             )
 
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            second_status = str(app.query_one("#mesh-context-status").render())
+            second_status = _bar_text(app)
             self.assertEqual(second_status, first_status)
-            self.assertEqual(second_status.rsplit(" / ", 1)[-1], first_distance)
+            self.assertEqual(_bar_field(second_status, "DISTANCE"), first_distance)
 
     async def test_no_scrollbars_on_mesh(self) -> None:
         app = self._make_app()
@@ -4584,8 +4765,8 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up")
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!qu1et000")
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.startswith("Quiet"))
+            status = _bar_text(app)
+            self.assertTrue(status.startswith("LONG NAME Quiet"))
 
     async def test_no_orphan_relays_under_realistic_mixed_topology(self) -> None:
         """Reproduction of the hardware-observed "phantom relay" report:
@@ -4743,7 +4924,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
         existed beforehand.
         """
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             now = 1_700_000_000.0
             you_id = app.radio.info.node_id
             alice_id, bob_id = "!al1cegps", "!b0bgps00"
@@ -4767,9 +4948,9 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            # SimulatedRadioService's default synced display.units is
-            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
-            self.assertTrue(str(app.query_one("#mesh-context-status").render()).endswith("? km"))
+            # No shared GPS fix yet (YOU has none) -> DISTANCE is the
+            # honest "--", never a fabricated/unit-suffixed value.
+            self.assertEqual(_bar_field(_bar_text(app), "DISTANCE"), "--")
 
             gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
             app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
@@ -4777,8 +4958,11 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertFalse(status.endswith("? km"))
+            status = _bar_text(app)
+            # SimulatedRadioService's default synced display.units is
+            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
+            self.assertTrue(_bar_field(status, "DISTANCE").endswith("km"))
+            self.assertNotEqual(_bar_field(status, "DISTANCE"), "--")
 
     async def test_you_losing_gps_returns_to_remote_relative_mode(self) -> None:
         """Case D: YOU loses GPS -- returns cleanly to remote-relative
@@ -4786,7 +4970,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
         placement on the next normal refresh.
         """
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             now = 1_700_000_000.0
             you_id = app.radio.info.node_id
             alice_id, bob_id = "!al1cegps", "!b0bgps00"
@@ -4803,9 +4987,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            self.assertFalse(
-                str(app.query_one("#mesh-context-status").render()).endswith("? km")
-            )
+            self.assertNotEqual(_bar_field(_bar_text(app), "DISTANCE"), "--")
 
             no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
             app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
@@ -4817,11 +4999,9 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            # SimulatedRadioService's default synced display.units is
-            # DISPLAY_UNITS_METRIC -- see MESH VIEW PASS item 11.
-            self.assertTrue(
-                str(app.query_one("#mesh-context-status").render()).endswith("? km")
-            )
+            # No shared GPS fix any more (YOU lost it) -> DISTANCE is the
+            # honest "--", never a fabricated/unit-suffixed value.
+            self.assertEqual(_bar_field(_bar_text(app), "DISTANCE"), "--")
 
     async def test_gps_cluster_coexists_with_fallback_nodes_without_collision(
         self,
@@ -5517,19 +5697,23 @@ class MeshSelectedRoutePaintPriorityTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
-class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
-    """#mesh-connection-status (top) vs #mesh-last-update (bottom-right):
+class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """MESH GPS + UNIFIED BAR Part B: #mesh-connection-status (top) vs
 
-    the shared connection-status text lives in the TOP widget while not
-    ONLINE; once ONLINE, that TOP widget is hidden entirely (freeing its
-    row for the grid) and a PERSISTENT "LAST UPDATE <age>" mesh-freshness
-    indicator -- always shown while ONLINE, not only when stale -- takes
-    over the SEPARATE bottom-right widget instead (see item 5,
-    app._update_mesh_status_line). The age is a pure function of (most
-    recent working-set remote last_heard, current wall time): it climbs
-    between refreshes with no new data and resets only when a genuinely
-    fresher NodeDB timestamp arrives, never merely because a refresh ran
-    or the indicator moved to a new widget.
+    #mesh-node-bar (bottom, unified) across the ONLINE/CONNECTING/OFFLINE
+    lifecycle. The shared connection-status text lives in the TOP widget
+    while not ONLINE; once ONLINE, that TOP widget is hidden entirely
+    (freeing its row for the grid) and the unified bar shows the
+    selected node's own TIME field instead (see app._update_mesh_node_bar).
+
+    Unlike the old split-widget design's board-wide "LAST UPDATE"
+    indicator, the unified bar is entirely selected-node-identity-driven
+    -- so, deliberately, it BLANKS (rather than freezing a stale value)
+    while off the MESH tab or not ONLINE, matching the old bottom-left
+    context line's own precedent rather than the old bottom-right LAST
+    UPDATE's "persist across a disconnect" one, since there is no longer
+    a separate "board freshness, independent of any one node" concept to
+    preserve.
     """
 
     def setUp(self) -> None:
@@ -5547,60 +5731,17 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
         )
         return MeshtasticPassApp(radio, self.settings)
 
-    async def _mesh_status_text(self, app: MeshtasticPassApp) -> str:
-        from textual.widgets import Static
-
-        return str(app.query_one("#mesh-last-update", Static).render())
-
     async def _mesh_connection_text(self, app: MeshtasticPassApp) -> str:
         from textual.widgets import Static
 
         return str(app.query_one("#mesh-connection-status", Static).render())
 
-    async def test_stale_board_shows_last_update_age(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            now = 1_700_000_000.0
-            local = NodeMetadata(app.radio.info.node_id, is_local=True)
-            stale = NodeMetadata(
-                "!stale001", "Stale", last_heard=now - ACTIVE_WINDOW_SECONDS - 3 * 60
-            )
-            app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
-            app._refresh_mesh(wall_now=now)
-            await pilot.pause()
-            text = await self._mesh_status_text(app)
-            self.assertIn("LAST UPDATE", text)
-            self.assertIn(format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60), text)
-
-    async def test_fresh_board_still_shows_last_update_age(self) -> None:
-        """LAST UPDATE is a persistent freshness indicator, not a
-
-        stale-only warning: it shows even while a node is currently
-        active and the board looks fully current.
-        """
-        app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
-            await pilot.pause()
-            now = 1_700_000_000.0
-            local = NodeMetadata(app.radio.info.node_id, is_local=True)
-            fresh = NodeMetadata("!fresh999", "Fresh", last_heard=now - 5)
-            app.radio.get_known_nodes = lambda nodes=(local, fresh): nodes
-            app._refresh_mesh(wall_now=now)
-            await pilot.pause()
-            text = await self._mesh_status_text(app)
-            self.assertIn("LAST UPDATE", text)
-            self.assertIn("5s", text)
-            # The old top-of-view widget no longer consumes a row while
-            # ONLINE -- its space is reclaimed by the grid (see item 5).
-            self.assertFalse(app.query_one("#mesh-connection-status").display)
-
-    async def test_last_update_ages_between_refreshes_with_no_new_data(self) -> None:
+    async def test_time_ages_between_refreshes_with_no_new_data(self) -> None:
         """Between two refreshes with the SAME underlying last_heard, the
 
-        displayed age must grow by exactly the elapsed wall-clock time --
-        proving it is computed from (data, now), not reset just because
-        a refresh happened.
+        selected node's displayed TIME must grow by exactly the elapsed
+        wall-clock time -- proving it is computed from (data, now), not
+        reset just because a refresh happened.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -5609,18 +5750,27 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             node = NodeMetadata("!ag1ng001", "Ager", last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            _mesh_select_node(app, "!ag1ng001")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("LAST UPDATE 5s", await self._mesh_status_text(app))
+            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "5s")
 
             app._refresh_mesh(wall_now=now + 30)
             await pilot.pause()
-            self.assertIn("LAST UPDATE 35s", await self._mesh_status_text(app))
+            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "35s")
 
-    async def test_ui_refresh_alone_does_not_reset_last_update(self) -> None:
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_ui_refresh_alone_does_not_reset_time(self) -> None:
         """Calling _refresh_mesh() again with unchanged data AND
 
-        unchanged wall-clock time must leave the displayed age exactly
+        unchanged wall-clock time must leave the displayed TIME exactly
         as it was -- a bare repaint is not a new data event.
         """
         app = self._make_app()
@@ -5630,20 +5780,23 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             node = NodeMetadata("!st111111", "Steady", last_heard=now - 42)
             app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            _mesh_select_node(app, "!st111111")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            first_text = await self._mesh_status_text(app)
-            self.assertIn("LAST UPDATE 42s", first_text)
+            first_text = _bar_text(app)
+            self.assertEqual(_bar_field(first_text, "TIME"), "42s")
 
             for _ in range(3):
                 app._refresh_mesh(wall_now=now)
                 await pilot.pause()
-            self.assertEqual(await self._mesh_status_text(app), first_text)
+            self.assertEqual(_bar_text(app), first_text)
 
-    async def test_meaningful_nodedb_update_resets_last_update_age(self) -> None:
-        """A genuinely fresher NodeDB last_heard resets the displayed age
+    async def test_meaningful_nodedb_update_resets_time(self) -> None:
+        """A genuinely fresher NodeDB last_heard resets the displayed
 
-        -- never derived from CHAT history, purely from the passive
+        TIME -- never derived from CHAT history, purely from the passive
         mesh-state timestamp itself.
         """
         app = self._make_app()
@@ -5653,23 +5806,25 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             old_heard = NodeMetadata("!upd00001", "Updater", last_heard=now - 90)
             app.radio.get_known_nodes = lambda nodes=(local, old_heard): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            _mesh_select_node(app, "!upd00001")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("LAST UPDATE 1m", await self._mesh_status_text(app))
+            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "1m")
 
             fresh_heard = NodeMetadata("!upd00001", "Updater", last_heard=now)
             app.radio.get_known_nodes = lambda nodes=(local, fresh_heard): nodes
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("LAST UPDATE 0s", await self._mesh_status_text(app))
+            self.assertEqual(_bar_field(_bar_text(app), "TIME"), "0s")
 
-    async def test_returning_online_restores_last_update(self) -> None:
-        """CONNECTING shows the shared status in the TOP widget (which
+    async def test_returning_online_restores_the_bar(self) -> None:
+        """CONNECTING shows the shared status in the TOP widget; the bar
 
-        reclaims the row LAST UPDATE would otherwise occupy at the
-        bottom-right); once ONLINE resumes, LAST UPDATE returns
-        automatically there -- no second/duplicate widget is ever
-        created, and the TOP widget goes back to hidden.
+        blanks while not ONLINE and shows real content again the instant
+        ONLINE resumes -- no second/duplicate widget is ever created,
+        and the TOP widget goes back to hidden.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -5678,9 +5833,12 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             node = NodeMetadata("!re1turn0", "Returner", last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, node): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            _mesh_select_node(app, "!re1turn0")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertIn("TIME", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.CONNECTING)
@@ -5688,26 +5846,24 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             text = await self._mesh_connection_text(app)
             self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.CONNECTING]}", text)
             self.assertTrue(app.query_one("#mesh-connection-status").display)
+            self.assertEqual(_bar_text(app), "")
 
             app._show_connection(RadioState.ONLINE, app.radio.info)
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertIn("TIME", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
             self.assertEqual(len(list(app.query("#mesh-connection-status"))), 1)
-            self.assertEqual(len(list(app.query("#mesh-last-update"))), 1)
+            self.assertEqual(len(list(app.query("#mesh-node-bar"))), 1)
 
-    async def test_connecting_status_appears_on_top_without_clearing_last_update(
+    async def test_connecting_status_appears_on_top_and_blanks_the_bar(
         self,
     ) -> None:
         """While CONNECTING/RECONNECTING, the shared connection-status
 
-        text appears in the TOP widget (see item 5's separate-widgets
-        layout); the bottom-right LAST UPDATE indicator is a distinct
-        widget now, and simply freezes at its last known value rather
-        than being cleared -- reconnecting introduces no new event that
-        touches it (see _update_mesh_status_line's own early-return
-        while not ONLINE).
+        text appears in the TOP widget; the unified bar blanks (see this
+        class's own docstring on why -- no board-wide freshness concept
+        survives independent of the selected node any more).
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -5718,10 +5874,12 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
                 "!stale002", "Stale", last_heard=now - ACTIVE_WINDOW_SECONDS - 100
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            _mesh_select_node(app, "!stale002")
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
-            text = await self._mesh_status_text(app)
-            self.assertIn("LAST UPDATE", text)
+            self.assertIn("TIME", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
 
             app._show_connection(RadioState.OFFLINE, message="lost")
@@ -5729,18 +5887,18 @@ class MeshLastUpdateStatusLineTests(unittest.IsolatedAsyncioTestCase):
             top_text = await self._mesh_connection_text(app)
             self.assertIn(f"STATUS {ANIMATED_STATUS[RadioState.OFFLINE]}", top_text)
             self.assertTrue(app.query_one("#mesh-connection-status").display)
-            # The bottom-right indicator is untouched by the disconnect --
-            # still showing its last computed value, not blanked.
-            self.assertIn("LAST UPDATE", await self._mesh_status_text(app))
+            self.assertEqual(_bar_text(app), "")
 
 
-class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
-    """Item 5: LAST UPDATE moved to bottom-right, freeing the old
+class MeshNodeBarLayoutTests(unittest.IsolatedAsyncioTestCase):
+    """Item 5 / MESH GPS + UNIFIED BAR Part B: the old top-of-view
 
-    top-of-view row for the grid, and the bottom row's two widgets
-    (#mesh-context-status left, #mesh-last-update right) must never
-    collide -- see app._update_mesh_context_status/_update_mesh_status_line
-    and the #mesh-bottom-row Horizontal in compose().
+    connection-status row is freed for the grid once ONLINE, and the
+    single #mesh-node-bar widget (which replaced the old #mesh-context-
+    status/#mesh-last-update split) never wraps or overflows its row --
+    see app._update_mesh_node_bar and mesh_state.format_mesh_node_bar_
+    line's own width-tiered degradation (proven at the pure-function
+    level in test_mesh_state.py's FormatMeshNodeBarLineTests).
     """
 
     def setUp(self) -> None:
@@ -5784,24 +5942,17 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertGreater(online_rows, offline_rows)
 
-    async def test_context_and_last_update_share_the_bottom_row_at_normal_width(
+    async def test_bar_shows_full_content_at_normal_width(
         self,
     ) -> None:
-        """At a normal XL uConsole-like width, a realistic-length
+        """At a normal XL uConsole-like width, a realistic-length bar
 
-        context line and LAST UPDATE both render in full on the same
-        row, with LAST UPDATE's own text never truncated (it is
-        `width: auto`, always sized to its own content).
-
-        UI POLISH Part C: a selected REMOTE node's LAST UPDATE text now
-        carries a leading LINK segment (here the honest "no data"
-        placeholder -- this fixture node was never registered with any
-        RadioService.get_link_quality observation) rather than starting
-        with "LAST UPDATE" itself; see FormatMeshBottomRightLineTests
-        in test_mesh_state.py for the segment-format tests themselves.
+        renders its fullest tier in full -- no ellipsis, no dropped
+        fields, no wrapping -- and never exceeds the widget's own
+        measured width.
         """
         app = self._make_app()
-        async with app.run_test(size=(120, 30)) as pilot:
+        async with app.run_test(size=(160, 30)) as pilot:
             await pilot.pause()
             app.show_tab("mesh")
             await pilot.pause()
@@ -5816,32 +5967,24 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, node_id)
             await pilot.pause()
 
-            context_widget = app.query_one("#mesh-context-status")
-            last_update_widget = app.query_one("#mesh-last-update")
-            context_text = str(context_widget.render())
-            last_update_text = str(last_update_widget.render())
+            bar_widget = app.query_one("#mesh-node-bar")
+            text = _bar_text(app)
 
-            self.assertIn("Golf Sierra Portable", context_text)
-            self.assertNotIn("…", context_text)
-            self.assertEqual(
-                last_update_text, "LINK  ----  -- / -- • LAST UPDATE 5s"
-            )
-            self.assertLessEqual(cell_len(context_text), context_widget.size.width)
+            self.assertIn("Golf Sierra Portable", text)
+            self.assertNotIn("…", text)
+            self.assertIn("LINK ---- -- / --", text)
+            self.assertIn("SHORT NAME GSP", text)
+            self.assertLessEqual(cell_len(text), bar_widget.size.width)
 
-    async def test_context_truncates_gracefully_at_narrow_width_without_overlap(
+    async def test_bar_degrades_gracefully_at_narrow_width_without_wrapping(
         self,
     ) -> None:
-        """At a narrow width, an overlong context line truncates
+        """At a narrow width, an overlong bar degrades deterministically
 
-        (grapheme-safe ellipsis, never a raw clip) to fit the space
-        Textual's own 1fr/auto layout actually assigned it -- LAST
-        UPDATE keeps rendering in full, and the two never overlap
-        because each occupies its own laid-out box.
-
-        UI POLISH Part C: at this width, LAST UPDATE's own text is
-        preceded by LINK's narrowest degradation tier (meter only, raw
-        values dropped -- see format_mesh_bottom_right_line) rather
-        than "LAST UPDATE" itself; the widths must still never overlap.
+        (dropping lower-priority fields per format_mesh_node_bar_line's
+        own tiers, and grapheme-safe-truncating with an ellipsis only as
+        the very last resort) -- always one physical line, never
+        overflowing the widget's own measured width.
         """
         app = self._make_app()
         async with app.run_test(size=(40, 30)) as pilot:
@@ -5862,31 +6005,22 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, node_id)
             await pilot.pause()
 
-            context_widget = app.query_one("#mesh-context-status")
-            last_update_widget = app.query_one("#mesh-last-update")
-            context_text = str(context_widget.render())
-            last_update_text = str(last_update_widget.render())
+            bar_widget = app.query_one("#mesh-node-bar")
+            text = _bar_text(app)
 
-            self.assertTrue(context_text.endswith("…"))
-            self.assertLessEqual(cell_len(context_text), context_widget.size.width)
-            self.assertEqual(last_update_text, "LINK ---- • UPDATE 5s")
-            self.assertNotIn("…", last_update_text)
-            bottom_row = app.query_one("#mesh-bottom-row")
-            self.assertLessEqual(
-                cell_len(context_text) + cell_len(last_update_text),
-                bottom_row.size.width,
-            )
+            self.assertNotIn("\n", text)
+            self.assertLessEqual(cell_len(text), bar_widget.size.width)
 
 
 class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
-    """UI POLISH Part C: MESH's passive LINK quality display, wired into
+    """MESH GPS + UNIFIED BAR Part B: MESH's passive LINK quality
 
-    the real app/#mesh-last-update -- see test_mesh_state.py's
-    FormatMeshLinkDisplayTests/FormatMeshBottomRightLineTests for the
-    pure-function formatting rules this exercises end to end, and
-    tests/test_radio_service.py's LinkQualityTests for RadioService.
-    get_link_quality's own honesty rules (traversed_hops == 0, radio-
-    swap safety).
+    display, wired into the real app/#mesh-node-bar -- see
+    test_mesh_state.py's FormatMeshLinkDisplayTests/
+    FormatMeshNodeBarFieldsTests for the pure-function formatting rules
+    this exercises end to end, and tests/test_radio_service.py's
+    LinkQualityTests for RadioService.get_link_quality's own honesty
+    rules (traversed_hops == 0, radio-swap safety).
     """
 
     def setUp(self) -> None:
@@ -5903,11 +6037,6 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             connect_delay=0, message_interval=0, scripted_messages=()
         )
         return MeshtasticPassApp(radio, self.settings)
-
-    async def _last_update_text(self, app: MeshtasticPassApp) -> str:
-        from textual.widgets import Static
-
-        return str(app.query_one("#mesh-last-update", Static).render())
 
     async def test_selected_remote_node_with_valid_link_shows_full_line(self) -> None:
         app = self._make_app()
@@ -5928,8 +6057,9 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             _mesh_select_node(app, "!near0001")
             await pilot.pause()
-            text = await self._last_update_text(app)
-            self.assertEqual(text, "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 3s")
+            text = _bar_text(app)
+            self.assertEqual(_bar_field(text, "LINK"), "▂▄▆█ -87 / +6")
+            self.assertEqual(_bar_field(text, "TIME"), "3s")
 
     async def test_selected_multi_hop_node_shows_honest_fallback_not_a_guess(
         self,
@@ -5955,14 +6085,16 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             _mesh_select_node(app, "!far00001")
             await pilot.pause()
-            text = await self._last_update_text(app)
-            self.assertEqual(text, "LINK  ----  -- / -- • LAST UPDATE 3s")
+            text = _bar_text(app)
+            self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
+            self.assertEqual(_bar_field(text, "TIME"), "3s")
 
-    async def test_you_selected_never_shows_link(self) -> None:
-        """A radio has no RF link to itself -- selecting YOU must never
+    async def test_you_selected_never_queries_link(self) -> None:
+        """A radio has no RF link to itself -- selecting YOU must show
 
-        show a LINK segment, even if get_link_quality were somehow
-        called for it.
+        the honest placeholder LINK segment, and get_link_quality must
+        never even be called for YOU's own node ID (no self-LINK claim
+        of any kind, not merely "displayed as unknown").
         """
         app = self._make_app()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -5973,16 +6105,21 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             remote = NodeMetadata("!rem00001", "Remote", last_heard=now - 3)
             app.radio.get_known_nodes = lambda nodes=(local, remote): nodes
-            app.radio.get_link_quality = lambda node_id: LinkObservation(
-                rssi=-40, snr=15.0, observed_at=now
-            )
+            queried_ids: list[str] = []
+
+            def get_link_quality(node_id: str) -> LinkObservation | None:
+                queried_ids.append(node_id)
+                return LinkObservation(rssi=-40, snr=15.0, observed_at=now)
+
+            app.radio.get_link_quality = get_link_quality
             app._refresh_mesh(wall_now=now)
             await pilot.pause()
             _mesh_select_node(app, local.node_id)
             await pilot.pause()
-            text = await self._last_update_text(app)
-            self.assertEqual(text, "LAST UPDATE 3s")
-            self.assertNotIn("LINK", text)
+            text = _bar_text(app)
+            self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
+            self.assertEqual(_bar_field(text, "TIME"), "NOW")
+            self.assertNotIn(local.node_id, queried_ids)
 
     async def test_changing_selection_switches_link_data_immediately(self) -> None:
         """Selection-driven (see _move_mesh_focus/_mesh_select_node), not
@@ -6011,18 +6148,15 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
 
             _mesh_select_node(app, "!strong01")
             await pilot.pause()
-            strong_text = await self._last_update_text(app)
-            self.assertIn("-40", strong_text)
-            self.assertIn("+15", strong_text)
-            self.assertEqual(strong_text.split("  ")[1], "▂▄▆█")  # excellent-tier meter
+            strong_link = _bar_field(_bar_text(app), "LINK")
+            self.assertEqual(strong_link, "▂▄▆█ -40 / +15")
 
             _mesh_select_node(app, "!weak0001")
             await pilot.pause()
-            weak_text = await self._last_update_text(app)
-            self.assertIn("-110", weak_text)
-            self.assertIn("-15", weak_text)
-            self.assertNotIn("-40", weak_text)
-            self.assertNotIn("+15", weak_text)
+            weak_link = _bar_field(_bar_text(app), "LINK")
+            self.assertEqual(weak_link, "▂ -110 / -15")
+            self.assertNotIn("-40", weak_link)
+            self.assertNotIn("+15", weak_link)
 
     async def test_selection_and_link_display_generate_zero_rf_traffic(self) -> None:
         app = self._make_app()
@@ -6041,7 +6175,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             _mesh_select_node(app, "!qz000001")
             await pilot.pause()
-            await self._last_update_text(app)
+            _bar_text(app)
             self.assertEqual(app.radio.sent_messages, ())
 
     async def test_stale_link_observation_falls_back_to_honest_placeholder(self) -> None:
@@ -6068,8 +6202,9 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             _mesh_select_node(app, "!old00001")
             await pilot.pause()
-            text = await self._last_update_text(app)
-            self.assertEqual(text, "LINK  ----  -- / -- • LAST UPDATE 3s")
+            text = _bar_text(app)
+            self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
+            self.assertEqual(_bar_field(text, "TIME"), "3s")
 
 
 class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
@@ -6295,6 +6430,140 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             # app instance given the SAME two nodes at the SAME small
             # size would also show.
             self.assertIn("!far0north", view.edge_node_ids)
+
+
+class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
+    """MESH GPS PLACEMENT, wired end to end through the real app's
+
+    _refresh_mesh -- see MeshGpsInformedPlacementTests above for the
+    pure-function proof underneath this.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    @staticmethod
+    def _real_positions(view: "MeshTopologyView") -> dict:
+        return {
+            node_id: position
+            for node_id, position in view.base_positions.items()
+            if not node_id.startswith("relay:")
+        }
+
+    async def test_rssi_and_selection_updates_never_move_a_gps_node(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            gps_node = NodeMetadata(
+                "!gps0001", "GPS Node", "GPS", last_heard=now - 5,
+                position=north_of_local(5),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, gps_node): nodes
+            app.radio.get_link_quality = lambda node_id: None
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            app.radio.get_link_quality = lambda node_id: LinkObservation(
+                rssi=-70, snr=3.0, observed_at=now
+            )
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(self._real_positions(view), before)
+
+            _mesh_select_node(app, "!gps0001")
+            await pilot.pause()
+            _mesh_select_node(app, local.node_id)
+            await pilot.pause()
+            self.assertEqual(self._real_positions(view), before)
+
+    async def test_minor_gps_jitter_does_not_move_the_node_across_refreshes(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            app.radio.get_known_nodes = lambda nodes=(
+                local,
+                NodeMetadata(
+                    "!gps0001", "GPS Node", "GPS", last_heard=now - 5,
+                    position=north_of_local(5.0),
+                ),
+            ): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            app.radio.get_known_nodes = lambda nodes=(
+                local,
+                NodeMetadata(
+                    "!gps0001", "GPS Node", "GPS", last_heard=now - 2,
+                    position=north_of_local(5.3),
+                ),
+            ): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(self._real_positions(view), before)
+
+    async def test_meaningful_gps_change_moves_only_the_affected_node(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            stable = NodeMetadata(
+                "!stable1", "Stable", "STBL", last_heard=now - 5, position=east_of_local(3)
+            )
+            app.radio.get_known_nodes = lambda nodes=(
+                local,
+                stable,
+                NodeMetadata(
+                    "!gps0001", "GPS Node", "GPS", last_heard=now - 5,
+                    position=north_of_local(5),
+                ),
+            ): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            app.radio.get_known_nodes = lambda nodes=(
+                local,
+                stable,
+                NodeMetadata(
+                    "!gps0001", "GPS Node", "GPS", last_heard=now - 5,
+                    position=south_of_local(5),
+                ),
+            ): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            after = self._real_positions(view)
+
+            self.assertEqual(after["!stable1"], before["!stable1"])
+            self.assertEqual(after[local.node_id], before[local.node_id])
+            self.assertNotEqual(after["!gps0001"], before["!gps0001"])
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):
@@ -7810,18 +8079,18 @@ class MeshDistanceUnitsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_metric_by_default_via_simulated_radio(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             await self._select_target_with_distance(app, pilot)
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.endswith("km"))
+            status = _bar_text(app)
+            self.assertTrue(_bar_field(status, "DISTANCE").endswith("km"))
 
     async def test_imperial_when_radio_reports_imperial(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             app.radio._config_sections["display"]["units"] = DISPLAY_UNITS_IMPERIAL
             await self._select_target_with_distance(app, pilot)
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.endswith("mi"))
+            status = _bar_text(app)
+            self.assertTrue(_bar_field(status, "DISTANCE").endswith("mi"))
 
     async def test_disconnected_radio_defaults_to_imperial(self) -> None:
         app = self._make_app()
@@ -7831,27 +8100,27 @@ class MeshDistanceUnitsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             target_id = await self._select_target_with_distance(app, pilot)
-            status_before = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status_before.endswith("km"))
+            status_before = _bar_text(app)
+            self.assertTrue(_bar_field(status_before, "DISTANCE").endswith("km"))
 
             app.radio._config_sections["display"]["units"] = DISPLAY_UNITS_IMPERIAL
             app._refresh_mesh(wall_now=time.time())
             await pilot.pause()
-            status_after = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status_after.endswith("mi"))
+            status_after = _bar_text(app)
+            self.assertTrue(_bar_field(status_after, "DISTANCE").endswith("mi"))
             self.assertEqual(
                 app.query_one(MeshTopologyView).selected_node_id, target_id
             )
 
     async def test_unsupported_schema_field_defaults_to_imperial(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             del app.radio._config_sections["display"]["units"]
             await self._select_target_with_distance(app, pilot)
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.endswith("mi"))
+            status = _bar_text(app)
+            self.assertTrue(_bar_field(status, "DISTANCE").endswith("mi"))
 
 
 class MeshYouIdentityCorrectionTests(unittest.IsolatedAsyncioTestCase):
@@ -8007,16 +8276,18 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_mesh(pilot)
-            status_before = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status_before.startswith("YOU / Simulated Node"))
+            status_before = _bar_text(app)
+            self.assertTrue(status_before.startswith("LONG NAME Simulated Node"))
 
             await self._swap_to_v4(app, pilot)
 
             # No tab switch, no manual _refresh_mesh() call, no focus
             # change -- _show_connection's own unconditional
             # _refresh_mesh() call is the entire rerender mechanism.
-            status_after = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status_after.startswith("YOU / V4 Radio / V4"))
+            status_after = _bar_text(app)
+            self.assertTrue(
+                status_after.startswith("LONG NAME V4 Radio • SHORT NAME V4")
+            )
             self.assertEqual(app.current_tab, "mesh")
 
             view = app.query_one(MeshTopologyView)
@@ -8056,38 +8327,38 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_focused_you_gps_after_swap_uses_new_radio_never_old(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             await self._open_mesh(pilot)
             now = time.time()
             old_radio_with_position = NodeMetadata(
                 "!aaaaaaaa", "Old V3", "V3", 0, last_heard=now - 5, position=south_of_local(9)
             )
             await self._swap_to_v4(app, pilot, extra_nodes=(old_radio_with_position,))
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.startswith("YOU / V4 Radio / V4"))
-            self.assertNotIn(format_coordinates(south_of_local(9)), status)
-            you_position_text = status.rsplit(" / ", 1)[-1]
-            self.assertEqual(
-                you_position_text, format_coordinates(north_of_local(1))
+            status = _bar_text(app)
+            self.assertTrue(
+                status.startswith("LONG NAME V4 Radio • SHORT NAME V4")
             )
+            self.assertNotIn(format_coordinates(south_of_local(9)), status)
+            you_gps_text = _bar_field(status, "GPS")
+            self.assertEqual(you_gps_text, format_coordinates(north_of_local(1)))
 
             # A's own remote line never shows raw coordinates (only YOU's
-            # line does) -- but its DISTANCE segment is real (not "?"),
+            # line does) -- but its DISTANCE field is real (not "--"),
             # proving it was computed from B's ACTUAL current position,
             # never a stale/zero/fabricated one.
             view = app.query_one(MeshTopologyView)
             _mesh_select_node(app, "!aaaaaaaa")
             await pilot.pause()
-            remote_status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(remote_status.startswith("Old V3 / V3"))
-            distance_segment = remote_status.rsplit(" / ", 1)[-1]
-            self.assertNotEqual(distance_segment, "? km")
+            remote_status = _bar_text(app)
+            self.assertTrue(remote_status.startswith("LONG NAME Old V3 • SHORT NAME V3"))
+            distance_segment = _bar_field(remote_status, "DISTANCE")
+            self.assertNotEqual(distance_segment, "--")
             expected_km = distance_between(north_of_local(1), south_of_local(9)) * KM_PER_MILE
             self.assertEqual(distance_segment, f"{expected_km:.1f} km")
 
     async def test_you_has_no_gps_after_swap_even_if_old_radio_had_one(self) -> None:
         app = self._make_app()
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(200, 28)) as pilot:
             await self._open_mesh(pilot)
             v4_info = replace(
                 app.radio.info, node_id="!bbbbbbbb", long_name="V4 Radio", short_name="V4"
@@ -8102,8 +8373,8 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             app._show_connection(RadioState.ONLINE, v4_info)
             await pilot.pause()
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.endswith("NO GPS"))
+            status = _bar_text(app)
+            self.assertEqual(_bar_field(status, "GPS"), "--")
 
     async def test_menu_local_vs_remote_after_swap(self) -> None:
         app = self._make_app()
@@ -8253,9 +8524,9 @@ class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(rendered_text, "V4")
             self.assertNotEqual(rendered_text, "V4 Radio")
 
-            # Bottom-left still correctly shows the real identity.
-            status = str(app.query_one("#mesh-context-status").render())
-            self.assertTrue(status.startswith("YOU / V4 Radio / V4"))
+            # The unified bar still correctly shows the real identity.
+            status = _bar_text(app)
+            self.assertTrue(status.startswith("LONG NAME V4 Radio • SHORT NAME V4"))
 
     async def test_topology_label_renders_you_with_accent2_color(self) -> None:
         app = self._make_app()

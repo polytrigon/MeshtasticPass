@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 
+from rich.cells import cell_len
+
 from geo import GeoPosition
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
@@ -13,11 +15,12 @@ from mesh_state import (
     MESH_LINK_SNR_WEAK_DB,
     MESH_STALE_THRESHOLD_SECONDS,
     MeshLinkDisplay,
+    MeshNodeBarFields,
     MeshNodeState,
     build_mesh_working_set,
-    format_mesh_bottom_right_line,
-    format_mesh_context_line,
     format_mesh_link_display,
+    format_mesh_node_bar_fields,
+    format_mesh_node_bar_line,
     normalize_mesh_node_id,
 )
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
@@ -248,7 +251,9 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
 
         originated a message we received, so it must not be fabricated
         as CLIENT merely for existing -- see MeshNodeState.
-        glyph_is_solid and format_mesh_context_line's "?" ROLE fallback.
+        glyph_is_solid; the unified bottom bar (mesh_state.
+        format_mesh_node_bar_fields) no longer renders a ROLE field at
+        all (MESH GPS + UNIFIED BAR Part B).
         """
         heard_only = NodeMetadata("!heard", "HeardOnly", None, None, NOW - 5)
         result = build_mesh_working_set([YOU, heard_only], now=NOW, last_message_at={})
@@ -434,187 +439,48 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         self.assertEqual(remote_ids, ["!aaa", "!bbb"])
 
 
-class FormatMeshContextLineTests(unittest.TestCase):
-    def test_you_context_shows_identity_and_no_gps(self) -> None:
-        """YOU's line is "YOU / LONG NAME / SHORT NAME / GPS LOCATION" --
+class FormatMeshNodeBarFieldsTests(unittest.TestCase):
+    """MESH GPS + UNIFIED BAR Part B: per-field resolution for the single
 
-        never the old bare "YOU" -- and GPS LOCATION reads exactly
-        "NO GPS" (never "UNKNOWN GPS"/"N/A"/"NO FIX") when the local
-        node carries no real position fix (see MESH VIEW PASS item 4).
+    unified bottom bar (LONG NAME / SHORT NAME / HOPS / GPS / DISTANCE /
+    LINK / TIME), replacing the old format_mesh_context_line.
+    """
+
+    def test_you_fields_have_no_you_label_and_no_self_link(self) -> None:
+        """YOU gets no literal "YOU" anywhere, HOPS "0", DISTANCE "--",
+
+        TIME "NOW", accent2=True, and the honest no-link placeholder --
+        never a fabricated self-observation.
         """
         state = MeshNodeState(
             node=YOU, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW), "YOU / Local / ME / NO GPS"
-        )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.long_name, "Local")
+        self.assertEqual(fields.short_name, "ME")
+        self.assertNotIn("YOU", fields.long_name)
+        self.assertNotIn("YOU", fields.short_name)
+        self.assertEqual(fields.hops_text, "0")
+        self.assertEqual(fields.distance_text, "--")
+        self.assertEqual(fields.time_text, "NOW")
+        self.assertTrue(fields.accent2)
+        self.assertEqual(fields.link_meter, MESH_LINK_METER_UNKNOWN)
+        self.assertEqual(fields.link_rssi_text, "--")
+        self.assertEqual(fields.link_snr_text, "--")
+        self.assertEqual(fields.gps_text, "--")
 
-    def test_client_only_format(self) -> None:
-        """Long Name / Short Name / ROLE / N HOPS / AGE / DISTANCE -- the
-
-        full new format (spec section 21/37). No distance_miles was set
-        on this state, so distance renders "? mi", never a fabricated
-        figure.
-        """
-        state = client_state(
-            NodeMetadata("!bob", "Bob Basecamp", "BOB", 1),
-            last_interaction_at=NOW - 30 * 60,
-        )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW),
-            "Bob Basecamp / BOB / CLIENT / 1 HOPS / 30m / ? mi",
-        )
-
-    def test_client_with_known_distance_format(self) -> None:
-        state = MeshNodeState(
-            node=NodeMetadata("!bob", "Bob Basecamp", "BOB", 1),
-            is_client=True,
-            is_relay=False,
-            last_interaction_at=NOW - 30 * 60,
-            distance_miles=4.23,
-        )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW),
-            "Bob Basecamp / BOB / CLIENT / 1 HOPS / 30m / 4.2 mi",
-        )
-
-    def test_client_and_relay_format(self) -> None:
-        state = MeshNodeState(
-            node=NodeMetadata("!alice", "Alice Trail", "ALC", 0),
-            is_client=True,
-            is_relay=True,
-            last_interaction_at=NOW - 30 * 60,
-            distance_miles=1.8,
-        )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW),
-            "Alice Trail / ALC / CLIENT+RELAY / 0 HOPS / 30m / 1.8 mi",
-        )
-
-    def test_relay_only_format(self) -> None:
-        """No Short Name on this node -- that segment is omitted entirely,
-
-        never rendered as a fabricated "?"/"UNKNOWN"/"NONE".
-        """
-        state = MeshNodeState(
-            node=NodeMetadata("!r", "Relay Only", None, 2),
-            is_client=False,
-            is_relay=True,
-            last_interaction_at=NOW - 60,
-        )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW),
-            "Relay Only / RELAY / 2 HOPS / 1m / ? mi",
-        )
-
-    def test_short_name_omitted_when_absent(self) -> None:
-        """No Short Name -> exactly 5 segments (name/role/hops/time/
-
-        distance), never a fabricated 6th "?"/"UNKNOWN"/"NONE" segment.
-        """
-        state = client_state(
-            NodeMetadata("!nick", "Long Only", None, 1, NOW), last_interaction_at=NOW - 10
-        )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertTrue(line.startswith("Long Only / CLIENT"))
-        self.assertEqual(len(line.split(" / ")), 5)
-
-    def test_short_name_not_duplicated_when_identical_to_long_name(self) -> None:
-        state = client_state(
-            NodeMetadata("!same", "SAME", "SAME", 1, NOW), last_interaction_at=NOW - 10
-        )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertEqual(line.count("SAME"), 1)
-        self.assertTrue(line.startswith("SAME / CLIENT"))
-
-    def test_long_name_missing_falls_back_to_short_name(self) -> None:
-        state = client_state(
-            NodeMetadata("!shortonly", None, "SHRT", 1, NOW), last_interaction_at=NOW - 10
-        )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertTrue(line.startswith("SHRT / CLIENT"))
-
-    def test_both_names_missing_falls_back_to_node_id(self) -> None:
-        state = client_state(NodeMetadata("!bareid"), last_interaction_at=NOW - 10)
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertTrue(line.startswith("!bareid / CLIENT"))
-
-    def test_non_string_name_field_does_not_crash_and_is_ignored(self) -> None:
-        """Defensive: a stray non-string value in a name field (should never
-
-        happen from RadioService, but nothing here should assume it) is
-        treated as absent, never passed to str.strip() directly.
-        """
-        state = client_state(
-            NodeMetadata("!weird", "Weird Name", 0), last_interaction_at=NOW - 10  # type: ignore[arg-type]
-        )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertTrue(line.startswith("Weird Name / CLIENT"))
-
-    def test_unknown_hops_renders_question_mark_not_zero(self) -> None:
-        state = client_state(
-            NodeMetadata("!x", "X", None, None, NOW), last_interaction_at=NOW - 10
-        )
-        self.assertIn("? HOPS", format_mesh_context_line(state, now=NOW))
-        self.assertNotIn("0 HOPS", format_mesh_context_line(state, now=NOW))
-
-    def test_unknown_interaction_time_renders_question_mark(self) -> None:
-        """Both CHAT interaction time and NodeDB last_heard missing --
-
-        LAST SEEN falls back to "?" truthfully, never a fabricated age.
-        """
-        state = MeshNodeState(
-            node=NodeMetadata("!x", "X", None, 1),
-            is_client=True,
-            is_relay=False,
-            last_interaction_at=None,
-        )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW), "X / CLIENT / 1 HOPS / ? / ? mi"
-        )
-
-    def test_you_context_shows_real_gps_but_never_role_hops_time_or_distance(self) -> None:
-        """YOU never gains a ROLE, hop count, interaction time, or
-
-        DISTANCE segment -- those describe a remote node's relationship
-        to YOU, which YOU does not have to itself (distance would
-        otherwise be a nonsensical 0 mi). A real position fix DOES
-        render, as GPS LOCATION -- "40.7128, -74.0060" here.
-        """
+    def test_you_with_real_gps_shows_coordinates(self) -> None:
         you_with_position = NodeMetadata(
             "!you", "Local", "ME", 0, NOW, True, position=YOU_POSITION
         )
         state = MeshNodeState(
             node=you_with_position, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW),
-            "YOU / Local / ME / 40.7128, -74.0060",
-        )
-
-    def test_you_gps_location_is_no_gps_not_a_fabricated_alternative(self) -> None:
-        """Exactly "NO GPS" -- never "UNKNOWN GPS"/"N/A"/"NO FIX" -- when
-
-        the local node has no real position fix (MESH VIEW PASS item 5).
-        """
-        state = MeshNodeState(
-            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
-        )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertTrue(line.endswith("NO GPS"))
-        for forbidden in ("UNKNOWN GPS", "N/A", "NO FIX"):
-            self.assertNotIn(forbidden, line)
-
-    def test_you_short_name_omitted_when_absent(self) -> None:
-        state = MeshNodeState(
-            node=NodeMetadata("!you", "Local Only", None, 0, NOW, True),
-            is_client=False,
-            is_relay=False,
-            last_interaction_at=None,
-        )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW), "YOU / Local Only / NO GPS"
-        )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.gps_text, "40.7128, -74.0060")
+        self.assertEqual(fields.gps_text_compact, "40.71,-74.01")
+        # DISTANCE from YOU to itself is always "--", GPS or not.
+        self.assertEqual(fields.distance_text, "--")
 
     def test_you_falls_back_to_node_id_when_no_names_at_all(self) -> None:
         state = MeshNodeState(
@@ -623,19 +489,35 @@ class FormatMeshContextLineTests(unittest.TestCase):
             is_relay=False,
             last_interaction_at=None,
         )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW), "YOU / !bareyou / NO GPS"
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.long_name, "!bareyou")
+        self.assertEqual(fields.short_name, "!bareyou")
+
+    def test_remote_client_full_fields(self) -> None:
+        state = client_state(
+            NodeMetadata("!bob", "Bob Basecamp", "BOB", 1),
+            last_interaction_at=NOW - 30 * 60,
         )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.long_name, "Bob Basecamp")
+        self.assertEqual(fields.short_name, "BOB")
+        self.assertEqual(fields.hops_text, "1")
+        self.assertEqual(fields.distance_text, "--")
+        self.assertEqual(fields.time_text, "30m")
+        self.assertFalse(fields.accent2)
 
+    def test_remote_with_known_distance(self) -> None:
+        state = MeshNodeState(
+            node=NodeMetadata("!bob", "Bob Basecamp", "BOB", 1),
+            is_client=True,
+            is_relay=False,
+            last_interaction_at=NOW - 30 * 60,
+            distance_miles=4.23,
+        )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.distance_text, "4.2 mi")
 
-class FormatMeshContextLineMetricTests(unittest.TestCase):
-    """MESH VIEW PASS item 11: DISTANCE honors the caller's `metric` flag,
-
-    always derived from the same underlying miles figure (see
-    FormatDistanceTests in test_geo.py for the conversion itself).
-    """
-
-    def test_defaults_to_imperial_when_metric_not_passed(self) -> None:
+    def test_distance_uses_metric_when_requested(self) -> None:
         state = MeshNodeState(
             node=NodeMetadata("!bob", "Bob", "BOB", 1),
             is_client=True,
@@ -643,23 +525,15 @@ class FormatMeshContextLineMetricTests(unittest.TestCase):
             last_interaction_at=NOW - 30 * 60,
             distance_miles=4.23,
         )
-        self.assertTrue(format_mesh_context_line(state, now=NOW).endswith("4.2 mi"))
+        fields = format_mesh_node_bar_fields(state, now=NOW, metric=True)
+        self.assertTrue(fields.distance_text.endswith("km"))
 
-    def test_metric_true_renders_km(self) -> None:
-        state = MeshNodeState(
-            node=NodeMetadata("!bob", "Bob", "BOB", 1),
-            is_client=True,
-            is_relay=False,
-            last_interaction_at=NOW - 30 * 60,
-            distance_miles=4.23,
-        )
-        line = format_mesh_context_line(state, now=NOW, metric=True)
-        self.assertTrue(line.endswith("km"))
-        self.assertFalse(line.endswith("mi"))
+    def test_distance_is_dash_when_no_shared_gps_fix_exists(self) -> None:
+        """DISTANCE is state.distance_miles, which build_mesh_working_set
 
-    def test_unknown_distance_renders_question_mark_with_correct_unit_suffix(
-        self,
-    ) -> None:
+        only ever populates when BOTH YOU and the remote carry a real
+        GPS fix -- never fabricated from hop count or any other proxy.
+        """
         state = MeshNodeState(
             node=NodeMetadata("!bob", "Bob", "BOB", 1),
             is_client=True,
@@ -667,120 +541,137 @@ class FormatMeshContextLineMetricTests(unittest.TestCase):
             last_interaction_at=NOW - 30 * 60,
             distance_miles=None,
         )
-        self.assertTrue(
-            format_mesh_context_line(state, now=NOW, metric=False).endswith("? mi")
-        )
-        self.assertTrue(
-            format_mesh_context_line(state, now=NOW, metric=True).endswith("? km")
-        )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.distance_text, "--")
 
-    def test_you_line_never_gains_a_distance_segment_regardless_of_metric(
-        self,
-    ) -> None:
-        state = MeshNodeState(
-            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+    def test_gps_is_dash_when_node_has_no_position(self) -> None:
+        state = client_state(NodeMetadata("!bob", "Bob", "BOB", 1), last_interaction_at=NOW - 10)
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.gps_text, "--")
+        self.assertEqual(fields.gps_text_compact, "--")
+
+    def test_gps_shows_real_coordinates_when_present(self) -> None:
+        node = NodeMetadata(
+            "!bob", "Bob", "BOB", 1, position=GeoPosition(40.7634, -73.9508)
         )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW, metric=True),
-            format_mesh_context_line(state, now=NOW, metric=False),
+        state = client_state(node, last_interaction_at=NOW - 10)
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.gps_text, "40.7634, -73.9508")
+        self.assertEqual(fields.gps_text_compact, "40.76,-73.95")
+
+    def test_unknown_hops_renders_question_mark_not_zero(self) -> None:
+        state = client_state(
+            NodeMetadata("!x", "X", None, None, NOW), last_interaction_at=NOW - 10
         )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.hops_text, "?")
+
+    def test_link_uses_the_passed_observation(self) -> None:
+        observation = LinkObservation(rssi=-87, snr=6.0, observed_at=NOW - 3)
+        state = client_state(
+            NodeMetadata("!near", "Near", "NEAR", 1), last_interaction_at=NOW - 3
+        )
+        fields = format_mesh_node_bar_fields(state, now=NOW, link=observation)
+        self.assertEqual(fields.link_rssi_text, "-87")
+        self.assertEqual(fields.link_snr_text, "+6")
+        self.assertNotEqual(fields.link_meter, MESH_LINK_METER_UNKNOWN)
+
+    def test_missing_link_shows_the_honest_placeholder(self) -> None:
+        """LINK preserves the passive direct-only semantics: no direct
+
+        observation for this node -> the honest placeholder, never a
+        misattributed relayed reading.
+        """
+        state = client_state(
+            NodeMetadata("!near", "Near", "NEAR", 1), last_interaction_at=NOW - 3
+        )
+        fields = format_mesh_node_bar_fields(state, now=NOW, link=None)
+        self.assertEqual(fields.link_meter, MESH_LINK_METER_UNKNOWN)
+        self.assertEqual(fields.link_rssi_text, "--")
+        self.assertEqual(fields.link_snr_text, "--")
 
 
-class LastSeenConsistencyTests(unittest.TestCase):
-    """A displayed node's LAST SEEN must never show "?" when the SAME
+class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
+    """TIME is the selected NODE's own freshness/last-heard age -- NOT
 
-    refresh's is_node_active() determination (and therefore MESH(N),
-    FILLED glyph, BASE styling, and active topology) came from a valid
-    NodeDB last_heard -- see format_mesh_context_line's LAST SEEN
-    computation, which must consider last_heard, not CHAT interaction
-    time alone.
+    LINK-observation age (see format_mesh_node_bar_fields' TIME
+    computation, ported verbatim from the old format_mesh_context_line).
     """
 
-    def test_active_nodedb_only_node_shows_concrete_last_seen(self) -> None:
-        """Case A/C: a NodeDB-only node (no CHAT history at all) that
-
-        is_node_active() would call ACTIVE must show a concrete LAST
-        SEEN age from that same last_heard, never "?".
-        """
+    def test_active_nodedb_only_node_shows_concrete_time(self) -> None:
         node = NodeMetadata("!heard0001", "Hairy 9874", "SHN", 3, last_heard=NOW - 120)
         state = MeshNodeState(
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
         self.assertTrue(is_node_active(node.last_heard, NOW))
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertEqual(line, "Hairy 9874 / SHN / ? / 3 HOPS / 2m / ? mi")
-        self.assertNotIn("/ ? /  mi", line)
-        segments = line.split(" / ")
-        self.assertEqual(segments[4], "2m")
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.time_text, "2m")
 
-    def test_stale_nodedb_only_node_shows_concrete_older_last_seen(self) -> None:
-        """Case B: a stale NodeDB-only node still shows the truthful,
-
-        older age of its last_heard -- not active, but not "?" either.
-        """
+    def test_stale_nodedb_only_node_shows_concrete_older_time(self) -> None:
         stale_heard = NOW - ACTIVE_WINDOW_SECONDS - 3 * 60
         node = NodeMetadata("!stale0001", "Stale Node", "STL", 1, last_heard=stale_heard)
         state = MeshNodeState(
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
         self.assertFalse(is_node_active(node.last_heard, NOW))
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertIn(format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60), line)
-        self.assertNotIn("?", line.split(" / ")[4])
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.time_text, format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60))
 
     def test_missing_last_heard_and_chat_history_stays_question_mark(self) -> None:
-        """Case D: a genuinely missing timestamp must continue to render
-
-        "?" -- never a fabricated age just because SOME other node in
-        the working set has one.
-        """
         node = NodeMetadata("!nodata001", "No Data", "ND", 1, last_heard=None)
         state = MeshNodeState(
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertEqual(line.split(" / ")[4], "?")
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.time_text, "?")
 
     def test_chat_history_does_not_substitute_when_last_heard_is_fresher(self) -> None:
-        """LAST SEEN reflects whichever signal is genuinely more recent --
-
-        an old CHAT interaction never masks a fresher NodeDB last_heard.
-        """
         node = NodeMetadata("!fresh0001", "Fresher", "FR", 1, last_heard=NOW - 10)
         state = MeshNodeState(
             node=node, is_client=True, is_relay=False, last_interaction_at=NOW - 5000
         )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertEqual(line.split(" / ")[4], "10s")
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.time_text, "10s")
 
     def test_last_heard_does_not_substitute_when_chat_is_fresher(self) -> None:
-        """Symmetric case: a fresher CHAT interaction is reflected too,
-
-        not masked by an older NodeDB last_heard.
-        """
         node = NodeMetadata("!fresh0002", "ChatFresh", "CF", 1, last_heard=NOW - 5000)
         state = MeshNodeState(
             node=node, is_client=True, is_relay=False, last_interaction_at=NOW - 20
         )
-        line = format_mesh_context_line(state, now=NOW)
-        self.assertEqual(line.split(" / ")[4], "20s")
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        self.assertEqual(fields.time_text, "20s")
 
-    def test_wall_time_advancing_ages_last_seen_without_new_data(self) -> None:
-        """Case E: the SAME underlying last_heard, evaluated at a later
-
-        `now`, must show a proportionally larger age -- a pure function
-        of (timestamp, now), not something that resets on repaint.
-        """
+    def test_wall_time_advancing_ages_time_without_new_data(self) -> None:
         node = NodeMetadata("!aging0001", "Ager", "AG", 1, last_heard=NOW - 5)
         state = MeshNodeState(
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW).split(" / ")[4], "5s"
+        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW).time_text, "5s")
+        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW + 30).time_text, "35s")
+
+    def test_link_observation_age_never_substitutes_for_node_time(self) -> None:
+        """A stale/irrelevant LINK observation must never influence TIME --
+
+        TIME is purely the node's own last_interaction_at/last_heard,
+        never LINK's observed_at.
+        """
+        node = NodeMetadata("!linkage1", "LinkAge", "LA", 1, last_heard=NOW - 5)
+        state = MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
-        self.assertEqual(
-            format_mesh_context_line(state, now=NOW + 30).split(" / ")[4], "35s"
+        stale_link = LinkObservation(rssi=-90, snr=-5, observed_at=NOW - 9999)
+        fields = format_mesh_node_bar_fields(state, now=NOW, link=stale_link)
+        self.assertEqual(fields.time_text, "5s")
+
+    def test_you_time_is_always_now_regardless_of_last_heard(self) -> None:
+        you_with_stale_last_heard = NodeMetadata("!you", "Local", "ME", 0, NOW - 99999, True)
+        state = MeshNodeState(
+            node=you_with_stale_last_heard,
+            is_client=False,
+            is_relay=False,
+            last_interaction_at=None,
         )
+        self.assertEqual(format_mesh_node_bar_fields(state, now=NOW).time_text, "NOW")
 
 
 class FormatMeshLinkDisplayTests(unittest.TestCase):
@@ -864,93 +755,95 @@ class FormatMeshLinkDisplayTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
 
 
-class FormatMeshBottomRightLineTests(unittest.TestCase):
-    """UI POLISH Part C: combining LINK with the pre-existing LAST
+class FormatMeshNodeBarLineTests(unittest.TestCase):
+    """MESH GPS + UNIFIED BAR Part B: assembling MeshNodeBarFields into
 
-    UPDATE text on one line, with graceful width-based degradation.
+    ONE physical line, degrading deterministically (compact precision
+    first, then drop lower-priority fields) rather than wrapping.
     """
 
-    FULL_LINK = MeshLinkDisplay(meter="▂▄▆█", rssi_text="-87", snr_text="+6")
-
-    def test_no_link_passes_last_update_through_unchanged(self) -> None:
-        self.assertEqual(
-            format_mesh_bottom_right_line(
-                last_update_text="LAST UPDATE 25s", link=None, available_width=100
-            ),
-            "LAST UPDATE 25s",
-        )
-
-    def test_empty_last_update_stays_empty_even_with_link(self) -> None:
-        """Never a floating LINK segment with nothing for it to attach
-
-        to -- see _update_mesh_status_line/Part D "preserve LAST UPDATE".
-        """
-        self.assertEqual(
-            format_mesh_bottom_right_line(
-                last_update_text="", link=self.FULL_LINK, available_width=100
-            ),
-            "",
-        )
+    REMOTE_FIELDS = MeshNodeBarFields(
+        long_name="SomeNode",
+        short_name="NODE",
+        hops_text="2",
+        gps_text="40.7634, -73.9508",
+        gps_text_compact="40.76,-73.95",
+        distance_text="3.2 km",
+        link_meter="▂▄▆█",
+        link_rssi_text="-87",
+        link_snr_text="+6",
+        time_text="25s",
+        accent2=False,
+    )
 
     def test_full_width_shows_the_complete_tier(self) -> None:
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=200)
         self.assertEqual(
-            format_mesh_bottom_right_line(
-                last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=100
-            ),
-            "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 25s",
+            text,
+            "LONG NAME SomeNode • SHORT NAME NODE • HOPS 2 • "
+            "GPS 40.7634, -73.9508 • DISTANCE 3.2 km • "
+            "LINK ▂▄▆█ -87 / +6 • TIME 25s",
         )
-
-    def test_medium_width_drops_to_compact_raw_values(self) -> None:
-        full = "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 25s"
-        compact = "LINK ▂▄▆█ -87/+6 • UPDATE 25s"
-        text = format_mesh_bottom_right_line(
-            last_update_text="LAST UPDATE 25s",
-            link=self.FULL_LINK,
-            available_width=len(compact),
-        )
-        self.assertEqual(text, compact)
-        self.assertGreater(len(full), len(compact))
-
-    def test_narrow_width_drops_raw_values_but_keeps_the_meter(self) -> None:
-        narrow = "LINK ▂▄▆█ • UPDATE 25s"
-        text = format_mesh_bottom_right_line(
-            last_update_text="LAST UPDATE 25s",
-            link=self.FULL_LINK,
-            available_width=len(narrow),
-        )
-        self.assertEqual(text, narrow)
-        self.assertNotIn("-87", text)
-
-    def test_raw_values_never_dropped_at_normal_uconsole_width(self) -> None:
-        """A real uConsole viewport (see test_viewport_context_favorites.py's
-
-        own 52-column fixture) always fits at least the compact tier,
-        which always keeps both raw values visible.
-        """
-        text = format_mesh_bottom_right_line(
-            last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=48
-        )
-        self.assertIn("-87", text)
-        self.assertIn("+6", text)
 
     def test_unmeasured_width_shows_the_fullest_tier_untouched(self) -> None:
-        """available_width <= 0 (not yet laid out) must never truncate --
-
-        mirrors _update_mesh_context_status's own `if available > 0`
-        "don't truncate against an unmeasured width" rule.
-        """
-        text = format_mesh_bottom_right_line(
-            last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=0
+        """available_width <= 0 (not yet laid out) must never truncate."""
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=0)
+        self.assertEqual(
+            text, format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=1000)
         )
-        self.assertEqual(text, "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 25s")
+
+    def test_medium_width_compacts_gps_precision_and_link_spacing(self) -> None:
+        full = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=1000)
+        compact = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(full) - 1)
+        self.assertIn("GPS 40.76,-73.95", compact)
+        self.assertIn("LINK ▂▄▆█ -87/+6", compact)
+        self.assertLess(cell_len(compact), cell_len(full))
+
+    def test_dropping_gps_only_keeps_the_other_fields(self) -> None:
+        tier3 = (
+            "LONG NAME SomeNode • SHORT NAME NODE • HOPS 2 • DISTANCE 3.2 km "
+            "• LINK ▂▄▆█ -87/+6 • TIME 25s"
+        )
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier3))
+        self.assertEqual(text, tier3)
+        self.assertNotIn("GPS", text)
+        self.assertIn("DISTANCE", text)
+
+    def test_narrow_width_drops_gps_and_distance(self) -> None:
+        tier4 = "LONG NAME SomeNode • SHORT NAME NODE • HOPS 2 • LINK ▂▄▆█ -87/+6 • TIME 25s"
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier4))
+        self.assertEqual(text, tier4)
+        self.assertNotIn("GPS", text)
+        self.assertNotIn("DISTANCE", text)
+
+    def test_very_narrow_width_drops_short_name_too(self) -> None:
+        tier5 = "LONG NAME SomeNode • HOPS 2 • LINK ▂▄▆█ -87/+6 • TIME 25s"
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier5))
+        self.assertEqual(text, tier5)
+        self.assertNotIn("SHORT NAME", text)
+
+    def test_narrowest_useful_width_drops_link_too(self) -> None:
+        tier6 = "LONG NAME SomeNode • HOPS 2 • TIME 25s"
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=len(tier6))
+        self.assertEqual(text, tier6)
+        self.assertNotIn("LINK", text)
 
     def test_absurdly_narrow_width_still_grapheme_safe_truncates(self) -> None:
-        text = format_mesh_bottom_right_line(
-            last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=5
-        )
-        from rich.cells import cell_len
-
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=5)
         self.assertLessEqual(cell_len(text), 5)
+
+    def test_you_bar_never_shows_a_you_label_and_uses_now_for_time(self) -> None:
+        state = MeshNodeState(
+            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        text = format_mesh_node_bar_line(fields, available_width=200)
+        self.assertNotIn("YOU", text)
+        self.assertIn("TIME NOW", text)
+        self.assertIn("HOPS 0", text)
+        self.assertIn("DISTANCE --", text)
+        self.assertIn("LINK ---- -- / --", text)
+        self.assertTrue(fields.accent2)
 
     def test_link_meter_glyphs_are_single_cell_narrow(self) -> None:
         """The bar glyphs are ordinary block-drawing characters -- never
@@ -959,8 +852,6 @@ class FormatMeshBottomRightLineTests(unittest.TestCase):
         POLISH Part A investigates -- so they can never trigger that
         same class of terminal-cell-width disagreement.
         """
-        from rich.cells import cell_len
-
         for meter in ("▂▄▆█", "▂▄▆", "▂▄", "▂", MESH_LINK_METER_UNKNOWN):
             with self.subTest(meter=meter):
                 self.assertEqual(cell_len(meter), len(meter))

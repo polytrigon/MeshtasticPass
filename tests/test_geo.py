@@ -47,6 +47,27 @@ class GeographicDistanceTests(unittest.TestCase):
             with self.subTest(latitude=latitude, longitude=longitude):
                 self.assertIsNone(make_geo_position(latitude, longitude))
 
+    def test_exact_null_island_is_never_a_real_position(self) -> None:
+        """MESH GPS PLACEMENT: (0, 0) is Meshtastic's own no-fix/
+
+        uninitialized-position sentinel (Position.latitude_i/
+        longitude_i default to 0) at least as often as it is ever a
+        genuine fix -- never trusted as real geographic data, even
+        though it would otherwise pass the plain range check.
+        """
+        self.assertIsNone(make_geo_position(0.0, 0.0))
+        self.assertIsNone(make_geo_position(0, 0))
+
+    def test_near_null_island_is_still_a_real_position(self) -> None:
+        """Only the EXACT (0, 0) pair is special-cased -- a genuine fix
+
+        that happens to be near the equator/prime meridian (e.g. off
+        the coast of west Africa) is never rejected.
+        """
+        self.assertIsNotNone(make_geo_position(0.0, 1.0))
+        self.assertIsNotNone(make_geo_position(1.0, 0.0))
+        self.assertIsNotNone(make_geo_position(0.0001, 0.0001))
+
     def test_distance_formatting(self) -> None:
         cases = (
             (0.0, "<0.1miles"),

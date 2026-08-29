@@ -60,9 +60,8 @@ from mesh_state import (
     MeshNodeState,
     _clean_text,
     build_mesh_working_set,
-    format_mesh_bottom_right_line,
-    format_mesh_context_line,
-    format_mesh_link_display,
+    format_mesh_node_bar_fields,
+    format_mesh_node_bar_line,
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
@@ -1330,21 +1329,13 @@ MESH_LOGICAL_GRID_CENTER_COLUMN = 11
 MESH_SELECTED_GLYPH_WIDTH = 3
 MESH_SELECTED_HALO_GLYPH = "·"
 # The label physically above a node's glyph is a compact hint, not the
-# full identity -- that lives in the rich bottom-left context (see
-# mesh_state.format_mesh_context_line, which always has the full Long
+# full identity -- that lives in the unified bottom bar (see
+# mesh_state.format_mesh_node_bar_fields, which always has the full Long
 # Name/Short Name, uncapped). Capped in DISPLAY CELLS (cell_len()), not
 # Python len(), so wide/CJK/emoji glyphs are counted by their actual
 # terminal width -- see mesh_topology.compact_node_label/_truncate for
 # the grapheme-safe truncation this limit is applied through.
 MESH_BOARD_LABEL_MAX_CELLS = 5
-
-# Minimum cells UI POLISH Part C's LINK content reserves for its
-# #mesh-context-status sibling (width: 1fr, sharing #mesh-bottom-row)
-# -- see _update_mesh_status_line. Small enough to rarely bind on a
-# real uConsole viewport, large enough that context-status never gets
-# squeezed to exactly 0, the one width at which its own truncation
-# guard (`if available > 0`) stops protecting it.
-MESH_CONTEXT_STATUS_MIN_WIDTH = 10
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
@@ -1662,13 +1653,7 @@ def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
     view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
-    # See _refresh_mesh's identical call_after_refresh use: LAST
-    # UPDATE's text (set first, which LINK/UI POLISH Part C can widen)
-    # must finish laying out before #mesh-context-status's own
-    # width:1fr resolution reads it, or it truncates against a stale,
-    # too-generous width.
-    app._update_mesh_status_line(view.working_set, time())
-    app.call_after_refresh(app._update_mesh_context_status)
+    app._update_mesh_node_bar(view.working_set, time())
 
 
 DOT_GRID_GLYPH = "·"
@@ -2192,9 +2177,10 @@ class MeshTopologyView(Container):
         # "draw an isolated active dot with no connection at all", and
         # treating it that way previously left active nodes with unknown
         # hops rendered with no connector whatsoever. The selected-node
-        # context line's own "? HOPS" still reports the hop count
-        # honestly (see format_mesh_context_line) -- this only concerns
-        # whether a connector renders, never fabricates a hop count.
+        # unified bottom bar's own "HOPS ?" still reports the hop count
+        # honestly (see mesh_state.format_mesh_node_bar_fields) -- this
+        # only concerns whether a connector renders, never fabricates a
+        # hop count.
         palette = THEME_PALETTES[theme]
         stages_by_client: dict[str, list[RelayStage]] = {}
         for stage in relay_stages:
@@ -3007,7 +2993,7 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $amber_dim;
     }
 
-    #mesh-status, #mesh-bottom-row {
+    #mesh-status, #mesh-node-bar {
         height: 1;
     }
 
@@ -3019,22 +3005,8 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #mesh-context-status {
+    #mesh-node-bar {
         width: 1fr;
-        color: $snow_base;
-    }
-
-    Screen.theme-amber #mesh-context-status {
-        color: $amber_base;
-    }
-
-    #mesh-last-update {
-        width: auto;
-        color: $snow_base;
-    }
-
-    Screen.theme-amber #mesh-last-update {
-        color: $amber_base;
     }
 
     #dm-content {
@@ -3644,16 +3616,12 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="mesh-connection-status", classes="page-title", markup=False)
                 yield Static(id="mesh-status", markup=False)
                 yield MeshTopologyView()
-                # Bottom row: focused-node context anchored left (1fr,
-                # truncates gracefully -- see _update_mesh_context_status),
-                # LAST UPDATE anchored right (auto width). Order matters:
-                # the 1fr widget must come first so it absorbs exactly
-                # "container width minus LAST UPDATE's own width", which
-                # is what makes LAST UPDATE land flush against the right
-                # edge with no manual offset math.
-                with Horizontal(id="mesh-bottom-row"):
-                    yield Static(id="mesh-context-status", markup=False)
-                    yield Static(id="mesh-last-update", markup=False)
+                # MESH GPS + UNIFIED BAR Part B: one single physical line
+                # for the selected node (LONG NAME - SHORT NAME - HOPS -
+                # GPS - DISTANCE - LINK - TIME), replacing the previous
+                # separate bottom-left context line and bottom-right
+                # LINK/LAST UPDATE line -- see _update_mesh_node_bar.
+                yield Static(id="mesh-node-bar", markup=False)
         yield Static("1-3 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
@@ -5698,7 +5666,7 @@ class MeshtasticPassApp(App[None]):
         # (see _mesh_active_count -- it never touches the board/widget,
         # so this can never "reshuffle" the topology).
         self._update_tab_bar(current_time, mesh_working_set=working_set)
-        self._update_mesh_status_line(working_set, current_time)
+        self._update_mesh_node_bar(working_set, current_time)
         views = list(self.query(MeshTopologyView))
         statuses = list(self.query("#mesh-status"))
         if not views or not statuses:
@@ -5722,7 +5690,7 @@ class MeshtasticPassApp(App[None]):
         if not working_set:
             view.clear_nodes()
             status.update("NO MESH DATA")
-            self._update_mesh_context_status()
+            self._update_mesh_node_bar(working_set, current_time)
             return
         status.update("")
         # A real CLIENT with a truthful nonzero hop count is placed at
@@ -5815,20 +5783,13 @@ class MeshtasticPassApp(App[None]):
             min_extent=self._mesh_extent_ratchet,
         )
         view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
-        # Deferred (not called inline): #mesh-context-status's own
-        # width:1fr resolution depends on how wide #mesh-last-update's
-        # CURRENT content is, and this method already set that content
-        # (via _update_mesh_status_line above, before the working-set/
-        # placement work) -- but Textual's own layout pass that
-        # resolves 1fr against the new content is not guaranteed to
-        # have completed yet by this point in the same synchronous
-        # call. call_after_refresh runs this once that layout has
-        # settled, so context-status truncates against the width it
-        # will ACTUALLY end up with, never a stale, too-generous one
-        # (see UI POLISH Part C, which is what first made
-        # #mesh-last-update's own content width vary enough for this
-        # ordering to matter).
-        self.call_after_refresh(self._update_mesh_context_status)
+        # Called again here (the earlier call above only ever sees LAST
+        # cycle's selected_node_id, since set_nodes -- which can fix up
+        # selection, e.g. when the previously selected node just
+        # disappeared -- has not run yet at that point this cycle): this
+        # second call is what makes the bar's content reflect THIS
+        # cycle's actual selection, never a one-refresh-stale one.
+        self._update_mesh_node_bar(working_set, current_time)
 
     def _move_mesh_focus(self, direction: str) -> None:
         view = self.query_one(MeshTopologyView)
@@ -5854,16 +5815,10 @@ class MeshtasticPassApp(App[None]):
                 theme=self._current_theme,
                 now=time(),
             )
-            # LINK (UI POLISH Part C) is selected-node-specific, exactly
-            # like #mesh-context-status below -- it must switch to the
-            # newly selected node's own data immediately, not wait for
-            # the next periodic _refresh_mesh() tick (up to ~1s later).
-            # See _refresh_mesh's identical call_after_refresh use:
-            # #mesh-context-status's own width:1fr resolution depends
-            # on how wide #mesh-last-update's (possibly LINK-widened)
-            # text ends up, which must finish laying out first.
-            self._update_mesh_status_line(view.working_set, time())
-            self.call_after_refresh(self._update_mesh_context_status)
+            # The unified bar is selected-node-specific -- it must switch
+            # to the newly selected node's own data immediately, not wait
+            # for the next periodic _refresh_mesh() tick (up to ~1s later).
+            self._update_mesh_node_bar(view.working_set, time())
 
     def _open_mesh_node_menu(self) -> None:
         """ENTER on the currently focused MESH node opens the shared
@@ -5922,50 +5877,86 @@ class MeshtasticPassApp(App[None]):
             self.radio.read_synced_config_field("display", "units") == DISPLAY_UNITS_METRIC
         )
 
-    def _update_mesh_context_status(self) -> None:
-        """Minimal truthful summary line for the currently selected MESH node.
+    def _update_mesh_node_bar(
+        self, working_set: tuple[MeshNodeState, ...], now: float
+    ) -> None:
+        """#mesh-node-bar: ONE physical line describing the currently
 
-        Shares its row with #mesh-last-update, anchored to the right (see
-        the #mesh-bottom-row Horizontal in compose()). This widget's own
-        `width: 1fr` already excludes LAST UPDATE's space from
-        `status_widget.size.width` -- so truncating to exactly that width
-        (grapheme-safe, never a raw slice) is enough to guarantee no
-        overlap, with no need to read LAST UPDATE's text/width directly.
+        selected MESH node (MESH GPS + UNIFIED BAR Part B) -- LONG NAME -
+        SHORT NAME - HOPS - GPS - DISTANCE - LINK - TIME, replacing the
+        previous separate bottom-left context line and bottom-right
+        LINK/LAST UPDATE line entirely (see mesh_state.
+        format_mesh_node_bar_fields/format_mesh_node_bar_line).
+
+        Also force-hides #mesh-connection-status (the OLD top-of-view
+        location) every ONLINE cycle, regardless of the current tab --
+        that widget is exclusively owned by _update_chat_connection_state()
+        while NOT ONLINE (see that method's own docstring), so once
+        ONLINE, nothing else would ever clear its stale text/display=True
+        from the last disconnected state. This mirrors the old
+        _update_mesh_status_line's identical unconditional-while-ONLINE
+        behavior.
+
+        The bar's own content, unlike that force-hide, IS gated on both
+        being on the MESH tab and being ONLINE -- matching the old
+        _update_mesh_context_status's precedent (blank rather than freeze
+        stale content while off-tab/disconnected), since this bar is now
+        entirely selected-node-identity-driven with no separate "board
+        freshness, independent of any one node" concept left to preserve
+        across a disconnect.
+
+        LINK is computed here (RadioService.get_link_quality -- zero RF
+        traffic) and passed into format_mesh_node_bar_fields; never
+        queried for YOU or when nothing is selected (a radio has no RF
+        link to itself).
+
+        Because this is now the ONLY widget in its row (no sibling to
+        share width with any more), `widget.size.width` is never
+        circularly dependent on another widget's content -- so, unlike
+        the old two-widget split, this can run synchronously with no
+        call_after_refresh layout-ordering workaround needed.
         """
-        widgets = list(self.query("#mesh-context-status"))
+        if self._radio_state is RadioState.ONLINE:
+            connection_widgets = list(self.query("#mesh-connection-status"))
+            if connection_widgets:
+                connection_widgets[0].display = False
+        widgets = list(self.query("#mesh-node-bar"))
         if not widgets:
             return
-        status_widget = widgets[0]
+        widget = widgets[0]
         if self.current_tab != "mesh" or self._radio_state is not RadioState.ONLINE:
-            status_widget.update("")
+            widget.update("")
             return
         views = list(self.query(MeshTopologyView))
         if not views:
-            status_widget.update("")
+            widget.update("")
             return
         view = views[0]
+        # An anonymous relay-stage placeholder can never be selected (see
+        # MeshRelayWidget/_move_mesh_focus), so `state` is None here only
+        # for a genuinely stale/invalid ID, never a relay stage.
         state = next(
             (
                 candidate
-                for candidate in view.working_set
+                for candidate in working_set
                 if candidate.node.node_id == view.selected_node_id
             ),
             None,
         )
-        # An anonymous relay-stage placeholder can never be selected (see
-        # MeshRelayWidget/_move_mesh_focus), so `state` is None here only
-        # for a genuinely stale/invalid ID, never a relay stage -- the
-        # bottom-left context is always either YOU or a real node's full
-        # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
-        text = (
-            format_mesh_context_line(state, now=time(), metric=self._mesh_distance_is_metric())
-            if state is not None
-            else ""
+        if state is None:
+            widget.update("")
+            return
+        link = (
+            self.radio.get_link_quality(state.node.node_id)
+            if not state.node.is_local
+            else None
         )
-        available = status_widget.size.width
-        if available > 0:
-            text = truncate_to_cells(text, available)
-        status_widget.update(text)
+        fields = format_mesh_node_bar_fields(
+            state, now=now, metric=self._mesh_distance_is_metric(), link=link
+        )
+        text = format_mesh_node_bar_line(fields, available_width=widget.size.width)
+        palette = THEME_PALETTES[self._current_theme]
+        widget.update(Text(text, style=palette.accent2 if fields.accent2 else palette.base))
 
     def _advance_delivery_states(self) -> None:
         self._send_animation_frame = self._send_animation_frame % len(
@@ -7695,12 +7686,12 @@ class MeshtasticPassApp(App[None]):
         never show different animation-dot phases (see
         _advance_connection_animation, which calls this on a fixed
         ~0.45s cadence). Once ONLINE (status_text == ""), this leaves
-        that widget untouched -- _update_mesh_status_line (called from
+        that widget untouched -- _update_mesh_node_bar (called from
         _refresh_mesh) force-hides it instead, unconditionally, since it
-        has no ONLINE-state purpose any more (LAST UPDATE now lives in
-        the separate bottom-right #mesh-last-update widget). The two
-        never fight over ownership: this function only ever writes while
-        NOT ONLINE, that one only ever touches the widget while ONLINE.
+        has no ONLINE-state purpose any more (the unified bottom bar now
+        lives in the separate #mesh-node-bar widget). The two never fight
+        over ownership: this function only ever writes while NOT ONLINE,
+        that one only ever touches the widget while ONLINE.
         """
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
@@ -7763,103 +7754,6 @@ class MeshtasticPassApp(App[None]):
                 widget.display = True
         elif dm_status_widgets:
             dm_status_widgets[0].display = False
-
-    def _update_mesh_status_line(
-        self, working_set: tuple[MeshNodeState, ...], now: float
-    ) -> None:
-        """#mesh-last-update: a PERSISTENT "LAST UPDATE <age>"
-
-        mesh-freshness indicator, anchored bottom-right (see the
-        #mesh-bottom-row Horizontal in compose()), shown while the radio
-        is ONLINE -- not a stale-only warning. Answers "how long ago did
-        this radio last obtain meaningful information about the mesh",
-        so it keeps aging (1s, 2s, ... 1m, ...) between refreshes with no
-        new data, and only resets when a genuinely fresher timestamp
-        arrives -- never merely because this method itself ran again or
-        LAST UPDATE's own widget moved (see _refresh_mesh's 1Hz periodic
-        call).
-
-        The age comes from the single most recent NodeDB last_heard
-        among the working set's remote nodes (excluding YOU) -- never
-        derived from CHAT history (see build_mesh_working_set; CHAT is
-        enrichment, not the timing source of record here) and never a
-        fabricated value: if no working-set remote node carries a
-        trustworthy last_heard at all, this is omitted rather than
-        showing a made-up age.
-
-        Also force-hides #mesh-connection-status (the OLD top-of-view
-        location) every ONLINE cycle: that widget is exclusively owned
-        by _update_chat_connection_state() while NOT ONLINE (see that
-        method's own docstring), so once ONLINE, nothing else would ever
-        clear its stale text/display=True from the last disconnected
-        state -- left alone, it would stay visible and keep reserving
-        its top row forever. Forcing display=False here (never merely
-        "when there's no LAST UPDATE text", unlike the old behavior this
-        replaces) is what lets #mesh-view's own `height: 1fr` reclaim
-        that freed row automatically, with no hardcoded row math.
-
-        UI POLISH Part C: also folds in the selected node's passive
-        LINK quality (RadioService.get_link_quality -- zero RF
-        traffic), sharing this SAME line rather than a second row (see
-        mesh_state.format_mesh_bottom_right_line). LINK is never shown
-        for YOU or when nothing is selected (a radio has no RF link to
-        itself), and never when LAST UPDATE itself would be empty --
-        it only ever rides alongside LAST UPDATE's own existing
-        meaning, never replaces or retimes it.
-        """
-        if self._radio_state is not RadioState.ONLINE:
-            return
-        connection_widgets = list(self.query("#mesh-connection-status"))
-        if connection_widgets:
-            connection_widgets[0].display = False
-        widgets = list(self.query("#mesh-last-update"))
-        if not widgets:
-            return
-        widget = widgets[0]
-        remote_last_heard = [
-            state.node.last_heard
-            for state in working_set
-            if not state.node.is_local and state.node.last_heard is not None
-        ]
-        text = ""
-        if remote_last_heard:
-            age = now - max(remote_last_heard)
-            if age >= 0:
-                text = f"LAST UPDATE {format_relative_age(age)}"
-
-        link_display = None
-        views = list(self.query(MeshTopologyView))
-        if text and views:
-            view = views[0]
-            selected = next(
-                (
-                    candidate
-                    for candidate in working_set
-                    if candidate.node.node_id == view.selected_node_id
-                ),
-                None,
-            )
-            if selected is not None and not selected.node.is_local:
-                link_display = format_mesh_link_display(
-                    self.radio.get_link_quality(selected.node.node_id), now=now
-                )
-        if link_display is not None:
-            # Reference the ROW's width, not this auto-width widget's
-            # own (previous-content-derived, and so circular) size --
-            # and reserve a small minimum for #mesh-context-status
-            # (width: 1fr, sharing this row) so LINK content can never
-            # grow to claim the entire row and squeeze that sibling to
-            # zero, which is the one width at which its own truncation
-            # guard (`if available > 0`) would stop protecting it.
-            row_widgets = list(self.query("#mesh-bottom-row"))
-            row_width = row_widgets[0].size.width if row_widgets else 0
-            available_width = max(0, row_width - MESH_CONTEXT_STATUS_MIN_WIDTH)
-            text = format_mesh_bottom_right_line(
-                last_update_text=text,
-                link=link_display,
-                available_width=available_width,
-            )
-        widget.update(text)
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:

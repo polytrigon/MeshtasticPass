@@ -517,14 +517,20 @@ def assign_grid_slots(
         entries = buckets.get(direction)
         if not entries:
             continue
+        # Sort order no longer determines radius (see
+        # _compress_distance_to_radius, which uses each node's own
+        # REAL distance directly) -- kept purely for deterministic
+        # _place_group_sticky_first/_reserve_slot collision resolution
+        # when two nodes compress to the identical radius.
         entries.sort(key=lambda item: (item[0], item[1].node_id.casefold()))
         dx, dy = _DIRECTION_VECTORS[direction]
         ideal: list[tuple[NodeMetadata, int, int]] = []
-        for rank, (_distance, node) in enumerate(entries, start=1):
-            clamped_rank = max(
-                min(rank, max_radius), min_radius_by_id.get(node.node_id, 0)
+        for distance, node in entries:
+            radius = max(
+                _compress_distance_to_radius(distance, max_radius),
+                min_radius_by_id.get(node.node_id, 0),
             )
-            ideal.append((node, dx * clamped_rank, dy * clamped_rank))
+            ideal.append((node, dx * radius, dy * radius))
         for node, slot_x, slot_y in _place_group_sticky_first(
             ideal, direction, sticky_positions, occupied
         ):
@@ -1049,6 +1055,42 @@ def _direction_bucket(bearing: float) -> str:
     """Map a compass bearing to one of eight 45-degree direction buckets."""
     index = int(((bearing % 360.0) + 22.5) // 45.0) % 8
     return _DIRECTION_ORDER[index]
+
+
+# MESH GPS PLACEMENT: real-world distance (miles) compressed onto the
+# fixed, small [1, max_radius] grid-step scale topology placement
+# already uses -- never a literal to-scale map. LoRa's realistic
+# effective range spans from well under a mile (dense urban/indoor) to
+# tens of miles (rural/line-of-sight), so a linear map would either
+# crowd every practical node into radius 1 or need an enormous board;
+# a base-5 geometric compression instead gives each grid step a full
+# order-of-magnitude-ish real distance range, so farther nodes always
+# land farther out while still fitting the same handful of usable grid
+# steps every non-GPS node already renders within. Deliberately a
+# fixed, documented breakpoint ladder rather than a continuous
+# log(distance) formula -- easier to reason about and test exactly,
+# and no less principled for it.
+_GPS_DISTANCE_RADIUS_GEOMETRIC_BASE = 5.0
+_GPS_DISTANCE_RADIUS_FIRST_BREAKPOINT_MILES = 1.0
+
+
+def _compress_distance_to_radius(distance_miles: float, max_radius: int) -> int:
+    """Deterministic real-distance -> grid-step-radius compression.
+
+    radius 1 for anything under the first breakpoint (default: 1
+    mile), then one additional grid step every time distance crosses
+    the next breakpoint (5x the previous one), capped at max_radius --
+    the same cap every other placement path in this module already
+    respects. Bearing (which direction bucket a node is even in) is
+    computed entirely separately; this only ever affects how far out
+    along that direction's ray a node sits.
+    """
+    radius = 1
+    breakpoint_miles = _GPS_DISTANCE_RADIUS_FIRST_BREAKPOINT_MILES
+    while distance_miles > breakpoint_miles and radius < max_radius:
+        radius += 1
+        breakpoint_miles *= _GPS_DISTANCE_RADIUS_GEOMETRIC_BASE
+    return radius
 
 
 def _reserve_slot(
