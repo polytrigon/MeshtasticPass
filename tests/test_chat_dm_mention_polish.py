@@ -23,7 +23,7 @@ from app import (
 )
 from app_settings import AppSettings
 from chat_store import ChatStore
-from radio_service import NodeMetadata, ReceivedMessage
+from radio_service import NodeMetadata, RadioState, ReceivedMessage
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 from tests.test_app import ControllableSendRadioService
 from theme_palette import THEME_PALETTES
@@ -1189,6 +1189,236 @@ class AmberComposerPromptColorTests(ChatDmMentionAppTestsBase):
             app._apply_color_theme("snow")
             await pilot.pause()
             self.assertEqual(radio.sent_texts, [])
+
+
+# ---- RECONNECT DELIVERY + CHAT HEADER FIX Part B -----------------------
+
+
+class ChatConnectingHeaderTests(ChatDmMentionAppTestsBase):
+    """While CONNECTING (or any other not-ONLINE state), CHAT's header
+
+    must show only the connection-status text -- never the separator
+    bullet or the DM selector alongside it (real-hardware report: both
+    remained visible, e.g. "STATUS CONNECTING... • [ DM(0) ▾ ]").
+    """
+
+    def _header_widgets(self, app: MeshtasticPassApp):
+        bullet = app.query_one("#chat-header-bullet")
+        dm_selector = app.query_one(DMModeSelector)
+        channel_selector = app.query_one(ChannelSelector)
+        return channel_selector, bullet, dm_selector
+
+    async def test_connecting_hides_bullet_and_dm_selector(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            channel_selector, bullet, dm_selector = self._header_widgets(app)
+            self.assertTrue(bullet.display)
+            self.assertTrue(dm_selector.display)
+
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+
+            self.assertFalse(bullet.display)
+            self.assertFalse(dm_selector.display)
+            self.assertTrue(dm_selector.disabled)
+            header_text = str(channel_selector.render())
+            self.assertIn("CONNECTING", header_text)
+            self.assertNotIn("DM", header_text)
+
+    async def test_offline_also_hides_bullet_and_dm_selector(self) -> None:
+        """Item 14: the same principle applies to every not-ONLINE
+
+        connection-status presentation, not CONNECTING specifically.
+        """
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            _, bullet, dm_selector = self._header_widgets(app)
+            self.assertFalse(bullet.display)
+            self.assertFalse(dm_selector.display)
+
+    async def test_online_restores_normal_header_automatically(self) -> None:
+        """Item 12: no tab switch, manual refresh, or focus movement
+
+        required -- ONLINE alone restores it, using whatever
+        channel/DM state the user already had selected.
+        """
+        radio = _simulated_radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            channel_selector, bullet, dm_selector = self._header_widgets(app)
+            self.assertFalse(bullet.display)
+            self.assertFalse(dm_selector.display)
+
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertTrue(bullet.display)
+            self.assertTrue(dm_selector.display)
+            self.assertFalse(dm_selector.disabled)
+            header_text = str(channel_selector.render())
+            self.assertNotIn("CONNECTING", header_text)
+            self.assertNotIn("STATUS", header_text)
+
+    async def test_hiding_does_not_auto_open_a_dropdown_on_restore(self) -> None:
+        radio = _simulated_radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            _, _, dm_selector = self._header_widgets(app)
+            self.assertFalse(dm_selector.is_open)
+            self.assertFalse(app.query_one(ChannelSelector).is_open)
+
+    async def test_focus_is_not_stranded_on_hidden_dm_selector(self) -> None:
+        """Item 15: focus must move to a visible, usable target the
+
+        instant the DM selector is hidden -- never remain on it.
+        """
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            dm_selector = app.query_one(DMModeSelector)
+            dm_selector.focus()
+            await pilot.pause()
+            self.assertIs(app.focused, dm_selector)
+
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+
+            self.assertIsNot(app.focused, dm_selector)
+            self.assertTrue(app.query_one("#chat-log").has_focus)
+
+    async def test_dm_selector_popup_closes_when_hidden(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            dm_selector = app.query_one(DMModeSelector)
+            dm_selector.focus()
+            dm_selector.open_menu()
+            await pilot.pause()
+            self.assertTrue(dm_selector.is_open)
+
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+
+            self.assertFalse(dm_selector.is_open)
+
+    async def test_c_and_d_are_inert_while_connecting(self) -> None:
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertFalse(app.query_one(DMModeSelector).is_open)
+
+            await pilot.press("c")
+            await pilot.pause()
+            self.assertFalse(app.query_one(ChannelSelector).is_open)
+
+    async def test_c_and_d_resume_normal_behavior_once_online(self) -> None:
+        radio = _simulated_radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertTrue(app.query_one(DMModeSelector).is_open)
+            await pilot.press("escape")
+            await pilot.pause()
+
+            await pilot.press("c")
+            await pilot.pause()
+            self.assertTrue(app.query_one(ChannelSelector).is_open)
+
+    async def test_hiding_header_preserves_dm_state_and_unread_count(self) -> None:
+        """Item 13: presentation only -- selected channel, active DM
+
+        conversation, DM unread count, drafts, transcript history, and
+        channel state must all survive the hide/show cycle untouched.
+        """
+        store = ChatStore.open(self.chat_db_path)
+        self.addCleanup(store.close)
+        store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        radio = _simulated_radio()
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            unread_before = app.query_one(DMModeSelector).selected_label
+            app.query_one("#chat-input", Input).value = "unsent draft"
+
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertEqual(
+                app.query_one(DMModeSelector).selected_label, unread_before
+            )
+            self.assertEqual(
+                app.query_one("#chat-input", Input).value, "unsent draft"
+            )
+            self.assertEqual(app.current_channel_index, 0)
+
+    async def test_header_visibility_generates_zero_rf_traffic(self) -> None:
+        radio = _simulated_radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+            self.assertEqual(radio.sent_messages, ())
 
 
 if __name__ == "__main__":

@@ -3781,6 +3781,25 @@ class MeshtasticPassApp(App[None]):
                 event.stop()
             return
 
+        # RECONNECT DELIVERY + CHAT HEADER FIX item 16: while not
+        # ONLINE, C/D must not open the channel/DM dropdowns their
+        # header selectors normally do -- those selectors are
+        # themselves hidden/disabled while not ONLINE (see
+        # _update_chat_connection_state), so this applies uniformly
+        # before any of the three chat_mode-specific branches below
+        # (channel-neutral, DMS list, DMS conversation) ever dispatch
+        # on "c"/"d", rather than repeating the same check three times.
+        # Every other hotkey (arrows, ENTER, ESC, etc.) is unaffected --
+        # this pass does not change existing offline/disabled behavior
+        # for anything except these two.
+        if (
+            self.current_tab == "chat"
+            and self._radio_state is not RadioState.ONLINE
+            and event.key.lower() in ("c", "d")
+        ):
+            event.stop()
+            return
+
         if self.current_tab == "chat" and self._chat_mode == "channel":
             transcript = self.query_one("#chat-log", ChatTranscript)
             if event.key in ("up", "down"):
@@ -7600,6 +7619,41 @@ class MeshtasticPassApp(App[None]):
             selectors[0].set_status_override(self._connection_status_rich_text())
 
         status_rich_text = self._connection_status_rich_text()
+        online = status_rich_text is None
+        # RECONNECT DELIVERY + CHAT HEADER FIX item 11: while not
+        # ONLINE, CHAT's header must show ONLY the connection-status
+        # text above (already handled by ChannelSelector's own
+        # set_status_override) -- the separator bullet and DM selector
+        # must not remain visible/interactive alongside it. Both are
+        # pure presentation toggles: value/options/unread count are
+        # never touched, so the normal header reappears exactly as it
+        # was the instant ONLINE returns (item 12/13), with no tab
+        # switch/manual refresh required -- this method already runs on
+        # every connection-state transition (see _show_connection) and
+        # every ~0.45s while not ONLINE (see
+        # _advance_connection_animation).
+        bullets = list(self.query("#chat-header-bullet"))
+        if bullets:
+            bullets[0].display = online
+        dm_selectors = list(self.query(DMModeSelector))
+        if dm_selectors:
+            dm_selector = dm_selectors[0]
+            was_focused = self.focused is dm_selector
+            if not online and dm_selector.is_open:
+                dm_selector.close_menu()
+            # disabled (not just display=False) so Textual's own
+            # dropdown/key handling can never treat it as interactive
+            # even if something reaches it directly (belt-and-suspenders
+            # alongside the "d" hotkey's own ONLINE check below, item
+            # 16) -- and so a stray Tab press cannot land focus back on
+            # a hidden widget while not ONLINE.
+            dm_selector.disabled = not online
+            dm_selector.display = online
+            if not online and was_focused:
+                # Item 15: never leave focus stranded on a now-hidden
+                # widget -- land on the SAME neutral per-mode target
+                # C/D/ESC already use elsewhere, never a dropdown.
+                self._focus_chat_mode(self._chat_mode)
         dm_status_widgets = list(self.query("#dm-connection-status"))
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))

@@ -149,12 +149,14 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual(entry.send_generation, 0)
 
     def test_already_terminal_states_are_not_reconciled(self) -> None:
-        """SENT is deliberately excluded here -- see the dedicated
+        """SENT included here -- see RECONNECT DELIVERY FIX below: every
 
-        SENT->UNCONFIRMED tests below; every other terminal state must
-        reload completely unchanged.
+        terminal state (and UNCONFIRMED itself) must reload completely
+        unchanged. Only SENDING is ever reconciled (to INTERRUPTED,
+        above), never any of these.
         """
         for raw_state, expected in (
+            ("SENT", DeliveryState.SENT),
             ("HEARD", DeliveryState.HEARD),
             ("UNCONFIRMED", DeliveryState.UNCONFIRMED),
             ("FAILED", DeliveryState.FAILED),
@@ -165,53 +167,85 @@ class AppControllerTests(unittest.TestCase):
                 entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
                 self.assertEqual(entry.delivery_state, expected)
 
-    # ---- Unconfirmable SENT reconciliation on reload --------------------
+    # ---- RECONNECT DELIVERY + CHAT HEADER FIX: SENT survives reload -----
 
-    def test_persisted_sent_message_reconciles_to_unconfirmed_on_load(self) -> None:
-        """Reproduces the real-device report exactly: message_id 81's
+    def test_persisted_sent_message_reloads_as_sent_not_unconfirmed(self) -> None:
+        """Delivery-state monotonicity across reconnect/reload: SENT is
 
-        real dump had messages.delivery_state = SENT and a terminal
-        SENT send_attempt (completed_at NULL, which is expected -- see
-        _set_delivery_state, SENT is deliberately excluded from the
-        completed_at stamp since it isn't a final outcome). A SENT row
-        has no persisted confirmation_deadline, and nothing can ever
-        move it out of SENT again after a restart (only a live
-        process's own radio callback can ever deliver HEARD, and
-        _advance_delivery_states() only promotes SENT->UNCONFIRMED once
-        a confirmation_deadline it doesn't have elapses) -- so the
-        widget's deliberate SENT-renders-as-SENDING display (see
-        ChatEntryWidget.refresh_delivery_state) would otherwise show
-        "SENDING..." forever, with no resend affordance either (SENT is
-        not in MANUAL_RESEND_STATES). UNCONFIRMED is the honest,
-        already-existing state for exactly this situation.
+        already a genuine positive routing confirmation for that send
+        attempt -- a resolved historical fact -- never "no evidence at
+        all". Reloading it (whether via an app restart, or mid-session
+        via load_older_chat_history after a disconnect/reconnect) must
+        never downgrade it to UNCONFIRMED merely because THIS session
+        has no live pending-send bookkeeping for it (see stored_chat_
+        entry's own updated docstring/comment for the full root-cause
+        analysis -- an earlier version of this function did exactly
+        that, on a premise -- SENT rendering as "SENDING..." forever --
+        that no longer holds: ChatEntryWidget.refresh_delivery_state()
+        already renders SENT as its own distinct "✓").
         """
         stored = make_stored_message(delivery_state="SENT")
 
         entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
 
-        self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
-        self.assertNotEqual(entry.delivery_state, DeliveryState.SENT)
+        self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+        self.assertNotEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
 
-    def test_sent_reconciliation_never_claims_heard(self) -> None:
+    def test_reloaded_sent_is_not_upgraded_to_heard_either(self) -> None:
+        """Reload never fabricates evidence in EITHER direction -- a
+
+        reloaded SENT row must reload as exactly SENT, not silently
+        promoted to HEARD any more than it is wrongly demoted to
+        UNCONFIRMED.
+        """
         stored = make_stored_message(delivery_state="SENT")
         entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
-        self.assertNotIn(
-            entry.delivery_state, (DeliveryState.SENT, DeliveryState.HEARD)
-        )
+        self.assertEqual(entry.delivery_state, DeliveryState.SENT)
 
-    def test_sent_reconciliation_unlocks_manual_resend(self) -> None:
+    def test_reloaded_sent_still_offers_no_manual_resend(self) -> None:
+        """Unchanged from a live SENT entry's own behavior -- it already
+
+        went out successfully; a manual resend affordance would risk a
+        real duplicate transmission, not fix an honesty problem (see
+        can_manual_resend/MANUAL_RESEND_STATES, which deliberately
+        excludes SENT).
+        """
         from app import can_manual_resend
 
         stored = make_stored_message(delivery_state="SENT")
         entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
-        self.assertTrue(can_manual_resend(entry))
+        self.assertFalse(can_manual_resend(entry))
 
-    def test_sent_reconciliation_does_not_fabricate_a_new_send_attempt(self) -> None:
+    def test_reloaded_sent_does_not_fabricate_a_new_send_attempt(self) -> None:
         stored = make_stored_message(delivery_state="SENT")
         entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
         self.assertIsNone(entry.active_attempt_id)
         self.assertIsNone(entry.confirmation_deadline)
         self.assertEqual(entry.send_generation, 0)
+
+    def test_repeated_reload_of_sent_is_idempotent(self) -> None:
+        """Reloading the SAME persisted SENT row repeatedly (e.g. across
+
+        several reconnect cycles within one process, or several
+        load_older_page calls) must never progressively mutate it --
+        each independent stored_chat_entry() call is a pure function of
+        its input row.
+        """
+        stored = make_stored_message(delivery_state="SENT")
+        for _ in range(3):
+            entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+    def test_reloaded_heard_and_failed_also_never_downgrade(self) -> None:
+        for raw_state, expected in (
+            ("HEARD", DeliveryState.HEARD),
+            ("FAILED", DeliveryState.FAILED),
+        ):
+            with self.subTest(raw_state=raw_state):
+                stored = make_stored_message(delivery_state=raw_state)
+                entry = stored_chat_entry(stored, wall_now=1_700_000_100.0)
+                self.assertEqual(entry.delivery_state, expected)
+                self.assertNotEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
 
     def test_incoming_messages_are_never_touched_by_reconciliation(self) -> None:
         """The SENDING->INTERRUPTED rule only ever applies to outgoing
