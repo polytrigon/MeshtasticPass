@@ -934,6 +934,162 @@ class MeshGridPlacementTests(unittest.TestCase):
         self.assertGreater(positions["!n"][0], 1)
 
 
+def _sticky_map(slots) -> dict:
+    return {item.node.node_id.strip().lower(): (item.x, item.y, item.region) for item in slots}
+
+
+class MeshLayoutStabilityStickyPositionTests(unittest.TestCase):
+    """MESH LAYOUT STABILITY: assign_grid_slots(sticky_positions=...) and
+
+    place_within_bounds(min_extent=...) are the pure-function core of
+    "no new topology information = no existing node movement" -- see
+    their own docstrings. Wired into the live app in _refresh_mesh;
+    MeshLayoutStabilityAppTests below proves that wiring end to end.
+    """
+
+    def test_sticky_position_is_reused_when_region_matches(self) -> None:
+        node = NodeMetadata("!a", "A", position=east_of_local(2))
+        first = assign_grid_slots([YOU, node])
+        sticky = _sticky_map(first)
+        # A brand new call, from scratch, fed the previous call's own
+        # output as sticky_positions -- exactly what app.py's
+        # _refresh_mesh does every cycle.
+        second = assign_grid_slots([YOU, node], sticky_positions=sticky)
+        self.assertEqual(_sticky_map(first), _sticky_map(second))
+
+    def test_new_node_does_not_move_an_existing_sticky_node(self) -> None:
+        existing = NodeMetadata("!a", "A", position=east_of_local(2))
+        first = assign_grid_slots([YOU, existing])
+        sticky = _sticky_map(first)
+
+        newcomer = NodeMetadata("!b", "B", position=east_of_local(6))
+        second = assign_grid_slots([YOU, existing, newcomer], sticky_positions=sticky)
+
+        existing_slot = next(item for item in second if item.node.node_id == "!a")
+        self.assertEqual((existing_slot.x, existing_slot.y), (sticky["!a"][0], sticky["!a"][1]))
+
+    def test_departed_then_returned_node_is_not_forced_back_to_the_same_cell(
+        self,
+    ) -> None:
+        """Once pruned from the sticky map (the node genuinely left the
+
+        working set), a later reappearance is an ordinary fresh
+        placement -- it MAY land back on the same cell (deterministic
+        geometry often agrees), but nothing forces it to; this proves
+        the two calls are independent, not that a stale entry lingered.
+        """
+        node = NodeMetadata("!a", "A", position=east_of_local(2))
+        first = assign_grid_slots([YOU, node])
+        sticky_without_a = {
+            key: value for key, value in _sticky_map(first).items() if key != "!a"
+        }
+        second = assign_grid_slots([YOU, node], sticky_positions=sticky_without_a)
+        # Deterministic geometry: still lands in the same place, but via
+        # fresh computation, not a leftover sticky entry (there is none).
+        self.assertEqual(_sticky_map(first)["!a"][:2], _sticky_map(second)["!a"][:2])
+
+    def test_gaining_a_real_bearing_overrides_stale_unknown_sticky_entry(self) -> None:
+        """A node's placement CATEGORY changing (no position -> a real
+
+        bearing) is genuine new topology information -- it is correctly
+        allowed to move, never forced back into its old UNKNOWN-region
+        cell.
+        """
+        node_no_gps = NodeMetadata("!a", "A")
+        first = assign_grid_slots([YOU, node_no_gps])
+        self.assertEqual(first[1].region, "UNKNOWN")
+        sticky = _sticky_map(first)
+
+        node_with_gps = NodeMetadata("!a", "A", position=east_of_local(2))
+        second = assign_grid_slots([YOU, node_with_gps], sticky_positions=sticky)
+        placed = next(item for item in second if item.node.node_id == "!a")
+        self.assertEqual(placed.region, "E")
+
+    def test_min_extent_prevents_recompaction_when_the_farthest_node_leaves(
+        self,
+    ) -> None:
+        near = NodeMetadata("!near", "Near", position=north_of_local(1))
+        far = NodeMetadata("!far", "Far", position=north_of_local(10))
+        slots_with_both = assign_grid_slots([YOU, near, far], max_radius=3)
+        positions_with_both = place_within_bounds(
+            slots_with_both, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        near_row_with_far_present = positions_with_both["!near"][0]
+
+        # Far leaves. Without a ratcheted min_extent, near would stretch
+        # to fill the axis's now-larger relative headroom and move.
+        slots_without_far = assign_grid_slots([YOU, near], max_radius=3)
+        # Exactly what far's own logical step had been (its clamped
+        # rank, not its raw geographic distance) -- what app.py's own
+        # ratchet remembers from the cycle far was last present.
+        farthest_up_with_far_present = max(
+            -item.y for item in slots_with_both if item.y < 0
+        )
+        ratcheted_extent = {"up": farthest_up_with_far_present}
+        positions_ratcheted = place_within_bounds(
+            slots_without_far,
+            center_row=5,
+            center_column=11,
+            row_count=8,
+            column_count=21,
+            min_extent=ratcheted_extent,
+        )
+        self.assertEqual(positions_ratcheted["!near"][0], near_row_with_far_present)
+
+        # Without the ratchet at all (the pre-existing, still-default
+        # behavior for any caller that omits min_extent), near DOES
+        # recompact -- proving the ratchet is what changes the outcome,
+        # not some other factor.
+        positions_unratcheted = place_within_bounds(
+            slots_without_far, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        self.assertNotEqual(positions_unratcheted["!near"][0], near_row_with_far_present)
+
+    def test_min_extent_omitted_reproduces_prior_behavior_exactly(self) -> None:
+        nodes = [YOU, NodeMetadata("!a", "A", position=east_of_local(2))]
+        slots = assign_grid_slots(nodes)
+        with_default = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21
+        )
+        with_explicit_empty = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21, min_extent={}
+        )
+        self.assertEqual(with_default, with_explicit_empty)
+
+    def test_sticky_positions_omitted_reproduces_prior_behavior_exactly(self) -> None:
+        nodes = [YOU, NodeMetadata("!a", "A", position=east_of_local(2))]
+        without_param = assign_grid_slots(nodes)
+        with_none = assign_grid_slots(nodes, sticky_positions=None)
+        with_empty = assign_grid_slots(nodes, sticky_positions={})
+        self.assertEqual(_sticky_map(without_param), _sticky_map(with_none))
+        self.assertEqual(_sticky_map(without_param), _sticky_map(with_empty))
+
+    def test_repeated_identical_calls_are_idempotent(self) -> None:
+        nodes = [
+            YOU,
+            NodeMetadata("!a", "A", position=east_of_local(2)),
+            NodeMetadata("!b", "B", position=north_of_local(4)),
+        ]
+        slots = assign_grid_slots(nodes)
+        sticky = _sticky_map(slots)
+        extent = {"up": 4, "down": 0, "left": 0, "right": 2}
+        first_positions = place_within_bounds(
+            slots, center_row=5, center_column=11, row_count=8, column_count=21, min_extent=extent
+        )
+        for _ in range(3):
+            slots = assign_grid_slots(nodes, sticky_positions=sticky)
+            sticky = _sticky_map(slots)
+            positions = place_within_bounds(
+                slots,
+                center_row=5,
+                center_column=11,
+                row_count=8,
+                column_count=21,
+                min_extent=extent,
+            )
+            self.assertEqual(positions, first_positions)
+
+
 class MeshTranslationAndDirectionalTargetTests(unittest.TestCase):
     """Pure tests for app.py's generic (not fixture-specific) whole-mesh
 
@@ -5916,6 +6072,231 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(text, "LINK  ----  -- / -- • LAST UPDATE 3s")
 
 
+class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
+    """MESH LAYOUT STABILITY, wired end to end through the real app's
+
+    _refresh_mesh (see MeshLayoutStabilityStickyPositionTests above for
+    the pure-function proof underneath this). Core invariant: no new
+    topology information, no existing node movement.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    @staticmethod
+    def _real_positions(view: "MeshTopologyView") -> dict:
+        return {
+            node_id: position
+            for node_id, position in view.base_positions.items()
+            if not node_id.startswith("relay:")
+        }
+
+    async def test_last_heard_update_alone_never_moves_nodes(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
+            b = NodeMetadata("!bbbb0002", "Bravo", "B", last_heard=now - 5, hops_away=1)
+            app.radio.get_known_nodes = lambda nodes=(local, a, b): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            # Ordinary passing time: last_heard age advances, nothing else.
+            app._refresh_mesh(wall_now=now + 10)
+            await pilot.pause()
+            self.assertEqual(self._real_positions(view), before)
+
+    async def test_telemetry_and_link_updates_never_move_nodes(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
+            app.radio.get_known_nodes = lambda nodes=(local, a): nodes
+            app.radio.get_link_quality = lambda node_id: None
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            app.radio.get_link_quality = lambda node_id: LinkObservation(
+                rssi=-70, snr=3.0, observed_at=now
+            )
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(self._real_positions(view), before)
+
+    async def test_selection_changes_never_move_nodes(self) -> None:
+        """YOU -> remote -> YOU -> remote: no coordinate movement."""
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
+            app.radio.get_known_nodes = lambda nodes=(local, a): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            for node_id in (local.node_id, "!aaaa0001", local.node_id, "!aaaa0001"):
+                _mesh_select_node(app, node_id)
+                await pilot.pause()
+                self.assertEqual(self._real_positions(view), before)
+
+    async def test_new_node_does_not_move_existing_ones(self) -> None:
+        """The new node's name/id sorts BEFORE both existing ones
+
+        (Bravo/Charlie vs. new "Aaron") -- neither has a trustworthy
+        position, so both land on the UNKNOWN outer ring, indexed by
+        _node_sort_key's alphabetical order; a newcomer sorting first
+        is exactly what would shift every existing node's ring index
+        without the sticky-position fix (see MeshLayoutStabilityStickyPositionTests).
+        """
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            b = NodeMetadata("!bbbb0002", "Bravo", "B", last_heard=now - 5, hops_away=1)
+            c = NodeMetadata("!cccc0003", "Charlie", "C", last_heard=now - 5, hops_away=1)
+            app.radio.get_known_nodes = lambda nodes=(local, b, c): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            before = self._real_positions(view)
+
+            aaron = NodeMetadata("!aaaa0001", "Aaron", "A", last_heard=now - 5, hops_away=1)
+            app.radio.get_known_nodes = lambda nodes=(local, b, c, aaron): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            after = self._real_positions(view)
+
+            for node_id, position in before.items():
+                self.assertEqual(after[node_id], position)
+            self.assertIn("!aaaa0001", after)
+            self.assertNotIn("!aaaa0001", before)
+
+    async def test_node_aging_out_does_not_recompact_remaining_nodes(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            near = NodeMetadata("!near0001", "Near", "NR", last_heard=now - 5, hops_away=1)
+            far = NodeMetadata(
+                "!far00001", "Far", "FR", last_heard=now - 5, hops_away=3
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, near, far): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            near_before = self._real_positions(view)["!near0001"]
+
+            # Far ages out of the working set entirely (VERY_OLD).
+            far_gone = NodeMetadata(
+                "!far00001",
+                "Far",
+                "FR",
+                last_heard=now - MESH_STALE_THRESHOLD_SECONDS - 60,
+                hops_away=3,
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, near, far_gone): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            positions = self._real_positions(view)
+            self.assertNotIn("!far00001", positions)
+            self.assertEqual(positions["!near0001"], near_before)
+
+    async def test_repeated_identical_refresh_is_idempotent(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
+            app.radio.get_known_nodes = lambda nodes=(local, a): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            first = self._real_positions(view)
+            for _ in range(3):
+                app._refresh_mesh(wall_now=now)
+                await pilot.pause()
+                self.assertEqual(self._real_positions(view), first)
+
+    async def test_total_remote_turnover_does_not_carry_over_stale_stretch(
+        self,
+    ) -> None:
+        """A complete remote-population swap (radio swap, or -- as here
+
+        -- the default simulated mesh's own real nodes being fully
+        replaced by a test-specific set with no shared identity) is a
+        genuine "substantial logical topology change" (item 27): a
+        leftover extent-ratchet/sticky-position from the OLD, unrelated
+        population must not constrain the NEW one's fresh placement.
+        Regression for exactly the cross-contamination
+        MeshResponsiveResizeAndFocusPersistenceTests's own
+        test_growing_the_terminal_reveals_more_grid_and_keeps_selection
+        surfaced: switching to MESH first renders the app's real
+        default SimulatedRadioService nodes (Alice/Bob/...), THEN the
+        test overrides get_known_nodes to an unrelated custom set.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()  # real default SIMULATED_NODES render first
+            view = app.query_one(MeshTopologyView)
+
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO)
+            far_north = NodeMetadata(
+                "!far0north", "Far North", "FARN", None, last_heard=now - 5,
+                position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far_north): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            # Computed fresh (no unrelated leftover history), far_north
+            # spreads out enough that the small viewport shows it as an
+            # off-screen edge indicator -- exactly what a from-scratch
+            # app instance given the SAME two nodes at the SAME small
+            # size would also show.
+            self.assertIn("!far0north", view.edge_node_ids)
+
+
 class ThinScrollBarRenderTests(unittest.TestCase):
     def test_vertical_thin_render_uses_the_thin_glyph(self) -> None:
         from rich.color import Color as RichColor
@@ -6449,6 +6830,154 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(0 <= y < height)
 
 
+class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
+    """MESH BOUNDARY CONTINUATION INDICATORS (items 30-33): a boundary
+
+    indicator must represent an actual off-screen NodeDB node only --
+    never inferred hop points, virtual relay positions, or other
+    synthetic topology geometry that merely happens to clip too. See
+    ProjectToViewportTests.test_clipping_is_id_agnostic_real_or_synthetic
+    for the underlying mechanism's own foundation-level proof.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    async def test_real_off_screen_node_with_no_hops_shows_the_indicator(self) -> None:
+        """Case B: an actual NodeDB node beyond the boundary, with no
+
+        relay chain at all (hops_away unknown) -- the plain, original
+        "real node off-screen" case, unaffected by this pass.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far = NodeMetadata(
+                "!far00001", "Far", "FAR1", None, last_heard=now - 5,
+                position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertIn("!far00001", view.edge_node_ids)
+            self.assertEqual(view.relay_stages, ())
+
+    async def test_synthetic_geometry_clipping_alongside_a_real_off_screen_node_is_not_double_counted(
+        self,
+    ) -> None:
+        """Case D: a real off-screen node whose OWN relay chain also
+
+        clips must produce exactly the real-node indication -- never an
+        extra, separate indication for the clipped relay stage(s). The
+        outermost relay stage of a 5-hop chain this far out genuinely
+        clips (verified fixture, not asserted-into-existence); it must
+        render hidden, not as a second boundary dot beside the real
+        node's own edge glyph.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far = NodeMetadata(
+                "!far00001", "Far", "FAR1", 5, last_heard=now - 5,
+                position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            # Exactly one real indication -- the node itself.
+            self.assertEqual(view.edge_node_ids, frozenset({"!far00001"}))
+            self.assertEqual(len(view.relay_stages), 5)
+
+            relay_widgets = {w.node_id: w for w in app.query(MeshRelayWidget)}
+            self.assertEqual(len(relay_widgets), 5)
+            clipped_relay_ids = {
+                stage.node_id for stage in view.relay_stages
+            } & view._edge_node_ids
+            # The fixture must genuinely exercise a clipped relay stage
+            # -- otherwise this test would pass vacuously.
+            self.assertTrue(clipped_relay_ids, "fixture must clip at least one relay stage")
+            for node_id, widget in relay_widgets.items():
+                if node_id in clipped_relay_ids:
+                    self.assertFalse(
+                        widget.display,
+                        f"{node_id} clipped to the boundary must render hidden, "
+                        "never as an extra continuation indication",
+                    )
+                else:
+                    self.assertTrue(widget.display)
+
+    async def test_selection_round_trip_restores_the_same_indicator_set(self) -> None:
+        """Case E: toggling selection away and back must restore the
+
+        exact same boundary-indicator set -- selection/recentering
+        alone is never what determines which relay stages get hidden.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            # Real current time, not a fixed historical epoch: unlike
+            # _refresh_mesh (called explicitly with wall_now= below),
+            # _mesh_select_node's own set_nodes() call always stamps
+            # `now=time()` internally -- a fixed past `now` here would
+            # make the fixture look VERY_OLD (and so lose its relay
+            # chain entirely) the instant selection triggers that call.
+            now = time.time()
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            far = NodeMetadata(
+                "!far00001", "Far", "FAR1", 5, last_heard=now - 5,
+                position=north_of_local(50),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            before_edge = view.edge_node_ids
+            before_relay_display = {
+                w.node_id: w.display for w in app.query(MeshRelayWidget)
+            }
+
+            _mesh_select_node(app, "!far00001")
+            await pilot.pause()
+            _mesh_select_node(app, you_id)
+            await pilot.pause()
+
+            self.assertEqual(view.edge_node_ids, before_edge)
+            after_relay_display = {
+                w.node_id: w.display for w in app.query(MeshRelayWidget)
+            }
+            self.assertEqual(after_relay_display, before_relay_display)
+
+
 class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestCase):
     """Real-hardware regression: selecting a multi-hop REMOTE node
 
@@ -6785,6 +7314,29 @@ class ProjectToViewportTests(unittest.TestCase):
         )
         self.assertEqual(viewport["you"], (3, 3))
         self.assertEqual(edge_ids, frozenset())
+
+    def test_clipping_is_id_agnostic_real_or_synthetic(self) -> None:
+        """MESH BOUNDARY CONTINUATION INDICATORS' foundation: this
+
+        function has no concept of "real node" vs "synthetic relay
+        stage" at all -- it clips whatever (id, position) pairs it is
+        given, purely by coordinate. A "relay:..."-shaped id that ends
+        up out of bounds is reported in edge_ids exactly like any other
+        id would be -- distinguishing "this represents an actual
+        off-screen NodeDB node" from "this is just interior route
+        geometry that happened to clip" is entirely the CALLER's job
+        (see app.py's MeshTopologyView.edge_node_ids, which intersects
+        this raw set with real working-set node IDs, and set_nodes'
+        own `widget.display = widget.node_id not in edge_ids` for
+        MeshRelayWidget, which hides a clipped relay stage rather than
+        rendering it at the boundary as if it were one).
+        """
+        viewport, edge_ids = project_to_viewport(
+            {"you": (3, 3), "real_far": (-10, 3), "relay:real_far:1": (-10, 3)},
+            row_count=5,
+            column_count=5,
+        )
+        self.assertEqual(edge_ids, frozenset({"real_far", "relay:real_far:1"}))
 
 
 class MeshResponsiveResizeAndFocusPersistenceTests(unittest.IsolatedAsyncioTestCase):

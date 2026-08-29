@@ -2141,6 +2141,23 @@ class MeshTopologyView(Container):
             widget.styles.offset = (grid_x, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
             widget.refresh_visual(theme=theme)
+            # MESH BOUNDARY CONTINUATION INDICATORS item 30-32: a real
+            # node's own clipped glyph at the viewport edge IS the
+            # existing "more topology exists here" signal (see the
+            # comment above viewport_positions/project_to_viewport --
+            # it renders unlabeled at the boundary). A relay stage is
+            # never a real NodeDB entry -- just interpolated route
+            # geometry between YOU and a real client (see RelayStage) --
+            # so if IT is what got clipped here (its own interpolated
+            # cell fell outside the viewport, independent of whether
+            # the real endpoint did), it must never visually stand in
+            # for that same signal: hidden entirely rather than
+            # rendered at the boundary, where an anonymous dim dot
+            # would be indistinguishable from a genuinely off-screen
+            # node. This is display-only -- edge_ids itself (used
+            # above for the spurious-connector chain-ordering check)
+            # is untouched, so that fix's own correctness is unaffected.
+            widget.display = widget.node_id not in edge_ids
 
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
@@ -3508,6 +3525,22 @@ class MeshtasticPassApp(App[None]):
         self._user_menu_scroll_x: float | None = None
         self._user_menu_scroll_y: float | None = None
         self._emoji_picker: EmojiPicker | None = None
+        # MESH LAYOUT STABILITY: sticky logical positions (node_id ->
+        # (x, y, region), assign_grid_slots' own PositionedNode shape)
+        # and a monotonic per-axis extent ratchet for place_within_
+        # bounds -- both fed back in as each subsequent _refresh_mesh()
+        # call's own input, so a routine update (last_heard, telemetry,
+        # LINK, selection, a node aging/appearing elsewhere) never
+        # moves an already-placed node purely because rank/index
+        # bookkeeping shifted. See _refresh_mesh and mesh_topology.
+        # assign_grid_slots/place_within_bounds' own docstrings.
+        self._mesh_sticky_positions: dict[str, tuple[int, int, str]] = {}
+        self._mesh_extent_ratchet: dict[str, int] = {
+            "up": 0,
+            "down": 0,
+            "left": 0,
+            "right": 0,
+        }
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -5701,11 +5734,73 @@ class MeshtasticPassApp(App[None]):
         min_radius_by_id = {
             node_id: hops + 1 for node_id, hops in _mesh_hop_counts(working_set).items()
         }
+        # A total remote-population turnover (radio swap, or a NodeDB
+        # reset -- not one remote node's ID mismatch, but the entire
+        # current remote set sharing nothing with what was previously
+        # remembered) is exactly the "substantial logical topology
+        # change" stickiness is not meant to apply across: without this
+        # reset, unrelated leftover positions/extents from a completely
+        # different node population would otherwise still constrain
+        # this one's fresh placement. Never triggers on ordinary churn
+        # (one node joining/leaving among others that persist), only a
+        # clean break -- see MeshLayoutStabilityAppTests.
+        current_remote_ids = {
+            state.node.node_id.strip().lower()
+            for state in working_set
+            if not state.node.is_local
+        }
+        local_id = next(
+            (state.node.node_id.strip().lower() for state in working_set if state.node.is_local),
+            "",
+        )
+        previous_remote_ids = set(self._mesh_sticky_positions) - {local_id}
+        if previous_remote_ids and current_remote_ids and not (
+            current_remote_ids & previous_remote_ids
+        ):
+            self._mesh_sticky_positions = {}
+            self._mesh_extent_ratchet = {"up": 0, "down": 0, "left": 0, "right": 0}
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
             max_radius=DEFAULT_MAX_GRID_RADIUS,
             min_radius_by_id=min_radius_by_id,
+            sticky_positions=self._mesh_sticky_positions,
         )
+        # MESH LAYOUT STABILITY: remember this cycle's own positions,
+        # pruned to only currently-present nodes (a departed node's
+        # vacated cell simply becomes free for whoever's placed next --
+        # it never itself displaces anyone), so the NEXT call's sticky
+        # lookup reflects reality, not indefinitely-accumulating history.
+        self._mesh_sticky_positions = {
+            item.node.node_id.strip().lower(): (item.x, item.y, item.region)
+            for item in slots
+        }
+        # Ratchet (monotonic max, never shrinks) each axis's own
+        # farthest-logical-step extent -- see place_within_bounds'
+        # min_extent docstring: without this, a node aging out (making
+        # the axis's current farthest node closer) would immediately
+        # re-compact every other node sharing that axis, and a new
+        # farther node appearing would stretch (and so move) them
+        # outward -- both routine events, neither genuine topology
+        # information about any node OTHER than the one that
+        # appeared/departed.
+        self._mesh_extent_ratchet = {
+            "up": max(
+                self._mesh_extent_ratchet["up"],
+                max((-item.y for item in slots if item.y < 0), default=0),
+            ),
+            "down": max(
+                self._mesh_extent_ratchet["down"],
+                max((item.y for item in slots if item.y > 0), default=0),
+            ),
+            "left": max(
+                self._mesh_extent_ratchet["left"],
+                max((-item.x for item in slots if item.x < 0), default=0),
+            ),
+            "right": max(
+                self._mesh_extent_ratchet["right"],
+                max((item.x for item in slots if item.x > 0), default=0),
+            ),
+        }
         # Placed in the STABLE logical coordinate space, entirely
         # independent of the current viewport's own row/column count
         # (see MESH_LOGICAL_GRID_ROWS) -- MeshTopologyView.set_nodes is
@@ -5717,6 +5812,7 @@ class MeshtasticPassApp(App[None]):
             center_column=MESH_LOGICAL_GRID_CENTER_COLUMN,
             row_count=MESH_LOGICAL_GRID_ROWS,
             column_count=MESH_LOGICAL_GRID_COLUMNS,
+            min_extent=self._mesh_extent_ratchet,
         )
         view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
         # Deferred (not called inline): #mesh-context-status's own
