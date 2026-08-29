@@ -217,6 +217,29 @@ class ChannelInfo:
 
 
 @dataclass(frozen=True)
+class LinkObservation:
+    """RF signal quality for one node, from a packet directly heard from it.
+
+    rssi and snr are always captured together, from the SAME MeshPacket,
+    so they can never describe two different moments in time. Only ever
+    recorded when traversed_hops(hop_start, hop_limit) == 0 for that
+    packet (see RadioService._on_any_packet_for_link_quality) -- i.e.
+    a packet this node itself transmitted and this radio received with
+    zero intermediate relays. A packet forwarded through one or more
+    relay nodes is deliberately never recorded here: rx_rssi/rx_snr on
+    a relayed packet describe the RF link from the LAST RELAY to this
+    radio, not from the packet's logical origin, and presenting that as
+    the origin node's own link quality would be dishonest (see PROTOBUF-
+    SOURCE-VERIFIED MeshPacket.rx_snr/rx_rssi docs: both are set once,
+    on reception, by the immediate receiver, never carried end-to-end).
+    """
+
+    rssi: int | None
+    snr: float | None
+    observed_at: float
+
+
+@dataclass(frozen=True)
 class NodeMetadata:
     """Trustworthy application-level node details from the synced database."""
 
@@ -412,6 +435,16 @@ class RadioService:
         self._pub: Any | None = None
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._direct_observations: dict[str, float] = {}
+        # Separate from _direct_observations above (which only tracks
+        # "was ANY accepted packet heard from this node recently", for
+        # last_heard/activity-tier freshening -- it never checks hop
+        # count). Keyed by lowercased node_id, one LinkObservation per
+        # node, always the most recently directly-heard packet's own
+        # rssi/snr/timestamp. Cleared on radio identity change/close
+        # exactly like _direct_observations, so a previous radio's (or
+        # previous connection's) readings can never be shown for a new
+        # one (see connect()/set_device_path()/close()).
+        self._link_observations: dict[str, LinkObservation] = {}
         self._activity_local_node_id: str | None = None
         # Tracks in-flight outgoing sends by packet ID, keyed to the
         # status_handler given to send_text() plus the EXPECTED
@@ -451,6 +484,7 @@ class RadioService:
                 and self._activity_local_node_id.lower() != info.node_id.lower()
             ):
                 self._direct_observations.clear()
+                self._link_observations.clear()
             self._activity_local_node_id = info.node_id
             # Item 7: a NEW connection always gets a NEW generation and
             # a freshly-built snapshot -- whether this is a reconnect to
@@ -490,6 +524,7 @@ class RadioService:
         self.close()
         self.device_path = device_path.strip()
         self._direct_observations.clear()
+        self._link_observations.clear()
         self._activity_local_node_id = None
 
     def connection_events(
@@ -1282,6 +1317,7 @@ class RadioService:
         # that NEW radio's own reported identity.
         self._activity_local_node_id = None
         self._direct_observations.clear()
+        self._link_observations.clear()
         if self._interface is not None:
             interface = self._interface
             self._interface = None
@@ -1357,6 +1393,21 @@ class RadioService:
             except Exception:
                 pass
 
+        # Always on (not diagnostic-gated): the same generic
+        # "meshtastic.receive" topic, read-only, purely to capture
+        # rx_rssi/rx_snr for MESH's passive LINK quality display (item
+        # 22-ish, UI POLISH Part C). This requests nothing new from the
+        # radio -- every packet here was already being decoded and
+        # published by the SDK regardless of whether anything
+        # subscribed; this only starts reading two fields the app
+        # previously discarded. See _on_any_packet_for_link_quality.
+        try:
+            pub.subscribe(
+                self._on_any_packet_for_link_quality, "meshtastic.receive"
+            )
+        except Exception:
+            pass
+
         self._pub = pub
 
     def _on_connection_lost(self, interface: Any = None, **_kwargs: Any) -> None:
@@ -1396,6 +1447,63 @@ class RadioService:
             return
         channel = packet.get("channel", 0)
         rx_debug_log(f"{from_id} {portnum} channel={channel} observed")
+
+    def _on_any_packet_for_link_quality(
+        self,
+        packet: Any = None,
+        interface: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Passively record directly-heard signal quality, for MESH LINK.
+
+        Fires for every decoded packet type (see _subscribe_to_events'
+        comment on the generic "meshtastic.receive" topic) -- portnum-
+        agnostic on purpose, since a node without any CHAT history can
+        still have valid, honest LINK data from a position/telemetry/
+        nodeinfo/routing-ack packet it sent.
+
+        Records rx_rssi/rx_snr ONLY when traversed_hops(hop_start,
+        hop_limit) == 0 for this specific packet -- a genuine zero-relay
+        reception, so the reading describes the RF link to the packet's
+        own sender and not to some intermediate relay (see
+        LinkObservation's docstring). Any other case (indeterminate, or
+        one-or-more hops traveled) is silently skipped: never recorded
+        as if it were direct, and never used to overwrite a previous
+        genuinely-direct reading with a multi-hop one.
+        """
+        if interface is not None and interface is not self._interface:
+            return
+        if not isinstance(packet, dict):
+            return
+        if traversed_hops(
+            self._optional_int(packet.get("hopStart")),
+            self._optional_int(packet.get("hopLimit")),
+        ) != 0:
+            return
+        rssi = self._optional_int(packet.get("rxRssi"))
+        snr = self._optional_float(packet.get("rxSnr"))
+        if rssi is None and snr is None:
+            return
+        node_id = self._format_from_id(packet)
+        normalized = node_id.strip().lower() if isinstance(node_id, str) else ""
+        if not normalized or normalized == "!unknown":
+            return
+        self._link_observations[normalized] = LinkObservation(
+            rssi=rssi, snr=snr, observed_at=time.time()
+        )
+
+    def get_link_quality(self, node_id: str) -> LinkObservation | None:
+        """Read the most recent directly-heard signal quality for a node.
+
+        Transmits nothing; returns None whenever nothing has been
+        directly heard from this node since the current connection (or
+        the current radio identity) began -- see LinkObservation's own
+        docstring for what "directly heard" requires.
+        """
+        normalized = node_id.strip().lower() if isinstance(node_id, str) else ""
+        if not normalized:
+            return None
+        return self._link_observations.get(normalized)
 
     @staticmethod
     def _format_from_id(packet: Any) -> str:
@@ -1491,6 +1599,7 @@ class RadioService:
                 (self._on_text_received, "meshtastic.receive.text"),
                 (self._on_routing_response, "meshtastic.receive.routing"),
                 (self._on_any_packet_for_debug, "meshtastic.receive"),
+                (self._on_any_packet_for_link_quality, "meshtastic.receive"),
             )
             for callback, topic in subscriptions:
                 try:

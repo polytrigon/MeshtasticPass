@@ -11,6 +11,7 @@ from radio_service import RadioIdentityError, RadioState
 from simulated_radio_service import (
     SIMULATED_MESSAGES,
     SIMULATED_LOCAL_POSITION,
+    SIMULATED_NODES,
     SimulatedRadioService,
 )
 
@@ -169,16 +170,17 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         with patch("simulated_radio_service.time.time", return_value=1_000):
             service.connect()
 
-        # Alice(30s)/Bob(299s)/Cafe(400s) are well inside the firmware-aligned
-        # ACTIVE_WINDOW_SECONDS (7200s); NOLN/No Short Name (600s each) are
-        # the next to age out, exactly when the window elapses since their
-        # last-heard time -- BAD's malformed "recent" value and NONE's
-        # missing timestamp are never active at any `now`.
-        self.assertEqual(service.active_node_count(now=1_000), 5)
+        # Alice(30s)/Bob(299s)/Cafe(400s)/Direct Neighbor(45s) are well
+        # inside the firmware-aligned ACTIVE_WINDOW_SECONDS (7200s);
+        # NOLN/No Short Name (600s each) are the next to age out, exactly
+        # when the window elapses since their last-heard time -- BAD's
+        # malformed "recent" value and NONE's missing timestamp are
+        # never active at any `now`.
+        self.assertEqual(service.active_node_count(now=1_000), 6)
         self.assertEqual(
-            service.active_node_count(now=1_000 + ACTIVE_WINDOW_SECONDS - 600), 3
+            service.active_node_count(now=1_000 + ACTIVE_WINDOW_SECONDS - 600), 4
         )
-        self.assertEqual(service.info.known_nodes, 8)
+        self.assertEqual(service.info.known_nodes, 9)
         self.assertEqual(service.sent_messages, ())
 
         service.close()
@@ -191,7 +193,7 @@ class SimulatedRadioServiceTests(unittest.TestCase):
             service.connect()
 
         nodes = service.get_known_nodes()
-        self.assertEqual(len(nodes), 8)
+        self.assertEqual(len(nodes), 9)
         self.assertEqual(sum(node.is_local for node in nodes), 1)
         self.assertGreaterEqual(sum(node.hops_away == 1 for node in nodes), 2)
         self.assertTrue(any(node.hops_away == 2 for node in nodes))
@@ -216,10 +218,11 @@ class SimulatedRadioServiceTests(unittest.TestCase):
                 )
             )
 
-        # 5 NodeDB-active nodes at now=1_000 (Alice/Bob/Cafe/NOLN/No Short
-        # Name, all inside the firmware-aligned ACTIVE_WINDOW_SECONDS) plus
-        # the freshly direct-observed "!new00006" sender.
-        self.assertEqual(service.active_node_count(now=1_000), 6)
+        # 6 NodeDB-active nodes at now=1_000 (Alice/Bob/Cafe/Direct
+        # Neighbor/NOLN/No Short Name, all inside the firmware-aligned
+        # ACTIVE_WINDOW_SECONDS) plus the freshly direct-observed
+        # "!new00006" sender.
+        self.assertEqual(service.active_node_count(now=1_000), 7)
         info = service.set_long_name("Clockwork Nomad")
         self.assertEqual(info.long_name, "Clockwork Nomad")
         self.assertEqual(service.info.long_name, "Clockwork Nomad")
@@ -301,6 +304,60 @@ class SimulatedRadioServiceTests(unittest.TestCase):
         self.assertFalse(position.has_fix)
         self.assertIsNone(position.latitude)
         self.assertIsNone(position.longitude)
+
+
+class SimulatedLinkQualityTests(unittest.TestCase):
+    """UI POLISH Part C, --simulate coverage: SimulatedRadioService.
+
+    get_link_quality() must mirror RadioService's own hops_away==0
+    honesty rule (its fake analog of traversed_hops(...) == 0) using
+    plain fixture data, with no radio/thread/timing involved.
+    """
+
+    def make_service(self) -> SimulatedRadioService:
+        return SimulatedRadioService(connect_delay=0, message_interval=0)
+
+    def test_direct_neighbor_fixture_has_hops_away_zero(self) -> None:
+        """Guards the fixture itself: LINK has real coverage only if at
+
+        least one SIMULATED_NODES entry is a genuine zero-hop neighbor.
+        """
+        direct = [node for node in SIMULATED_NODES if node.hops_away == 0]
+        self.assertEqual(len(direct), 1)
+        self.assertIsNotNone(direct[0].rssi)
+        self.assertIsNotNone(direct[0].snr)
+
+    def test_direct_neighbor_returns_link_quality(self) -> None:
+        service = self.make_service()
+        service.connect()
+        direct = next(node for node in SIMULATED_NODES if node.hops_away == 0)
+        observation = service.get_link_quality(direct.node_id)
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.rssi, direct.rssi)
+        self.assertEqual(observation.snr, direct.snr)
+
+    def test_multi_hop_node_has_no_link_quality(self) -> None:
+        service = self.make_service()
+        service.connect()
+        multi_hop = next(node for node in SIMULATED_NODES if node.hops_away == 1)
+        self.assertIsNone(service.get_link_quality(multi_hop.node_id))
+
+    def test_unknown_hops_node_has_no_link_quality(self) -> None:
+        service = self.make_service()
+        service.connect()
+        unknown_hops = next(node for node in SIMULATED_NODES if node.hops_away is None)
+        self.assertIsNone(service.get_link_quality(unknown_hops.node_id))
+
+    def test_unknown_node_returns_none(self) -> None:
+        service = self.make_service()
+        service.connect()
+        self.assertIsNone(service.get_link_quality("!deadbeef"))
+
+    def test_node_id_is_case_insensitive(self) -> None:
+        service = self.make_service()
+        service.connect()
+        direct = next(node for node in SIMULATED_NODES if node.hops_away == 0)
+        self.assertIsNotNone(service.get_link_quality(direct.node_id.upper()))
 
 
 if __name__ == "__main__":

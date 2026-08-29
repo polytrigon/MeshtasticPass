@@ -22,6 +22,7 @@ from radio_service import (
     RadioIdentityError,
     RadioSendError,
     RadioState,
+    LinkObservation,
     NodeMetadata,
     ReceivedMessage,
     SentMessage,
@@ -58,6 +59,15 @@ class SimulatedNode:
     position: GeoPosition | None
     last_heard_age_seconds: object | None
     hops_away: int | None = None
+    # Fake directly-heard RF signal quality (see RadioService.
+    # LinkObservation/get_link_quality) -- only meaningful, and only
+    # ever surfaced by get_link_quality below, when hops_away == 0, the
+    # same "zero relays traveled" honesty rule the real radio enforces
+    # via traversed_hops(). Every existing node below predates MESH
+    # LINK and deliberately keeps hops_away >= 1 or None, so none of
+    # them gain LINK data by accident.
+    rssi: int | None = None
+    snr: float | None = None
 
 
 SIMULATED_LOCAL_POSITION = GeoPosition(40.7128, -74.0060, 1_700_000_000.0)
@@ -84,6 +94,16 @@ SIMULATED_NODES = (
     SimulatedNode("!none0005", "Missing Clock", "NONE", None, None),
     SimulatedNode("!10a60006", None, "NOLN", None, 600.0, 2),
     SimulatedNode("!5a070007", "No Short Name", None, None, 600.0, None),
+    SimulatedNode(
+        "!d1ec7008",
+        "Direct Neighbor",
+        "DIRN",
+        GeoPosition(40.7300, -73.9950, 1_700_000_300.0),
+        45.0,
+        0,
+        rssi=-52,
+        snr=9.5,
+    ),
 )
 
 _SIMULATED_REFERENCE_TIME = time.time()
@@ -323,6 +343,35 @@ class SimulatedRadioService:
                     position=node.position,
                 )
         return NodeMetadata(node_id.strip())
+
+    def get_link_quality(self, node_id: str) -> LinkObservation | None:
+        """Return fixture-defined directly-heard signal quality.
+
+        Mirrors RadioService.get_link_quality's own honesty rule: only
+        a node with hops_away == 0 (SIMULATED_NODES' fake analog of
+        traversed_hops(...) == 0 -- a genuine zero-relay reception) can
+        ever have LINK data, and only when the fixture actually
+        supplies rssi/snr. observed_at is anchored to this connection's
+        own activity_reference_time (falling back to the current time
+        the app is already free to treat as fresh) rather than a fixed
+        constant, so --simulate's LINK display ages exactly like real
+        last_heard/LAST UPDATE do.
+        """
+        normalized = node_id.strip().lower()
+        for node in SIMULATED_NODES:
+            if node.node_id.lower() != normalized:
+                continue
+            if node.hops_away != 0:
+                return None
+            if node.rssi is None and node.snr is None:
+                return None
+            observed_at = (
+                self._activity_reference_time
+                if self._activity_reference_time is not None
+                else time.time()
+            )
+            return LinkObservation(rssi=node.rssi, snr=node.snr, observed_at=observed_at)
+        return None
 
     def get_known_nodes(self) -> tuple[NodeMetadata, ...]:
         """Return stable fake topology data without hardware or transmissions."""

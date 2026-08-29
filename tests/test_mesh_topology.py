@@ -88,6 +88,7 @@ from relative_time import format_relative_age
 from radio_service import (
     DISPLAY_UNITS_IMPERIAL,
     DISPLAY_UNITS_METRIC,
+    LinkObservation,
     NodeMetadata,
     RadioInfo,
     RadioState,
@@ -5635,6 +5636,13 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
         context line and LAST UPDATE both render in full on the same
         row, with LAST UPDATE's own text never truncated (it is
         `width: auto`, always sized to its own content).
+
+        UI POLISH Part C: a selected REMOTE node's LAST UPDATE text now
+        carries a leading LINK segment (here the honest "no data"
+        placeholder -- this fixture node was never registered with any
+        RadioService.get_link_quality observation) rather than starting
+        with "LAST UPDATE" itself; see FormatMeshBottomRightLineTests
+        in test_mesh_state.py for the segment-format tests themselves.
         """
         app = self._make_app()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -5659,7 +5667,9 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("Golf Sierra Portable", context_text)
             self.assertNotIn("…", context_text)
-            self.assertTrue(last_update_text.startswith("LAST UPDATE"))
+            self.assertEqual(
+                last_update_text, "LINK  ----  -- / -- • LAST UPDATE 5s"
+            )
             self.assertLessEqual(cell_len(context_text), context_widget.size.width)
 
     async def test_context_truncates_gracefully_at_narrow_width_without_overlap(
@@ -5671,6 +5681,11 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
         Textual's own 1fr/auto layout actually assigned it -- LAST
         UPDATE keeps rendering in full, and the two never overlap
         because each occupies its own laid-out box.
+
+        UI POLISH Part C: at this width, LAST UPDATE's own text is
+        preceded by LINK's narrowest degradation tier (meter only, raw
+        values dropped -- see format_mesh_bottom_right_line) rather
+        than "LAST UPDATE" itself; the widths must still never overlap.
         """
         app = self._make_app()
         async with app.run_test(size=(40, 30)) as pilot:
@@ -5698,13 +5713,207 @@ class MeshLastUpdateLayoutTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(context_text.endswith("…"))
             self.assertLessEqual(cell_len(context_text), context_widget.size.width)
-            self.assertTrue(last_update_text.startswith("LAST UPDATE"))
+            self.assertEqual(last_update_text, "LINK ---- • UPDATE 5s")
             self.assertNotIn("…", last_update_text)
             bottom_row = app.query_one("#mesh-bottom-row")
             self.assertLessEqual(
                 cell_len(context_text) + cell_len(last_update_text),
                 bottom_row.size.width,
             )
+
+
+class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
+    """UI POLISH Part C: MESH's passive LINK quality display, wired into
+
+    the real app/#mesh-last-update -- see test_mesh_state.py's
+    FormatMeshLinkDisplayTests/FormatMeshBottomRightLineTests for the
+    pure-function formatting rules this exercises end to end, and
+    tests/test_radio_service.py's LinkQualityTests for RadioService.
+    get_link_quality's own honesty rules (traversed_hops == 0, radio-
+    swap safety).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _last_update_text(self, app: MeshtasticPassApp) -> str:
+        from textual.widgets import Static
+
+        return str(app.query_one("#mesh-last-update", Static).render())
+
+    async def test_selected_remote_node_with_valid_link_shows_full_line(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            neighbor = NodeMetadata("!near0001", "Near Neighbor", "NEAR", last_heard=now - 3)
+            app.radio.get_known_nodes = lambda nodes=(local, neighbor): nodes
+            app.radio.get_link_quality = (
+                lambda node_id: LinkObservation(rssi=-87, snr=6.0, observed_at=now - 3)
+                if node_id == "!near0001"
+                else None
+            )
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, "!near0001")
+            await pilot.pause()
+            text = await self._last_update_text(app)
+            self.assertEqual(text, "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 3s")
+
+    async def test_selected_multi_hop_node_shows_honest_fallback_not_a_guess(
+        self,
+    ) -> None:
+        """A node only ever reachable through relays must never borrow
+
+        ANY node's real RSSI/SNR -- get_link_quality legitimately
+        returns None for it (RadioService only ever records a
+        traversed_hops == 0 packet), and the display must show the
+        placeholder, never fabricate a plausible-looking number.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            far = NodeMetadata("!far00001", "Far Relay Client", "FAR", last_heard=now - 3, hops_away=2)
+            app.radio.get_known_nodes = lambda nodes=(local, far): nodes
+            app.radio.get_link_quality = lambda node_id: None
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, "!far00001")
+            await pilot.pause()
+            text = await self._last_update_text(app)
+            self.assertEqual(text, "LINK  ----  -- / -- • LAST UPDATE 3s")
+
+    async def test_you_selected_never_shows_link(self) -> None:
+        """A radio has no RF link to itself -- selecting YOU must never
+
+        show a LINK segment, even if get_link_quality were somehow
+        called for it.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            remote = NodeMetadata("!rem00001", "Remote", last_heard=now - 3)
+            app.radio.get_known_nodes = lambda nodes=(local, remote): nodes
+            app.radio.get_link_quality = lambda node_id: LinkObservation(
+                rssi=-40, snr=15.0, observed_at=now
+            )
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, local.node_id)
+            await pilot.pause()
+            text = await self._last_update_text(app)
+            self.assertEqual(text, "LAST UPDATE 3s")
+            self.assertNotIn("LINK", text)
+
+    async def test_changing_selection_switches_link_data_immediately(self) -> None:
+        """Selection-driven (see _move_mesh_focus/_mesh_select_node), not
+
+        waiting for the next periodic _refresh_mesh() tick -- and never
+        leaking the PREVIOUSLY selected node's own reading onto the
+        newly selected one.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            strong = NodeMetadata("!strong01", "Strong", last_heard=now - 1)
+            weak = NodeMetadata("!weak0001", "Weak", last_heard=now - 1)
+            app.radio.get_known_nodes = lambda nodes=(local, strong, weak): nodes
+            readings = {
+                "!strong01": LinkObservation(rssi=-40, snr=15.0, observed_at=now - 1),
+                "!weak0001": LinkObservation(rssi=-110, snr=-15.0, observed_at=now - 1),
+            }
+            app.radio.get_link_quality = lambda node_id: readings.get(node_id)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            _mesh_select_node(app, "!strong01")
+            await pilot.pause()
+            strong_text = await self._last_update_text(app)
+            self.assertIn("-40", strong_text)
+            self.assertIn("+15", strong_text)
+            self.assertEqual(strong_text.split("  ")[1], "▂▄▆█")  # excellent-tier meter
+
+            _mesh_select_node(app, "!weak0001")
+            await pilot.pause()
+            weak_text = await self._last_update_text(app)
+            self.assertIn("-110", weak_text)
+            self.assertIn("-15", weak_text)
+            self.assertNotIn("-40", weak_text)
+            self.assertNotIn("+15", weak_text)
+
+    async def test_selection_and_link_display_generate_zero_rf_traffic(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            neighbor = NodeMetadata("!qz000001", "Quiet Zone", "QZ", last_heard=now - 3)
+            app.radio.get_known_nodes = lambda nodes=(local, neighbor): nodes
+            app.radio.get_link_quality = lambda node_id: LinkObservation(
+                rssi=-70, snr=2.0, observed_at=now - 3
+            )
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, "!qz000001")
+            await pilot.pause()
+            await self._last_update_text(app)
+            self.assertEqual(app.radio.sent_messages, ())
+
+    async def test_stale_link_observation_falls_back_to_honest_placeholder(self) -> None:
+        """An observation older than ACTIVE_WINDOW_SECONDS must never be
+
+        presented as current, even though RadioService itself still has
+        it cached (see LinkQualityTests.
+        test_same_radio_reconnect_preserves_link_observations) --
+        staleness is enforced at display time, not by the cache.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            now = time.time()
+            local = NodeMetadata(app.radio.info.node_id, is_local=True)
+            old = NodeMetadata("!old00001", "Old Reading", last_heard=now - 3)
+            app.radio.get_known_nodes = lambda nodes=(local, old): nodes
+            app.radio.get_link_quality = lambda node_id: LinkObservation(
+                rssi=-60, snr=4.0, observed_at=now - ACTIVE_WINDOW_SECONDS - 1
+            )
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            _mesh_select_node(app, "!old00001")
+            await pilot.pause()
+            text = await self._last_update_text(app)
+            self.assertEqual(text, "LINK  ----  -- / -- • LAST UPDATE 3s")
 
 
 class ThinScrollBarRenderTests(unittest.TestCase):

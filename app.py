@@ -49,14 +49,20 @@ from chat_store import (
 )
 from geo import format_distance_miles
 from host_timezone import detect_host_timezone
-from grapheme_text import install_flag_pair_protection, truncate_to_cells
+from grapheme_text import (
+    install_flag_pair_protection,
+    terminal_safe_text,
+    truncate_to_cells,
+)
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshActivityTier,
     MeshNodeState,
     _clean_text,
     build_mesh_working_set,
+    format_mesh_bottom_right_line,
     format_mesh_context_line,
+    format_mesh_link_display,
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
@@ -1332,6 +1338,14 @@ MESH_SELECTED_HALO_GLYPH = "·"
 # the grapheme-safe truncation this limit is applied through.
 MESH_BOARD_LABEL_MAX_CELLS = 5
 
+# Minimum cells UI POLISH Part C's LINK content reserves for its
+# #mesh-context-status sibling (width: 1fr, sharing #mesh-bottom-row)
+# -- see _update_mesh_status_line. Small enough to rarely bind on a
+# real uConsole viewport, large enough that context-status never gets
+# squeezed to exactly 0, the one width at which its own truncation
+# guard (`if available > 0`) stops protecting it.
+MESH_CONTEXT_STATUS_MIN_WIDTH = 10
+
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
     """YOU is ALWAYS ACCENT2 -- a persistent identity anchor, entirely
@@ -1648,7 +1662,13 @@ def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
     view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
-    app._update_mesh_context_status()
+    # See _refresh_mesh's identical call_after_refresh use: LAST
+    # UPDATE's text (set first, which LINK/UI POLISH Part C can widen)
+    # must finish laying out before #mesh-context-status's own
+    # width:1fr resolution reads it, or it truncates against a stale,
+    # too-generous width.
+    app._update_mesh_status_line(view.working_set, time())
+    app.call_after_refresh(app._update_mesh_context_status)
 
 
 DOT_GRID_GLYPH = "·"
@@ -2554,8 +2574,17 @@ class ChatEntryWidget(Vertical):
         # touched. Selection styling likewise never touches this text
         # or its width -- see ChatEntryWidget.on_focus/on_blur, which
         # only ever update the separate, fixed-width selection_marker.
+        #
+        # terminal_safe_text() additionally substitutes keycap-digit
+        # emoji (e.g. a boxed/keycap-style "5") with the equivalent
+        # single-codepoint circled digit -- see grapheme_text.py for
+        # why that specific sequence's Rich/Textual-accounted width can
+        # disagree with what a plain terminal font actually paints.
+        # Display-only: self.entry.text itself, chat_store persistence,
+        # the outgoing RF payload, and @mention matching all still use
+        # the original, untouched text.
         self.message_label = Static(
-            self.entry.text,
+            terminal_safe_text(self.entry.text),
             classes="chat-entry-text",
             markup=False,
         )
@@ -5671,7 +5700,20 @@ class MeshtasticPassApp(App[None]):
             column_count=MESH_LOGICAL_GRID_COLUMNS,
         )
         view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
-        self._update_mesh_context_status()
+        # Deferred (not called inline): #mesh-context-status's own
+        # width:1fr resolution depends on how wide #mesh-last-update's
+        # CURRENT content is, and this method already set that content
+        # (via _update_mesh_status_line above, before the working-set/
+        # placement work) -- but Textual's own layout pass that
+        # resolves 1fr against the new content is not guaranteed to
+        # have completed yet by this point in the same synchronous
+        # call. call_after_refresh runs this once that layout has
+        # settled, so context-status truncates against the width it
+        # will ACTUALLY end up with, never a stale, too-generous one
+        # (see UI POLISH Part C, which is what first made
+        # #mesh-last-update's own content width vary enough for this
+        # ordering to matter).
+        self.call_after_refresh(self._update_mesh_context_status)
 
     def _move_mesh_focus(self, direction: str) -> None:
         view = self.query_one(MeshTopologyView)
@@ -5697,7 +5739,16 @@ class MeshtasticPassApp(App[None]):
                 theme=self._current_theme,
                 now=time(),
             )
-            self._update_mesh_context_status()
+            # LINK (UI POLISH Part C) is selected-node-specific, exactly
+            # like #mesh-context-status below -- it must switch to the
+            # newly selected node's own data immediately, not wait for
+            # the next periodic _refresh_mesh() tick (up to ~1s later).
+            # See _refresh_mesh's identical call_after_refresh use:
+            # #mesh-context-status's own width:1fr resolution depends
+            # on how wide #mesh-last-update's (possibly LINK-widened)
+            # text ends up, which must finish laying out first.
+            self._update_mesh_status_line(view.working_set, time())
+            self.call_after_refresh(self._update_mesh_context_status)
 
     def _open_mesh_node_menu(self) -> None:
         """ENTER on the currently focused MESH node opens the shared
@@ -7362,7 +7413,16 @@ class MeshtasticPassApp(App[None]):
 
     def _update_footer(self) -> None:
         if self.current_tab == "chat" and isinstance(self.focused, Input):
-            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
+            # Matches the UPPERCASE-HOTKEY + lowercase-descriptor
+            # grammar every other footer line below already uses.
+            # CTRL+E (not a bare "E") is the real emoji-picker binding
+            # (see on_key's ctrl+e handling) -- printable "e" must stay
+            # typeable while the composer is focused, so the label
+            # reflects the actual binding rather than a shorter one
+            # that would collide with typing. #chat-input and #dm-input
+            # are both plain Input widgets on this tab, so this single
+            # branch already covers CHANNEL and DM identically.
+            text = "CTRL+E emojis    ESC cancel    ENTER send"
         elif self.current_tab == "chat" and self._chat_mode == "channel":
             text = "↑↓ navigate    C channel    D dms    ENTER action    F4 quit"
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
@@ -7587,6 +7647,15 @@ class MeshtasticPassApp(App[None]):
         "when there's no LAST UPDATE text", unlike the old behavior this
         replaces) is what lets #mesh-view's own `height: 1fr` reclaim
         that freed row automatically, with no hardcoded row math.
+
+        UI POLISH Part C: also folds in the selected node's passive
+        LINK quality (RadioService.get_link_quality -- zero RF
+        traffic), sharing this SAME line rather than a second row (see
+        mesh_state.format_mesh_bottom_right_line). LINK is never shown
+        for YOU or when nothing is selected (a radio has no RF link to
+        itself), and never when LAST UPDATE itself would be empty --
+        it only ever rides alongside LAST UPDATE's own existing
+        meaning, never replaces or retimes it.
         """
         if self._radio_state is not RadioState.ONLINE:
             return
@@ -7607,6 +7676,39 @@ class MeshtasticPassApp(App[None]):
             age = now - max(remote_last_heard)
             if age >= 0:
                 text = f"LAST UPDATE {format_relative_age(age)}"
+
+        link_display = None
+        views = list(self.query(MeshTopologyView))
+        if text and views:
+            view = views[0]
+            selected = next(
+                (
+                    candidate
+                    for candidate in working_set
+                    if candidate.node.node_id == view.selected_node_id
+                ),
+                None,
+            )
+            if selected is not None and not selected.node.is_local:
+                link_display = format_mesh_link_display(
+                    self.radio.get_link_quality(selected.node.node_id), now=now
+                )
+        if link_display is not None:
+            # Reference the ROW's width, not this auto-width widget's
+            # own (previous-content-derived, and so circular) size --
+            # and reserve a small minimum for #mesh-context-status
+            # (width: 1fr, sharing this row) so LINK content can never
+            # grow to claim the entire row and squeeze that sibling to
+            # zero, which is the one width at which its own truncation
+            # guard (`if available > 0`) would stop protecting it.
+            row_widgets = list(self.query("#mesh-bottom-row"))
+            row_width = row_widgets[0].size.width if row_widgets else 0
+            available_width = max(0, row_width - MESH_CONTEXT_STATUS_MIN_WIDTH)
+            text = format_mesh_bottom_right_line(
+                last_update_text=text,
+                link=link_display,
+                available_width=available_width,
+            )
         widget.update(text)
 
     def _advance_connection_animation(self) -> None:

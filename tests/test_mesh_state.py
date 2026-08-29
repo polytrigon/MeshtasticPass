@@ -7,14 +7,21 @@ import unittest
 from geo import GeoPosition
 from mesh_state import (
     DEFAULT_MAX_REMOTE_NODES,
+    MESH_LINK_METER_UNKNOWN,
+    MESH_LINK_SNR_EXCELLENT_DB,
+    MESH_LINK_SNR_GOOD_DB,
+    MESH_LINK_SNR_WEAK_DB,
     MESH_STALE_THRESHOLD_SECONDS,
+    MeshLinkDisplay,
     MeshNodeState,
     build_mesh_working_set,
+    format_mesh_bottom_right_line,
     format_mesh_context_line,
+    format_mesh_link_display,
     normalize_mesh_node_id,
 )
 from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
-from radio_service import NodeMetadata
+from radio_service import LinkObservation, NodeMetadata
 from relative_time import format_relative_age
 
 
@@ -774,6 +781,189 @@ class LastSeenConsistencyTests(unittest.TestCase):
         self.assertEqual(
             format_mesh_context_line(state, now=NOW + 30).split(" / ")[4], "35s"
         )
+
+
+class FormatMeshLinkDisplayTests(unittest.TestCase):
+    """UI POLISH Part C: passive LINK quality for the selected node.
+
+    format_mesh_link_display never fabricates a value -- see its own
+    docstring -- and _mesh_link_meter's SNR->bar mapping is exercised
+    indirectly through it, at each threshold boundary.
+    """
+
+    def test_no_observation_is_the_honest_placeholder(self) -> None:
+        display = format_mesh_link_display(None, now=NOW)
+        self.assertEqual(display, MeshLinkDisplay(MESH_LINK_METER_UNKNOWN, "--", "--"))
+
+    def test_fresh_direct_observation_is_shown(self) -> None:
+        observation = LinkObservation(rssi=-52, snr=9.5, observed_at=NOW - 5)
+        display = format_mesh_link_display(observation, now=NOW)
+        self.assertEqual(display.rssi_text, "-52")
+        self.assertEqual(display.snr_text, "+10")  # round-half-to-even(9.5) == 10
+        self.assertEqual(display.meter, "▂▄▆█")
+
+    def test_observation_at_exactly_active_window_is_stale(self) -> None:
+        """Reuses the SAME ACTIVE_WINDOW_SECONDS boundary MESH's own
+
+        activity tier already treats as "no longer active" (see
+        is_node_active's own `age < ACTIVE_WINDOW_SECONDS`).
+        """
+        observation = LinkObservation(
+            rssi=-52, snr=9.5, observed_at=NOW - ACTIVE_WINDOW_SECONDS
+        )
+        display = format_mesh_link_display(observation, now=NOW)
+        self.assertEqual(display, MeshLinkDisplay(MESH_LINK_METER_UNKNOWN, "--", "--"))
+
+    def test_observation_one_second_inside_window_is_fresh(self) -> None:
+        observation = LinkObservation(
+            rssi=-52, snr=9.5, observed_at=NOW - ACTIVE_WINDOW_SECONDS + 1
+        )
+        display = format_mesh_link_display(observation, now=NOW)
+        self.assertNotEqual(display.meter, MESH_LINK_METER_UNKNOWN)
+
+    def test_negative_age_is_treated_as_the_honest_placeholder(self) -> None:
+        observation = LinkObservation(rssi=-52, snr=9.5, observed_at=NOW + 5)
+        display = format_mesh_link_display(observation, now=NOW)
+        self.assertEqual(display, MeshLinkDisplay(MESH_LINK_METER_UNKNOWN, "--", "--"))
+
+    def test_missing_rssi_alone_shows_dash_for_rssi_only(self) -> None:
+        observation = LinkObservation(rssi=None, snr=6.0, observed_at=NOW)
+        display = format_mesh_link_display(observation, now=NOW)
+        self.assertEqual(display.rssi_text, "--")
+        self.assertEqual(display.snr_text, "+6")
+
+    def test_missing_snr_alone_shows_dash_for_snr_and_unknown_meter(self) -> None:
+        observation = LinkObservation(rssi=-52, snr=None, observed_at=NOW)
+        display = format_mesh_link_display(observation, now=NOW)
+        self.assertEqual(display.snr_text, "--")
+        self.assertEqual(display.meter, MESH_LINK_METER_UNKNOWN)
+
+    def test_meter_thresholds_are_deterministic_boundaries(self) -> None:
+        cases = [
+            (MESH_LINK_SNR_EXCELLENT_DB, "▂▄▆█"),
+            (MESH_LINK_SNR_EXCELLENT_DB - 0.1, "▂▄▆"),
+            (MESH_LINK_SNR_GOOD_DB, "▂▄▆"),
+            (MESH_LINK_SNR_GOOD_DB - 0.1, "▂▄"),
+            (MESH_LINK_SNR_WEAK_DB, "▂▄"),
+            (MESH_LINK_SNR_WEAK_DB - 0.1, "▂"),
+            (-20.0, "▂"),  # LoRa can remain viable at strongly negative SNR
+        ]
+        for snr, expected_meter in cases:
+            with self.subTest(snr=snr):
+                observation = LinkObservation(rssi=-90, snr=snr, observed_at=NOW)
+                self.assertEqual(
+                    format_mesh_link_display(observation, now=NOW).meter, expected_meter
+                )
+
+    def test_same_reading_always_yields_the_same_meter(self) -> None:
+        """Deterministic: no animation/randomization/smoothing."""
+        observation = LinkObservation(rssi=-52, snr=9.5, observed_at=NOW)
+        results = {
+            format_mesh_link_display(observation, now=NOW).meter for _ in range(20)
+        }
+        self.assertEqual(len(results), 1)
+
+
+class FormatMeshBottomRightLineTests(unittest.TestCase):
+    """UI POLISH Part C: combining LINK with the pre-existing LAST
+
+    UPDATE text on one line, with graceful width-based degradation.
+    """
+
+    FULL_LINK = MeshLinkDisplay(meter="▂▄▆█", rssi_text="-87", snr_text="+6")
+
+    def test_no_link_passes_last_update_through_unchanged(self) -> None:
+        self.assertEqual(
+            format_mesh_bottom_right_line(
+                last_update_text="LAST UPDATE 25s", link=None, available_width=100
+            ),
+            "LAST UPDATE 25s",
+        )
+
+    def test_empty_last_update_stays_empty_even_with_link(self) -> None:
+        """Never a floating LINK segment with nothing for it to attach
+
+        to -- see _update_mesh_status_line/Part D "preserve LAST UPDATE".
+        """
+        self.assertEqual(
+            format_mesh_bottom_right_line(
+                last_update_text="", link=self.FULL_LINK, available_width=100
+            ),
+            "",
+        )
+
+    def test_full_width_shows_the_complete_tier(self) -> None:
+        self.assertEqual(
+            format_mesh_bottom_right_line(
+                last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=100
+            ),
+            "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 25s",
+        )
+
+    def test_medium_width_drops_to_compact_raw_values(self) -> None:
+        full = "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 25s"
+        compact = "LINK ▂▄▆█ -87/+6 • UPDATE 25s"
+        text = format_mesh_bottom_right_line(
+            last_update_text="LAST UPDATE 25s",
+            link=self.FULL_LINK,
+            available_width=len(compact),
+        )
+        self.assertEqual(text, compact)
+        self.assertGreater(len(full), len(compact))
+
+    def test_narrow_width_drops_raw_values_but_keeps_the_meter(self) -> None:
+        narrow = "LINK ▂▄▆█ • UPDATE 25s"
+        text = format_mesh_bottom_right_line(
+            last_update_text="LAST UPDATE 25s",
+            link=self.FULL_LINK,
+            available_width=len(narrow),
+        )
+        self.assertEqual(text, narrow)
+        self.assertNotIn("-87", text)
+
+    def test_raw_values_never_dropped_at_normal_uconsole_width(self) -> None:
+        """A real uConsole viewport (see test_viewport_context_favorites.py's
+
+        own 52-column fixture) always fits at least the compact tier,
+        which always keeps both raw values visible.
+        """
+        text = format_mesh_bottom_right_line(
+            last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=48
+        )
+        self.assertIn("-87", text)
+        self.assertIn("+6", text)
+
+    def test_unmeasured_width_shows_the_fullest_tier_untouched(self) -> None:
+        """available_width <= 0 (not yet laid out) must never truncate --
+
+        mirrors _update_mesh_context_status's own `if available > 0`
+        "don't truncate against an unmeasured width" rule.
+        """
+        text = format_mesh_bottom_right_line(
+            last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=0
+        )
+        self.assertEqual(text, "LINK  ▂▄▆█  -87 / +6 • LAST UPDATE 25s")
+
+    def test_absurdly_narrow_width_still_grapheme_safe_truncates(self) -> None:
+        text = format_mesh_bottom_right_line(
+            last_update_text="LAST UPDATE 25s", link=self.FULL_LINK, available_width=5
+        )
+        from rich.cells import cell_len
+
+        self.assertLessEqual(cell_len(text), 5)
+
+    def test_link_meter_glyphs_are_single_cell_narrow(self) -> None:
+        """The bar glyphs are ordinary block-drawing characters -- never
+
+        the kind of combining-mark/variation-selector sequence UI
+        POLISH Part A investigates -- so they can never trigger that
+        same class of terminal-cell-width disagreement.
+        """
+        from rich.cells import cell_len
+
+        for meter in ("▂▄▆█", "▂▄▆", "▂▄", "▂", MESH_LINK_METER_UNKNOWN):
+            with self.subTest(meter=meter):
+                self.assertEqual(cell_len(meter), len(meter))
 
 
 if __name__ == "__main__":

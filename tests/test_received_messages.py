@@ -207,7 +207,7 @@ class ReceivedMessageTests(unittest.TestCase):
         self.service._subscribe_to_events(pub)
         self.service._subscribe_to_events(pub)
 
-        self.assertEqual(pub.subscribe.call_count, 3)
+        self.assertEqual(pub.subscribe.call_count, 4)
         self.assertEqual(
             pub.subscribe.call_args_list,
             [
@@ -223,6 +223,10 @@ class ReceivedMessageTests(unittest.TestCase):
                     self.service._on_routing_response,
                     "meshtastic.receive.routing",
                 ),
+                call(
+                    self.service._on_any_packet_for_link_quality,
+                    "meshtastic.receive",
+                ),
             ],
         )
 
@@ -231,7 +235,7 @@ class ReceivedMessageTests(unittest.TestCase):
         # too (see rx_debug_enabled()), even when it was never actually
         # subscribed -- each attempt is independently wrapped so an
         # unsubscribe for a topic that was never joined is harmless.
-        self.assertEqual(pub.unsubscribe.call_count, 4)
+        self.assertEqual(pub.unsubscribe.call_count, 5)
 
     def test_broadcast_packet_is_never_direct(self) -> None:
         """PART A item 3: SDK-source-verified check (__main__.py's own

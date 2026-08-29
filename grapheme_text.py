@@ -16,6 +16,7 @@ implementation rather than two independent copies of the same algorithm.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 import rich.cells
@@ -165,3 +166,72 @@ def install_flag_pair_protection() -> None:
 
     _split_graphemes_with_flag_pairs._flag_pair_protected = True  # type: ignore[attr-defined]
     rich.cells.split_graphemes = _split_graphemes_with_flag_pairs
+
+
+COMBINING_ENCLOSING_KEYCAP = "⃣"
+
+# A "keycap" emoji (e.g. the boxed/keycap-style "5" in a message: digit
+# "5" + VARIATION SELECTOR-16 + COMBINING ENCLOSING KEYCAP) is one of the
+# few emoji sequences whose *declared* cell width depends on a rule most
+# minimal terminal fonts do not implement. Confirmed directly against
+# Rich's own width table (rich.cells._cell_len, the function Textual's
+# Strip -- and so every wrap/height/virtual-size calculation -- resolves
+# its cell counts from): a bare digit is narrow (1 cell) and the
+# COMBINING ENCLOSING KEYCAP mark is zero-width on its own, but the
+# presence of VARIATION SELECTOR-16 (U+FE0F) triggers a specific
+# "narrow_to_wide" bump that promotes the preceding digit to 2 cells --
+# i.e. Rich models the fully-qualified sequence as one indivisible,
+# self-consistently-measured 2-cell-wide unit, per the Unicode emoji
+# variation-sequence convention. That convention assumes a terminal font
+# with a real combined keycap glyph. A plain monospace terminal font
+# without one typically falls back to rendering one or more of the
+# individual codepoints as its own visible placeholder glyph -- so the
+# number of columns the terminal actually paints can diverge from the 2
+# cells Textual accounted for. Textual's own layout (wrap points, this
+# entry's rendered height, the transcript's virtual size, the
+# scrollbar's thumb/track math) all trust the accounted width, so any
+# such divergence corrupts everything drawn after the mismatch, not just
+# the emoji glyph itself -- in CHAT, that means the scrollbar.
+#
+# Unlike install_flag_pair_protection() above (which only changes where
+# a wrap break may fall), this is a genuine text substitution: there is
+# no wrap-boundary trick that can fix a terminal painting a different
+# number of columns than were accounted for. terminal_safe_text() is
+# applied only at the display boundary (see app.py's ChatEntryWidget) --
+# never to entry.text itself, chat_store persistence, the outgoing RF
+# payload, or @mention matching -- so the message a user typed or
+# received is always stored and transmitted exactly as-is.
+_KEYCAP_BASE_TO_CIRCLED = {
+    "0": "⓪",  # CIRCLED DIGIT ZERO
+    "1": "①",
+    "2": "②",
+    "3": "③",
+    "4": "④",
+    "5": "⑤",
+    "6": "⑥",
+    "7": "⑦",
+    "8": "⑧",
+    "9": "⑨",
+}
+_KEYCAP_DIGIT_PATTERN = re.compile(r"([0-9])️?" + COMBINING_ENCLOSING_KEYCAP)
+
+
+def terminal_safe_text(text: str) -> str:
+    """Replace unreliable-width keycap-digit sequences for display.
+
+    Each digit keycap emoji ("0️⃣"-"9️⃣", qualified or unqualified) is
+    replaced with the single-codepoint CIRCLED DIGIT of the same
+    number -- an ordinary Number-category character with no
+    presentation-selector or combining-mark interaction, so its
+    rendered width can never disagree with what Rich/Textual accounted
+    for. No other emoji or character is touched: a bare digit or a
+    COMBINING ENCLOSING KEYCAP not paired with the other is left alone,
+    since only the full sequence carries the width risk above. "#" and
+    "*" keycap sequences are left untouched -- not the reported bug and
+    without a matching single-codepoint circled glyph to substitute.
+    """
+    if COMBINING_ENCLOSING_KEYCAP not in text:
+        return text
+    return _KEYCAP_DIGIT_PATTERN.sub(
+        lambda match: _KEYCAP_BASE_TO_CIRCLED[match.group(1)], text
+    )

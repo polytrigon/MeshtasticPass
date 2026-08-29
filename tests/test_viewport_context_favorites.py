@@ -389,7 +389,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
                 "...",
             )
             app._show_connection(RadioState.ONLINE, radio.info)
-            self.assertIn("NODES        8", str(app.query_one("#connection-details", Static).render()))
+            self.assertIn("NODES        9", str(app.query_one("#connection-details", Static).render()))
             self.assertEqual(app.query_one("#short-name-input", Input).value, "SIM")
             app._show_connection(RadioState.OFFLINE)
             self.assertIn("NODES        —", str(app.query_one("#connection-details", Static).render()))

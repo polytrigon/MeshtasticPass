@@ -639,7 +639,19 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             footer_text = str(app.query_one("#footer", Static).render())
             self.assertIn("1-3", footer_text)
 
-    async def test_composer_hint_shows_enter_send_ctrl_e_emoji_esc_cancel(self) -> None:
+    async def test_composer_hint_matches_uppercase_hotkey_lowercase_descriptor_grammar(
+        self,
+    ) -> None:
+        """UI POLISH Part B: the composer-focused footer must follow the
+
+        same UPPERCASE HOTKEY + lowercase descriptor grammar every other
+        footer line already uses (e.g. "C channel", "D dms") -- the
+        previous "ENTER SEND    CTRL+E EMOJI    ESC CANCEL" was
+        all-uppercase throughout, inconsistent with that grammar. The
+        hotkey label is CTRL+E, not a bare E, because that is the real
+        emoji-picker binding (on_key's ctrl+e handling) -- preserved
+        so "e" stays typeable while composing.
+        """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
@@ -650,15 +662,34 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertEqual(footer_text, "ENTER SEND    CTRL+E EMOJI    ESC CANCEL")
+            self.assertEqual(footer_text, "CTRL+E emojis    ESC cancel    ENTER send")
 
-            # Exact order: SEND, then EMOJI, then CANCEL.
+            # Exact order: emojis, then cancel, then send.
             self.assertLess(
-                footer_text.index("ENTER SEND"), footer_text.index("CTRL+E EMOJI")
+                footer_text.index("CTRL+E emojis"), footer_text.index("ESC cancel")
             )
             self.assertLess(
-                footer_text.index("CTRL+E EMOJI"), footer_text.index("ESC CANCEL")
+                footer_text.index("ESC cancel"), footer_text.index("ENTER send")
             )
+
+    async def test_dm_composer_hint_matches_channel_composer_hint(self) -> None:
+        """CHANNEL and DM composer modes share the same Input-based
+
+        composer, so the composer-focused footer hint must be identical
+        in both.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!a11ce001", long_name="Alice")
+            await pilot.pause()
+            dm_input = app.query_one("#dm-input", Input)
+            dm_input.focus()
+            await pilot.pause()
+
+            footer_text = str(app.query_one("#footer", Static).render())
+            self.assertEqual(footer_text, "CTRL+E emojis    ESC cancel    ENTER send")
 
     async def test_ctrl_e_hint_absent_outside_composer_focus(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())

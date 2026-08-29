@@ -11,9 +11,12 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Mapping
 
+from rich.cells import cell_len
+
 from geo import distance_between, format_coordinates, format_distance
-from node_activity import is_node_active
-from radio_service import NodeMetadata
+from grapheme_text import truncate_to_cells
+from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
+from radio_service import LinkObservation, NodeMetadata
 from relative_time import format_relative_age
 
 
@@ -505,3 +508,142 @@ def format_mesh_context_line(
     segments.append(_format_distance(state.distance_miles, metric=metric))
 
     return " / ".join(segments)
+
+
+# UI POLISH Part C: MESH's passive LINK quality display, for the
+# currently selected REMOTE node only (see app.py's
+# _update_mesh_status_line -- YOU and "nothing selected" never call
+# any of this, since a radio has no RF link to itself).
+#
+# SNR, not RSSI, drives the meter: PROTOBUF-SOURCE-VERIFIED
+# (mesh_pb2.pyi), LoRa's spreading-gain means a link can stay fully
+# viable at a strongly negative SNR (unlike Wi-Fi, where RSSI alone is
+# a reasonable proxy) -- RSSI alone cannot tell a strong link on a
+# quiet channel from a weak one on a quiet channel. These thresholds
+# are this app's own reasoned mapping from realistic LoRa SNR ranges
+# (roughly +10 dB "clean, strong" down to roughly -20 dB "still
+# decodable, near the radio's own sensitivity floor" for the higher
+# spreading factors Meshtastic's default configs commonly use), not a
+# copied third-party constant:
+MESH_LINK_SNR_EXCELLENT_DB = 5.0
+MESH_LINK_SNR_GOOD_DB = 0.0
+MESH_LINK_SNR_WEAK_DB = -10.0
+
+# Placeholder meter for "no honest reading available" (no observation,
+# a stale one, or one with SNR missing) -- also the exact meter shown
+# in the "nothing to report" fallback line, matching UI POLISH Part C's
+# own example (`LINK  ----  -- / -- • LAST UPDATE 25s`).
+MESH_LINK_METER_UNKNOWN = "----"
+
+
+@dataclass(frozen=True)
+class MeshLinkDisplay:
+    """Display-ready LINK meter/raw-value text for the selected node.
+
+    Always resolvable to *something* displayable -- meter/rssi_text/
+    snr_text are each independently "--"-style placeholders when their
+    underlying value is missing, never a fabricated number. Raw values
+    are carried as already-formatted text (not a bare number) so a
+    caller never needs its own second "-- vs formatted" branch.
+    """
+
+    meter: str
+    rssi_text: str
+    snr_text: str
+
+
+def _mesh_link_meter(snr: float | None) -> str:
+    """Deterministic SNR -> bar mapping: same SNR always yields the same
+
+    bar, with no animation, randomization, or smoothing. The 4 glyphs
+    (U+2582/2584/2586/2588, "lower N eighths/full block") are ordinary
+    single-cell BMP symbols -- ASCII-adjacent block-drawing characters,
+    never a combining mark, variation selector, or multi-codepoint
+    emoji sequence, so they carry none of the terminal-cell-width risk
+    UI POLISH Part A investigates for keycap-style emoji.
+    """
+    if snr is None:
+        return MESH_LINK_METER_UNKNOWN
+    if snr >= MESH_LINK_SNR_EXCELLENT_DB:
+        return "▂▄▆█"
+    if snr >= MESH_LINK_SNR_GOOD_DB:
+        return "▂▄▆"
+    if snr >= MESH_LINK_SNR_WEAK_DB:
+        return "▂▄"
+    return "▂"
+
+
+def format_mesh_link_display(
+    observation: LinkObservation | None, *, now: float
+) -> MeshLinkDisplay:
+    """Build the LINK meter/raw-value text for one directly-heard reading.
+
+    Returns the honest "no data" placeholder (MeshLinkDisplay(
+    MESH_LINK_METER_UNKNOWN, "--", "--")) whenever `observation` is
+    None (never directly heard from this node -- see RadioService.
+    get_link_quality/LinkObservation for what "directly heard"
+    requires) OR its own age has reached ACTIVE_WINDOW_SECONDS -- the
+    SAME threshold MESH already uses to decide whether a node counts as
+    ACTIVE at all (see is_node_active), reused here rather than
+    inventing a second, hidden freshness model, so a LINK reading is
+    never shown as current once this board would already call the
+    underlying evidence stale. A negative age (a clock skew/ordering
+    edge case) is treated exactly like an over-age reading: honest
+    placeholder, never a fabricated "very fresh" claim.
+    """
+    if observation is not None:
+        age = now - observation.observed_at
+        if 0 <= age < ACTIVE_WINDOW_SECONDS:
+            return MeshLinkDisplay(
+                meter=_mesh_link_meter(observation.snr),
+                rssi_text=(
+                    str(observation.rssi) if observation.rssi is not None else "--"
+                ),
+                snr_text=(
+                    f"{round(observation.snr):+d}"
+                    if observation.snr is not None
+                    else "--"
+                ),
+            )
+    return MeshLinkDisplay(MESH_LINK_METER_UNKNOWN, "--", "--")
+
+
+def format_mesh_bottom_right_line(
+    *,
+    last_update_text: str,
+    link: MeshLinkDisplay | None,
+    available_width: int,
+) -> str:
+    """Combine LINK with the existing LAST UPDATE text on one line.
+
+    `last_update_text` is passed through completely unchanged whenever
+    `link` is None (YOU selected, nothing selected, or the pre-existing
+    "no remote node has a trustworthy last_heard at all" empty string)
+    -- LINK never alters LAST UPDATE's own established meaning or
+    triggers when it would not already apply (UI POLISH Part D:
+    "preserve LAST UPDATE").
+
+    Otherwise degrades through the three explicit priority tiers UI
+    POLISH Part C specifies, picking the FIRST (most detailed) one that
+    fits `available_width`: full raw values and units spelled out,
+    then compact raw values, then the meter alone -- raw values are
+    only ever dropped at a width narrower than a normal uConsole
+    viewport already requires, never at normal width. `available_width
+    <= 0` (not yet laid out) shows the fullest tier untouched, mirroring
+    _update_mesh_context_status's own "don't truncate against an
+    unmeasured width" rule.
+    """
+    if not last_update_text or link is None:
+        return last_update_text
+    compact_update = last_update_text.removeprefix("LAST ")
+    candidates = (
+        f"LINK  {link.meter}  {link.rssi_text} / {link.snr_text} • {last_update_text}",
+        f"LINK {link.meter} {link.rssi_text}/{link.snr_text} • {compact_update}",
+        f"LINK {link.meter} • {compact_update}",
+    )
+    if available_width <= 0:
+        return candidates[0]
+    for candidate in candidates:
+        if cell_len(candidate) <= available_width:
+            return candidate
+    return truncate_to_cells(candidates[-1], available_width)

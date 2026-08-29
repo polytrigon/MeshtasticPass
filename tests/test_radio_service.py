@@ -9,6 +9,7 @@ from geo import GeoPosition
 from node_activity import ACTIVE_WINDOW_SECONDS
 from radio_service import (
     ChannelInfo,
+    LinkObservation,
     RadioConnectionError,
     RadioIdentityError,
     RadioInfo,
@@ -1091,6 +1092,215 @@ class TraversedHopsTests(unittest.TestCase):
 
     def test_zero_hop_start_and_limit(self) -> None:
         self.assertEqual(traversed_hops(0, 0), 0)
+
+
+def _direct_packet(rssi=-87, snr=6.5, hop_start=3, hop_limit=3, from_id="!12345678"):
+    return {
+        "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"},
+        "from": int(from_id.removeprefix("!"), 16),
+        "fromId": from_id,
+        "channel": 0,
+        "hopStart": hop_start,
+        "hopLimit": hop_limit,
+        "rxRssi": rssi,
+        "rxSnr": snr,
+    }
+
+
+class LinkQualityTests(unittest.TestCase):
+    """UI POLISH Part C: MESH's passive LINK quality display.
+
+    RadioService.get_link_quality() must only ever reflect a packet
+    this radio received with traversed_hops(hopStart, hopLimit) == 0 --
+    a genuine zero-relay reception -- since rx_rssi/rx_snr describe the
+    immediate receiver's own RF link to whoever transmitted THIS
+    packet, never the packet's logical origin once it has been
+    relayed. Exercised entirely through RadioService's public surface
+    plus the same package-private _on_any_packet_for_link_quality/
+    _link_observations RadioServiceTests already reaches into for its
+    sibling _on_text_received/_direct_observations tests.
+    """
+
+    def test_direct_reception_is_recorded(self) -> None:
+        import time as time_module
+
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        before = time_module.time()
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(rssi=-87, snr=6.5), interface=interface
+        )
+        after = time_module.time()
+        observation = service.get_link_quality("!12345678")
+        self.assertIsInstance(observation, LinkObservation)
+        self.assertEqual(observation.rssi, -87)
+        self.assertEqual(observation.snr, 6.5)
+        self.assertTrue(before <= observation.observed_at <= after)
+
+    def test_multi_hop_reception_is_not_recorded(self) -> None:
+        """hop_start=3, hop_limit=1: traveled 2 hops -- rx_rssi/rx_snr
+
+        describe the RF link to the last relay, not to !12345678 --
+        never attributed to !12345678's own link quality.
+        """
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(hop_start=3, hop_limit=1), interface=interface
+        )
+        self.assertIsNone(service.get_link_quality("!12345678"))
+
+    def test_indeterminate_hop_fields_are_not_recorded(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        packet = _direct_packet()
+        del packet["hopStart"]
+        service._on_any_packet_for_link_quality(packet=packet, interface=interface)
+        self.assertIsNone(service.get_link_quality("!12345678"))
+
+    def test_missing_rssi_and_snr_is_not_recorded_even_when_direct(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(rssi=None, snr=None), interface=interface
+        )
+        self.assertIsNone(service.get_link_quality("!12345678"))
+
+    def test_portnum_agnostic_even_undecodable_packet_still_recorded(self) -> None:
+        """An encrypted/undecodable packet still carries MeshPacket's own
+
+        hopStart/hopLimit/rxRssi/rxSnr at the transport level -- LINK
+        must not require a successfully decoded payload of any kind.
+        """
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        packet = _direct_packet()
+        del packet["decoded"]
+        service._on_any_packet_for_link_quality(packet=packet, interface=interface)
+        observation = service.get_link_quality("!12345678")
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.rssi, -87)
+
+    def test_most_recent_direct_observation_wins(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(rssi=-100, snr=1.0), interface=interface
+        )
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(rssi=-52, snr=9.5), interface=interface
+        )
+        observation = service.get_link_quality("!12345678")
+        self.assertEqual((observation.rssi, observation.snr), (-52, 9.5))
+
+    def test_stray_interface_is_ignored(self) -> None:
+        service = RadioService()
+        live_interface = make_interface()
+        stale_interface = make_interface()
+        service._interface = live_interface
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(), interface=stale_interface
+        )
+        self.assertIsNone(service.get_link_quality("!12345678"))
+
+    def test_unknown_sender_is_never_recorded(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        service._interface = interface
+        packet = _direct_packet()
+        del packet["fromId"]
+        del packet["from"]
+        service._on_any_packet_for_link_quality(packet=packet, interface=interface)
+        self.assertIsNone(service.get_link_quality("!unknown"))
+
+    def test_radio_identity_change_clears_link_observations(self) -> None:
+        service = RadioService("/dev/ttyACM0")
+        a_number, b_number = 0xAAAAAAAA, 0xBBBBBBBB
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service, "_open_interface", return_value=_make_swap_interface("!aaaaaaaa", a_number)
+            ),
+        ):
+            service.connect()
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(from_id="!aaaaaaaa"), interface=service._interface
+        )
+        self.assertIsNotNone(service.get_link_quality("!aaaaaaaa"))
+        service.close()
+
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service, "_open_interface", return_value=_make_swap_interface("!bbbbbbbb", b_number)
+            ),
+        ):
+            service.connect()
+        self.assertIsNone(service.get_link_quality("!aaaaaaaa"))
+
+    def test_same_radio_reconnect_preserves_link_observations(self) -> None:
+        """A dropped-and-auto-reconnected SAME physical radio (identical
+
+        node_id, no explicit close() in between -- see
+        RadioService.connection_events/_on_connection_lost, and
+        test_receive_callback_delivers_messages_across_a_reconnect
+        above for the identical pattern) must not discard cached LINK
+        data -- exactly the established _direct_observations precedent
+        this mirrors (see connect()'s own identity-comparison clear).
+        Staleness is the caller's job (via observed_at), not this
+        cache's -- see app.py's own freshness gate. An explicit close()
+        (a deliberate disconnect, not an auto-retry) DOES clear it --
+        see test_close_clears_link_observations above -- since close()
+        has no way to know a reconnect is coming.
+        """
+        service = RadioService("/dev/ttyACM0")
+        a_number = 0xAAAAAAAA
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service, "_open_interface", return_value=_make_swap_interface("!aaaaaaaa", a_number)
+            ),
+        ):
+            service.connect()
+        service._on_any_packet_for_link_quality(
+            packet=_direct_packet(from_id="!aaaaaaaa"), interface=service._interface
+        )
+        with (
+            patch.object(service, "_check_device"),
+            patch.object(
+                service, "_open_interface", return_value=_make_swap_interface("!aaaaaaaa", a_number)
+            ),
+        ):
+            service.connect()
+        self.assertIsNotNone(service.get_link_quality("!aaaaaaaa"))
+
+    def test_set_device_path_clears_link_observations(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = make_interface()
+        service._interface = interface
+        service._on_any_packet_for_link_quality(packet=_direct_packet(), interface=interface)
+        self.assertIsNotNone(service.get_link_quality("!12345678"))
+        service.set_device_path("/dev/ttyACM0")
+        self.assertIsNone(service.get_link_quality("!12345678"))
+
+    def test_close_clears_link_observations(self) -> None:
+        service = RadioService("/dev/ttyUSB0")
+        interface = make_interface()
+        service._interface = interface
+        service._on_any_packet_for_link_quality(packet=_direct_packet(), interface=interface)
+        self.assertIsNotNone(service.get_link_quality("!12345678"))
+        service.close()
+        self.assertIsNone(service.get_link_quality("!12345678"))
+
+    def test_unheard_node_returns_none(self) -> None:
+        service = RadioService()
+        self.assertIsNone(service.get_link_quality("!deadbeef"))
 
 
 if __name__ == "__main__":
