@@ -14,7 +14,14 @@ import unittest
 
 from textual.widgets import Input
 
-from app import ChatEntryWidget, MeshtasticPassApp, _mesh_select_node, MeshTopologyView
+from app import (
+    ChannelSelector,
+    ChatEntryWidget,
+    DMModeSelector,
+    MeshtasticPassApp,
+    _mesh_select_node,
+    MeshTopologyView,
+)
 from app_settings import AppSettings
 from chat_store import ChatStore
 from radio_service import DeliveryState, NodeMetadata, ReceivedMessage, SendStatus
@@ -42,17 +49,22 @@ class DirectMessageAppTestsBase(unittest.IsolatedAsyncioTestCase):
 
 class DMTabAndConversationTests(DirectMessageAppTestsBase):
     async def test_dm_is_not_the_channel_selector(self) -> None:
-        """Item 1: DM is a distinct tab, not another channel-dropdown
+        """CHAT/DM/MENTION UX Part A: DM is a MODE inside CHAT, not
 
-        entry -- CHAT's channel selector never gains a DM option.
+        another channel-dropdown entry -- CHAT's channel selector never
+        gains a DM option, and DMS mode never assigns a fake channel
+        index (item 2/Part A item 2).
         """
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            app.show_tab("dm")
+            app.show_tab("chat")
+            app._switch_chat_mode("dms")
             await pilot.pause()
-            self.assertEqual(app.current_tab, "dm")
-            self.assertNotEqual(app.current_tab, "chat")
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "dms")
+            channel_values = [o.value for o in app.query_one(ChannelSelector).options]
+            self.assertNotIn("dms", channel_values)
 
     async def test_open_dm_creates_and_switches_to_conversation(self) -> None:
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
@@ -60,7 +72,8 @@ class DMTabAndConversationTests(DirectMessageAppTestsBase):
             await pilot.pause()
             app.open_dm("!a11ce001", long_name="Alice Trail", short_name="ALCE")
             await pilot.pause()
-            self.assertEqual(app.current_tab, "dm")
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "dms")
             self.assertEqual(app.current_dm_node_id, "!a11ce001")
             self.assertEqual(
                 app.query_one("#dm-content").current, "dm-conversation"
@@ -139,7 +152,8 @@ class DMConversationListTests(DirectMessageAppTestsBase):
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            app.show_tab("dm")
+            app.show_tab("chat")
+            app._switch_chat_mode("dms")
             await pilot.pause()
             rows = [str(c.render()) for c in app.query_one("#dm-list").children]
             self.assertEqual(rows, ["No DM conversations yet."])
@@ -444,7 +458,8 @@ class DMNodeMenuIntegrationTests(DirectMessageAppTestsBase):
             )
             app._user_menu.activate(dm_index)
             await pilot.pause()
-            self.assertEqual(app.current_tab, "dm")
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "dms")
             self.assertEqual(
                 app.current_dm_node_id, SIMULATED_MESSAGES[0].sender_node_id
             )
@@ -488,7 +503,8 @@ class DMNodeMenuIntegrationTests(DirectMessageAppTestsBase):
             )
             app._user_menu.activate(dm_index)
             await pilot.pause()
-            self.assertEqual(app.current_tab, "dm")
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "dms")
             self.assertEqual(app.current_dm_node_id, "!c0ffee01")
 
     async def test_you_has_no_dm_action_in_mesh_menu(self) -> None:
@@ -537,7 +553,8 @@ class DMTrafficTests(DirectMessageAppTestsBase):
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            app.show_tab("dm")
+            app.show_tab("chat")
+            app._switch_chat_mode("dms")
             await pilot.pause()
             self.assertEqual(radio.sent_texts, [])
 

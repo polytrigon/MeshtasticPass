@@ -33,6 +33,19 @@ def make_geo_position(
         return None
     if not -180 <= longitude_value <= 180:
         return None
+    # Exact (0, 0) -- "Null Island" -- is never treated as a real fix.
+    # Meshtastic's Position.latitude_i/longitude_i are proto3 explicit-
+    # presence int32 fields that default to 0 when genuinely unset; not
+    # every code path that reaches here (this SDK's own dict caching,
+    # a fixture, a future protobuf/library version) is guaranteed to
+    # have preserved that presence distinction rather than surfacing a
+    # bare 0. No real Meshtastic deployment legitimately sits at the
+    # intersection of the equator and the prime meridian, so refusing
+    # this one exact coordinate pair is strictly safer than risking an
+    # uninitialized/no-fix node being placed as if it had a genuine
+    # GPS position.
+    if latitude_value == 0.0 and longitude_value == 0.0:
+        return None
 
     timestamp = _finite_number(updated_at)
     if timestamp is not None and timestamp <= 0:

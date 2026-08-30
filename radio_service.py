@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
@@ -208,12 +209,103 @@ class SendStatus:
     detail: str = ""
 
 
+class TracerouteState(Enum):
+    """Truthful, terminal outcome of one explicit TRACEROUTE_APP request.
+
+    Only ever reported by RadioService.send_traceroute's own status_handler
+    -- never inferred, never a "request sent" placeholder (see
+    TracerouteStatus).
+    """
+
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class TracerouteResult:
+    """Real protocol evidence from one successful traceroute response.
+
+    PROTOBUF-SOURCE-VERIFIED (mesh_pb2.RouteDiscovery): `route`/
+    `route_back` are the REAL intermediate node numbers a MeshPacket
+    accumulates as it physically travels forward (towards the
+    destination) and back (the response's own return trip) -- never
+    including the two endpoints (the local radio, the destination)
+    themselves, and never a fabricated/inferred hop; an empty tuple
+    means a genuinely direct connection with zero relays, not "unknown".
+    forward_snr/return_snr are PARALLEL, dB, one entry per hop of the
+    corresponding route PLUS one extra final entry for the last hop
+    into the endpoint (so len == len(route) + 1) -- None wherever the
+    firmware's own UNK_SNR (-128, prescaled by 4) sentinel marks that
+    one hop's reading as unavailable, never a fabricated number.
+    """
+
+    destination_node_id: str
+    forward_route: tuple[str, ...]
+    forward_snr: tuple[float | None, ...]
+    return_route: tuple[str, ...]
+    return_snr: tuple[float | None, ...]
+    completed_at: float
+
+
+@dataclass(frozen=True)
+class TracerouteStatus:
+    """An asynchronous traceroute outcome, reported once per request.
+
+    `packet_id` is the SAME id send_traceroute() returned -- a caller
+    correlates a status_handler invocation against a specific attempt
+    by comparing this field, exactly like SendStatus.packet_id already
+    lets send_text callers do for ordinary sends.
+    """
+
+    state: TracerouteState
+    packet_id: int | None
+    result: TracerouteResult | None = None
+    detail: str = ""
+
+
 @dataclass(frozen=True)
 class ChannelInfo:
-    """One enabled application-facing Meshtastic channel."""
+    """One enabled application-facing Meshtastic channel.
+
+    `stable_key` (FINAL MESHTASTIC POLISH pass -- CHAT channel-history
+    isolation) is this channel's own cryptographic/assigned identity --
+    NEVER derived from `index` (a mutable radio-assigned SLOT NUMBER
+    the user can freely reassign to a completely different channel,
+    e.g. reconfiguring slot 0 from "LongFast" to "MediumSlow") and
+    never from `name` alone either (a bare rename must not fabricate a
+    new identity out of thin air with no cryptographic backing -- see
+    _read_channel_info). Empty string means "not yet known" (e.g. this
+    app's own pre-connection placeholder channel list) -- CHAT history
+    isolation treats that as "unknown," never as a real identity to
+    compare against.
+    """
 
     index: int
     name: str
+    stable_key: str = ""
+
+
+@dataclass(frozen=True)
+class LinkObservation:
+    """RF signal quality for one node, from a packet directly heard from it.
+
+    rssi and snr are always captured together, from the SAME MeshPacket,
+    so they can never describe two different moments in time. Only ever
+    recorded when traversed_hops(hop_start, hop_limit) == 0 for that
+    packet (see RadioService._on_any_packet_for_link_quality) -- i.e.
+    a packet this node itself transmitted and this radio received with
+    zero intermediate relays. A packet forwarded through one or more
+    relay nodes is deliberately never recorded here: rx_rssi/rx_snr on
+    a relayed packet describe the RF link from the LAST RELAY to this
+    radio, not from the packet's logical origin, and presenting that as
+    the origin node's own link quality would be dishonest (see PROTOBUF-
+    SOURCE-VERIFIED MeshPacket.rx_snr/rx_rssi docs: both are set once,
+    on reception, by the immediate receiver, never carried end-to-end).
+    """
+
+    rssi: int | None
+    snr: float | None
+    observed_at: float
 
 
 @dataclass(frozen=True)
@@ -270,6 +362,35 @@ DISPLAY_UNITS_IMPERIAL = 1
 # on" -- confirmed via the installed .pyi stub, never invented.
 SCREEN_ON_SECS_ALWAYS_ON = 4294967295
 
+# Meshtastic primary-channel PSK sentinels (see meshtastic.util.fromPSK):
+# a single byte 0x01 means "use the well-known default public key", a
+# single byte 0x00 means "no encryption". The 16-byte well-known default
+# key itself (meshtastic.util.DEFAULT_KEY) -- some firmware/SDK paths
+# echo the expanded form on readback, others keep the 0x01 sentinel, so
+# PSK verification treats the two as equivalent (see psk_matches_request).
+PSK_DEFAULT_SENTINEL = bytes([1])
+PSK_NONE_SENTINEL = bytes([0])
+DEFAULT_CHANNEL_PSK = base64.b64decode("1PG7OiApB1nwvP+rz05pAQ==")
+
+
+def psk_matches_request(requested: bytes, actual: bytes) -> bool:
+    """Semantic PSK comparison for readback verification.
+
+    Exact bytes match, OR both sides resolve to the same well-known
+    channel key: a requested 0x01 sentinel is satisfied by an actual
+    0x01 OR the expanded 16-byte DEFAULT_CHANNEL_PSK (and vice versa);
+    a requested "" (leave unset) is satisfied by "" or the 0x00
+    ("no encryption") sentinel. Never inspects/logs the raw key bytes
+    beyond this equality decision.
+    """
+    if requested == actual:
+        return True
+    default_family = {PSK_DEFAULT_SENTINEL, DEFAULT_CHANNEL_PSK}
+    if requested in default_family and actual in default_family:
+        return True
+    unset_family = {b"", PSK_NONE_SENTINEL}
+    return requested in unset_family and actual in unset_family
+
 
 @dataclass(frozen=True)
 class ConfigWriteResult:
@@ -294,6 +415,29 @@ class ConfigWriteResult:
     requested_value: Any
     readback_value: Any | None
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class RadioApplyResult:
+    """Outcome of apply_radio_config_preset() -- one controlled,
+
+    sequential, multi-field operation (LoRaConfig.use_preset/
+    modem_preset/channel_num, then the PRIMARY channel's name/psk),
+    each individually write-verified via the SAME ConfigWriteResult
+    model ordinary RADIO-section fields already use.
+
+    Stops at the FIRST failing step: `failed_step` names it
+    ("use_preset"/"modem_preset"/"frequency_slot"/"channel") and
+    `results` holds every ConfigWriteResult attempted so far (never a
+    step that was never reached). There is no transactional multi-
+    write primitive on real Meshtastic hardware to roll a partial
+    apply back with, so a partial apply is reported honestly rather
+    than silently retried, reordered, or hidden.
+    """
+
+    applied: bool
+    failed_step: str
+    results: dict[str, ConfigWriteResult]
 
 
 @dataclass(frozen=True)
@@ -412,6 +556,16 @@ class RadioService:
         self._pub: Any | None = None
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._direct_observations: dict[str, float] = {}
+        # Separate from _direct_observations above (which only tracks
+        # "was ANY accepted packet heard from this node recently", for
+        # last_heard/activity-tier freshening -- it never checks hop
+        # count). Keyed by lowercased node_id, one LinkObservation per
+        # node, always the most recently directly-heard packet's own
+        # rssi/snr/timestamp. Cleared on radio identity change/close
+        # exactly like _direct_observations, so a previous radio's (or
+        # previous connection's) readings can never be shown for a new
+        # one (see connect()/set_device_path()/close()).
+        self._link_observations: dict[str, LinkObservation] = {}
         self._activity_local_node_id: str | None = None
         # Tracks in-flight outgoing sends by packet ID, keyed to the
         # status_handler given to send_text() plus the EXPECTED
@@ -451,6 +605,7 @@ class RadioService:
                 and self._activity_local_node_id.lower() != info.node_id.lower()
             ):
                 self._direct_observations.clear()
+                self._link_observations.clear()
             self._activity_local_node_id = info.node_id
             # Item 7: a NEW connection always gets a NEW generation and
             # a freshly-built snapshot -- whether this is a reconnect to
@@ -490,6 +645,7 @@ class RadioService:
         self.close()
         self.device_path = device_path.strip()
         self._direct_observations.clear()
+        self._link_observations.clear()
         self._activity_local_node_id = None
 
     def connection_events(
@@ -925,11 +1081,19 @@ class RadioService:
 
         try:
             local_node._sendAdmin(write_message, onResponse=on_ack)
-            interface.waitForAckNak()
         except Exception:
-            # A missing/weak ack must not by itself fail OR pass the
-            # write -- only the fresh readback below is authoritative.
             pass
+        # NOTE: no interface.waitForAckNak() here. That call is bounded
+        # only by the interface's 300s Timeout, and for a LOCAL-node
+        # admin write the SDK never delivers the routing ACK to a
+        # callback that is not literally named "onAckNak" -- so it
+        # blocked for the full 300s on real hardware unless a stale
+        # receivedAck from an unrelated prior response happened to still
+        # be set. A routing ACK was never verification here anyway (see
+        # this method's docstring); the fresh readback below is, and it
+        # -- plus the NAK poll in its loop -- bounds the whole call to
+        # `timeout`. Mirrors Node.writeConfig()'s own local-node path
+        # (onResponse=None, fire and forget).
 
         if self._interface is not target_interface or self._connection_lost.is_set():
             return ConfigWriteResult(False, value, None, "disconnected")
@@ -966,6 +1130,8 @@ class RadioService:
         while time.monotonic() - start < timeout:
             if self._interface is not target_interface or self._connection_lost.is_set():
                 return ConfigWriteResult(False, value, None, "disconnected")
+            if nak_seen["nak"]:
+                return ConfigWriteResult(False, value, None, "nak")
             if "value" in found:
                 readback = found["value"]
                 if readback == value:
@@ -979,6 +1145,315 @@ class RadioService:
             time.sleep(0.05)
 
         return ConfigWriteResult(False, value, None, "timeout")
+
+    def read_primary_channel_settings(self) -> tuple[str, bytes] | None:
+        """Zero-RF read of the PRIMARY channel's (index 0) name/psk from
+
+        the already-synced interface -- mirrors read_synced_config_field's
+        own contract exactly: no new radio request, None when
+        unavailable (not connected, or this installed schema/interface
+        doesn't expose it).
+        """
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if not channels:
+            return None
+        settings = getattr(channels[0], "settings", None)
+        if settings is None:
+            return None
+        name = getattr(settings, "name", "") or ""
+        psk = getattr(settings, "psk", b"") or b""
+        return (name, bytes(psk))
+
+    def write_verified_primary_channel(
+        self,
+        *,
+        name: str,
+        psk: bytes,
+        timeout: float = 15.0,
+    ) -> ConfigWriteResult:
+        """Write the PRIMARY channel's (index 0) name/psk and verify it
+
+        with a fresh radio-originated get_channel_response -- the same
+        verification MODEL write_verified_config_field uses for
+        localConfig fields (see its own docstring), adapted for a
+        Channel message: Channel settings live in their own
+        AdminMessage.set_channel/get_channel_request family, never
+        localConfig, so this is a distinct write path rather than a
+        call to write_verified_config_field with a different section
+        name. Never touches role, channel_num, uplink/downlink_enabled,
+        or any OTHER channel's settings -- only this one channel's
+        name/psk.
+        """
+        interface = self._interface
+        if interface is None:
+            return ConfigWriteResult(False, (name, psk), None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if local_node is None or not channels:
+            return ConfigWriteResult(False, (name, psk), None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2
+
+        target_interface = interface
+        primary = channels[0]
+        primary.settings.name = name
+        primary.settings.psk = psk
+
+        write_message = admin_pb2.AdminMessage()
+        write_message.set_channel.CopyFrom(primary)
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+        except Exception:
+            pass
+        # No interface.waitForAckNak() -- see write_verified_config_field
+        # for why (unbounded 300s local-node stall). Bounded by the
+        # readback loop + NAK poll below.
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return ConfigWriteResult(False, (name, psk), None, "disconnected")
+        if nak_seen["nak"]:
+            return ConfigWriteResult(False, (name, psk), None, "nak")
+
+        read_request = admin_pb2.AdminMessage()
+        # AdminMessage.get_channel_request is 1-INDEXED on the wire:
+        # meshtastic.node.Node._requestChannel sends `channelNum + 1`,
+        # so requesting the PRIMARY channel (index 0) means a value of
+        # 1. A value of 0 addresses no valid channel, the firmware never
+        # answers, and this readback silently times out on real hardware
+        # (the observed "NETWORK apply never completes" bug).
+        read_request.get_channel_request = 1
+        found: dict[str, Any] = {}
+
+        def on_response(packet: Any) -> None:
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            if not isinstance(admin, dict):
+                return
+            raw = admin.get("raw")
+            if raw is None or not raw.HasField("get_channel_response"):
+                return
+            response_channel = raw.get_channel_response
+            if getattr(response_channel, "index", 0) != 0:
+                return  # not the primary channel's response
+            found["name"] = response_channel.settings.name
+            found["psk"] = bytes(response_channel.settings.psk)
+
+        try:
+            local_node._sendAdmin(read_request, onResponse=on_response)
+        except Exception:
+            return ConfigWriteResult(False, (name, psk), None, "timeout")
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                return ConfigWriteResult(False, (name, psk), None, "disconnected")
+            if nak_seen["nak"]:
+                return ConfigWriteResult(False, (name, psk), None, "nak")
+            if "name" in found:
+                readback = (found["name"], found["psk"])
+                if found["name"] == name and psk_matches_request(psk, found["psk"]):
+                    self._rebuild_config_snapshot()
+                    return ConfigWriteResult(True, (name, psk), readback, "")
+                return ConfigWriteResult(False, (name, psk), readback, "mismatch")
+            time.sleep(0.05)
+
+        return ConfigWriteResult(False, (name, psk), None, "timeout")
+
+    def begin_settings_transaction(self) -> bool:
+        """Open a Meshtastic settings-edit transaction
+
+        (AdminMessage.begin_edit_settings) -- exactly what
+        `meshtastic --set` does before a MULTI-field config change (see
+        meshtastic.__main__: it wraps >1 writeConfig() calls in
+        begin/commitSettingsTransaction). Best-effort: returns False and
+        never raises if there is no connection or the installed SDK
+        predates the method. apply_radio_config_preset uses this so a
+        NETWORK apply is committed the same way the CLI commits one,
+        rather than as loose, individually-persisted set_config writes.
+        """
+        local_node = getattr(self._interface, "localNode", None)
+        begin = getattr(local_node, "beginSettingsTransaction", None)
+        if begin is None:
+            return False
+        try:
+            begin()
+            return True
+        except Exception:
+            return False
+
+    def commit_settings_transaction(self) -> bool:
+        """Commit the open settings-edit transaction
+
+        (AdminMessage.commit_edit_settings). The firmware persists the
+        batch of edits -- and reboots if any of them require it -- on
+        THIS message, not on the individual set_config writes. Always
+        paired with begin_settings_transaction() so a transaction is
+        never left dangling on the radio. Best-effort / never raises.
+        """
+        local_node = getattr(self._interface, "localNode", None)
+        commit = getattr(local_node, "commitSettingsTransaction", None)
+        if commit is None:
+            return False
+        try:
+            commit()
+            return True
+        except Exception:
+            return False
+
+    def reread_lora_and_primary_channel(self, *, timeout: float = 8.0) -> bool:
+        """Ask the radio for a FRESH copy of localConfig.lora and the
+
+        primary channel (get_config_request LORA + get_channel_request
+        1) and fold it into the SDK's synced objects -- so a following
+        read_synced_config_field("lora", ...) / read_primary_channel_
+        settings() reflects the radio's CURRENT state, not a stale
+        connect-time snapshot. Used to verify a NETWORK apply that
+        completed WITHOUT an observed reboot (there was no reconnect
+        full-sync to refresh the cache). Best-effort; returns True if
+        both responses arrived. Never raises.
+        """
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        if interface is None or local_node is None:
+            return False
+        try:
+            from meshtastic.protobuf import admin_pb2
+        except Exception:
+            return False
+        got = {"lora": False, "channel": False}
+
+        def on_config(packet: Any) -> None:
+            try:
+                local_node.onResponseRequestSettings(packet)
+            except Exception:
+                pass
+            got["lora"] = True
+
+        def on_channel(packet: Any) -> None:
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            raw = admin.get("raw") if isinstance(admin, dict) else None
+            if raw is not None and raw.HasField("get_channel_response"):
+                channel = raw.get_channel_response
+                if getattr(channel, "index", 0) == 0 and local_node.channels:
+                    local_node.channels[0].CopyFrom(channel)
+            got["channel"] = True
+
+        lora_request = admin_pb2.AdminMessage()
+        lora_request.get_config_request = admin_pb2.AdminMessage.ConfigType.Value(
+            "LORA_CONFIG"
+        )
+        channel_request = admin_pb2.AdminMessage()
+        channel_request.get_channel_request = 1  # 1-indexed: primary == 0
+        try:
+            local_node._sendAdmin(lora_request, onResponse=on_config)
+            local_node._sendAdmin(channel_request, onResponse=on_channel)
+        except Exception:
+            return False
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._connection_lost.is_set():
+                return False
+            if got["lora"] and got["channel"]:
+                self._rebuild_config_snapshot()
+                return True
+            time.sleep(0.05)
+        return False
+
+    def apply_network_config(
+        self,
+        *,
+        use_preset: bool,
+        modem_preset: int,
+        channel_num: int,
+        channel_name: str,
+        psk: bytes,
+        stage_log: "Callable[[str], None] | None" = None,
+    ) -> RadioApplyResult:
+        """FIRE-AND-FORGET NETWORK write, matching the meshtastic CLI's
+
+        local-node path (`--set lora.*` switches this hardware without a
+        reboot): stage lora fields -> writeConfig("lora") -> stage the
+        primary channel -> writeChannel(0), inside begin/commit
+        SettingsTransaction. NO interface.waitForAckNak(), NO per-field
+        readback -- none of the SDK calls here block, so no stage can
+        leave the UI pending. Verification is a SEPARATE step the caller
+        runs afterwards (reread_lora_and_primary_channel +
+        verify_radio_config_preset). Every stage boundary is reported
+        through `stage_log` ("<stage> START" / "<stage> DONE" /
+        "<stage> ERROR ...") for hardware diagnosis; PSK bytes are never
+        passed to it.
+        """
+        log = stage_log or (lambda _message: None)
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        local_config = getattr(local_node, "localConfig", None) if local_node else None
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if interface is None or local_config is None or not channels:
+            log("connect ERROR not_connected")
+            return RadioApplyResult(
+                False, "connect", {"connect": ConfigWriteResult(False, None, None, "not_connected")}
+            )
+        target_interface = interface
+        results: dict[str, ConfigWriteResult] = {}
+
+        def stage(name: str, action: "Callable[[], Any]") -> bool:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                results[name] = ConfigWriteResult(False, None, None, "disconnected")
+                log(f"{name} ERROR disconnected")
+                return False
+            log(f"{name} START")
+            try:
+                action()
+            except Exception as error:
+                detail = error.__class__.__name__
+                results[name] = ConfigWriteResult(False, None, None, f"error: {detail}")
+                log(f"{name} ERROR {detail}")
+                return False
+            results[name] = ConfigWriteResult(True, None, None, "")
+            log(f"{name} DONE")
+            return True
+
+        # begin: best-effort -- an SDK without the transaction methods,
+        # or a benign failure, must not block the actual writes (the
+        # CLI itself only opens a transaction opportunistically).
+        stage("begin", self.begin_settings_transaction)
+
+        def write_lora() -> None:
+            lora = local_config.lora
+            lora.use_preset = use_preset
+            lora.modem_preset = modem_preset
+            lora.channel_num = channel_num
+            local_node.writeConfig("lora")
+
+        if not stage("lora", write_lora):
+            self.commit_settings_transaction()
+            return RadioApplyResult(False, "lora", results)
+
+        def write_channel() -> None:
+            primary = channels[0]
+            primary.settings.name = channel_name
+            primary.settings.psk = psk
+            local_node.writeChannel(0)
+
+        if not stage("channel", write_channel):
+            self.commit_settings_transaction()
+            return RadioApplyResult(False, "channel", results)
+
+        if not stage("commit", self.commit_settings_transaction):
+            return RadioApplyResult(False, "commit", results)
+
+        return RadioApplyResult(True, "", results)
 
     def supports_clock_sync(self) -> bool:
         """Whether the installed SDK/protobuf schema exposes
@@ -1260,6 +1735,160 @@ class RadioService:
             return None
         return reason
 
+    # Node numbers on the wire are always unsigned 32-bit (route/
+    # route_back are protobuf `fixed32`, never sign-extended) -- this
+    # mask is purely defensive symmetry with _node_number_from_id's own
+    # convention, not a correction of anything the SDK gets wrong.
+    _NODE_NUMBER_MASK = 0xFFFFFFFF
+    # PROTOBUF-SOURCE-VERIFIED (mesh_pb2.pyi RouteDiscovery.snr_towards/
+    # snr_back): "SNR of the received packet, 1 = 0.25dB, -128 = invalid".
+    _TRACEROUTE_UNKNOWN_SNR = -128
+
+    def send_traceroute(
+        self,
+        destination_node_id: str,
+        status_handler: Callable[[TracerouteStatus], None],
+    ) -> int:
+        """Send one explicit TRACEROUTE_APP request; report the outcome
+
+        exactly once via `status_handler`, asynchronously, whenever a
+        real response arrives (never for "request sent" alone -- see
+        TracerouteState). This is genuine RF traffic, only ever
+        triggered by an explicit caller action (never from here).
+
+        Uses the SAME zero-RF-cost lora.hop_limit the app's own HOP
+        LIMIT setting already reads/writes (read_synced_config_field) --
+        never a second, independent hop-limit concept.
+
+        Correlation is by `requestId` via the SDK's own one-shot
+        sendData(onResponse=...) response-handler registry (Meshtastic
+        2.7.11 mesh_interface.py) -- the SAME mechanism send_text uses
+        for delivery ACKs/NAKs, reused here rather than the SDK's own
+        sendTraceRoute/waitForTraceRoute helpers, which BLOCK the
+        calling thread for up to `hopLimit + 1` multiples of a 300s base
+        timeout (see meshtastic.util.Timeout.waitForTraceRoute) --
+        entirely unsuitable for this app's async UI. This method never
+        blocks; if the destination never responds at all, the SDK's own
+        response-handler entry simply lingers unfired (the SAME
+        characteristic already true of any unanswered wantResponse
+        send) -- the caller is responsible for its own UI-appropriate
+        timeout and for ignoring a callback it no longer cares about
+        (see MeshtasticPassApp._active_traceroute's own packet_id guard).
+
+        Returns the outgoing packet's own id, letting the caller
+        correlate a later status_handler call against exactly this
+        attempt via TracerouteStatus.packet_id -- critical because
+        selection/navigation must never affect which attempt a response
+        belongs to.
+        """
+        if self._interface is None:
+            raise RadioSendError("The radio is not connected.")
+        from meshtastic.protobuf import mesh_pb2, portnums_pb2
+
+        hop_limit = self._optional_int(
+            self.read_synced_config_field("lora", "hop_limit")
+        )
+
+        def onResponse(packet: dict[str, Any]) -> None:
+            status = self._parse_traceroute_response(
+                packet,
+                destination_node_id=destination_node_id,
+                now=time.time(),
+            )
+            if status is not None:
+                status_handler(status)
+
+        try:
+            sdk_packet = self._interface.sendData(
+                mesh_pb2.RouteDiscovery(),
+                destinationId=destination_node_id,
+                portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                wantResponse=True,
+                onResponse=onResponse,
+                hopLimit=hop_limit,
+            )
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            raise RadioSendError(f"Could not send traceroute: {detail}") from error
+
+        packet_id = self._optional_int(getattr(sdk_packet, "id", None))
+        if packet_id is None:
+            raise RadioSendError("Traceroute request was not assigned a packet ID.")
+        return packet_id
+
+    @staticmethod
+    def _parse_traceroute_response(
+        packet: Any,
+        *,
+        destination_node_id: str,
+        now: float,
+    ) -> TracerouteStatus | None:
+        """Convert one raw response packet into a TracerouteStatus, or
+
+        None when this packet carries no conclusive evidence yet (e.g.
+        a bare ACK on ROUTING_APP that is not itself a NAK -- the real
+        RouteDiscovery reply is always a separate, later packet).
+
+        Two portnums legitimately arrive under the SAME requestId:
+        ROUTING_APP (a NAK means the request could not be routed/
+        delivered at all -- FAILED) or TRACEROUTE_APP (the destination's
+        own real RouteDiscovery reply -- SUCCEEDED, carrying the actual
+        route). Only these two ever resolve to a terminal status here.
+        """
+        if not isinstance(packet, dict):
+            return None
+        decoded = packet.get("decoded")
+        if not isinstance(decoded, dict):
+            return None
+        packet_id = RadioService._optional_int(decoded.get("requestId"))
+        portnum = decoded.get("portnum")
+
+        if portnum == "ROUTING_APP":
+            routing = decoded.get("routing")
+            reason = (
+                RadioService._normalize_routing_error(routing)
+                if isinstance(routing, dict)
+                else None
+            )
+            if reason is not None and reason != "NONE":
+                return TracerouteStatus(
+                    TracerouteState.FAILED,
+                    packet_id,
+                    detail=f"Meshtastic routing failure: {reason}",
+                )
+            return None
+
+        if portnum != "TRACEROUTE_APP":
+            return None
+        traceroute_dict = decoded.get("traceroute")
+        raw = traceroute_dict.get("raw") if isinstance(traceroute_dict, dict) else None
+        if raw is None:
+            return None
+
+        def node_ids(numbers: Any) -> tuple[str, ...]:
+            return tuple(
+                f"!{number & RadioService._NODE_NUMBER_MASK:08x}" for number in numbers
+            )
+
+        def snr_values(values: Any) -> tuple[float | None, ...]:
+            return tuple(
+                None if value == RadioService._TRACEROUTE_UNKNOWN_SNR else value / 4.0
+                for value in values
+            )
+
+        return TracerouteStatus(
+            TracerouteState.SUCCEEDED,
+            packet_id,
+            result=TracerouteResult(
+                destination_node_id=destination_node_id,
+                forward_route=node_ids(raw.route),
+                forward_snr=snr_values(raw.snr_towards),
+                return_route=node_ids(raw.route_back),
+                return_snr=snr_values(raw.snr_back),
+                completed_at=now,
+            ),
+        )
+
     def close(self) -> None:
         """Close the serial connection if it is open."""
         # Item 7: a closed connection's config snapshot is never
@@ -1282,6 +1911,7 @@ class RadioService:
         # that NEW radio's own reported identity.
         self._activity_local_node_id = None
         self._direct_observations.clear()
+        self._link_observations.clear()
         if self._interface is not None:
             interface = self._interface
             self._interface = None
@@ -1357,6 +1987,21 @@ class RadioService:
             except Exception:
                 pass
 
+        # Always on (not diagnostic-gated): the same generic
+        # "meshtastic.receive" topic, read-only, purely to capture
+        # rx_rssi/rx_snr for MESH's passive LINK quality display (item
+        # 22-ish, UI POLISH Part C). This requests nothing new from the
+        # radio -- every packet here was already being decoded and
+        # published by the SDK regardless of whether anything
+        # subscribed; this only starts reading two fields the app
+        # previously discarded. See _on_any_packet_for_link_quality.
+        try:
+            pub.subscribe(
+                self._on_any_packet_for_link_quality, "meshtastic.receive"
+            )
+        except Exception:
+            pass
+
         self._pub = pub
 
     def _on_connection_lost(self, interface: Any = None, **_kwargs: Any) -> None:
@@ -1396,6 +2041,63 @@ class RadioService:
             return
         channel = packet.get("channel", 0)
         rx_debug_log(f"{from_id} {portnum} channel={channel} observed")
+
+    def _on_any_packet_for_link_quality(
+        self,
+        packet: Any = None,
+        interface: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Passively record directly-heard signal quality, for MESH LINK.
+
+        Fires for every decoded packet type (see _subscribe_to_events'
+        comment on the generic "meshtastic.receive" topic) -- portnum-
+        agnostic on purpose, since a node without any CHAT history can
+        still have valid, honest LINK data from a position/telemetry/
+        nodeinfo/routing-ack packet it sent.
+
+        Records rx_rssi/rx_snr ONLY when traversed_hops(hop_start,
+        hop_limit) == 0 for this specific packet -- a genuine zero-relay
+        reception, so the reading describes the RF link to the packet's
+        own sender and not to some intermediate relay (see
+        LinkObservation's docstring). Any other case (indeterminate, or
+        one-or-more hops traveled) is silently skipped: never recorded
+        as if it were direct, and never used to overwrite a previous
+        genuinely-direct reading with a multi-hop one.
+        """
+        if interface is not None and interface is not self._interface:
+            return
+        if not isinstance(packet, dict):
+            return
+        if traversed_hops(
+            self._optional_int(packet.get("hopStart")),
+            self._optional_int(packet.get("hopLimit")),
+        ) != 0:
+            return
+        rssi = self._optional_int(packet.get("rxRssi"))
+        snr = self._optional_float(packet.get("rxSnr"))
+        if rssi is None and snr is None:
+            return
+        node_id = self._format_from_id(packet)
+        normalized = node_id.strip().lower() if isinstance(node_id, str) else ""
+        if not normalized or normalized == "!unknown":
+            return
+        self._link_observations[normalized] = LinkObservation(
+            rssi=rssi, snr=snr, observed_at=time.time()
+        )
+
+    def get_link_quality(self, node_id: str) -> LinkObservation | None:
+        """Read the most recent directly-heard signal quality for a node.
+
+        Transmits nothing; returns None whenever nothing has been
+        directly heard from this node since the current connection (or
+        the current radio identity) began -- see LinkObservation's own
+        docstring for what "directly heard" requires.
+        """
+        normalized = node_id.strip().lower() if isinstance(node_id, str) else ""
+        if not normalized:
+            return None
+        return self._link_observations.get(normalized)
 
     @staticmethod
     def _format_from_id(packet: Any) -> str:
@@ -1491,6 +2193,7 @@ class RadioService:
                 (self._on_text_received, "meshtastic.receive.text"),
                 (self._on_routing_response, "meshtastic.receive.routing"),
                 (self._on_any_packet_for_debug, "meshtastic.receive"),
+                (self._on_any_packet_for_link_quality, "meshtastic.receive"),
             )
             for callback, topic in subscriptions:
                 try:
@@ -1790,9 +2493,66 @@ class RadioService:
             name = raw_name.strip() if isinstance(raw_name, str) else ""
             if not name and index == 0:
                 name = RadioService._primary_channel_default_name(local_node)
-            result.append(ChannelInfo(index, name or f"Channel {index + 1}"))
+            resolved_name = name or f"Channel {index + 1}"
+            result.append(
+                ChannelInfo(
+                    index,
+                    resolved_name,
+                    stable_key=RadioService._channel_stable_key(settings, resolved_name),
+                )
+            )
             seen_indexes.add(index)
         return tuple(sorted(result, key=lambda channel: channel.index))
+
+    @staticmethod
+    def _channel_stable_key(settings: Any, resolved_name: str) -> str:
+        """This channel's own cryptographic/assigned identity (CHAT
+
+        channel-history isolation) -- NEVER the radio-assigned slot
+        index, which a user can freely reassign to a completely
+        different channel (e.g. reconfiguring slot 0 from "LongFast" to
+        "MediumSlow") while keeping the SAME index. Preference order:
+
+        1. Channel.settings.id -- PROTOBUF-SOURCE-VERIFIED (channel_pb2.pyi):
+           "Used to construct a globally unique channel ID... Any time
+           a non wire compatible change is made to a channel, this
+           field should be regenerated." The SDK's own purpose-built,
+           64-bit, collision-negligible answer to exactly this question
+           -- used whenever the connected firmware actually populates it
+           (0 is its unset/default value, never a real assigned id).
+        2. meshtastic.util.generate_channel_hash(name, psk) -- the SAME
+           8-bit "channel number" hash Meshtastic's own official tooling
+           (meshtastic.node) already computes for channel disambiguation,
+           paired with the resolved display name here specifically to
+           close the "two different names happen to hash the same" case
+           (the hash alone has a real, if small, 1-in-256 collision
+           floor for two independently-chosen PSKs -- not eliminated by
+           this pairing, just not made worse by name-only guessing).
+        3. The resolved display name alone, if `settings`/`psk` are
+           unavailable for some reason -- strictly better than the bare
+           index (a rename is at least a DELIBERATE, visible user
+           action, unlike a same-index slot reassignment), even though
+           it cannot detect a same-name-different-PSK reassignment.
+
+        Returns "" (never a fabricated key) only if `settings` itself
+        is entirely unavailable -- callers treat "" as "unknown," the
+        same honest default a pre-connection placeholder channel uses.
+        """
+        if settings is None:
+            return ""
+        settings_id = RadioService._optional_int(getattr(settings, "id", None))
+        if settings_id:
+            return f"id:{settings_id}"
+        psk = getattr(settings, "psk", None)
+        if isinstance(psk, (bytes, bytearray)) and psk:
+            try:
+                from meshtastic.util import generate_channel_hash
+
+                channel_hash = generate_channel_hash(resolved_name, bytes(psk))
+            except Exception:
+                return resolved_name
+            return f"hash:{resolved_name}:{channel_hash}"
+        return resolved_name
 
     @staticmethod
     def _primary_channel_default_name(local_node: Any) -> str:
@@ -1809,3 +2569,211 @@ class RadioService:
         except (ImportError, AttributeError, KeyError, TypeError, ValueError):
             return ""
         return "".join(part.title() for part in enum_name.split("_"))
+
+
+# Compact UI wording for the write STAGE a NETWORK apply failed at
+# (as opposed to a post-write verification field mismatch --
+# NETWORK_FIELD_LABELS covers those).
+NETWORK_STAGE_LABELS = {
+    "connect": "RADIO NOT CONNECTED",
+    "begin": "BEGIN TRANSACTION",
+    "lora": "WRITE RADIO MODE / FREQ. SLOT",
+    "channel": "WRITE PRIMARY CHANNEL",
+    "commit": "COMMIT",
+}
+
+
+def apply_radio_config_preset(
+    radio: Any, preset: Any, *, stage_log: "Callable[[str], None] | None" = None
+) -> RadioApplyResult:
+    """Apply one saved radio/network configuration, following the SAME
+
+    local-node semantics the installed meshtastic CLI uses for
+    `--set lora.modem_preset X` / `--set lora.channel_num N` (which
+    switch this hardware WITHOUT a reboot): stage the LoRa fields into
+    localConfig, `writeConfig("lora")`, stage the primary channel,
+    `writeChannel(0)`, all FIRE-AND-FORGET (Node.writeConfig for the
+    local node passes onResponse=None -- no ACK wait, no per-field
+    readback), wrapped in begin/commitSettingsTransaction so the batch
+    commits atomically. NONE of these calls block; the operation is
+    verified afterwards by ONE fresh readback (see
+    RadioService.reread_lora_and_primary_channel + verify_radio_config_
+    preset), never by an intermediate per-field ACK/readback that could
+    stall.
+
+    Validation (invalid modem preset name / PSK) happens here, before
+    any RF. `radio` is duck-typed against RadioService/
+    SimulatedRadioService's `apply_network_config`.
+    """
+    log = stage_log or (lambda _message: None)
+    try:
+        from meshtastic.protobuf import config_pb2
+
+        modem_preset_value = config_pb2.Config.LoRaConfig.ModemPreset.Value(
+            preset.modem_preset
+        )
+    except Exception:
+        return RadioApplyResult(
+            False,
+            "modem_preset",
+            {
+                "modem_preset": ConfigWriteResult(
+                    False, preset.modem_preset, None, "invalid"
+                )
+            },
+        )
+    try:
+        psk_bytes = (
+            base64.b64decode(preset.channel_psk_base64)
+            if preset.channel_psk_base64
+            else b""
+        )
+    except Exception:
+        return RadioApplyResult(
+            False,
+            "channel",
+            {"channel": ConfigWriteResult(False, preset.channel_psk_base64, None, "invalid")},
+        )
+
+    return radio.apply_network_config(
+        use_preset=True,
+        modem_preset=modem_preset_value,
+        channel_num=int(getattr(preset, "frequency_slot", 0) or 0),
+        # NETWORK NAME is local-only -- the Meshtastic primary channel
+        # name is never derived from it (stays exactly what the preset
+        # carries, normally blank).
+        channel_name=getattr(preset, "channel_name", "") or "",
+        psk=psk_bytes,
+        stage_log=log,
+    )
+
+
+@dataclass(frozen=True)
+class RadioConfigFieldCheck:
+    """One field of a NETWORK-apply readback verification."""
+
+    field: str          # "modem_preset" | "frequency_slot" | "channel_psk"
+    requested: str       # already display-safe (PSK is a length note only)
+    actual: str
+    match: bool
+
+
+@dataclass(frozen=True)
+class RadioConfigVerification:
+    ok: bool
+    checks: tuple[RadioConfigFieldCheck, ...]
+    mismatched_field: str          # "" when ok
+    channel_name_note: str         # diagnostic only, never a pass/fail input
+
+
+# The three LoRa/channel apply steps a mismatch can be attributed to,
+# mapped to the compact UI wording the failure status uses.
+NETWORK_FIELD_LABELS = {
+    "modem_preset": "RADIO MODE MISMATCH",
+    "frequency_slot": "FREQ. SLOT MISMATCH",
+    "channel_psk": "KEY MISMATCH",
+}
+
+
+def verify_radio_config_preset(radio: Any, preset: Any) -> RadioConfigVerification:
+    """Compare the connected radio's ACTUAL already-synced lora +
+
+    primary-channel state against `preset`, field by field and
+    SEMANTICALLY -- for the post-apply verification step (after a
+    reconnect full-sync, or after RadioService.reread_lora_and_primary_
+    channel for a no-reboot apply). Duck-typed against read_synced_
+    config_field / read_primary_channel_settings, like
+    apply_radio_config_preset, so it behaves identically in --simulate.
+
+    channel_num: a requested 0 is the Meshtastic "auto-select" sentinel
+    (the firmware derives the real frequency from region + modem preset
+    + a hash of the primary channel name; the stored config field stays
+    0), so requested 0 matches an actual 0 OR an unavailable/unset
+    readback -- never a false literal-equality failure. An explicit
+    slot (MS48 -> 48) must match exactly.
+
+    PSK: compared with psk_matches_request (0x01 default sentinel <->
+    expanded default key; "" <-> 0x00). Only a decoded LENGTH is ever
+    put in the returned strings -- never key bytes.
+    """
+    checks: list[RadioConfigFieldCheck] = []
+
+    raw_modem = radio.read_synced_config_field("lora", "modem_preset")
+    try:
+        from radio_capabilities import modem_preset_enum_name
+
+        actual_modem = (
+            modem_preset_enum_name(raw_modem) if raw_modem is not None else None
+        )
+    except Exception:
+        actual_modem = None
+    checks.append(
+        RadioConfigFieldCheck(
+            "modem_preset",
+            str(preset.modem_preset),
+            actual_modem or "unavailable",
+            actual_modem == preset.modem_preset,
+        )
+    )
+
+    raw_slot = radio.read_synced_config_field("lora", "channel_num")
+    requested_slot = int(getattr(preset, "frequency_slot", 0) or 0)
+    if raw_slot is None:
+        slot_match = requested_slot == 0
+        actual_slot_text = "unset"
+    else:
+        actual_slot = int(raw_slot)
+        slot_match = actual_slot == requested_slot or (
+            requested_slot == 0 and actual_slot == 0
+        )
+        actual_slot_text = str(actual_slot)
+    checks.append(
+        RadioConfigFieldCheck(
+            "frequency_slot", str(requested_slot), actual_slot_text, slot_match
+        )
+    )
+
+    try:
+        requested_psk = (
+            base64.b64decode(preset.channel_psk_base64)
+            if preset.channel_psk_base64
+            else b""
+        )
+    except Exception:
+        requested_psk = b""
+    primary = None
+    reader = getattr(radio, "read_primary_channel_settings", None)
+    if callable(reader):
+        primary = reader()
+    actual_name = primary[0] if primary else ""
+    actual_psk = primary[1] if primary else b""
+    psk_match = psk_matches_request(requested_psk, actual_psk)
+    checks.append(
+        RadioConfigFieldCheck(
+            "channel_psk",
+            f"len={len(requested_psk)}",
+            f"len={len(actual_psk)}",
+            psk_match,
+        )
+    )
+
+    # NETWORK NAME is local-only and must never be written as the
+    # Meshtastic primary-channel name -- this is a diagnostic breadcrumb
+    # only (report if the channel name unexpectedly changed), never a
+    # verification failure.
+    requested_channel_name = getattr(preset, "channel_name", "") or ""
+    if actual_name == requested_channel_name:
+        channel_name_note = f"channel_name={actual_name or 'blank'} (as requested)"
+    else:
+        channel_name_note = (
+            f"channel_name={actual_name or 'blank'} "
+            f"(requested {requested_channel_name or 'blank'})"
+        )
+
+    mismatched = next((c.field for c in checks if not c.match), "")
+    return RadioConfigVerification(
+        ok=not mismatched,
+        checks=tuple(checks),
+        mismatched_field=mismatched,
+        channel_name_note=channel_name_note,
+    )

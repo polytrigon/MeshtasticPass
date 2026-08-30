@@ -57,6 +57,82 @@ def default_config_home() -> Path:
 
 
 @dataclass
+class RadioConfigPreset:
+    """One locally saved radio/network configuration (ADVANCED RADIO
+
+    CONFIG). Deliberately narrow: a user-visible name, the Meshtastic
+    MODEM PRESET, a frequency slot, and the PRIMARY channel's name/key
+    -- exactly the fields a saved "network" identity needs. HOP LIMIT
+    is intentionally excluded: it stays the existing, independent
+    RADIO-section HopLimitSelector field, never folded into a saved
+    network preset. Raw bandwidth/spread_factor/coding_rate are also
+    excluded -- those are derived from `modem_preset` in PRESET mode
+    when applying (see radio_service.apply_radio_config_preset), never
+    stored or written manually here.
+
+    This class holds untrusted, unvalidated user input as-is (mirrors
+    favorite_node_ids' own "just a string" scope) -- validating
+    `modem_preset` against the installed Meshtastic protobuf schema is
+    the caller's job (see radio_capabilities.modem_preset_choices),
+    never this module's: app_settings.py has no Meshtastic SDK
+    dependency at all, by design, and this preset is equally valid
+    persisted data whether or not that package happens to be
+    installed right now.
+    """
+
+    name: str
+    modem_preset: str
+    # LoRaConfig.channel_num -- 0 means "not set" (Meshtastic's own
+    # "let the radio auto-select a channel" sentinel), never a
+    # fabricated default frequency slot.
+    frequency_slot: int = 0
+    # The primary channel's ChannelSettings.name -- "" is a legitimate,
+    # real-hardware value (an unnamed/default primary channel), never
+    # coerced to a placeholder string.
+    channel_name: str = ""
+    # Canonical representation of ChannelSettings.psk: standard base64
+    # TEXT (e.g. "AQ==" for the SDK's own default-channel-psk sentinel
+    # byte 0x01) -- the SAME string end-to-end from the KEY UI field to
+    # this persisted value; only the actual radio-write boundary
+    # (radio_service.apply_radio_config_preset) ever decodes this to
+    # raw bytes. "" means "not set".
+    channel_psk_base64: str = ""
+
+
+def _radio_config_preset_from_dict(raw: Any) -> RadioConfigPreset | None:
+    """Tolerantly parse one saved preset entry -- an unrecognized/
+
+    malformed entry is skipped (returns None) rather than corrupting
+    the whole load or crashing the app (see AppSettings.load's own
+    "never destroy existing settings" contract).
+    """
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    modem_preset = raw.get("modem_preset")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(modem_preset, str) or not modem_preset.strip():
+        return None
+    frequency_slot = raw.get("frequency_slot", 0)
+    if isinstance(frequency_slot, bool) or not isinstance(frequency_slot, int):
+        frequency_slot = 0
+    channel_name = raw.get("channel_name", "")
+    if not isinstance(channel_name, str):
+        channel_name = ""
+    channel_psk_base64 = raw.get("channel_psk_base64", "")
+    if not isinstance(channel_psk_base64, str):
+        channel_psk_base64 = ""
+    return RadioConfigPreset(
+        name=name.strip(),
+        modem_preset=modem_preset.strip(),
+        frequency_slot=frequency_slot,
+        channel_name=channel_name,
+        channel_psk_base64=channel_psk_base64,
+    )
+
+
+@dataclass
 class AppSettings:
     """Load, validate, and save the small user-facing settings file."""
 
@@ -69,6 +145,11 @@ class AppSettings:
     # the user explicitly turns it on; never silently enabled by a
     # default-on migration or an unrelated setting.
     clock_auto_sync: bool = False
+    # ADVANCED RADIO CONFIG: locally saved network/radio configurations
+    # -- never auto-applied on load/connect (see radio_service.
+    # apply_radio_config_preset's own callers, always an explicit user
+    # APPLY action).
+    radio_config_presets: list[RadioConfigPreset] = field(default_factory=list)
     config_path: Path = field(
         default_factory=lambda: default_config_home()
         / "meshtasticpass"
@@ -112,6 +193,7 @@ class AppSettings:
                 "device_path",
                 "favorite_node_ids",
                 "clock_auto_sync",
+                "radio_config_presets",
             )
         }
         candidate = raw.get("font_size")
@@ -137,6 +219,15 @@ class AppSettings:
         auto_sync_candidate = raw.get("clock_auto_sync")
         if isinstance(auto_sync_candidate, bool):
             settings.clock_auto_sync = auto_sync_candidate
+        presets_candidate = raw.get("radio_config_presets")
+        if isinstance(presets_candidate, list):
+            settings.radio_config_presets = [
+                preset
+                for preset in (
+                    _radio_config_preset_from_dict(item) for item in presets_candidate
+                )
+                if preset is not None
+            ]
         return settings
 
     @staticmethod
@@ -192,6 +283,35 @@ class AppSettings:
         else:
             self.favorite_node_ids.discard(normalized)
 
+    def radio_config_preset_names(self) -> tuple[str, ...]:
+        return tuple(preset.name for preset in self.radio_config_presets)
+
+    def get_radio_config_preset(self, name: str) -> RadioConfigPreset | None:
+        return next(
+            (preset for preset in self.radio_config_presets if preset.name == name),
+            None,
+        )
+
+    def save_radio_config_preset(self, preset: RadioConfigPreset) -> None:
+        """Create or update-by-name -- SAVE never touches the connected
+
+        radio (see ADVANCED RADIO CONFIG's own "browsing/editing/
+        saving causes zero RF" requirement).
+        """
+        if not preset.name.strip():
+            raise ValueError("Preset name cannot be empty.")
+        self.radio_config_presets = [
+            existing
+            for existing in self.radio_config_presets
+            if existing.name != preset.name
+        ]
+        self.radio_config_presets.append(preset)
+
+    def delete_radio_config_preset(self, name: str) -> None:
+        self.radio_config_presets = [
+            preset for preset in self.radio_config_presets if preset.name != name
+        ]
+
     def save(self) -> None:
         """Atomically save known settings while retaining unknown future keys."""
         data = dict(self._unknown)
@@ -200,6 +320,16 @@ class AppSettings:
         data["device_path"] = self.device_path
         data["favorite_node_ids"] = sorted(self.favorite_node_ids)
         data["clock_auto_sync"] = self.clock_auto_sync
+        data["radio_config_presets"] = [
+            {
+                "name": preset.name,
+                "modem_preset": preset.modem_preset,
+                "frequency_slot": preset.frequency_slot,
+                "channel_name": preset.channel_name,
+                "channel_psk_base64": preset.channel_psk_base64,
+            }
+            for preset in self.radio_config_presets
+        ]
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         self._atomic_write(self.config_path, content)
 

@@ -36,6 +36,7 @@ from app import (
     ChatEntryWidget,
     ColorSelector,
     DeviceSelector,
+    DMModeSelector,
     EndOfChatHistoryMarker,
     FlipScreenSelector,
     FontSizeSelector,
@@ -527,8 +528,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         assert its exact order/membership directly, the same source
         _update_tab_bar() renders from.
         """
-        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh", "dm"])
+        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh"])
         self.assertNotIn("profile", TAB_NAMES)
+        self.assertNotIn("dm", TAB_NAMES)
 
     async def test_nav_bar_renders_connection_chat_mesh_with_active_count(
         self,
@@ -579,10 +581,17 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("3")
             self.assertEqual(app.current_tab, "mesh")
 
-    async def test_key_4_selects_dm_not_mesh_or_hidden_profile(self) -> None:
-        """"4" is now the legitimate DM tab (PART A item 1) -- PROFILE
+    async def test_key_4_does_nothing_dm_is_a_chat_mode_not_a_tab(self) -> None:
+        """"4" is unmapped -- DM is a MODE inside CHAT now (CHAT/DM/
 
-        remains hidden/unreachable via any digit key, unchanged.
+        MENTION UX Part A), reached via "2" + the D hotkey or the
+        header's DM(N) selector, never its own digit key. Unmapped
+        exactly like any other ordinary character, "4" pressed from
+        CHAT's neutral state simply begins composing (types itself)
+        rather than switching anything -- it is NOT excluded from the
+        printable-character fallback the way "1"/"2"/"3"/"c"/"d" are.
+        PROFILE remains hidden/unreachable via any digit key too,
+        unchanged.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
@@ -590,28 +599,59 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
             await pilot.press("4")
-            self.assertEqual(app.current_tab, "dm")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "connection")
+            self.assertNotEqual(app.current_tab, "dm")
             self.assertNotEqual(app.current_tab, "profile")
 
             await pilot.press("2")
+            await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            await pilot.press("escape", "4")
-            self.assertEqual(app.current_tab, "dm")
+            self.assertEqual(app._chat_mode, "channel")
 
-    async def test_footer_help_text_reflects_1_through_4(self) -> None:
+            await pilot.press("4")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(app._chat_mode, "channel")
+            chat_input = app.query_one("#chat-input", Input)
+            self.assertEqual(chat_input.value, "4")
+
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            # PR #46 follow-up Part B item 7: D opens the DM dropdown --
+            # it no longer immediately switches CHAT into DMS mode.
+            self.assertTrue(app.query_one(DMModeSelector).is_open)
+            self.assertEqual(app._chat_mode, "channel")
+
+    async def test_footer_help_text_reflects_1_through_3(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-4", footer_text)
+            self.assertIn("1-3", footer_text)
+            self.assertNotIn("1-4", footer_text)
 
             await pilot.press("3")
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-4", footer_text)
+            self.assertIn("1-3", footer_text)
 
-    async def test_composer_hint_shows_enter_send_ctrl_e_emoji_esc_cancel(self) -> None:
+    async def test_composer_hint_matches_uppercase_hotkey_lowercase_descriptor_grammar(
+        self,
+    ) -> None:
+        """UI POLISH Part B: the composer-focused footer must follow the
+
+        same UPPERCASE HOTKEY + lowercase descriptor grammar every other
+        footer line already uses (e.g. "C channel", "D dms") -- the
+        previous "ENTER SEND    CTRL+E EMOJI    ESC CANCEL" was
+        all-uppercase throughout, inconsistent with that grammar. The
+        hotkey label is CTRL+E, not a bare E, because that is the real
+        emoji-picker binding (on_key's ctrl+e handling) -- preserved
+        so "e" stays typeable while composing.
+        """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
@@ -622,15 +662,34 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertEqual(footer_text, "ENTER SEND    CTRL+E EMOJI    ESC CANCEL")
+            self.assertEqual(footer_text, "CTRL+E emojis    ESC cancel    ENTER send")
 
-            # Exact order: SEND, then EMOJI, then CANCEL.
+            # Exact order: emojis, then cancel, then send.
             self.assertLess(
-                footer_text.index("ENTER SEND"), footer_text.index("CTRL+E EMOJI")
+                footer_text.index("CTRL+E emojis"), footer_text.index("ESC cancel")
             )
             self.assertLess(
-                footer_text.index("CTRL+E EMOJI"), footer_text.index("ESC CANCEL")
+                footer_text.index("ESC cancel"), footer_text.index("ENTER send")
             )
+
+    async def test_dm_composer_hint_matches_channel_composer_hint(self) -> None:
+        """CHANNEL and DM composer modes share the same Input-based
+
+        composer, so the composer-focused footer hint must be identical
+        in both.
+        """
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!a11ce001", long_name="Alice")
+            await pilot.pause()
+            dm_input = app.query_one("#dm-input", Input)
+            dm_input.focus()
+            await pilot.pause()
+
+            footer_text = str(app.query_one("#footer", Static).render())
+            self.assertEqual(footer_text, "CTRL+E emojis    ESC cancel    ENTER send")
 
     async def test_ctrl_e_hint_absent_outside_composer_focus(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0, scripted_messages=())
@@ -1492,6 +1551,130 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 5)
             self.assertIn("[ 5 ▾ ]", str(app.query_one(HopLimitSelector).render()))
 
+    # ---- HOP LIMIT keyboard-focus-chain regression (real-hardware
+    # report: the row rendered but was unreachable by UP/DOWN because
+    # HopLimitSelector was never added to on_key's own separate
+    # CONNECTION-page navigation tuple, even though it was already
+    # correctly wired into RADIO_SETTINGS/_render_radio_settings) ----
+
+    async def test_hop_limit_reachable_via_normal_up_down_navigation(self) -> None:
+        """Drives REAL settings navigation (not dropdown.focus()) to
+
+        prove the keyboard can actually land on HOP LIMIT -- the
+        previous tests above all used .focus() directly, which is
+        exactly why this reachability gap went uncaught.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(Clock24HSelector).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, HopLimitSelector)
+
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, AutoSyncSelector)
+
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, HopLimitSelector)
+
+    async def test_hop_limit_enter_opens_dropdown_from_real_navigation(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            app.query_one(Clock24HSelector).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            self.assertIs(app.focused, dropdown)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(dropdown.is_open)
+            self.assertEqual([o.label for o in dropdown.options], [str(n) for n in range(8)])
+
+    async def test_hop_limit_dropdown_navigation_does_not_move_settings_focus(
+        self,
+    ) -> None:
+        """Overlay key ownership (the same rule established for the
+
+        node/user menu and the CHAT header dropdowns): while HOP LIMIT
+        owns UP/DOWN, the underlying CONNECTION settings focus chain
+        must not also move.
+        """
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            dropdown = app.query_one(HopLimitSelector)
+            dropdown.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(dropdown.is_open)
+
+            await pilot.press("up", "up", "down")
+            await pilot.pause()
+            self.assertIs(app.focused, dropdown)
+            self.assertTrue(dropdown.is_open)
+
+    async def test_hop_limit_esc_closes_dropdown_with_zero_writes(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio._config_sections["lora"]["hop_limit"] = 3
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            dropdown = app.query_one(HopLimitSelector)
+            dropdown.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("up", "up")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(dropdown.is_open)
+            self.assertIs(app.focused, dropdown)
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.read_synced_config_field("lora", "hop_limit"), 3)
+            self.assertIn("[ 3 ▾ ]", str(dropdown.render()))
+
+    async def test_focusing_and_opening_hop_limit_generates_zero_traffic(self) -> None:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            radio.write_verified_config_field = Mock(
+                wraps=radio.write_verified_config_field
+            )
+            app.query_one(Clock24HSelector).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(radio.sent_messages, ())
+
     # ---- Section headers use DIM, not ACCENT ---------------------------
 
     async def test_section_headers_use_dim_not_accent(self) -> None:
@@ -1570,6 +1753,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, app.query_one(FlipScreenSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(Clock24HSelector))
+            await pilot.press("down")
+            # PR #46 final follow-up Part A: HOP LIMIT was previously
+            # missing from this exact navigation tuple even though it
+            # was already wired into RADIO_SETTINGS/compose() -- real
+            # hardware could see the row but never reach it via
+            # UP/DOWN.
+            self.assertIs(app.focused, app.query_one(HopLimitSelector))
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(AutoSyncSelector))
 
@@ -2778,7 +2968,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 app._apply_color_theme(theme)
                 for state, expected in (
                     (RadioState.CONNECTING, palette.accent),
-                    (RadioState.ONLINE, palette.base),
+                    # CONNECTED renders in ACCENT, not BASE (CHAT/DM/
+                    # MENTION UX Part I item 34) -- presentation only,
+                    # the connection logic/detection itself is
+                    # unchanged.
+                    (RadioState.ONLINE, palette.accent),
                     (RadioState.OFFLINE, palette.accent),
                     (RadioState.ERROR, palette.error),
                 ):
@@ -4555,13 +4749,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                     for entry in second_app.chat_history
                 )
             )
-            # Not DeliveryState.SENT: a restored SENT row has no way to
-            # ever receive a HEARD confirmation or age out on its own
-            # (see stored_chat_entry's SENT->UNCONFIRMED reconciliation),
-            # so it reloads as the honest UNCONFIRMED instead.
+            # RECONNECT DELIVERY FIX: a restored SENT row reloads as
+            # exactly SENT -- delivery-state monotonicity means a
+            # resolved historical send attempt is never reinterpreted as
+            # UNCONFIRMED merely because this new process/session has no
+            # live pending-send bookkeeping for it (see stored_chat_
+            # entry). It may still be strengthened to HEARD later by a
+            # genuine live ack, just never downgraded by a reload alone.
             self.assertEqual(
                 second_app.chat_history[-1].delivery_state,
-                DeliveryState.UNCONFIRMED,
+                DeliveryState.SENT,
             )
             self.assertEqual(second_app.unread_count, 0)
 
@@ -4896,20 +5093,28 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- Correction: message_id 81 was SENT, not SENDING, in SQLite -----
 
-    async def test_fresh_hydration_of_persisted_sent_row_renders_unconfirmed(
+    async def test_fresh_hydration_of_persisted_sent_row_stays_sent(
         self,
     ) -> None:
-        """Exact reproduction of the real message_id 81 dump: messages.
+        """RECONNECT DELIVERY FIX -- exact reproduction of the real
 
-        delivery_state = SENT, an earlier FAILED/MAX_RETRANSMIT attempt,
-        and a later SENT attempt with completed_at = NULL (expected --
-        see _set_delivery_state, which deliberately never stamps
-        completed_at for SENT since it isn't a final outcome). A fresh
-        app instance must never render this as SENDING, and must offer
-        manual resend since nothing can ever confirm it now. Also
-        proves a SECOND restart doesn't regress it back toward SENDING
-        or SENT -- the real device survived a full reboot still showing
-        the bug.
+        message_id 81 dump: messages.delivery_state = SENT, an earlier
+        FAILED/MAX_RETRANSMIT attempt, and a later SENT attempt with
+        completed_at = NULL (expected -- see _set_delivery_state, which
+        deliberately never stamps completed_at for SENT since it isn't
+        a final outcome).
+
+        An EARLIER version of this test (and of app_controller.
+        stored_chat_entry) treated this exact fixture as motivation to
+        reconcile a reloaded SENT row to UNCONFIRMED, on the premise
+        that it would otherwise render as "SENDING..." forever with no
+        resend affordance. That premise does not hold: SENT already
+        renders as its own distinct "✓" (see DELIVERY_CHECKMARKS), not
+        as SENDING, and delivery-state monotonicity requires a resolved
+        SENT to survive any number of reloads/restarts completely
+        unchanged -- it must NOT gain a resend affordance either (a
+        manual resend for an already-successfully-sent message would
+        risk a real duplicate transmission).
         """
         seeding_store = ChatStore.open(self.chat_db_path)
         message_id = seeding_store.add_outgoing(
@@ -4944,34 +5149,41 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             entry = app.chat_history[-1]
             self.assertEqual(entry.message_id, message_id)
-            self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
-            self.assertNotEqual(entry.delivery_state, DeliveryState.SENT)
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
             widget = next(w for w in app.query(ChatEntryWidget) if w.entry is entry)
             rendered = str(widget.delivery_label.render())
-            self.assertIn("⟐", rendered)
+            self.assertIn("✓", rendered)
+            self.assertNotIn("⟐", rendered)
             self.assertNotIn("SENDING", rendered)
-            self.assertTrue(can_manual_resend(entry))
-            self.assertTrue(widget.action_control.display)
+            self.assertFalse(can_manual_resend(entry))
+            self.assertFalse(widget.action_control.display)
             self.assertEqual(radio.sent_messages, ())
 
-        second_store = ChatStore.open(self.chat_db_path)
-        second_radio = SimulatedRadioService(
-            connect_delay=0, message_interval=0, scripted_messages=()
-        )
-        second_app = MeshtasticPassApp(second_radio, self.settings, chat_store=second_store)
-        async with second_app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause()
-            reloaded = next(
-                e for e in second_app.chat_history if e.message_id == message_id
+        # A second restart (and a third) must not progressively mutate
+        # it either -- proving idempotency across repeated reload, not
+        # merely that the first reload happens to be correct.
+        for _ in range(2):
+            reopened_store = ChatStore.open(self.chat_db_path)
+            reopened_radio = SimulatedRadioService(
+                connect_delay=0, message_interval=0, scripted_messages=()
             )
-            self.assertEqual(reloaded.delivery_state, DeliveryState.UNCONFIRMED)
-            widget = next(
-                w for w in second_app.query(ChatEntryWidget) if w.entry is reloaded
+            reopened_app = MeshtasticPassApp(
+                reopened_radio, self.settings, chat_store=reopened_store
             )
-            rendered = str(widget.delivery_label.render())
-            self.assertIn("⟐", rendered)
-            self.assertNotIn("SENDING", rendered)
-            self.assertEqual(second_radio.sent_messages, ())
+            async with reopened_app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                reloaded = next(
+                    e for e in reopened_app.chat_history if e.message_id == message_id
+                )
+                self.assertEqual(reloaded.delivery_state, DeliveryState.SENT)
+                widget = next(
+                    w for w in reopened_app.query(ChatEntryWidget) if w.entry is reloaded
+                )
+                rendered = str(widget.delivery_label.render())
+                self.assertIn("✓", rendered)
+                self.assertNotIn("⟐", rendered)
+                self.assertNotIn("SENDING", rendered)
+                self.assertEqual(reopened_radio.sent_messages, ())
 
     async def test_live_resend_to_sent_updates_store_entry_and_widget_together(
         self,
@@ -5398,7 +5610,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreater(
                     reopened_app.chat_history.index(reloaded), alice_index
                 )
-                self.assertEqual(reloaded.delivery_state, DeliveryState.UNCONFIRMED)
+                # RECONNECT DELIVERY FIX: a resolved SENT reloads as
+                # exactly SENT across any number of restarts -- never
+                # reinterpreted as UNCONFIRMED (see app_controller.
+                # stored_chat_entry).
+                self.assertEqual(reloaded.delivery_state, DeliveryState.SENT)
 
     async def test_later_heard_after_resent_sent_does_not_retimestamp(self) -> None:
         """A resend that reaches SENT, then later HEARD, must not move
@@ -6938,6 +7154,343 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             len(reopened.load_send_attempts(stored_messages[0].id)),
             2,
         )
+
+
+class ReconnectDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
+    """RECONNECT DELIVERY + CHAT HEADER FIX Part A: delivery-state
+
+    monotonicity must survive disconnect/reconnect/radio-reboot/radio-
+    swap, for both a same-session reconnect (see _show_connection) and
+    a full app/store restart (see app_controller.stored_chat_entry).
+    See tests/test_app_controller.py for the pure-function proof of the
+    underlying fix; this class proves it end to end through the real
+    app/ChatStore.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        self.chat_db_path = self.root / "chat.db"
+
+    @staticmethod
+    def _radio(**kwargs) -> SimulatedRadioService:
+        return SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=(), **kwargs
+        )
+
+    # ---- A/B/C/D: same-session reconnect never mutates a resolved state -
+
+    async def test_same_session_reconnect_never_downgrades_sent(self) -> None:
+        radio = self._radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("channel sent")
+            app.run_worker(lambda: app._send_from_thread(entry), thread=True)
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.CONNECTING)
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+            self.assertEqual(len(radio.sent_messages), 1)
+
+    async def test_same_session_reconnect_never_downgrades_heard(self) -> None:
+        radio = self._radio(send_outcomes=(SimulatedSendOutcome.HEARD,))
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("channel heard")
+            app.run_worker(lambda: app._send_from_thread(entry), thread=True)
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.HEARD:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.HEARD)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.HEARD)
+
+    async def test_same_session_reconnect_never_downgrades_failed(self) -> None:
+        radio = self._radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("channel failed")
+            app._set_delivery_state(entry, DeliveryState.FAILED)
+            await pilot.pause()
+            self.assertEqual(entry.delivery_state, DeliveryState.FAILED)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.FAILED)
+
+    async def test_same_session_reconnect_leaves_unconfirmed_unless_new_evidence(
+        self,
+    ) -> None:
+        """UNCONFIRMED is not itself a terminal failure -- reconnect
+
+        alone must not move it either direction; only a genuine live
+        ack arriving afterward (correlated through delivery_status_
+        received) may still strengthen it, exactly as it could have
+        before the reconnect.
+        """
+        radio = self._radio(send_outcomes=(SimulatedSendOutcome.UNCONFIRMED,))
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("channel unconfirmed")
+            app.run_worker(lambda: app._send_from_thread(entry), thread=True)
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.UNCONFIRMED:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
+
+    # ---- F: repeated reconnect cycles are idempotent ---------------------
+
+    async def test_repeated_reconnect_cycles_never_progressively_mutate(self) -> None:
+        radio = self._radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            sent_entry = app._start_outgoing("stays sent")
+            app.run_worker(lambda: app._send_from_thread(sent_entry), thread=True)
+            for _ in range(10):
+                await pilot.pause()
+                if sent_entry.delivery_state is DeliveryState.SENT:
+                    break
+            failed_entry = app._start_outgoing("stays failed")
+            app._set_delivery_state(failed_entry, DeliveryState.FAILED)
+            await pilot.pause()
+
+            for _ in range(3):
+                app._show_connection(RadioState.OFFLINE, message="lost")
+                await pilot.pause()
+                app._show_connection(RadioState.CONNECTING)
+                await pilot.pause()
+                app._show_connection(RadioState.ONLINE, radio.info)
+                await pilot.pause()
+                self.assertEqual(sent_entry.delivery_state, DeliveryState.SENT)
+                self.assertEqual(failed_entry.delivery_state, DeliveryState.FAILED)
+
+    # ---- H/I: opening CHAT / switching views must not mutate state ------
+
+    async def test_opening_chat_and_switching_views_after_reconnect_is_inert(
+        self,
+    ) -> None:
+        radio = self._radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = app._start_outgoing("survives view switching")
+            app.run_worker(lambda: app._send_from_thread(entry), thread=True)
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            app.show_tab("mesh")
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+            app._switch_chat_mode("dms")
+            await pilot.pause()
+            app._switch_chat_mode("channel")
+            await pilot.pause()
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+    # ---- Cross-restart reload: CHANNEL, all terminal states --------------
+
+    async def test_cross_restart_reload_preserves_all_channel_terminal_states(
+        self,
+    ) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        sent_id = store.add_outgoing(
+            text="reload sent", channel_index=0, local_sent_at=100.0,
+            delivery_state="SENT",
+        )
+        heard_id = store.add_outgoing(
+            text="reload heard", channel_index=0, local_sent_at=101.0,
+            delivery_state="HEARD",
+        )
+        failed_id = store.add_outgoing(
+            text="reload failed", channel_index=0, local_sent_at=102.0,
+            delivery_state="FAILED",
+        )
+        unconfirmed_id = store.add_outgoing(
+            text="reload unconfirmed", channel_index=0, local_sent_at=103.0,
+            delivery_state="UNCONFIRMED",
+        )
+        store.close()
+
+        expected = {
+            sent_id: DeliveryState.SENT,
+            heard_id: DeliveryState.HEARD,
+            failed_id: DeliveryState.FAILED,
+            unconfirmed_id: DeliveryState.UNCONFIRMED,
+        }
+        # G: repeat the reload 3 times -- proving idempotency, not just
+        # that the first reload happens to be correct.
+        for _ in range(3):
+            reopened = ChatStore.open(self.chat_db_path)
+            app = MeshtasticPassApp(self._radio(), self.settings, chat_store=reopened)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                by_id = {e.message_id: e.delivery_state for e in app.chat_history}
+                for message_id, expected_state in expected.items():
+                    self.assertEqual(by_id[message_id], expected_state)
+
+    # ---- DM: same invariant, same-session and cross-restart --------------
+
+    async def test_same_session_reconnect_never_downgrades_dm_sent(self) -> None:
+        radio = self._radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!a11ce001", long_name="Alice")
+            await pilot.pause()
+            entry = app._start_dm_outgoing("!a11ce001", "dm sent")
+            app._send_from_thread(entry, entry.send_generation)
+            for _ in range(10):
+                await pilot.pause()
+                if entry.delivery_state is DeliveryState.SENT:
+                    break
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+            app._show_connection(RadioState.OFFLINE, message="lost")
+            await pilot.pause()
+            app._show_connection(RadioState.ONLINE, radio.info)
+            await pilot.pause()
+
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+    async def test_cross_restart_reload_preserves_dm_terminal_states(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        sent_id = store.add_outgoing(
+            text="dm reload sent",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENT",
+            dm_node_id="!a11ce001",
+        )
+        heard_id = store.add_outgoing(
+            text="dm reload heard",
+            channel_index=0,
+            local_sent_at=101.0,
+            delivery_state="HEARD",
+            dm_node_id="!a11ce001",
+        )
+        store.close()
+
+        reopened = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(self._radio(), self.settings, chat_store=reopened)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!a11ce001", long_name="Alice")
+            await pilot.pause()
+            by_id = {
+                e.message_id: e.delivery_state
+                for e in app._dm_states["!a11ce001"].entries
+            }
+            self.assertEqual(by_id[sent_id], DeliveryState.SENT)
+            self.assertEqual(by_id[heard_id], DeliveryState.HEARD)
+
+    # ---- Radio swap: a different physical radio never reinterprets history
+
+    async def test_radio_swap_does_not_reinterpret_persisted_sent(self) -> None:
+        """A NEW radio identity (different node_id -- see RadioInfo) must
+
+        never cause a persisted send attempt's own historical outcome
+        to be reinterpreted -- delivery status depends only on that
+        attempt's own persisted record, never on which radio happens to
+        be connected now.
+        """
+        store = ChatStore.open(self.chat_db_path)
+        message_id = store.add_outgoing(
+            text="survives a radio swap",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENT",
+        )
+        store.close()
+
+        reopened = ChatStore.open(self.chat_db_path)
+        different_radio = self._radio()
+        different_radio.info = replace(
+            different_radio.info, node_id="!bbbbbbbb", long_name="Different Radio"
+        )
+        app = MeshtasticPassApp(different_radio, self.settings, chat_store=reopened)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = next(e for e in app.chat_history if e.message_id == message_id)
+            self.assertEqual(entry.delivery_state, DeliveryState.SENT)
+
+    # ---- Genuinely interrupted SENDING: existing, documented rule --------
+
+    async def test_genuinely_sending_at_restart_becomes_interrupted_not_unconfirmed(
+        self,
+    ) -> None:
+        """The existing, intended rule for a message still genuinely
+
+        SENDING when the process stops (ChatStore.reconcile_abandoned_
+        sending, run once at ChatStore.open()) -- INTERRUPTED, never
+        UNCONFIRMED and never a resurrected SENDING. This pass does not
+        change this rule; it only ensures it is never ALSO applied to
+        an already-resolved SENT/HEARD/FAILED row (see the tests
+        above).
+        """
+        store = ChatStore.open(self.chat_db_path)
+        message_id = store.add_outgoing(
+            text="still in flight at shutdown",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENDING",
+        )
+        store.close()
+
+        reopened = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(self._radio(), self.settings, chat_store=reopened)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            entry = next(e for e in app.chat_history if e.message_id == message_id)
+            self.assertEqual(entry.delivery_state, DeliveryState.INTERRUPTED)
+            self.assertNotEqual(entry.delivery_state, DeliveryState.UNCONFIRMED)
 
 
 if __name__ == "__main__":

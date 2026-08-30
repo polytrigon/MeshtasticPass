@@ -376,7 +376,9 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             page = app.query_one(ConnectionPage)
             titles = [str(item.render()) for item in page.query(".page-title")]
-            self.assertEqual(titles, ["CONNECTION", "STYLE", "RADIO"])
+            self.assertEqual(
+                titles, ["CONNECTION", "STYLE", "RADIO", "ADVANCED RADIO"]
+            )
             self.assertEqual(len(page.query("#identity-title")), 0)
             self.assertEqual(len(page.query("#identity-waiting")), 0)
             self.assertGreater(page.max_scroll_y, 0)
@@ -389,7 +391,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
                 "...",
             )
             app._show_connection(RadioState.ONLINE, radio.info)
-            self.assertIn("NODES        8", str(app.query_one("#connection-details", Static).render()))
+            self.assertIn("NODES        9", str(app.query_one("#connection-details", Static).render()))
             self.assertEqual(app.query_one("#short-name-input", Input).value, "SIM")
             app._show_connection(RadioState.OFFLINE)
             self.assertIn("NODES        —", str(app.query_one("#connection-details", Static).render()))

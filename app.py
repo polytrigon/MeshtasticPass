@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from threading import Thread
-from time import monotonic, time
+from time import monotonic, sleep, time
 from typing import Any, Callable
 
 from rich.cells import cell_len
@@ -39,7 +41,7 @@ from app_controller import (
     received_chat_entry,
     stored_chat_entry,
 )
-from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES
+from app_settings import AppSettings, COLOR_CHOICES, FONT_SIZE_CHOICES, RadioConfigPreset
 from chat_store import (
     DEFAULT_HISTORY_LIMIT,
     OLDER_HISTORY_PAGE_SIZE,
@@ -48,14 +50,19 @@ from chat_store import (
 )
 from geo import format_distance_miles
 from host_timezone import detect_host_timezone
-from grapheme_text import install_flag_pair_protection, truncate_to_cells
+from grapheme_text import (
+    install_flag_pair_protection,
+    terminal_safe_text,
+    truncate_to_cells,
+)
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from mesh_state import (
     MeshActivityTier,
     MeshNodeState,
-    _name_segments,
+    _clean_text,
     build_mesh_working_set,
-    format_mesh_context_line,
+    format_mesh_node_bar_fields,
+    format_mesh_node_bar_line,
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
@@ -64,14 +71,18 @@ from mesh_topology import (
     TopologyLayout,
     assign_grid_slots,
     build_relay_stages,
-    compact_node_label,
     directional_target,
+    mesh_board_marker_label,
     place_within_bounds,
     project_to_viewport,
     route_chain_avoiding,
 )
 from node_activity import is_node_active
-from radio_capabilities import format_hw_model_name, role_choices
+from radio_capabilities import (
+    format_hw_model_name,
+    modem_preset_choices,
+    role_choices,
+)
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -82,15 +93,24 @@ from radio_service import (
     LONG_NAME_MAX_UTF8_BYTES,
     SCREEN_ON_SECS_ALWAYS_ON,
     SHORT_NAME_MAX_UTF8_BYTES,
+    NETWORK_FIELD_LABELS,
+    NETWORK_STAGE_LABELS,
+    RadioApplyResult,
+    RadioConfigVerification,
     RadioEvent,
     RadioIdentityError,
     RadioInfo,
     NodeMetadata,
     RadioSendError,
+    apply_radio_config_preset,
+    verify_radio_config_preset,
     RadioState,
     ReceivedMessage,
     SendStatus,
     SentMessage,
+    TracerouteResult,
+    TracerouteState,
+    TracerouteStatus,
     rx_debug_enabled,
     rx_debug_log,
     validate_long_name,
@@ -118,15 +138,18 @@ install_flag_pair_protection()
 # unreachable via any digit key -- see tab_for_key below. This is a
 # navigation/UI-only change, not a deletion; restoring PROFILE to the
 # nav later only requires re-adding it to this dict and to tab_for_key.
+#
+# DM is likewise intentionally absent as its own top-level entry (CHAT/
+# DM/MENTION UX Part A): it is no longer a fourth top-level view -- it
+# is now a MODE inside CHAT (see MeshtasticPassApp._chat_mode/
+# _switch_chat_mode), reached via the header's DM(N) peer selector or
+# the D hotkey. The DM feature itself (persistence/identity/delivery/
+# resend/delete/draft architecture) is completely unchanged -- only how
+# the user NAVIGATES to it changed.
 TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
     "mesh": "MESH",
-    # No unread-count badge here (unlike CHAT's own) -- item 8: "Do not
-    # use unread counts unless actual unread state is implemented
-    # correctly", and this pass deliberately does not implement one for
-    # DM conversations.
-    "dm": "DM",
 }
 
 ANIMATED_STATUS = {
@@ -153,6 +176,19 @@ SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # Same lifecycle again for LONG NAME SAVED/SHORT NAME SAVED (see
 # _set_long_name_status/_set_short_name_status).
 IDENTITY_STATUS_AUTO_DISMISS_SECONDS = 10.0
+# ADVANCED RADIO: how long a SAVE / NETWORK-switch confirmation stays
+# armed after the first press before auto-disarming -- long enough for a
+# deliberate second press, short enough that an armed-but-abandoned
+# confirmation never lingers as a trap for a later, unrelated ENTER.
+ADVANCED_RADIO_CONFIRM_SECONDS = 6.0
+# Hard upper bound on ONE NETWORK apply (SAVE or switch). Writing LoRa
+# modem_preset / channel_num / primary-channel PSK reboots real
+# Meshtastic firmware, so this must comfortably cover the write +
+# reboot + serial reconnect + config re-sync + readback. If no terminal
+# result (success or failure) is reached within this window the
+# operation is force-resolved to an honest ERROR -- there is never a
+# permanent "SAVING & APPLYING..." state (see _network_apply_timed_out).
+NETWORK_APPLY_TIMEOUT_SECONDS = 90.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -227,13 +263,69 @@ def can_manual_resend(entry: ChatEntry) -> bool:
 
 
 def _reply_mention_name(metadata: NodeMetadata) -> str:
-    """Long Name -> Short Name -> compact Node ID, reusing the exact same
+    """SHORTNAME -> LONG NAME -> canonical node ID (CHAT/DM MENTION UX
 
-    name-fallback precedence mesh_state.format_mesh_context_line already
-    uses for a real node's display name, rather than a second,
-    independently-defined fallback rule.
+    item 21) -- the OPPOSITE precedence from MESH's own _name_segments
+    (Long Name first, used for on-screen display elsewhere): an inline
+    @mention exists to compactly and unambiguously address one sender
+    in running composer text, where a real SHORTNAME is short by
+    firmware convention while a Long Name can be arbitrarily long/
+    spaced. Resolved from the sender's stable node ID via already-
+    synced NodeDB metadata -- never from display-name equality (item
+    20): two different nodes that happen to share a Long Name still
+    resolve to their own distinct SHORTNAMEs (or node IDs).
     """
-    return _name_segments(metadata)[0]
+    short_name = _clean_text(metadata.short_name)
+    if short_name:
+        return short_name
+    long_name = _clean_text(metadata.long_name)
+    if long_name:
+        return long_name
+    return metadata.node_id
+
+
+# @SHORTNAME token boundary (CHAT/DM/MENTION UX Part H item 29):
+# "@" not itself preceded by "@" or a word character (rejects
+# "foo@POLYbar" -- an embedded/email-like "@", never a real mention
+# start), followed by one-or-more word characters captured greedily
+# (so "@POLYGON" captures the WHOLE word "POLYGON", which then simply
+# fails the exact-match comparison below rather than partially
+# matching "POLY"), with an implicit \b boundary from \w+ naturally
+# stopping at the next non-word character (so "@POLY," / "@POLY!" /
+# "(@POLY)" all correctly capture just "POLY"). Case-insensitive
+# comparison is applied by the caller, not baked into this pattern.
+_MENTION_TOKEN_PATTERN = re.compile(r"(?<![@\w])@(\w+)")
+
+
+def message_mentions_short_name(text: str, short_name: str | None) -> bool:
+    """Whether `text` contains an explicit @SHORTNAME token addressing
+
+    `short_name` (item 26/29) -- case-insensitive, word-bounded. A
+    missing/blank `short_name` (item 27: no usable current local
+    identity) always returns False rather than guessing.
+    """
+    normalized_target = (short_name or "").strip().lower()
+    if not normalized_target:
+        return False
+    return any(
+        match.group(1).lower() == normalized_target
+        for match in _MENTION_TOKEN_PATTERN.finditer(text)
+    )
+
+
+def _dm_dropdown_label(
+    node_id: str, long_name: str | None, short_name: str | None
+) -> str:
+    """"LONG NAME / SHORT NAME" presentation for one DM dropdown row
+
+    (PR #46 follow-up Part B item 9), falling back to whichever single
+    name is known, then the canonical node ID -- names are presentation
+    only, never conversation identity (that is always the dropdown
+    option's own `value`, the node_id itself).
+    """
+    if long_name and short_name and long_name != short_name:
+        return f"{long_name} / {short_name}"
+    return long_name or short_name or node_id
 
 
 class ThinScrollBarRender(ScrollBarRender):
@@ -638,6 +730,190 @@ class AutoSyncSelector(KeyboardDropdown):
         )
 
 
+# ADVANCED RADIO: the built-in "LongFast" NETWORK. Always available in
+# the NETWORK selector without the user creating it, and the default
+# selection. It represents the normal public LongFast configuration
+# using Meshtastic's own defaults: the LONG_FAST modem preset, no
+# explicit frequency slot (0 == "let the radio auto-select"), a blank
+# primary-channel name, and the SDK's own default public-channel PSK
+# sentinel byte 0x01 (base64 "AQ=="). Selecting it is never applied to
+# the radio automatically -- only an explicit, confirmed NETWORK switch
+# or SAVE ever writes RF/config (see _apply_network_from_thread).
+BUILTIN_LONGFAST_NETWORK = "LongFast"
+_LONGFAST_DEFAULT_PSK_BASE64 = "AQ=="
+
+
+def builtin_longfast_preset() -> "RadioConfigPreset":
+    return RadioConfigPreset(
+        name=BUILTIN_LONGFAST_NETWORK,
+        modem_preset="LONG_FAST",
+        frequency_slot=0,
+        channel_name="",
+        channel_psk_base64=_LONGFAST_DEFAULT_PSK_BASE64,
+    )
+
+
+class NetworkSelector(KeyboardDropdown):
+    """ADVANCED RADIO's "NETWORK [ ... ]" dropdown -- the mechanism for
+
+    switching between complete saved Meshtastic network configurations
+    (RadioConfigPreset.name) plus the built-in BUILTIN_LONGFAST_NETWORK
+    entry. Merely focusing it, opening it, or navigating its choices is
+    zero RF/config; only re-selecting a different NETWORK to confirm it
+    ever applies anything (see MeshtasticPassApp.dropdown_selected's
+    "network" branch).
+    """
+
+    def __init__(self, options: Iterable[DropdownOption]) -> None:
+        super().__init__(
+            "network",
+            "NETWORK",
+            options,
+            BUILTIN_LONGFAST_NETWORK,
+            widget_id="advanced-radio-network-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row",
+        )
+
+
+class RadioModeSelector(KeyboardDropdown):
+    """The NEW NETWORK editor's "RADIO MODE [ ... ]" dropdown -- a
+
+    friendly UI label ("LONG FAST", "MEDIUM SLOW", ...) over Meshtastic's
+    actual modem_preset enum NAME (see radio_capabilities.
+    modem_preset_choices), which is what is stored and applied.
+    """
+
+    def __init__(self, modem_preset_name: str) -> None:
+        super().__init__(
+            "radio_mode",
+            "RADIO MODE",
+            (DropdownOption(label, name) for label, name in modem_preset_choices()),
+            modem_preset_name,
+            widget_id="advanced-radio-mode-selector",
+            label_width=CONNECTION_LABEL_WIDTH,
+            classes="keyboard-dropdown connection-action-row advanced-radio-editor",
+        )
+
+
+class NewNetworkControl(Static):
+    """[ NEW NETWORK ] -- reveals the transient NEW NETWORK editor.
+
+    Zero RF, zero persistence by itself: it only shows the editor rows
+    (see MeshtasticPassApp._set_network_editor_open). The user must
+    still explicitly SAVE, and abandoning the editor discards it.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        # Indented to the same control/value column the NETWORK selector's
+        # "[ LongFast ▾ ]" starts at (CONNECTION_VALUE_COLUMN_INDENT),
+        # derived from CONNECTION_LABEL_WIDTH so it tracks UI scale rather
+        # than a hardcoded gap.
+        super().__init__(
+            f"{CONNECTION_VALUE_COLUMN_INDENT}[ NEW NETWORK ]",
+            id="advanced-radio-new-network",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            self.post_message(self.Activated())
+            event.stop()
+
+
+class SaveNetworkControl(Static):
+    """[ SAVE ] -- validate the NEW NETWORK editor, then (after a
+
+    press-again-to-confirm cycle, because RF/config will change) persist
+    the NETWORK locally and apply it through radio_service.
+    apply_radio_config_preset. There is no separate APPLY button.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ SAVE ]",
+            id="advanced-radio-save",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            self.post_message(self.Activated())
+            event.stop()
+
+
+class CancelNetworkControl(Static):
+    """[ CANCEL ] -- discard the NEW NETWORK editor's unsaved contents,
+
+    collapse it, and restore [ NEW NETWORK ]. Zero RF/config, no
+    confirmation, leaves the currently selected NETWORK unchanged.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ CANCEL ]",
+            id="advanced-radio-cancel",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            self.post_message(self.Activated())
+            event.stop()
+
+
+class NetworkFieldInput(Horizontal):
+    """One labeled text-entry row inside the transient NEW NETWORK
+
+    editor (NETWORK NAME / FREQ. SLOT / KEY) -- a plain, always-enabled
+    LOCAL DRAFT field. Never itself written anywhere by being edited:
+    SAVE is the only action that persists/applies the editor's values,
+    so no two-state nav/edit toggle is needed here.
+    """
+
+    can_focus = False
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        widget_id: str,
+        input_id: str,
+        max_length: int | None = None,
+    ) -> None:
+        super().__init__(
+            id=widget_id, classes="connection-action-row advanced-radio-editor"
+        )
+        self._label = label
+        self._input_id = input_id
+        self._max_length = max_length
+
+    def compose(self) -> ComposeResult:
+        yield Static(" ", classes="connection-selection-gutter", markup=False)
+        yield Static(self._label, classes="connection-label", markup=False)
+        yield Static("[ ", classes="identity-bracket", markup=False)
+        yield Input(id=self._input_id, max_length=self._max_length)
+        yield Static(" ]", classes="identity-bracket", markup=False)
+
+
 class ChannelSelector(KeyboardDropdown):
     def __init__(self, channels: tuple[ChannelInfo, ...], value: int) -> None:
         super().__init__(
@@ -648,6 +924,98 @@ class ChannelSelector(KeyboardDropdown):
             widget_id="chat-title",
             prefix="",
         )
+
+
+class DMModeSelector(KeyboardDropdown):
+    """CHAT's RIGHT peer selector: [ DM(N) ▾ ] -- N is the unread DM
+
+    count (see MeshtasticPassApp._recount_dm_unread). A TRUE dropdown,
+    peer to ChannelSelector (PR #46 follow-up Part B): opening it
+    (ENTER, click, or the D hotkey) shows existing DM conversations
+    directly, most-recent-activity first -- never immediately
+    switching into DMS mode/the full conversation list the way the
+    original PR #46 pass did. Opening this dropdown alone is zero-RF
+    and never clears DM(N) -- only actually opening a conversation
+    does (see MeshtasticPassApp._open_dm_conversation).
+
+    `self.options`/`self.value` hold exactly one entry -- the CLOSED
+    heading's own DropdownOption("DM(N)", "dms") -- and are restored
+    after every close (see close_menu); they are NOT what the open
+    popup shows. The open popup's real conversation rows live in
+    `self._conversation_items`, a completely separate list rebuilt
+    fresh on every open_menu() call (never cached/persisted), because
+    KeyboardDropdown's own on_key navigation math (`% len(self.
+    options)`) would otherwise misbehave against a "DM(N)"-only
+    options list of length 1.
+    """
+
+    def __init__(self, unread_count: int) -> None:
+        super().__init__(
+            "chat_dm_mode",
+            "",
+            (DropdownOption(f"DM({unread_count})", "dms"),),
+            "dms",
+            widget_id="chat-dm-selector",
+            prefix="",
+        )
+        self._closed_options = self.options
+        self._conversation_items: tuple[DropdownOption, ...] = ()
+
+    def set_unread_count(self, unread_count: int) -> None:
+        option = DropdownOption(f"DM({unread_count})", "dms")
+        self._closed_options = (option,)
+        if not self.is_open:
+            self.set_options((option,), value="dms")
+
+    def open_menu(self) -> None:
+        conversations = self.app.dm_dropdown_conversations()
+        empty = not conversations
+        self._conversation_items = conversations or (DropdownOption("NO DMS", None),)
+        # Swapped in only so KeyboardDropdown's own on_key navigation
+        # math (`% len(self.options)`) operates against the REAL
+        # conversation count while open -- restored by close_menu.
+        self.options = self._conversation_items
+        self.value = self._conversation_items[0].value
+        self.is_open = True
+        self._highlighted_index = 0
+        self.add_class("open")
+        items = tuple(
+            PopupItem(option.label, option.value, actionable=not empty)
+            for option in self._conversation_items
+        )
+        self.popup = ViewportMenu(
+            items,
+            highlighted_index=self._highlighted_index,
+            on_activate=self._activate_popup_item,
+        )
+        width = max(len(option.label) for option in self._conversation_items) + 4
+        self.screen.mount(self.popup)
+        self.popup.place(self.region, self.screen.region, width)
+        self._render_dropdown()
+
+    def close_menu(self) -> None:
+        super().close_menu()
+        self.options = self._closed_options
+        self.value = "dms"
+        self._render_dropdown()
+
+    def _activate_popup_item(self, index: int, _item: PopupItem) -> None:
+        if not 0 <= index < len(self._conversation_items):
+            self.close_menu()
+            return
+        option = self._conversation_items[index]
+        node_id = option.value
+        self.close_menu()
+        if node_id is None:
+            # "NO DMS" -- item 14: safely closes without opening or
+            # fabricating a conversation, whether reached by mouse
+            # click (ViewportMenu.activate's own actionable=False
+            # guard already no-ops it) or by keyboard ENTER
+            # (KeyboardDropdown.on_key calls _activate_popup_item
+            # directly, bypassing that actionable check -- so this
+            # explicit guard is the one that actually matters there).
+            return
+        self.post_message(self.Selected(self, node_id))
 
 
 # The first-pass emoji set -- see the CHAT delivery/menu/emoji task.
@@ -800,6 +1168,17 @@ class ChannelChatState:
     mounted_target: int = DEFAULT_HISTORY_LIMIT
     open_scroll_pending: bool = False
     loaded: bool = False
+    # The channel_key (ChannelInfo.stable_key) `entries` was actually
+    # queried with (FINAL MESHTASTIC POLISH -- CHAT channel-history
+    # isolation) -- None means "loaded before the radio's real channel
+    # identity was known" (this app's own pre-connection placeholder).
+    # _ensure_channel_loaded compares this against the CURRENT stable
+    # key on every access, never trusting `loaded` alone: a same-index
+    # radio reconfiguration (e.g. slot 0 LongFast -> MediumSlow between
+    # runs) must invalidate an already-"loaded" cache the instant the
+    # real identity resolves to something different than what it was
+    # last queried with, even though the index itself never changed.
+    loaded_key: str | None = None
     new_message_ids: set[int] = field(default_factory=set)
     unread_message_ids: set[int] = field(default_factory=set)
     pending_older_ids: set[tuple[str, int]] = field(default_factory=set)
@@ -848,6 +1227,39 @@ class DeliveryStatusReceived(Message):
         self.generation = generation
 
 
+class TracerouteStatusReceived(Message):
+    """A real traceroute outcome arrived (TRACE ROUTE Part C).
+
+    `request_token` (an app-local sequence number, assigned BEFORE the
+    RF request is even sent -- see MeshtasticPassApp._start_traceroute)
+    is what the handler correlates against _active_traceroute, never
+    RadioService's own SDK packet_id: the token is known synchronously,
+    before the background worker even starts, so it can never race a
+    same-thread/synchronous status_handler call (e.g. SimulatedRadioService)
+    that fires before the worker's own return value would otherwise be
+    recorded.
+    """
+
+    def __init__(self, request_token: int, status: TracerouteStatus) -> None:
+        super().__init__()
+        self.request_token = request_token
+        self.status = status
+
+
+class TracerouteRequestFailed(Message):
+    """send_traceroute() itself raised (e.g. the radio disconnected
+
+    between the menu press and the worker thread actually running) --
+    never a routing NAK/timeout, which arrive as TracerouteStatusReceived
+    instead.
+    """
+
+    def __init__(self, request_token: int, detail: str) -> None:
+        super().__init__()
+        self.request_token = request_token
+        self.detail = detail
+
+
 class IdentitySaved(Message):
     """The radio accepted an advertised identity-name update."""
 
@@ -884,6 +1296,57 @@ class RadioSettingApplied(Message):
         self.dropdown = dropdown
         self.setting_name = setting_name
         self.result = result
+
+
+class RadioConfigPresetApplied(Message):
+    """One ADVANCED RADIO NETWORK apply-worker (radio_service.
+
+    apply_radio_config_preset, then -- while still on the worker thread
+    -- a fresh readback via reread_lora_and_primary_channel +
+    verify_radio_config_preset) RETURNED. The write may have completed
+    cleanly with no reboot (Path B: `verification` is populated and
+    authoritative), or the radio may have rebooted to commit LoRa
+    config (Path A: `verification` is None / the radio is no longer
+    ONLINE, and the operation now waits for the reconnect full-sync).
+    `token` correlates this against the ONE outstanding _network_apply.
+    `saved` distinguishes a SAVE from a bare NETWORK switch.
+    """
+
+    def __init__(
+        self,
+        token: int,
+        preset_name: str,
+        result: RadioApplyResult,
+        saved: bool = False,
+        verification: RadioConfigVerification | None = None,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.preset_name = preset_name
+        self.result = result
+        self.saved = saved
+        self.verification = verification
+
+
+@dataclass
+class NetworkApply:
+    """The ONE outstanding ADVANCED RADIO NETWORK apply (SAVE or switch).
+
+    Held on MeshtasticPassApp._network_apply from the moment SAVE/switch
+    is confirmed until a terminal SUCCESS or ERROR is reached. `token`
+    correlates the worker return and the timeout timer; `saved` picks
+    the "SAVED & APPLIED" vs "APPLIED" wording and whether a failure
+    reverts the NETWORK selector; `awaiting_reconnect` means the apply
+    write already landed the radio in a reboot/reconnect and the
+    operation is now waiting for the interface to come back so it can
+    read the new config back (see _resolve_network_apply_after_reconnect).
+    """
+
+    token: int
+    name: str
+    preset: RadioConfigPreset
+    saved: bool
+    awaiting_reconnect: bool = False
 
 
 class ClockSyncApplied(Message):
@@ -928,6 +1391,30 @@ class EndOfChatHistoryMarker(Static):
         super().__init__(
             "END OF CHAT HISTORY",
             id="end-of-chat-history",
+            markup=False,
+        )
+
+
+class StartOfChannelHistoryMarker(Static):
+    """Informational-only proof a channel has zero stored messages yet.
+
+    (FINAL MESHTASTIC POLISH -- CHAT channel-history isolation.) Purely
+    a rendered Static line, exactly like EndOfChatHistoryMarker: never
+    inserted into chat_history/state.entries, never given a message_id,
+    never counted toward unread/new, never a resend/delete/reply
+    target -- there is simply no ChatEntry for it to be. Removed
+    automatically (see _insert_chat_widget) the instant this channel's
+    first real message is inserted, and only ever mounted for a
+    CHANNEL (see _initial_chat_widgets) -- DM conversations use their
+    own separate empty-state handling, if any, untouched here.
+    """
+
+    can_focus = False
+
+    def __init__(self, channel_label: str) -> None:
+        super().__init__(
+            f"This is the start of {channel_label} channel history",
+            id="start-of-channel-history",
             markup=False,
         )
 
@@ -1172,13 +1659,74 @@ MESH_LOGICAL_GRID_CENTER_COLUMN = 11
 MESH_SELECTED_GLYPH_WIDTH = 3
 MESH_SELECTED_HALO_GLYPH = "·"
 # The label physically above a node's glyph is a compact hint, not the
-# full identity -- that lives in the rich bottom-left context (see
-# mesh_state.format_mesh_context_line, which always has the full Long
+# full identity -- that lives in the unified bottom bar (see
+# mesh_state.format_mesh_node_bar_fields, which always has the full Long
 # Name/Short Name, uncapped). Capped in DISPLAY CELLS (cell_len()), not
 # Python len(), so wide/CJK/emoji glyphs are counted by their actual
-# terminal width -- see mesh_topology.compact_node_label/_truncate for
-# the grapheme-safe truncation this limit is applied through.
+# terminal width -- see mesh_topology.mesh_board_marker_label/_truncate
+# for the grapheme-safe truncation this limit is applied through (this
+# is the NAME portion's own budget -- TRACE ROUTE's "<marker> " prefix
+# adds two more cells on top, never shrinking the name itself).
 MESH_BOARD_LABEL_MAX_CELLS = 5
+
+
+@dataclass(frozen=True)
+class ActiveTraceroute:
+    """TRACE ROUTE Part C: the ONE currently in-flight traceroute (v1
+
+    allows exactly one at a time). `request_token` -- an app-local
+    sequence number assigned synchronously in _start_traceroute, BEFORE
+    any RF request is even sent -- is the sole correlation key: it is
+    known before the background worker starts, so a response (or a
+    same-thread/synchronous simulated one) can never race its own
+    assignment. `destination_short_name` is captured once, at request
+    time, for the "TRACING ROUTE TO <name>" status text -- never a live
+    re-lookup, so it can never go stale/blank if the destination's own
+    NodeDB record changes or the node temporarily drops out of the
+    working set mid-trace.
+    """
+
+    request_token: int
+    destination_node_id: str
+    destination_short_name: str
+
+
+@dataclass(frozen=True)
+class TracerouteBanner:
+    """The terminal TRACE SUCCEEDED/TRACE FAILED status text, shown in
+
+    #mesh-status for TRACEROUTE_BANNER_SECONDS before the normal status
+    (NO MESH DATA / blank) automatically returns -- see
+    MeshtasticPassApp._show_traceroute_banner/_dismiss_traceroute_banner.
+    """
+
+    text: str
+    style_kind: str  # "accent" (TRACE SUCCEEDED) or "error" (TRACE FAILED)
+
+
+# TRACE ROUTE's "TRACING ROUTE TO SHN  > > >" animation reuses the
+# EXACT visual language of CHAT's own SENDING arrows (see
+# SENDING_ARROW_FRAMES/_sending_arrows_text above): active = ACCENT,
+# inactive = the SAME dim_quarter token SENDING's own inactive arrow
+# uses. Three positions (not two, unlike SENDING) -- one active arrow
+# cycles 0 -> 1 -> 2 -> 0, advanced by the SAME pre-existing 0.45s
+# _delivery_timer/_advance_delivery_states tick SENDING already uses,
+# never a new timer (see _advance_delivery_states' own extension).
+TRACEROUTE_ARROW_GLYPH = ">"
+TRACEROUTE_ARROW_POSITIONS = 3
+# A UI-appropriate hard ceiling -- deliberately NOT the Meshtastic SDK's
+# own sendTraceRoute/waitForTraceRoute helper's blocking timeout (up to
+# hopLimit+1 multiples of a 300s base -- see RadioService.
+# send_traceroute's own docstring), which is designed for a CLI script
+# willing to wait indefinitely, not an interactive TUI. Long enough for
+# a real multi-hop LoRa round trip, short enough that "TRACING ROUTE"
+# never appears stuck.
+TRACEROUTE_TIMEOUT_SECONDS = 30.0
+# "Only an actual successful traceroute response counts as success... in
+# ACCENT for 10 seconds, then restore the normal top-left status" -- the
+# literal duration the spec gives, for both TRACE SUCCEEDED and TRACE
+# FAILED.
+TRACEROUTE_BANNER_SECONDS = 10.0
 
 
 def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
@@ -1404,7 +1952,9 @@ class MeshNodeWidget(Static):
         self.node_id = state.node.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+    def refresh_visual(
+        self, *, selected: bool, theme: str, now: float, traced: bool = False
+    ) -> None:
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
         # The glyph shape itself is never altered by selection -- ACTIVE
         # (solid) vs stale (stroked) stays the authoritative visual state
@@ -1417,11 +1967,25 @@ class MeshNodeWidget(Static):
         # a genuinely active endpoint look like a relay chain dead-end
         # (see MeshRelayWidget, always stroked/unlabeled). YOU has no
         # activity concept and is always solid.
-        glyph = (
-            CIRCLE_SOLID_LARGE
-            if self.state.node.is_local or is_node_active(self.state.node.last_heard, now)
-            else CIRCLE_STROKED_LARGE
-        )
+        #
+        # UI / CHANNEL / RADIO CONFIG TUNING Part A: session-local
+        # successful-traceroute evidence (see MeshTopologyView.
+        # mark_traced) replaces this ENTIRE glyph -- shape and color --
+        # with the plain "*" in existing successful-trace/ACCENT color,
+        # taking priority over the ACTIVE/stale distinction (a
+        # successful trace is itself stronger, more recent evidence
+        # than passive last-heard staleness). This never moves the
+        # glyph's own (grid_x, grid_y) anchor or its selected-composite
+        # width -- only the single character/color drawn there.
+        if traced:
+            glyph = "*"
+            color = THEME_PALETTES[theme].accent
+        else:
+            glyph = (
+                CIRCLE_SOLID_LARGE
+                if self.state.node.is_local or is_node_active(self.state.node.last_heard, now)
+                else CIRCLE_STROKED_LARGE
+            )
         style = Style(color=color, bold=selected)
         if selected:
             # Bold alone reads as barely-different on many terminals, so
@@ -1459,8 +2023,17 @@ class MeshNodeLabelWidget(Static):
         super().__init__(classes="mesh-node", markup=False)
 
     def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+        # UI / CHANNEL / RADIO CONFIG TUNING Part A: the label is now
+        # always the bare name in this node's ordinary ACTIVE/STALE/
+        # selected color -- no marker prefix, no traced-specific
+        # branch. Successful-traceroute evidence is shown entirely on
+        # the GRID GLYPH one cell below (see MeshNodeWidget.
+        # refresh_visual) instead, so there is no second color/glyph
+        # decision to make here any more.
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
-        label = compact_node_label(self.state.node, MESH_BOARD_LABEL_MAX_CELLS)
+        label = mesh_board_marker_label(
+            self.state.node, max_name_cells=MESH_BOARD_LABEL_MAX_CELLS
+        )
         self.update(Text(label, style=Style(color=color)))
 
     def on_click(self, _event: Click) -> None:
@@ -1496,7 +2069,7 @@ def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
     view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
-    app._update_mesh_context_status()
+    app._update_mesh_node_bar(view.working_set, time())
 
 
 DOT_GRID_GLYPH = "·"
@@ -1649,6 +2222,14 @@ class MeshTopologyView(Container):
         self._relay_stages: tuple[RelayStage, ...] = ()
         self._edge_node_ids: frozenset[str] = frozenset()
         self._last_now: float = 0.0
+        # TRACE ROUTE (Part C): canonical node IDs with successful
+        # traceroute evidence during THIS app session -- persistent
+        # view-level state, exactly like _selected_node_id, so it
+        # survives every ordinary set_nodes() refresh and every tab
+        # switch, and is never cleared except by an app restart (never
+        # erased by a later FAILED trace -- see MeshtasticPassApp.
+        # _finish_traceroute_success, this set's only writer).
+        self._traced_node_ids: frozenset[str] = frozenset()
 
     @property
     def board(self) -> Container:
@@ -1955,7 +2536,8 @@ class MeshTopologyView(Container):
             widget.styles.height = 1
             widget.styles.offset = (grid_x - width // 2, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
-            widget.refresh_visual(selected=selected, theme=theme, now=now)
+            traced = widget.node_id in self._traced_node_ids
+            widget.refresh_visual(selected=selected, theme=theme, now=now, traced=traced)
 
         # Relay-stage placeholders share the same glyph anchor formula as
         # a real node's glyph (see MeshNodeWidget above) but never the
@@ -1969,6 +2551,23 @@ class MeshTopologyView(Container):
             widget.styles.offset = (grid_x, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
             widget.refresh_visual(theme=theme)
+            # MESH BOUNDARY CONTINUATION INDICATORS item 30-32: a real
+            # node's own clipped glyph at the viewport edge IS the
+            # existing "more topology exists here" signal (see the
+            # comment above viewport_positions/project_to_viewport --
+            # it renders unlabeled at the boundary). A relay stage is
+            # never a real NodeDB entry -- just interpolated route
+            # geometry between YOU and a real client (see RelayStage) --
+            # so if IT is what got clipped here (its own interpolated
+            # cell fell outside the viewport, independent of whether
+            # the real endpoint did), it must never visually stand in
+            # for that same signal: hidden entirely rather than
+            # rendered at the boundary, where an anonymous dim dot
+            # would be indistinguishable from a genuinely off-screen
+            # node. This is display-only -- edge_ids itself (used
+            # above for the spurious-connector chain-ordering check)
+            # is untouched, so that fix's own correctness is unaffected.
+            widget.display = widget.node_id not in edge_ids
 
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
@@ -1977,7 +2576,13 @@ class MeshTopologyView(Container):
         for widget in label_widgets:
             grid_x, grid_y = centers[widget.node_id]
             label_width = max(
-                1, cell_len(compact_node_label(widget.state.node, MESH_BOARD_LABEL_MAX_CELLS))
+                1,
+                cell_len(
+                    mesh_board_marker_label(
+                        widget.state.node,
+                        max_name_cells=MESH_BOARD_LABEL_MAX_CELLS,
+                    )
+                ),
             )
             widget.styles.width = label_width
             widget.styles.height = 1
@@ -2003,9 +2608,10 @@ class MeshTopologyView(Container):
         # "draw an isolated active dot with no connection at all", and
         # treating it that way previously left active nodes with unknown
         # hops rendered with no connector whatsoever. The selected-node
-        # context line's own "? HOPS" still reports the hop count
-        # honestly (see format_mesh_context_line) -- this only concerns
-        # whether a connector renders, never fabricates a hop count.
+        # unified bottom bar's own "HOPS ?" still reports the hop count
+        # honestly (see mesh_state.format_mesh_node_bar_fields) -- this
+        # only concerns whether a connector renders, never fabricates a
+        # hop count.
         palette = THEME_PALETTES[theme]
         stages_by_client: dict[str, list[RelayStage]] = {}
         for stage in relay_stages:
@@ -2055,25 +2661,50 @@ class MeshTopologyView(Container):
                     for node_id, position in centers.items()
                     if node_id not in chain_ids
                 )
-                route_cells = route_chain_avoiding(chain_points, obstacles)
-                if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
-                    # build_relay_stages already guarantees an ordered,
-                    # non-self-overlapping chain in LOGICAL space (see
-                    # its own docstring), but project_to_viewport clips
-                    # each node's position independently, with no
-                    # awareness of chain order -- a chain whose stages
-                    # get clipped onto DIFFERENT edge cells can still
-                    # end up geometrically out of order once translated
-                    # to screen coordinates. Rather than let that render
-                    # as a branch, fall back to a direct YOU-to-endpoint
-                    # line for the connector's PATH only -- the relay
-                    # dots themselves stay rendered at their own clipped
-                    # positions (see the glyph-placement loop above),
-                    # never fabricated or hidden, only the connecting
-                    # LINE no longer visits them.
+                # build_relay_stages already guarantees an ordered,
+                # non-self-overlapping chain in LOGICAL space (see its
+                # own docstring), but project_to_viewport clips each
+                # node's position independently, with no awareness of
+                # chain order -- once the current selection recenters
+                # the board, an INTERMEDIATE relay stage (never the
+                # real you_id/remote_id endpoints, whose own off-screen
+                # clipping is the intended "edge indicator" case) can
+                # independently clip onto a viewport edge far from its
+                # true interpolated position, breaking the straight-
+                # line ordering the chain's geometry otherwise
+                # guarantees. Detected directly against the same
+                # edge_ids project_to_viewport already computed --
+                # real-hardware regression: this used to be detected
+                # only indirectly, by checking for a DUPLICATE cell in
+                # the resulting route, which caught some but not all
+                # such cases (a chain can retrace across itself and
+                # visibly zigzag across the whole board -- "start in
+                # the lower topology, rise to the top, then run
+                # horizontally across it" -- entirely through CELLS
+                # that never individually repeat). Falling back to a
+                # direct YOU-to-endpoint line for the connector's PATH
+                # only -- the relay dots themselves stay rendered at
+                # their own clipped positions (see the glyph-placement
+                # loop above), never fabricated or hidden, only the
+                # connecting LINE no longer visits them.
+                relay_stage_ids_in_chain = {
+                    stage.node_id for stage in chain_stages if stage.node_id in centers
+                }
+                if relay_stage_ids_in_chain & self._edge_node_ids:
                     route_cells = route_chain_avoiding(
                         (centers[you_id], centers[remote_id]), obstacles
                     )
+                else:
+                    route_cells = route_chain_avoiding(chain_points, obstacles)
+                    if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
+                        # Belt-and-suspenders: a chain with every stage
+                        # genuinely on-screen could still self-overlap
+                        # via obstacle-avoidance detours alone (see
+                        # route_connector_avoiding) -- same fallback,
+                        # different trigger.
+                        route_cells = route_chain_avoiding(
+                            (centers[you_id], centers[remote_id]), obstacles
+                        )
                 if is_selected:
                     color = palette.accent
                 elif is_stale:
@@ -2135,6 +2766,22 @@ class MeshTopologyView(Container):
         )
         if local_id is not None:
             self.select_node(local_id)
+
+    @property
+    def traced_node_ids(self) -> frozenset[str]:
+        return self._traced_node_ids
+
+    def mark_traced(self, node_id: str) -> None:
+        """Record session-local successful-traceroute evidence for
+
+        `node_id` (TRACE ROUTE Part C) -- additive only (a later failed
+        trace against a DIFFERENT node, or a later failed retry of THIS
+        SAME node, never removes a prior success; see
+        MeshtasticPassApp._finish_traceroute_failure, which never calls
+        this). Takes effect the next time a label is rendered
+        (set_nodes/refresh_visual), not immediately.
+        """
+        self._traced_node_ids = self._traced_node_ids | {node_id}
 
 
 class IdentityNameControl(Horizontal):
@@ -2322,9 +2969,14 @@ class ChatEntryWidget(Vertical):
         entry: ChatEntry,
         now: float | None = None,
         favorite: bool = False,
+        mention: bool = False,
     ) -> None:
         self.entry = entry
         self.favorite = favorite and not entry.outgoing
+        # @mention highlighting (Part H) is CHANNEL-incoming only
+        # (item 32/31) -- never DM, never an outgoing entry's own
+        # delivery glyph semantics.
+        self.mention = mention and not entry.outgoing and entry.dm_node_id is None
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
         self.timestamp_label = Static(
@@ -2372,8 +3024,17 @@ class ChatEntryWidget(Vertical):
         # touched. Selection styling likewise never touches this text
         # or its width -- see ChatEntryWidget.on_focus/on_blur, which
         # only ever update the separate, fixed-width selection_marker.
+        #
+        # terminal_safe_text() additionally substitutes keycap-digit
+        # emoji (e.g. a boxed/keycap-style "5") with the equivalent
+        # single-codepoint circled digit -- see grapheme_text.py for
+        # why that specific sequence's Rich/Textual-accounted width can
+        # disagree with what a plain terminal font actually paints.
+        # Display-only: self.entry.text itself, chat_store persistence,
+        # the outgoing RF payload, and @mention matching all still use
+        # the original, untouched text.
         self.message_label = Static(
-            self.entry.text,
+            terminal_safe_text(self.entry.text),
             classes="chat-entry-text",
             markup=False,
         )
@@ -2387,6 +3048,8 @@ class ChatEntryWidget(Vertical):
         classes = "chat-entry new-message" if is_new else "chat-entry"
         if self.favorite:
             classes += " favorite-sender"
+        if self.mention:
+            classes += " mention"
         super().__init__(
             Horizontal(
                 self.selection_marker,
@@ -2417,6 +3080,10 @@ class ChatEntryWidget(Vertical):
     def set_favorite(self, favorite: bool) -> None:
         self.favorite = favorite and not self.entry.outgoing
         self.set_class(self.favorite, "favorite-sender")
+
+    def set_mention(self, mention: bool) -> None:
+        self.mention = mention and not self.entry.outgoing and self.entry.dm_node_id is None
+        self.set_class(self.mention, "mention")
 
     def refresh_delivery_state(self, animation_frame: int) -> None:
         if self.delivery_label is None:
@@ -2524,13 +3191,14 @@ class MeshtasticPassApp(App[None]):
        ID-scoped so "PROFILE" and #mesh-connection-status (which
        reuse .page-title for its own layout/weight, not this coloring)
        are entirely unaffected. */
-    #connection-title, #style-title, #radio-title {
+    #connection-title, #style-title, #radio-title, #advanced-radio-title {
         color: $snow_dim;
     }
 
     Screen.theme-amber #connection-title,
     Screen.theme-amber #style-title,
-    Screen.theme-amber #radio-title {
+    Screen.theme-amber #radio-title,
+    Screen.theme-amber #advanced-radio-title {
         color: $amber_dim;
     }
 
@@ -2575,8 +3243,9 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #long-name-input, #short-name-input {
-        width: 8;
+    #long-name-input, #short-name-input,
+    #network-name-input, #freq-slot-input, #key-input {
+        width: 16;
         height: 1;
         border: none;
         padding: 0;
@@ -2584,9 +3253,23 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
+    #long-name-input, #short-name-input {
+        width: 8;
+    }
+
     Screen.theme-amber #long-name-input,
-    Screen.theme-amber #short-name-input {
+    Screen.theme-amber #short-name-input,
+    Screen.theme-amber #network-name-input,
+    Screen.theme-amber #freq-slot-input,
+    Screen.theme-amber #key-input {
         color: $amber_base;
+    }
+
+    .advanced-radio-editor {
+        /* Collapsed by default (spec B): the NEW NETWORK editor rows
+           are revealed only by _set_network_editor_open, which flips
+           each widget's inline display to override this. */
+        display: none;
     }
 
     #long-name-input:disabled, #short-name-input:disabled {
@@ -2677,21 +3360,100 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-amber #chat-input {
-        color: $amber_base;
+        color: $amber_accent2;
+    }
+
+    /* "> message" is Textual's OWN Input.placeholder, styled via the
+       separate "input--placeholder" component class (Textual's
+       get_component_rich_style machinery, DEFAULT_CSS: "color:
+       $text-disabled") -- a completely different mechanism from the
+       plain `color` property above, which only ever affected TYPED
+       text. Real hardware exposed that the prompt stayed Textual's
+       own built-in disabled-grey under AMBER; this targets that exact
+       component class so the prompt shares the same AMBER ACCENT2
+       identity as typed text. */
+    Screen.theme-amber #chat-input > .input--placeholder {
+        color: $amber_accent2;
     }
 
     Screen.theme-amber .page-title {
         color: $amber_accent;
     }
 
-    #chat-title {
+    #chat-header {
+        height: auto;
+        min-height: 2;
+    }
+
+    #chat-title, #chat-dm-selector {
+        width: auto;
+        max-width: 70%;
         height: auto;
         min-height: 2;
         text-style: bold;
+        text-overflow: ellipsis;
+    }
+
+    #chat-header-bullet {
+        width: 3;
+        height: auto;
+        min-height: 2;
+        content-align: center middle;
+        color: $snow_dim;
+    }
+
+    Screen.theme-amber #chat-header-bullet {
+        color: $amber_dim;
+    }
+
+    #chat-content, #chat-channel, #chat-dms {
+        height: 1fr;
     }
 
     #radio-status {
         height: 2;
+    }
+
+    #advanced-radio-title {
+        margin-top: 1;
+    }
+
+    #advanced-radio-status {
+        /* auto, not a fixed 2 like #radio-status: the press-again-to-
+           confirm SAVE/switch message is long enough to wrap across
+           several lines at typical terminal widths, and must never be
+           clipped. */
+        height: auto;
+        min-height: 0;
+    }
+
+    #advanced-radio-actions {
+        height: 1;
+        /* CONNECTION_VALUE_COLUMN_INDENT (2 row-prefix + 12 label + 1)
+           minus each button's own margin-left:2 -- so [ SAVE ] lands in
+           the same column the form controls' "[ ... ]" start at, and
+           [ CANCEL ] follows on the SAME row after a 2-cell gap. */
+        padding-left: 13;
+    }
+
+    #advanced-radio-actions .connection-action-row {
+        width: auto;
+        margin-left: 2;
+    }
+
+    /* Spec D/J: pending ("SAVING & APPLYING...") and normal success
+       ("... APPLIED") both use ACCENT; a genuine failure uses ERROR and
+       never ACCENT. */
+    #advanced-radio-status.setting-accent {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber #advanced-radio-status.setting-accent {
+        color: $amber_accent;
+    }
+
+    #advanced-radio-status.setting-error {
+        color: $error;
     }
 
     .setting-success {
@@ -2736,7 +3498,7 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $amber_dim;
     }
 
-    #mesh-status, #mesh-bottom-row {
+    #mesh-status, #mesh-node-bar {
         height: 1;
     }
 
@@ -2748,22 +3510,8 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
-    #mesh-context-status {
+    #mesh-node-bar {
         width: 1fr;
-        color: $snow_base;
-    }
-
-    Screen.theme-amber #mesh-context-status {
-        color: $amber_base;
-    }
-
-    #mesh-last-update {
-        width: auto;
-        color: $snow_base;
-    }
-
-    Screen.theme-amber #mesh-last-update {
-        color: $amber_base;
     }
 
     #dm-content {
@@ -2841,7 +3589,11 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-amber #dm-input {
-        color: $amber_base;
+        color: $amber_accent2;
+    }
+
+    Screen.theme-amber #dm-input > .input--placeholder {
+        color: $amber_accent2;
     }
 
     #mesh-view {
@@ -2960,6 +3712,18 @@ class MeshtasticPassApp(App[None]):
         color: $amber_dim;
     }
 
+    #start-of-channel-history {
+        width: 1fr;
+        height: 1;
+        margin-bottom: 1;
+        color: $snow_dim;
+        text-align: center;
+    }
+
+    Screen.theme-amber #start-of-channel-history {
+        color: $amber_dim;
+    }
+
     #load-older:focus, .message-action:focus {
         text-style: reverse;
     }
@@ -3067,6 +3831,30 @@ class MeshtasticPassApp(App[None]):
         height: auto;
     }
 
+    /* @mention highlighting (CHAT/DM/MENTION UX Part H): the ENTIRE
+       incoming CHANNEL CHAT block, not merely the "@SHORTNAME"
+       characters (item 30) -- a background wash in ACCENT2, so
+       stronger nested semantics (ERROR text, delivery glyphs,
+       resend/delete controls) keep their own explicit color
+       unaffected. Textual CSS has no :not() pseudo-class, so
+       ".chat-entry.mention:focus" below is an explicit, HIGHER-
+       specificity (3 selectors vs. this rule's 2, and vs.
+       ".chat-entry:focus" alone) override that guarantees the
+       existing focus/selection background always wins outright when
+       both apply, regardless of declaration order (item 31) -- never
+       a real ambiguous tie. */
+    .chat-entry.mention {
+        background: $snow_accent2 20%;
+    }
+
+    Screen.theme-amber .chat-entry.mention {
+        background: $amber_accent2 20%;
+    }
+
+    .chat-entry.mention:focus {
+        background: $selection_background;
+    }
+
     .chat-entry.new-message .chat-entry-author,
     .chat-entry.new-message .chat-entry-timestamp,
     .chat-entry.new-message .chat-entry-distance,
@@ -3158,12 +3946,21 @@ class MeshtasticPassApp(App[None]):
         # by the remote party's canonical node ID (never a display
         # name -- item 2), each reusing the SAME ChannelChatState shape
         # (entries/draft/etc.) channel CHAT already uses. current_dm_
-        # node_id is None while the DM tab shows its conversation LIST;
-        # set to a specific conversation's node ID once opened.
+        # node_id is None while CHAT's DMS mode shows its conversation
+        # LIST; set to a specific conversation's node ID once opened.
         self._dm_states: dict[str, ChannelChatState] = {}
         self.current_dm_node_id: str | None = None
         self._dm_conversation_order: list[str] = []
         self._dm_list_highlighted_index = 0
+        # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
+        # tab -- it is a MODE inside CHAT, alongside "channel" (the
+        # default). current_tab stays "chat" for both; only this and
+        # the inner #chat-content ContentSwitcher change (see
+        # _switch_chat_mode). dm_unread_count is the DM(N) header
+        # badge's count -- see _recount_dm_unread's own docstring for
+        # the exact chosen unread model.
+        self._chat_mode = "channel"
+        self.dm_unread_count = 0
         self.chat_store = chat_store
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
@@ -3196,6 +3993,33 @@ class MeshtasticPassApp(App[None]):
         # without depending on Textual's own worker exclusivity (which
         # cannot actually interrupt a blocking thread either way).
         self._radio_workers: dict[str, Thread] = {}
+        # ADVANCED RADIO: the currently selected NETWORK name (app-side
+        # notion of "which NETWORK this app would apply / last applied",
+        # never a live radio readback -- see _refresh_network_options).
+        # Starts on the built-in LongFast; changes ONLY on a confirmed
+        # NETWORK switch or a confirmed SAVE, never on connect/reconnect.
+        self._selected_network: str = BUILTIN_LONGFAST_NETWORK
+        # Whether the transient NEW NETWORK editor is currently revealed
+        # (see _set_network_editor_open). Purely local UI state -- never
+        # persisted, discarded on leaving CONNECTION (see show_tab).
+        self._network_editor_open = False
+        # Press-again-to-confirm arming (see _arm_advanced_radio_confirm/
+        # _advanced_radio_confirm_expired) -- "save" or "switch:<name>"
+        # while armed, else None. Auto-disarms after
+        # ADVANCED_RADIO_CONFIRM_SECONDS via a Timer, and is explicitly
+        # disarmed by ANY other editor action (editing a field, CANCEL,
+        # leaving the view) so a stale arm can never survive into an
+        # unrelated confirmation.
+        self._advanced_radio_confirm: str | None = None
+        self._advanced_radio_confirm_timer: Timer | None = None
+        # The ONE outstanding NETWORK apply (SAVE or switch), its
+        # monotonic correlation token source, and its hard-timeout
+        # Timer. Cleared the instant a terminal SUCCESS/ERROR is
+        # reached, so "SAVING & APPLYING..." can never persist (see
+        # NetworkApply / _network_apply_timed_out).
+        self._network_apply: NetworkApply | None = None
+        self._network_apply_seq = 0
+        self._network_apply_timer: Timer | None = None
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -3217,6 +4041,38 @@ class MeshtasticPassApp(App[None]):
         self._user_menu_scroll_x: float | None = None
         self._user_menu_scroll_y: float | None = None
         self._emoji_picker: EmojiPicker | None = None
+        # MESH LAYOUT STABILITY: sticky logical positions (node_id ->
+        # (x, y, region), assign_grid_slots' own PositionedNode shape)
+        # and a monotonic per-axis extent ratchet for place_within_
+        # bounds -- both fed back in as each subsequent _refresh_mesh()
+        # call's own input, so a routine update (last_heard, telemetry,
+        # LINK, selection, a node aging/appearing elsewhere) never
+        # moves an already-placed node purely because rank/index
+        # bookkeeping shifted. See _refresh_mesh and mesh_topology.
+        # assign_grid_slots/place_within_bounds' own docstrings.
+        self._mesh_sticky_positions: dict[str, tuple[int, int, str]] = {}
+        self._mesh_extent_ratchet: dict[str, int] = {
+            "up": 0,
+            "down": 0,
+            "left": 0,
+            "right": 0,
+        }
+        # TRACE ROUTE (Part C): the ONE currently in-flight explicit
+        # traceroute (v1 -- see _start_traceroute's own one-active-at-a-
+        # time guard), the session-local ledger of successful results
+        # (keyed by canonical destination node ID, replaced not
+        # duplicated on a repeat trace), the terminal TRACE SUCCEEDED/
+        # TRACE FAILED banner (if one is currently showing), and the
+        # 3-position arrow-animation frame (see TRACEROUTE_ARROW_
+        # POSITIONS/_advance_delivery_states). None of this is ever
+        # persisted to disk -- an app restart clears it completely.
+        self._active_traceroute: ActiveTraceroute | None = None
+        self._traceroute_results: dict[str, TracerouteResult] = {}
+        self._traceroute_banner: TracerouteBanner | None = None
+        self._traceroute_banner_timer: Timer | None = None
+        self._traceroute_timeout_timer: Timer | None = None
+        self._traceroute_animation_frame = 0
+        self._traceroute_request_seq = 0
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
             radio,
@@ -3262,16 +4118,104 @@ class MeshtasticPassApp(App[None]):
                 yield HopLimitSelector(3)
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
                 yield Static(id="radio-status")
-            with Vertical(id="chat", classes="tab-page"):
-                yield ChannelSelector(self._channels, self.current_channel_index)
-                yield ChatTranscript(id="chat-log")
-                yield Static(id="chat-new-below")
-                yield Static(id="send-error")
-                yield ChatMessageInput(
-                    placeholder="> message",
-                    id="chat-input",
-                    select_on_focus=False,
+                # ADVANCED RADIO: a compact sub-section for switching
+                # between complete saved Meshtastic NETWORK configs --
+                # HOP LIMIT above stays completely independent (never
+                # folded into a saved NETWORK; see RadioConfigPreset's
+                # own docstring). Collapsed by default: only the NETWORK
+                # selector and [ NEW NETWORK ] are visible; the
+                # .advanced-radio-editor rows below are hidden until
+                # NEW NETWORK is activated and discarded on leaving the
+                # view (see _set_network_editor_open / show_tab).
+                yield Static(
+                    "ADVANCED RADIO",
+                    id="advanced-radio-title",
+                    classes="page-title",
                 )
+                yield NetworkSelector(
+                    (
+                        DropdownOption(
+                            BUILTIN_LONGFAST_NETWORK, BUILTIN_LONGFAST_NETWORK
+                        ),
+                    ),
+                )
+                yield NewNetworkControl()
+                # The one blank row that separates the NETWORK selector
+                # from the revealed editor (spec D).
+                yield Static(
+                    " ",
+                    id="advanced-radio-editor-spacer",
+                    classes="connection-action-row advanced-radio-editor",
+                    markup=False,
+                )
+                yield NetworkFieldInput(
+                    label="NETWORK NAME",
+                    widget_id="network-name-row",
+                    input_id="network-name-input",
+                )
+                yield RadioModeSelector("LONG_FAST")
+                yield NetworkFieldInput(
+                    label="FREQ. SLOT",
+                    widget_id="freq-slot-row",
+                    input_id="freq-slot-input",
+                    max_length=3,
+                )
+                yield NetworkFieldInput(
+                    label="KEY",
+                    widget_id="key-row",
+                    input_id="key-input",
+                )
+                with Horizontal(
+                    id="advanced-radio-actions", classes="advanced-radio-editor"
+                ):
+                    yield SaveNetworkControl()
+                    yield CancelNetworkControl()
+                yield Static(id="advanced-radio-status", markup=False)
+            with Vertical(id="chat", classes="tab-page"):
+                # Peer selectors (CHAT/DM/MENTION UX Part B): LEFT is the
+                # configured Meshtastic channel selector (unchanged
+                # ChannelSelector); RIGHT is the DM(N) mode selector --
+                # opening it switches CHAT into DMS mode instead of
+                # picking from a normal dropdown popup (see
+                # DMModeSelector.open_menu). The bullet between them is
+                # a plain, non-focusable Static -- purely a visual
+                # separator (item 6).
+                with Horizontal(id="chat-header"):
+                    yield ChannelSelector(self._channels, self.current_channel_index)
+                    yield Static(
+                        "•",
+                        id="chat-header-bullet",
+                        classes="chat-header-bullet",
+                        markup=False,
+                    )
+                    yield DMModeSelector(0)
+                with ContentSwitcher(initial="chat-channel", id="chat-content"):
+                    with Vertical(id="chat-channel"):
+                        yield ChatTranscript(id="chat-log")
+                        yield Static(id="chat-new-below")
+                        yield Static(id="send-error")
+                        yield ChatMessageInput(
+                            placeholder="> message",
+                            id="chat-input",
+                            select_on_focus=False,
+                        )
+                    with Vertical(id="chat-dms"):
+                        yield Static(
+                            id="dm-connection-status",
+                            classes="page-title",
+                            markup=False,
+                        )
+                        with ContentSwitcher(initial="dm-list", id="dm-content"):
+                            yield VerticalScroll(id="dm-list")
+                            with Vertical(id="dm-conversation"):
+                                yield Static(id="dm-header", markup=False)
+                                yield ChatTranscript(id="dm-log")
+                                yield Static(id="dm-send-error")
+                                yield ChatMessageInput(
+                                    placeholder="> message",
+                                    id="dm-input",
+                                    select_on_focus=False,
+                                )
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
@@ -3285,30 +4229,13 @@ class MeshtasticPassApp(App[None]):
                 yield Static(id="mesh-connection-status", classes="page-title", markup=False)
                 yield Static(id="mesh-status", markup=False)
                 yield MeshTopologyView()
-                # Bottom row: focused-node context anchored left (1fr,
-                # truncates gracefully -- see _update_mesh_context_status),
-                # LAST UPDATE anchored right (auto width). Order matters:
-                # the 1fr widget must come first so it absorbs exactly
-                # "container width minus LAST UPDATE's own width", which
-                # is what makes LAST UPDATE land flush against the right
-                # edge with no manual offset math.
-                with Horizontal(id="mesh-bottom-row"):
-                    yield Static(id="mesh-context-status", markup=False)
-                    yield Static(id="mesh-last-update", markup=False)
-            with Vertical(id="dm", classes="tab-page"):
-                yield Static(id="dm-connection-status", classes="page-title", markup=False)
-                with ContentSwitcher(initial="dm-list", id="dm-content"):
-                    yield VerticalScroll(id="dm-list")
-                    with Vertical(id="dm-conversation"):
-                        yield Static(id="dm-header", markup=False)
-                        yield ChatTranscript(id="dm-log")
-                        yield Static(id="dm-send-error")
-                        yield ChatMessageInput(
-                            placeholder="> message",
-                            id="dm-input",
-                            select_on_focus=False,
-                        )
-        yield Static("1-4 switch tabs    F4 quit", id="footer")
+                # MESH GPS + UNIFIED BAR Part B: one single physical line
+                # for the selected node (LONG NAME - SHORT NAME - HOPS -
+                # GPS - DISTANCE - LINK - TIME), replacing the previous
+                # separate bottom-left context line and bottom-right
+                # LINK/LAST UPDATE line -- see _update_mesh_node_bar.
+                yield Static(id="mesh-node-bar", markup=False)
+        yield Static("1-3 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -3351,6 +4278,10 @@ class MeshtasticPassApp(App[None]):
             self._delivery_timer.stop()
         if self._send_error_dismiss_timer is not None:
             self._send_error_dismiss_timer.stop()
+        if self._network_apply_timer is not None:
+            self._network_apply_timer.stop()
+        if self._advanced_radio_confirm_timer is not None:
+            self._advanced_radio_confirm_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
         self._reconcile_interrupted_sends_before_shutdown()
@@ -3407,15 +4338,43 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
         if self._user_menu is not None:
+            # Real-hardware regression (PR #46 follow-up Part A): the
+            # node/user menu never steals Textual focus (ViewportMenu.
+            # can_focus = False, by design -- see its own docstring),
+            # so the ORIGINATING ChatEntryWidget/#chat-log stays
+            # focused the entire time the menu is open. event.stop()
+            # alone only blocks this event from bubbling PAST the App
+            # -- it does NOT stop Textual's own separate, always-
+            # present App._on_key handler (inherited from the base App
+            # class) from ALSO running in the SAME dispatch pass. That
+            # handler independently walks the bindings of every widget
+            # from the still-focused ChatEntryWidget up to the Screen,
+            # finds ChatTranscript's OWN inherited ScrollableContainer
+            # bindings ("up"->scroll_up, "down"->scroll_down), and
+            # fires them regardless -- silently scrolling the
+            # transcript underneath the menu on every arrow press. In
+            # ordinary (menu-closed) navigation this same double-fire
+            # happens too, but _move_chat_focus's own scroll_visible()
+            # call immediately re-settles the correct position
+            # afterward, masking it; nothing re-settles it while the
+            # menu owns navigation, which is what actually exposed the
+            # bug. event.prevent_default() is the one call that
+            # actually suppresses that second, independent handler
+            # (see Message._no_default_action / _get_dispatch_methods
+            # in Textual's own message_pump.py) -- event.stop() is not
+            # enough on its own here.
             if event.key in ("up", "down"):
                 self._user_menu.move_highlight(-1 if event.key == "up" else 1)
                 event.stop()
+                event.prevent_default()
             elif event.key == "enter":
                 self._user_menu.activate()
                 event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 self._close_user_menu()
                 event.stop()
+                event.prevent_default()
             return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
@@ -3438,9 +4397,45 @@ class MeshtasticPassApp(App[None]):
             elif self.focused.id == "short-name-input" and event.key == "escape":
                 self.query_one(ShortNameControl).cancel_edit()
                 event.stop()
+            elif (
+                self.current_tab == "connection"
+                and self.focused.id
+                in (
+                    "network-name-input",
+                    "freq-slot-input",
+                    "key-input",
+                )
+                and event.key in ("up", "down")
+            ):
+                # ADVANCED RADIO's plain editor Input fields join
+                # the ordinary CONNECTION row up/down order (see
+                # _move_connection_focus) -- otherwise this whole
+                # isinstance(Input) branch's own unconditional `return`
+                # below would swallow up/down for them entirely.
+                self._move_connection_focus(-1 if event.key == "up" else 1)
+                event.stop()
             return
 
-        if self.current_tab == "chat":
+        # RECONNECT DELIVERY + CHAT HEADER FIX item 16: while not
+        # ONLINE, C/D must not open the channel/DM dropdowns their
+        # header selectors normally do -- those selectors are
+        # themselves hidden/disabled while not ONLINE (see
+        # _update_chat_connection_state), so this applies uniformly
+        # before any of the three chat_mode-specific branches below
+        # (channel-neutral, DMS list, DMS conversation) ever dispatch
+        # on "c"/"d", rather than repeating the same check three times.
+        # Every other hotkey (arrows, ENTER, ESC, etc.) is unaffected --
+        # this pass does not change existing offline/disabled behavior
+        # for anything except these two.
+        if (
+            self.current_tab == "chat"
+            and self._radio_state is not RadioState.ONLINE
+            and event.key.lower() in ("c", "d")
+        ):
+            event.stop()
+            return
+
+        if self.current_tab == "chat" and self._chat_mode == "channel":
             transcript = self.query_one("#chat-log", ChatTranscript)
             if event.key in ("up", "down"):
                 self._move_chat_focus(-1 if event.key == "up" else 1)
@@ -3460,6 +4455,18 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
+            if event.key.lower() == "d":
+                # PR #46 follow-up Part B item 7: D mirrors C -- it
+                # opens the DM DROPDOWN, never immediately switches
+                # into DMS mode/the full conversation list. The user
+                # picks a conversation from the dropdown to actually
+                # enter DMS mode (see DMModeSelector.open_menu/
+                # dropdown_selected's "chat_dm_mode" handling).
+                selector = self.query_one(DMModeSelector)
+                selector.focus()
+                selector.open_menu()
+                event.stop()
+                return
             if event.key == "left":
                 self._focus_oldest_new_message()
                 event.stop()
@@ -3475,14 +4482,19 @@ class MeshtasticPassApp(App[None]):
             if (
                 event.is_printable
                 and event.character
-                # "1"/"2"/"3"/"4" must still reach the tab-switch dispatch
+                # "1"/"2"/"3" must still reach the tab-switch dispatch
                 # below even from CHAT's neutral state -- see
                 # tab_for_key -- or the keyboard could never leave CHAT
                 # once on it (they only ever type into the composer when
                 # it is ALREADY focused, via the isinstance(self.focused,
                 # Input) branch above, which returns before this code
-                # even runs).
-                and event.key not in ("1", "2", "3", "4")
+                # even runs). "c"/"d" are excluded for the identical
+                # reason -- they are CHANNEL/DMS mode hotkeys handled
+                # above, never typed into the composer from this neutral
+                # state (typing them while the composer IS already
+                # focused goes through the isinstance(self.focused,
+                # Input) branch instead, unaffected by this exclusion).
+                and event.key not in ("1", "2", "3", "c", "d")
             ):
                 # Any other printable character begins composing: focus
                 # the input and insert exactly what was typed, appending
@@ -3515,12 +4527,12 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
 
-        if self.current_tab == "dm":
+        if self.current_tab == "chat" and self._chat_mode == "dms":
             if self.current_dm_node_id is None:
                 # Conversation LIST mode: UP/DOWN move the highlight,
                 # ENTER opens the highlighted conversation. Any other
-                # key (notably the "1"-"4" tab-switch digits) falls
-                # through unhandled, exactly like CHAT's own neutral
+                # key (notably the "1"-"3" tab-switch digits) falls
+                # through unhandled, exactly like CHANNEL's own neutral
                 # state does, so the keyboard is never trapped here.
                 if event.key in ("up", "down"):
                     self._move_dm_list_highlight(-1 if event.key == "up" else 1)
@@ -3528,6 +4540,17 @@ class MeshtasticPassApp(App[None]):
                     return
                 if event.key == "enter":
                     self._activate_dm_list_selection()
+                    event.stop()
+                    return
+                if event.key.lower() == "c":
+                    self._switch_chat_mode("channel")
+                    self._focus_chat_mode("channel", open_dropdown=True)
+                    event.stop()
+                    return
+                if event.key.lower() == "d":
+                    selector = self.query_one(DMModeSelector)
+                    selector.focus()
+                    selector.open_menu()
                     event.stop()
                     return
             else:
@@ -3547,10 +4570,21 @@ class MeshtasticPassApp(App[None]):
                     )
                     event.stop()
                     return
+                if event.key.lower() == "c":
+                    self._switch_chat_mode("channel")
+                    self._focus_chat_mode("channel", open_dropdown=True)
+                    event.stop()
+                    return
+                if event.key.lower() == "d":
+                    selector = self.query_one(DMModeSelector)
+                    selector.focus()
+                    selector.open_menu()
+                    event.stop()
+                    return
                 if (
                     event.is_printable
                     and event.character
-                    and event.key not in ("1", "2", "3", "4")
+                    and event.key not in ("1", "2", "3", "c", "d")
                 ):
                     dm_input = self.query_one("#dm-input", Input)
                     if not dm_input.disabled:
@@ -3559,33 +4593,36 @@ class MeshtasticPassApp(App[None]):
                         event.stop()
                         return
 
+        if (
+            self.current_tab == "connection"
+            and self._network_editor_open
+            and event.key in ("left", "right")
+        ):
+            # [ SAVE ] [ CANCEL ] share one row -- RIGHT/LEFT moves
+            # within the pair so the user never has to press DOWN to
+            # reach CANCEL (see _connection_nav_controls).
+            save = self.query_one(SaveNetworkControl)
+            cancel = self.query_one(CancelNetworkControl)
+            if self.focused is save and event.key == "right":
+                cancel.focus()
+                event.stop()
+                return
+            if self.focused is cancel and event.key == "left":
+                save.focus()
+                event.stop()
+                return
+
         if self.current_tab == "connection" and event.key in ("up", "down"):
-            controls = [
-                control
-                for control in (
-                    self.query_one(DeviceSelector),
-                    self.query_one(LongNameControl),
-                    self.query_one(ShortNameControl),
-                    self.query_one(FontSizeSelector),
-                    self.query_one(ColorSelector),
-                    self.query_one(RoleSelector),
-                    self.query_one(BluetoothSelector),
-                    self.query_one(TimezoneSelector),
-                    self.query_one(ScreenTimeoutSelector),
-                    self.query_one(UnitsSelector),
-                    self.query_one(CompassSelector),
-                    self.query_one(FlipScreenSelector),
-                    self.query_one(Clock24HSelector),
-                    self.query_one(AutoSyncSelector),
+            step = -1 if event.key == "up" else 1
+            if isinstance(self.focused, CancelNetworkControl):
+                # CANCEL is not its own vertical stop: vertical nav from
+                # it behaves exactly as from its SAVE sibling.
+                self._move_connection_focus(
+                    step, origin=self.query_one(SaveNetworkControl)
                 )
-                if not getattr(control, "disabled", False)
-            ]
-            if self.focused in controls:
-                current = controls.index(self.focused)
-                step = -1 if event.key == "up" else 1
-                target = controls[(current + step) % len(controls)]
-                target.focus()
-                target.scroll_visible(animate=False)
+                event.stop()
+                return
+            if self._move_connection_focus(step):
                 event.stop()
                 return
             if event.key.lower() == "r" and isinstance(
@@ -3597,14 +4634,14 @@ class MeshtasticPassApp(App[None]):
                 return
 
         # PROFILE is intentionally absent: hidden from the visible top
-        # nav (see TAB_NAMES), so no digit key may reach it -- key "4"
-        # is simply not mapped to anything, rather than falling through
-        # to the now-hidden tab.
+        # nav (see TAB_NAMES), so no digit key may reach it. DM is
+        # likewise absent here -- it is a MODE inside CHAT now (see
+        # TAB_NAMES/_switch_chat_mode), reached via "2" + the D hotkey
+        # or the header's DM(N) selector, never its own digit key.
         tab_for_key = {
             "1": "connection",
             "2": "chat",
             "3": "mesh",
-            "4": "dm",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -3882,6 +4919,7 @@ class MeshtasticPassApp(App[None]):
         self._radio_info = event.info
         self._render_identity(force_value=True)
         self._refresh_mesh()
+        self._refresh_chat_mentions()
         if event.field_label == "LONG NAME":
             self._set_long_name_status("LONG NAME SAVED", "setting-success")
         else:
@@ -3896,10 +4934,30 @@ class MeshtasticPassApp(App[None]):
             self._set_short_name_status(event.detail, "setting-error")
 
     def show_tab(self, tab_id: str) -> None:
+        # DM is a MODE inside CHAT now, not its own tab (see
+        # _switch_chat_mode) -- leaving "chat" for a different
+        # top-level tab must still run whichever of CHANNEL's or DMS's
+        # own "I was actively being viewed" bookkeeping applies,
+        # exactly matching what leaving the old standalone "chat"/"dm"
+        # tabs used to do individually.
         if self.current_tab == "chat" and tab_id != "chat":
-            self._mark_new_messages_read()
-        if self.current_tab == "dm" and tab_id != "dm":
-            self._capture_current_dm_state()
+            if self._chat_mode == "channel":
+                self._mark_new_messages_read()
+            else:
+                self._capture_current_dm_state()
+        if self.current_tab == "connection" and tab_id != "connection":
+            # ADVANCED RADIO (spec E): an unfinished NEW NETWORK editor
+            # is transient UI state -- leaving the view by ANY path
+            # discards its unsaved contents, collapses it, restores
+            # [ NEW NETWORK ], and shows no unsaved-changes prompt.
+            # Zero RF/config, creates no NETWORK. A no-op when the
+            # editor was never opened. Any pending SAVE/switch confirm
+            # is disarmed here too (via _collapse_network_editor).
+            if self._network_editor_open:
+                self._collapse_network_editor()
+                self._set_advanced_radio_status("", None)
+            else:
+                self._disarm_advanced_radio_confirm()
         if self._emoji_picker is not None:
             # Reachable only from the composer of whichever of CHAT/DM
             # is currently active (Ctrl+E requires that Input to be
@@ -3907,25 +4965,37 @@ class MeshtasticPassApp(App[None]):
             # with no tab-specific branching needed.
             self._close_emoji_picker()
         self.current_tab = tab_id
-        if tab_id == "chat":
-            self._mark_unread_messages_viewed()
-            self._recount_unread()
-            self._refresh_chat_timestamps()
         self.query_one("#content", ContentSwitcher).current = tab_id
         self._update_tab_bar()
         if tab_id == "chat":
-            # Neutral navigation state -- NOT the message composer. The
-            # user must explicitly begin composing, either by pressing a
-            # printable character (focuses #chat-input and inserts it --
-            # see on_key's chat branch) or DOWN (focuses it without
-            # inserting anything -- see _move_chat_focus's fallback).
-            # #chat-log is the same neutral destination Escape already
-            # returns to from the composer, so entering CHAT and
-            # escaping out of a draft land in the identical state.
-            self.query_one("#chat-log", ChatTranscript).focus()
-            if self._chat_open_scroll_pending:
-                self._chat_open_scroll_pending = False
-                self.call_after_refresh(self._jump_to_newest)
+            if self._chat_mode == "channel":
+                # Neutral navigation state -- NOT the message composer.
+                # The user must explicitly begin composing, either by
+                # pressing a printable character (focuses #chat-input
+                # and inserts it -- see on_key's chat branch) or DOWN
+                # (focuses it without inserting anything -- see
+                # _move_chat_focus's fallback). #chat-log is the same
+                # neutral destination Escape already returns to from
+                # the composer, so entering CHAT and escaping out of a
+                # draft land in the identical state.
+                self._mark_unread_messages_viewed()
+                self._recount_unread()
+                self._refresh_chat_timestamps()
+                self.query_one("#chat-log", ChatTranscript).focus()
+                if self._chat_open_scroll_pending:
+                    self._chat_open_scroll_pending = False
+                    self.call_after_refresh(self._jump_to_newest)
+            else:
+                if self.current_dm_node_id is None:
+                    self._refresh_dm_list()
+                    self.query_one("#dm-list", VerticalScroll).focus()
+                else:
+                    self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+                    dm_input = self.query_one("#dm-input", Input)
+                    if not dm_input.disabled:
+                        dm_input.focus()
+                    else:
+                        self.query_one("#dm-log", ChatTranscript).focus()
         elif tab_id == "connection":
             self._refresh_device_options()
             self.query_one(FontSizeSelector).focus()
@@ -3943,25 +5013,85 @@ class MeshtasticPassApp(App[None]):
             # below, is what CONNECTION and CHAT already do for
             # themselves by claiming their own widget's focus.
             self.set_focus(None)
-        elif tab_id == "dm":
-            if self.current_dm_node_id is None:
-                self._refresh_dm_list()
-                self.query_one("#dm-list", VerticalScroll).focus()
-            else:
-                self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
-                dm_input = self.query_one("#dm-input", Input)
-                if not dm_input.disabled:
-                    dm_input.focus()
-                else:
-                    self.query_one("#dm-log", ChatTranscript).focus()
         else:
             self.set_focus(None)
         self._update_footer()
+
+    def _switch_chat_mode(self, mode: str) -> None:
+        """Switch CHAT between its CHANNEL and DMS peer modes (CHAT/DM/
+
+        MENTION UX Part B/C) -- the header's peer selectors and the
+        C/D hotkeys all funnel through here. current_tab stays "chat"
+        throughout; only the inner #chat-content ContentSwitcher and
+        the leave/enter bookkeeping below change. A no-op if already in
+        the requested mode, matching every other selector's own
+        already-selected short-circuit -- callers that also want to
+        (re)focus the mode's own widget do so separately via
+        _focus_chat_mode, so re-focusing still works even when the
+        mode itself doesn't change.
+        """
+        if self._chat_mode == mode:
+            return
+        if self._chat_mode == "channel":
+            self._mark_new_messages_read()
+        else:
+            self._capture_current_dm_state()
+        self._chat_mode = mode
+        self.query_one("#chat-content", ContentSwitcher).current = (
+            "chat-channel" if mode == "channel" else "chat-dms"
+        )
+        if mode == "channel":
+            self._mark_unread_messages_viewed()
+            self._recount_unread()
+            self._refresh_chat_timestamps()
+        elif self.current_dm_node_id is None:
+            self._refresh_dm_list()
+        self._update_tab_bar()
+        self._update_footer()
+
+    def _focus_chat_mode(self, mode: str, *, open_dropdown: bool = False) -> None:
+        """Focus the appropriate widget for CHAT's given mode -- shared
+
+        by the C/D hotkeys, the header selectors, and show_tab("chat")'s
+        own entry behavior (which calls this only implicitly, via the
+        equivalent inline logic above, since it must also run the
+        mode's read/list-refresh bookkeeping every time the tab is
+        re-entered, not only when the mode actually changes).
+        """
+        if mode == "channel":
+            if open_dropdown:
+                selector = self.query_one(ChannelSelector)
+                selector.focus()
+                selector.open_menu()
+            else:
+                self.query_one("#chat-log", ChatTranscript).focus()
+        elif self.current_dm_node_id is None:
+            self.query_one("#dm-list", VerticalScroll).focus()
+        else:
+            self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+            dm_input = self.query_one("#dm-input", Input)
+            if not dm_input.disabled:
+                dm_input.focus()
+            else:
+                self.query_one("#dm-log", ChatTranscript).focus()
 
     @on(KeyboardDropdown.Selected)
     async def dropdown_selected(self, event: KeyboardDropdown.Selected) -> None:
         if event.setting_name == "channel_index":
             await self._switch_channel(int(event.value))
+            return
+        if event.setting_name == "chat_dm_mode":
+            # DMModeSelector's own Selected event ALWAYS carries a real
+            # conversation node_id here (never "dms" -- see its
+            # _activate_popup_item, which never posts Selected for the
+            # non-actionable "NO DMS" placeholder) -- PR #46 follow-up
+            # Part B item 11: ENTER on a highlighted conversation opens
+            # that EXACT conversation directly, the dropdown's whole
+            # point being to skip the generic list.
+            node_id = str(event.value)
+            self._switch_chat_mode("dms")
+            long_name, short_name = self._dm_identity(node_id)
+            self._open_dm_conversation(node_id, long_name=long_name, short_name=short_name)
             return
         if event.setting_name == "device_path":
             await self._switch_device(str(event.value))
@@ -3975,6 +5105,14 @@ class MeshtasticPassApp(App[None]):
             # separate "AUTO SYNC ENABLED/DISABLED" status line.
             self.settings.set_clock_auto_sync(bool(event.value))
             self.settings.save()
+            return
+        if event.setting_name == "network":
+            self._on_network_selected(str(event.value))
+            return
+        if event.setting_name == "radio_mode":
+            # Editing the RADIO MODE draft disarms any pending SAVE
+            # confirm, exactly like the plain editor fields do.
+            self._disarm_advanced_radio_confirm()
             return
 
         if event.setting_name == "font_size":
@@ -4022,6 +5160,78 @@ class MeshtasticPassApp(App[None]):
             self._monitor.start()
         except (OSError, ValueError) as error:
             status.update(f"USB DEVICE NOT CHANGED — {error}")
+
+    def _connection_nav_controls(self) -> list[Widget]:
+        """The explicit, ordered CONNECTION/CONFIG up/down focus list --
+
+        shared by the plain up/down dispatch (for non-Input rows) and
+        the isinstance(self.focused, Input) branch above (for the
+        ADVANCED RADIO NEW NETWORK editor's own plain Input fields,
+        which that branch's own early-return would otherwise swallow
+        up/down for) -- one definition, never two independently
+        maintained copies of this order.
+
+        Only ONE of the ADVANCED RADIO tails is ever included: the
+        collapsed [ NEW NETWORK ] row, or -- when the transient editor
+        is open -- NETWORK NAME/RADIO MODE/FREQ. SLOT/KEY then SAVE. The
+        hidden side is left out entirely so a `display: none` row never
+        becomes an unreachable focus stop. CANCEL is deliberately NOT a
+        vertical stop -- [ SAVE ] [ CANCEL ] share one row and CANCEL is
+        reached from SAVE with RIGHT (see on_key); vertical nav from
+        CANCEL is delegated to its SAVE sibling.
+        """
+        base: tuple[Widget, ...] = (
+            self.query_one(DeviceSelector),
+            self.query_one(LongNameControl),
+            self.query_one(ShortNameControl),
+            self.query_one(FontSizeSelector),
+            self.query_one(ColorSelector),
+            self.query_one(RoleSelector),
+            self.query_one(BluetoothSelector),
+            self.query_one(TimezoneSelector),
+            self.query_one(ScreenTimeoutSelector),
+            self.query_one(UnitsSelector),
+            self.query_one(CompassSelector),
+            self.query_one(FlipScreenSelector),
+            self.query_one(Clock24HSelector),
+            self.query_one(HopLimitSelector),
+            self.query_one(AutoSyncSelector),
+            self.query_one(NetworkSelector),
+        )
+        if self._network_editor_open:
+            tail: tuple[Widget, ...] = (
+                self.query_one("#network-name-input", Input),
+                self.query_one(RadioModeSelector),
+                self.query_one("#freq-slot-input", Input),
+                self.query_one("#key-input", Input),
+                self.query_one(SaveNetworkControl),
+            )
+        else:
+            tail = (self.query_one(NewNetworkControl),)
+        return [
+            control
+            for control in (*base, *tail)
+            if not getattr(control, "disabled", False)
+        ]
+
+    def _move_connection_focus(self, step: int, *, origin: Widget | None = None) -> bool:
+        """Move focus to the previous/next CONNECTION row; True if it did
+
+        (the caller's own responsibility to check self.current_tab ==
+        "connection" first and event.stop() on a True return). `origin`
+        overrides "which row we're moving FROM" -- used for CANCEL,
+        whose vertical movement is measured from its SAVE sibling since
+        CANCEL itself is not in the vertical list.
+        """
+        controls = self._connection_nav_controls()
+        current_widget = origin if origin is not None else self.focused
+        if current_widget not in controls:
+            return False
+        current = controls.index(current_widget)
+        target = controls[(current + step) % len(controls)]
+        target.focus()
+        target.scroll_visible(animate=False)
+        return True
 
     def _refresh_device_options(self) -> None:
         try:
@@ -4180,6 +5390,693 @@ class MeshtasticPassApp(App[None]):
                     event.dropdown.options if options is None else options,
                     value=spec.from_schema_value(authoritative),
                 )
+
+    # ---- ADVANCED RADIO (NETWORK selector + transient NEW NETWORK editor)
+
+    def _network_preset(self, name: str) -> RadioConfigPreset | None:
+        """The RadioConfigPreset for a NETWORK name -- a user-saved one
+
+        if it exists, else the built-in LongFast, else None. A user
+        NETWORK saved under the name "LongFast" deliberately shadows the
+        built-in (spec M: the built-in only has to remain *available*).
+        """
+        saved = self.settings.get_radio_config_preset(name)
+        if saved is not None:
+            return saved
+        if name == BUILTIN_LONGFAST_NETWORK:
+            return builtin_longfast_preset()
+        return None
+
+    def _network_options(self) -> list[DropdownOption]:
+        names = list(self.settings.radio_config_preset_names())
+        options: list[DropdownOption] = []
+        if BUILTIN_LONGFAST_NETWORK not in names:
+            options.append(
+                DropdownOption(BUILTIN_LONGFAST_NETWORK, BUILTIN_LONGFAST_NETWORK)
+            )
+        options.extend(DropdownOption(name, name) for name in names)
+        return options
+
+    def _refresh_network_options(self) -> None:
+        """Rebuild the NETWORK dropdown from the built-in LongFast plus
+
+        the saved NETWORK list, and re-assert the app's own selected
+        NETWORK (_selected_network) as the shown value -- never a live
+        radio readback, and never auto-applied. Called on mount, on
+        every connection-state change (see _render_radio_settings), and
+        after a SAVE/switch, so it is never left stale relative to the
+        saved list or a pending-then-abandoned selector choice.
+        """
+        selector = self.query_one(NetworkSelector)
+        options = self._network_options()
+        valid = {option.value for option in options}
+        if self._selected_network not in valid:
+            self._selected_network = BUILTIN_LONGFAST_NETWORK
+        selector.set_options(options, value=self._selected_network)
+
+    def _network_editor_fields(
+        self,
+    ) -> tuple[Input, RadioModeSelector, Input, Input]:
+        return (
+            self.query_one("#network-name-input", Input),
+            self.query_one(RadioModeSelector),
+            self.query_one("#freq-slot-input", Input),
+            self.query_one("#key-input", Input),
+        )
+
+    def _network_editor_rows(self) -> list[Widget]:
+        return [
+            self.query_one("#advanced-radio-editor-spacer", Static),
+            self.query_one("#network-name-row", NetworkFieldInput),
+            self.query_one(RadioModeSelector),
+            self.query_one("#freq-slot-row", NetworkFieldInput),
+            self.query_one("#key-row", NetworkFieldInput),
+            self.query_one("#advanced-radio-actions", Horizontal),
+        ]
+
+    def _set_network_editor_open(self, is_open: bool) -> None:
+        """Reveal/hide the transient NEW NETWORK editor rows. Toggles
+
+        each widget's inline `display` (overriding the
+        .advanced-radio-editor `display: none` default), and mirrors
+        the [ NEW NETWORK ] control the opposite way, so exactly one of
+        the two is ever visible/focusable.
+        """
+        self._network_editor_open = is_open
+        for row in self._network_editor_rows():
+            row.display = is_open
+        self.query_one(NewNetworkControl).display = not is_open
+
+    def _reset_network_editor_fields(self) -> None:
+        name_input, mode_selector, freq_input, key_input = self._network_editor_fields()
+        name_input.value = ""
+        freq_input.value = ""
+        key_input.value = ""
+        mode_selector.set_options(
+            (DropdownOption(label, value) for label, value in modem_preset_choices()),
+            value="LONG_FAST",
+        )
+
+    def _collapse_network_editor(self) -> None:
+        """Discard the NEW NETWORK editor's unsaved contents and hide it.
+
+        Zero RF, zero persistence, creates no NETWORK, shows no
+        unsaved-changes confirmation -- see spec E/F. Safe to call when
+        the editor is already collapsed (an idempotent no-op).
+        """
+        self._disarm_advanced_radio_confirm()
+        self._reset_network_editor_fields()
+        self._set_network_editor_open(False)
+
+    def _set_advanced_radio_status(self, text: str, css_class: str | None) -> None:
+        """#advanced-radio-status. Non-empty text is indented to the same
+
+        control/value column the form controls' "[ ... ]" start at
+        (CONNECTION_VALUE_COLUMN_INDENT), never the far-left label
+        column (spec J). `css_class`: "setting-accent" for pending AND
+        normal success (spec D/J both say ACCENT), "setting-error" for a
+        genuine failure (never ACCENT), None for a neutral confirm
+        prompt.
+
+        Non-empty status is scrolled just into view (minimal scroll, no
+        jump to the top) so the user can always see the result of the
+        NETWORK action they just triggered -- SWITCHING..., WAITING FOR
+        RECONNECT..., APPLIED, NOT APPLIED... (spec item 6).
+        """
+        status = self.query_one("#advanced-radio-status", Static)
+        status.remove_class("setting-error")
+        status.remove_class("setting-success")
+        status.remove_class("setting-accent")
+        if css_class:
+            status.add_class(css_class)
+        status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
+        if text and self.current_tab == "connection":
+            self.call_after_refresh(self._scroll_advanced_radio_status_into_view)
+
+    def _scroll_advanced_radio_status_into_view(self) -> None:
+        try:
+            self.query_one("#advanced-radio-status").scroll_visible(animate=False)
+        except Exception:
+            pass
+
+    def _arm_advanced_radio_confirm(self, action: str) -> None:
+        self._advanced_radio_confirm = action
+        if self._advanced_radio_confirm_timer is not None:
+            self._advanced_radio_confirm_timer.stop()
+        self._advanced_radio_confirm_timer = self.set_timer(
+            ADVANCED_RADIO_CONFIRM_SECONDS, self._advanced_radio_confirm_expired
+        )
+
+    def _disarm_advanced_radio_confirm(self) -> None:
+        self._advanced_radio_confirm = None
+        if self._advanced_radio_confirm_timer is not None:
+            self._advanced_radio_confirm_timer.stop()
+            self._advanced_radio_confirm_timer = None
+
+    def _advanced_radio_confirm_expired(self) -> None:
+        # Only the NEW NETWORK [ SAVE ] press-again-to-confirm is ever
+        # armed now -- switching between saved NETWORKs is a single
+        # ENTER with no confirmation (see _on_network_selected).
+        self._advanced_radio_confirm_timer = None
+        if self._advanced_radio_confirm is not None:
+            self._advanced_radio_confirm = None
+            self._set_advanced_radio_status("", None)
+
+    @on(NewNetworkControl.Activated)
+    def open_new_network(self, _event: NewNetworkControl.Activated) -> None:
+        """[ NEW NETWORK ] -- reveal a blank transient editor. Zero RF.
+
+        Brings the newly revealed editor into view and focuses NETWORK
+        NAME -- scrolling only as much as needed, never jumping the
+        CONNECTION view back to the top (spec H).
+        """
+        self._disarm_advanced_radio_confirm()
+        self._reset_network_editor_fields()
+        self._set_network_editor_open(True)
+        self._set_advanced_radio_status("", None)
+        self._reveal_network_editor()
+
+    def _reveal_network_editor(self) -> None:
+        def _do() -> None:
+            try:
+                name_input = self.query_one("#network-name-input", Input)
+            except Exception:
+                return
+            # Expose the whole revealed form, scrolling the minimum
+            # amount: the SAVE/CANCEL row (its bottom edge) first, then
+            # settle on NETWORK NAME so the first field and its cursor
+            # are what the user actually lands on.
+            self.query_one("#advanced-radio-actions").scroll_visible(animate=False)
+            name_input.focus()
+            name_input.scroll_visible(animate=False)
+
+        self.call_after_refresh(_do)
+
+    @on(CancelNetworkControl.Activated)
+    def cancel_new_network(self, _event: CancelNetworkControl.Activated) -> None:
+        """[ CANCEL ] -- discard + collapse the editor. Zero RF, no
+
+        confirmation, selected NETWORK unchanged (spec F).
+        """
+        self._collapse_network_editor()
+        self._set_advanced_radio_status("", None)
+        self.call_after_refresh(lambda: self.query_one(NewNetworkControl).focus())
+
+    @on(Input.Changed, "#network-name-input")
+    def network_name_changed(self, _event: Input.Changed) -> None:
+        self._disarm_advanced_radio_confirm()
+
+    @on(Input.Changed, "#freq-slot-input")
+    def network_freq_slot_changed(self, _event: Input.Changed) -> None:
+        self._disarm_advanced_radio_confirm()
+
+    @on(Input.Changed, "#key-input")
+    def network_key_changed(self, _event: Input.Changed) -> None:
+        self._disarm_advanced_radio_confirm()
+
+    def _validated_network_from_editor(self) -> RadioConfigPreset | None:
+        """Build a RadioConfigPreset from the editor, or set an error
+
+        status and return None. NETWORK NAME is never written as the
+        Meshtastic primary-channel name (channel_name stays "").
+        """
+        name_input, mode_selector, freq_input, key_input = self._network_editor_fields()
+        name = name_input.value.strip()
+        if not name:
+            self._set_advanced_radio_status(
+                "NOT SAVED — NETWORK NAME REQUIRED", "setting-error"
+            )
+            return None
+        freq_text = freq_input.value.strip()
+        try:
+            frequency_slot = int(freq_text) if freq_text else 0
+            if frequency_slot < 0:
+                raise ValueError
+        except ValueError:
+            self._set_advanced_radio_status(
+                "NOT SAVED — INVALID FREQ. SLOT", "setting-error"
+            )
+            return None
+        key_text = key_input.value.strip()
+        if key_text:
+            try:
+                base64.b64decode(key_text, validate=True)
+            except Exception:
+                self._set_advanced_radio_status(
+                    "NOT SAVED — INVALID KEY (MUST BE BASE64)", "setting-error"
+                )
+                return None
+        return RadioConfigPreset(
+            name=name,
+            modem_preset=str(mode_selector.value),
+            frequency_slot=frequency_slot,
+            channel_name="",
+            channel_psk_base64=key_text,
+        )
+
+    @staticmethod
+    def _log_netcfg(line: str) -> None:
+        """One concise ADVANCED RADIO apply diagnostic line -- rare (only
+
+        a deliberate, confirmed SAVE/switch triggers any), never a
+        continuous stream, and never secret key material (see
+        _begin_network_apply's PSK line: length only). Plain print,
+        matching rx_debug_log's own "lightweight terminal trace, not
+        logging.*" precedent.
+        """
+        print(f"[NETCFG] {line}", flush=True)
+
+    @on(SaveNetworkControl.Activated)
+    def save_network(self, _event: SaveNetworkControl.Activated) -> None:
+        """[ SAVE ] -- validate, confirm (RF/config WILL change), persist
+
+        the NETWORK locally, then apply it through the radio-service
+        boundary. There is no separate APPLY button (spec I).
+        """
+        preset = self._validated_network_from_editor()
+        if preset is None:
+            return
+        if self._network_apply is not None:
+            self._set_advanced_radio_status(
+                f"APPLY IN PROGRESS — {self._network_apply.name}", None
+            )
+            return
+        if self._advanced_radio_confirm != "save":
+            self._arm_advanced_radio_confirm("save")
+            self._set_advanced_radio_status(
+                "PRESS SAVE AGAIN TO CONFIRM — SAVING WILL CHANGE THE CONNECTED "
+                "RADIO'S NETWORK/RF CONFIGURATION AND MAY MOVE IT OFF ITS "
+                "CURRENT NETWORK",
+                None,
+            )
+            return
+        self._disarm_advanced_radio_confirm()
+        try:
+            self.settings.save_radio_config_preset(preset)
+            self.settings.save()
+        except (OSError, ValueError) as error:
+            # Local persistence failed -- keep the editor open so the
+            # user can retry; nothing was applied.
+            self._set_advanced_radio_status(f"NOT SAVED — {error}", "setting-error")
+            return
+        # Persisted. Select it, collapse the editor, restore NEW NETWORK
+        # (spec I steps 6-8) -- the RF result is reported honestly in
+        # the status line, never by falsely claiming it was applied.
+        self._selected_network = preset.name
+        self._refresh_network_options()
+        self._collapse_network_editor()
+        if self._radio_state is not RadioState.ONLINE:
+            self._set_advanced_radio_status(
+                f"{preset.name} SAVED — RADIO OFFLINE, NOT APPLIED", "setting-error"
+            )
+            return
+        self._begin_network_apply(preset.name, preset, saved=True)
+
+    def _on_network_selected(self, value: str) -> None:
+        """NETWORK dropdown ENTER-selection. Opening the dropdown and
+
+        moving through choices never reaches here (KeyboardDropdown only
+        posts Selected on ENTER), and ESC just closes it -- both are
+        zero RF. Selecting a DIFFERENT saved NETWORK is itself the
+        commitment: it immediately begins the reboot-aware apply
+        lifecycle with NO second ENTER and NO confirmation prompt. The
+        NETWORK is not treated as active until post-reconnect readback
+        verification succeeds (see _resolve_network_apply_after_reconnect).
+        """
+        if value == self._selected_network:
+            if self._network_apply is None:
+                self._set_advanced_radio_status("", None)
+            return
+        if self._network_apply is not None:
+            # An apply is already in flight -- ignore the stray
+            # selection and put the selector back where it was.
+            self._refresh_network_options()
+            return
+        # Selecting a NETWORK abandons any unfinished NEW NETWORK editor
+        # (spec K) -- same transient discard rules, never an accidental
+        # SAVE of half-entered values.
+        if self._network_editor_open:
+            self._collapse_network_editor()
+        self._disarm_advanced_radio_confirm()
+        preset = self._network_preset(value)
+        if preset is None:
+            self._set_advanced_radio_status(
+                f"UNKNOWN NETWORK — {value}", "setting-error"
+            )
+            self._refresh_network_options()
+            return
+        if self._radio_state is not RadioState.ONLINE:
+            self._set_advanced_radio_status(
+                "NOT APPLIED — RADIO NOT CONNECTED", "setting-error"
+            )
+            self._refresh_network_options()
+            return
+        self._begin_network_apply(value, preset, saved=False)
+
+    # ---- NETWORK apply state machine (SAVE + switch share this) ----------
+
+    def _begin_network_apply(
+        self, name: str, preset: RadioConfigPreset, *, saved: bool
+    ) -> None:
+        """Start the ONE outstanding NETWORK apply. Writing LoRa
+
+        modem_preset / channel_num / PSK reboots real Meshtastic
+        firmware, so this operation is explicitly bounded: a
+        NETWORK_APPLY_TIMEOUT_SECONDS timer guarantees a terminal
+        SUCCESS/ERROR even if the SDK call never returns, and an
+        expected mid-apply disconnect is folded into the lifecycle (see
+        _on_connection_state_for_network_apply) rather than treated as
+        failure.
+        """
+        self._network_apply_seq += 1
+        token = self._network_apply_seq
+        self._network_apply = NetworkApply(token, name, preset, saved)
+        try:
+            decoded_len = (
+                len(base64.b64decode(preset.channel_psk_base64))
+                if preset.channel_psk_base64
+                else 0
+            )
+        except Exception:
+            decoded_len = -1
+        self._log_netcfg(
+            f"apply#{token} REQUEST name={name!r} saved={saved} "
+            f"modem_preset={preset.modem_preset} freq_slot={preset.frequency_slot} "
+            f"psk={'present' if preset.channel_psk_base64 else 'absent'} "
+            f"decoded_len={decoded_len}"
+        )
+        if self._network_apply_timer is not None:
+            self._network_apply_timer.stop()
+        self._network_apply_timer = self.set_timer(
+            NETWORK_APPLY_TIMEOUT_SECONDS,
+            lambda: self._network_apply_timed_out(token),
+        )
+        opening = (
+            f"SAVING & APPLYING {name}..." if saved else f"SWITCHING TO {name}..."
+        )
+        self._set_advanced_radio_status(opening, "setting-accent")
+        self._run_radio_worker(
+            f"network-apply-{token}",
+            lambda: self._apply_network_from_thread(token, name, preset, saved),
+        )
+
+    def _apply_network_from_thread(
+        self, token: int, name: str, preset: RadioConfigPreset, saved: bool
+    ) -> None:
+        stage_log = lambda message: self._log_netcfg(f"apply#{token} {message}")
+        try:
+            result = apply_radio_config_preset(self.radio, preset, stage_log=stage_log)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            result = RadioApplyResult(
+                False,
+                "error",
+                {"error": ConfigWriteResult(False, None, None, f"error: {detail}")},
+            )
+        self._log_netcfg(
+            f"apply#{token} write returned applied={result.applied} "
+            f"failed_step={result.failed_step or '-'}"
+        )
+        # A genuine write/commit/API stage error fails immediately --
+        # no point verifying a write that did not go out. Only a write
+        # that RETURNED applied gets the post-commit convergence poll.
+        verification: RadioConfigVerification | None = None
+        if result.applied:
+            verification = self._verify_network_apply_converge(token, preset)
+        self.post_message(
+            RadioConfigPresetApplied(token, name, result, saved, verification)
+        )
+
+    # A fire-and-forget set_config + commit takes a moment to propagate
+    # into the SDK's synced state on real hardware, so the FIRST fresh
+    # readback can still show the OLD config -- which is what made a
+    # switch "work only every few tries". After a write that returned
+    # applied, poll a genuinely fresh readback ~once/second until it
+    # converges on the requested NETWORK, or the bounded window passes.
+    # Never a single big sleep; never blocks the UI thread (runs on the
+    # apply worker). Well within the 90s overall safety timeout.
+    _NETWORK_VERIFY_SETTLE_SECONDS = 0.5
+    _NETWORK_VERIFY_DEADLINE_SECONDS = 12.0
+    _NETWORK_VERIFY_INTERVAL_SECONDS = 1.0
+    _NETWORK_VERIFY_REREAD_TIMEOUT = 3.0
+
+    def _verify_network_apply_converge(
+        self, token: int, preset: RadioConfigPreset
+    ) -> RadioConfigVerification | None:
+        """Post-commit convergence poll (apply worker thread).
+
+        Returns the matching RadioConfigVerification the moment the
+        radio's fresh readback matches the requested NETWORK; None if
+        the radio dropped mid-window (the reconnect path then owns the
+        verify -- see _on_connection_state_for_network_apply); or, at
+        the deadline, the last mismatch (-> terminal field-named error)
+        or None if the readback never answered (-> VERIFY READBACK
+        TIMEOUT). Every attempt asks the radio for CURRENT values
+        (reread_lora_and_primary_channel = fresh get_config +
+        get_channel), never a re-check of one cached object. Zero
+        config writes -- readback only.
+        """
+        sleep(self._NETWORK_VERIFY_SETTLE_SECONDS)
+        started = monotonic()
+        deadline = started + self._NETWORK_VERIFY_DEADLINE_SECONDS
+        reread = getattr(self.radio, "reread_lora_and_primary_channel", None)
+        last: RadioConfigVerification | None = None
+        attempt = 0
+        while True:
+            attempt += 1
+            current = self._network_apply
+            if current is None or current.token != token:
+                # This apply was superseded by a newer one, cancelled,
+                # or already resolved -- stop polling the radio.
+                self._log_netcfg(f"apply#{token} verify cancelled (superseded)")
+                return None
+            if self._radio_state is not RadioState.ONLINE:
+                self._log_netcfg(
+                    f"apply#{token} verify attempt={attempt} radio not ONLINE "
+                    "-> reconnect path owns verify"
+                )
+                return None
+            answered = True
+            try:
+                if callable(reread):
+                    answered = bool(
+                        reread(timeout=self._NETWORK_VERIFY_REREAD_TIMEOUT)
+                    )
+            except Exception as error:
+                self._log_netcfg(
+                    f"apply#{token} verify attempt={attempt} reread ERROR "
+                    f"{error.__class__.__name__}"
+                )
+                answered = False
+            if answered:
+                last = verify_radio_config_preset(self.radio, preset)
+                for check in last.checks:
+                    self._log_netcfg(
+                        f"apply#{token} verify attempt={attempt} {check.field} "
+                        f"requested={check.requested} actual={check.actual} "
+                        f"match={check.match}"
+                    )
+                if last.ok:
+                    self._log_netcfg(
+                        f"apply#{token} converged attempt={attempt} "
+                        f"elapsed={monotonic() - started:.1f}s"
+                    )
+                    return last
+            else:
+                self._log_netcfg(
+                    f"apply#{token} verify attempt={attempt} readback did not answer"
+                )
+            if monotonic() >= deadline:
+                if last is not None:
+                    unconverged = [c.field for c in last.checks if not c.match]
+                    actual = ", ".join(f"{c.field}={c.actual}" for c in last.checks)
+                    self._log_netcfg(
+                        f"apply#{token} did NOT converge after {attempt} attempts "
+                        f"{monotonic() - started:.1f}s -- unconverged={unconverged} "
+                        f"final actual: {actual}"
+                    )
+                else:
+                    self._log_netcfg(
+                        f"apply#{token} did NOT converge -- readback never answered "
+                        f"in {monotonic() - started:.1f}s"
+                    )
+                return last
+            sleep(self._NETWORK_VERIFY_INTERVAL_SECONDS)
+
+    @on(RadioConfigPresetApplied)
+    def radio_config_preset_applied(self, event: RadioConfigPresetApplied) -> None:
+        apply = self._network_apply
+        if apply is None or apply.token != event.token:
+            # A late return from a superseded / already-timed-out
+            # attempt: never misattributed to whatever is current now.
+            return
+        if apply.awaiting_reconnect:
+            # A disconnect was already observed while the worker ran
+            # (commit rebooted the radio). Its verification -- if any --
+            # is pre-reboot and stale; the reconnect full-sync + verify
+            # is authoritative (see _resolve_network_apply_after_reconnect).
+            self._log_netcfg(
+                f"apply#{apply.token} worker returned but disconnect already "
+                "observed -- reconnect owns the verify"
+            )
+            return
+        result = event.result
+        step_result = (
+            result.results.get(result.failed_step) if not result.applied else None
+        )
+        raw_reason = step_result.reason if step_result is not None else ""
+        # WAITING FOR RECONNECT is entered ONLY on a real observed
+        # ONLINE -> non-ONLINE transition correlated with this apply --
+        # never merely because a write/ACK/readback timed out. A generic
+        # "timeout"/"not_connected" service string is NOT evidence the
+        # radio rebooted (hardware has shown these writes do NOT reboot
+        # it).
+        if self._radio_state is not RadioState.ONLINE or raw_reason == "disconnected":
+            apply.awaiting_reconnect = True
+            self._log_netcfg(
+                f"apply#{apply.token} radio down after "
+                f"{result.failed_step or 'commit'} ({raw_reason or '-'}) "
+                "-> awaiting reboot/reconnect"
+            )
+            self._set_advanced_radio_status(
+                f"APPLYING {apply.name} — RADIO REBOOTED, WAITING FOR RECONNECT...",
+                "setting-accent",
+            )
+            return
+        # The radio is still connected. A write STAGE that failed is a
+        # terminal error naming that stage.
+        if not result.applied:
+            label = NETWORK_STAGE_LABELS.get(
+                result.failed_step, (result.failed_step or "WRITE").upper()
+            )
+            self._finish_network_apply(
+                success=False, detail=f"{label} {(raw_reason or 'FAILED').upper()}"
+            )
+            return
+        # Writes went out; verify from the fresh readback. A readback
+        # that never answered while still connected is itself a terminal
+        # failure -- NOT a reboot, NOT an indefinite wait.
+        if event.verification is None:
+            self._log_netcfg(
+                f"apply#{apply.token} connected but readback did not answer"
+            )
+            self._finish_network_apply(
+                success=False, detail="VERIFY READBACK TIMEOUT"
+            )
+            return
+        self._finish_network_apply_from_verification(
+            event.verification, source="post-write"
+        )
+
+    def _finish_network_apply_from_verification(
+        self, verification: RadioConfigVerification, *, source: str
+    ) -> None:
+        apply = self._network_apply
+        if apply is None:
+            return
+        # The post-write convergence poll already logged every attempt's
+        # per-field lines; only the reconnect path needs them here.
+        if source != "post-write":
+            for check in verification.checks:
+                self._log_netcfg(
+                    f"apply#{apply.token} verify[{source}] {check.field} "
+                    f"requested={check.requested} actual={check.actual} "
+                    f"match={check.match}"
+                )
+        self._log_netcfg(
+            f"apply#{apply.token} verify[{source}] {verification.channel_name_note}"
+        )
+        if verification.ok:
+            self._finish_network_apply(
+                success=True, detail=f"readback-verified ({source})"
+            )
+            return
+        label = NETWORK_FIELD_LABELS.get(
+            verification.mismatched_field,
+            f"{verification.mismatched_field.upper() or 'READBACK'} MISMATCH",
+        )
+        self._finish_network_apply(success=False, detail=label)
+
+    def _on_connection_state_for_network_apply(
+        self, state: RadioState, was_online: bool
+    ) -> None:
+        """Fold an EXPECTED mid-apply disconnect/reconnect into the
+
+        NETWORK apply lifecycle -- called from _show_connection on every
+        radio-state transition. A disconnect while an apply is
+        outstanding is the LoRa-config reboot, not a failure; the
+        following reconnect is where the new config is read back and the
+        operation finally resolves. Scoped entirely to a live
+        _network_apply -- ordinary connects/reconnects with nothing
+        outstanding are untouched.
+        """
+        apply = self._network_apply
+        if apply is None:
+            return
+        if state is not RadioState.ONLINE:
+            if not apply.awaiting_reconnect:
+                apply.awaiting_reconnect = True
+                self._log_netcfg(
+                    f"apply#{apply.token} disconnect observed during apply "
+                    "-> awaiting reconnect"
+                )
+            self._set_advanced_radio_status(
+                f"APPLYING {apply.name} — RADIO REBOOTED, WAITING FOR RECONNECT...",
+                "setting-accent",
+            )
+            return
+        # ONLINE again. Only a genuine reconnect after the expected
+        # reboot triggers readback -- never a redundant "still ONLINE".
+        if apply.awaiting_reconnect and not was_online:
+            self._resolve_network_apply_after_reconnect()
+
+    def _resolve_network_apply_after_reconnect(self) -> None:
+        apply = self._network_apply
+        if apply is None:
+            return
+        # The reconnect already ran a full config sync, so the SDK's
+        # already-synced cache is fresh -- verify_radio_config_preset
+        # only reads it (zero RF), safe on the UI thread.
+        verification = verify_radio_config_preset(self.radio, apply.preset)
+        self._finish_network_apply_from_verification(verification, source="reconnect")
+
+    def _network_apply_timed_out(self, token: int) -> None:
+        if self._network_apply is None or self._network_apply.token != token:
+            return
+        self._log_netcfg(f"apply#{token} timed out after {NETWORK_APPLY_TIMEOUT_SECONDS}s")
+        self._finish_network_apply(success=False, detail="timed out")
+
+    def _finish_network_apply(self, *, success: bool, detail: str) -> None:
+        apply = self._network_apply
+        if apply is None:
+            return
+        if self._network_apply_timer is not None:
+            self._network_apply_timer.stop()
+            self._network_apply_timer = None
+        self._network_apply = None
+        self._log_netcfg(
+            f"apply#{apply.token} FINAL success={success} ({detail})"
+        )
+        if success:
+            self._selected_network = apply.name
+            self._refresh_network_options()
+            prefix = "SAVED & " if apply.saved else ""
+            # Spec D/J: normal success uses ACCENT here, not the
+            # confirm-green .setting-success other CONNECTION rows use.
+            self._set_advanced_radio_status(
+                f"{apply.name} {prefix}APPLIED", "setting-accent"
+            )
+            return
+        # Failure. A SAVE stays saved+selected locally (honest: "SAVED
+        # -- NOT APPLIED"); a bare switch reverts the selector to the
+        # actual current NETWORK. Never claims the failed NETWORK is
+        # active.
+        if not apply.saved:
+            self._refresh_network_options()
+        prefix = "SAVED — " if apply.saved else ""
+        self._set_advanced_radio_status(
+            f"{apply.name} {prefix}NOT APPLIED: {detail}", "setting-error"
+        )
 
     def _reset_clock_sync_state(self) -> None:
         """Invalidate whatever the OLD connection's in-flight AUTO SYNC
@@ -4351,6 +6248,7 @@ class MeshtasticPassApp(App[None]):
         write_verified_config_field, to verify a write this session
         just made.
         """
+        self._refresh_network_options()
         info_widget = self.query_one("#radio-info", Static)
         timezone_dropdown = self.query_one(TimezoneSelector)
         dropdowns: tuple[tuple[KeyboardDropdown, RadioSettingSpec], ...] = (
@@ -4515,6 +6413,17 @@ class MeshtasticPassApp(App[None]):
             lambda: self._send_from_thread(entry, generation),
             thread=True,
         )
+        # UI / CHANNEL / RADIO CONFIG TUNING Part B: a successful send
+        # (text was accepted -- both guard clauses above already
+        # returned early without reaching here for empty text/offline
+        # radio, so no typed text is ever discarded by this) returns
+        # CHAT to its neutral navigation state -- the composer already
+        # cleared its own value (_start_outgoing) and now loses focus
+        # too, so the very next ordinary printable keypress starts a
+        # NEW message from scratch via on_key's own unfocused-hotkey/
+        # printable-character dispatch, rather than continuing to type
+        # into an already-focused, already-empty composer.
+        self.query_one("#chat-log", ChatTranscript).focus()
 
     @on(Input.Changed, "#chat-input")
     def chat_input_changed(self, _event: Input.Changed) -> None:
@@ -4712,6 +6621,7 @@ class MeshtasticPassApp(App[None]):
         monotonic_now = monotonic()
         chat_is_visible = (
             self.current_tab == "chat"
+            and self._chat_mode == "channel"
             and channel_index == self.current_channel_index
         )
         entry = received_chat_entry(
@@ -4815,6 +6725,33 @@ class MeshtasticPassApp(App[None]):
     def _state_for(self, channel_index: int) -> ChannelChatState:
         return self._channel_states.setdefault(channel_index, ChannelChatState())
 
+    def _channel_key_for(self, channel_index: int) -> str | None:
+        """The live radio's own stable identity for this channel slot.
+
+        None means "unknown" (index not found, or the radio hasn't
+        reported a real ChannelSettings.id/psk for it yet -- e.g. the
+        pre-connection placeholder channel list) -- see
+        ChannelInfo.stable_key and ChannelChatState.loaded_key.
+        """
+        for channel in self._channels:
+            if channel.index == channel_index:
+                return channel.stable_key or None
+        return None
+
+    def _channel_label(self, channel_index: int) -> str:
+        """The current channel selector's own presentation label.
+
+        Falls back exactly like RadioService._read_channel_info's own
+        "Channel {index + 1}" convention when the index isn't in the
+        live list (e.g. not yet connected) -- so the empty-history
+        marker (StartOfChannelHistoryMarker) always shows something
+        sensible rather than a blank/placeholder name.
+        """
+        for channel in self._channels:
+            if channel.index == channel_index:
+                return channel.name
+        return f"Channel {channel_index + 1}"
+
     def _capture_current_channel_state(self) -> None:
         state = self._state_for(self.current_channel_index)
         state.entries = self.chat_history
@@ -4838,16 +6775,35 @@ class MeshtasticPassApp(App[None]):
         return state
 
     def _ensure_channel_loaded(self, channel_index: int) -> ChannelChatState:
+        """Load `channel_index` from the store the FIRST time it is
+
+        touched this app run, and never again after that (`state.loaded`
+        latches permanently true) -- this method deliberately never
+        re-queries or replaces `state.entries` for an already-loaded
+        state: doing so here (rather than through
+        _reconcile_current_channel_identity's own careful compare-then-
+        remount) would silently desync self.chat_history's objects from
+        whatever ChatEntryWidgets are already mounted for the CURRENT
+        channel (identity comparisons like _trim_mounted_chat_window's
+        `widget.entry is entry` would then never match). A same-slot
+        identity change discovered later is handled entirely by
+        _show_connection's own channel-sync block instead -- see
+        _reconcile_current_channel_identity (current channel) and
+        _invalidate_reassigned_channel_caches (every other channel).
+        """
         state = self._state_for(channel_index)
         if state.loaded:
             return state
         state.loaded = True
+        key = self._channel_key_for(channel_index)
+        state.loaded_key = key
         if self.chat_store is None:
             return state
         try:
             page = self.chat_store.load_recent_page(
                 channel_index=channel_index,
                 limit=DEFAULT_HISTORY_LIMIT,
+                channel_key=key,
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -4857,28 +6813,91 @@ class MeshtasticPassApp(App[None]):
         state.open_scroll_pending = bool(page.messages)
         return state
 
+    def _invalidate_reassigned_channel_caches(
+        self, new_channels: tuple[ChannelInfo, ...]
+    ) -> None:
+        """Drop the cached state for any NON-CURRENT channel whose live
+
+        identity changed since it was last loaded (CHAT channel-history
+        isolation). Safe to simply discard entirely: unlike the
+        CURRENTLY-displayed channel there is no already-mounted
+        transcript here to keep in sync (see
+        _reconcile_current_channel_identity, which handles that harder,
+        remount-aware case for the current channel instead) -- the next
+        access just reloads from scratch, exactly like a channel
+        touched for the first time this run.
+        """
+        live_keys = {channel.index: channel.stable_key or None for channel in new_channels}
+        for index in list(self._channel_states):
+            if index == self.current_channel_index:
+                continue
+            state = self._channel_states[index]
+            if not state.loaded or state.loaded_key is None:
+                continue
+            live_key = live_keys.get(index)
+            if live_key is not None and live_key != state.loaded_key:
+                del self._channel_states[index]
+
+    def _initial_chat_widgets(
+        self, channel_index: int, state: ChannelChatState
+    ) -> list[Static | ChatEntryWidget]:
+        """The widget list a freshly (re)mounted transcript starts with.
+
+        Shared by _load_chat_history (startup), _switch_channel (user-
+        driven switch), and _show_connection's post-reconnect identity
+        reload -- one place decides between LOAD OLDER, END OF CHAT
+        HISTORY, and the new empty-channel marker (CHAT channel-history
+        isolation), so the three call sites can never drift apart.
+        """
+        widgets: list[Static | ChatEntryWidget] = []
+        if state.has_older_history:
+            widgets.append(LoadOlderControl())
+        elif state.entries and self.chat_store is not None:
+            widgets.append(EndOfChatHistoryMarker())
+        elif self.chat_store is not None:
+            widgets.append(
+                StartOfChannelHistoryMarker(self._channel_label(channel_index))
+            )
+        widgets.extend(self._chat_entry_widget(entry) for entry in state.entries)
+        return widgets
+
     async def _switch_channel(self, channel_index: int) -> None:
+        # Selecting a channel always switches CHAT into CHANNEL mode
+        # (CHAT/DM/MENTION UX item 4) -- even when the target index is
+        # already the current one (the user may be sitting in DMS mode
+        # and re-picking the already-selected channel purely to get
+        # back to it), so this mode switch runs unconditionally, before
+        # the early-return below.
+        if self.current_tab == "chat":
+            self._switch_chat_mode("channel")
         if channel_index == self.current_channel_index:
             return
-        if self.current_tab == "chat":
+        if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_new_messages_read()
         self._capture_current_channel_state()
         state = self._restore_channel_state(channel_index)
+        await self._mount_channel_transcript(channel_index, state)
+
+    async def _mount_channel_transcript(
+        self, channel_index: int, state: ChannelChatState
+    ) -> None:
+        """Rebuild the mounted transcript to match `state` for `channel_index`.
+
+        The shared tail of a user-driven _switch_channel AND a
+        background identity-driven refresh of the ALREADY-displayed
+        channel (see _reconcile_current_channel_identity) -- both need
+        the exact same "clear, remount from state" behavior.
+        """
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
             chat_inputs[0].value = state.draft
             chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
         await transcript.remove_children()
-        widgets: list[Static | ChatEntryWidget] = []
-        if state.has_older_history:
-            widgets.append(LoadOlderControl())
-        elif state.entries and self.chat_store is not None:
-            widgets.append(EndOfChatHistoryMarker())
-        widgets.extend(self._chat_entry_widget(entry) for entry in state.entries)
+        widgets = self._initial_chat_widgets(channel_index, state)
         if widgets:
             await transcript.mount(*widgets)
-        if self.current_tab == "chat":
+        if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_unread_messages_viewed()
             self._recount_unread()
         selector = self.query_one(ChannelSelector)
@@ -4889,6 +6908,66 @@ class MeshtasticPassApp(App[None]):
         self.call_after_refresh(self._jump_to_newest)
 
         self._render_chat_status()
+
+    async def _reconcile_current_channel_identity(self) -> None:
+        """Refresh the CURRENTLY-displayed channel if its live identity
+
+        changed since it was loaded (CHAT channel-history isolation).
+        Handles the one case _show_connection's own channel-sync block
+        cannot: a same-INDEX radio reconfiguration (e.g. slot 0
+        LongFast -> MediumSlow, whether discovered between app runs or
+        mid-session) never trips "selected_index != current_channel_
+        index", since the index itself never changes -- only what it
+        now MEANS does.
+
+        A no-op the overwhelming majority of the time (ordinary
+        reconnect, nothing reconfigured): only issues a second query
+        when the live channel_key actually differs from what is
+        currently mounted, and only remounts the transcript when that
+        query's result set is genuinely different content -- never a
+        visible refresh on every ordinary reconnect.
+        """
+        channel_index = self.current_channel_index
+        state = self._state_for(channel_index)
+        key = self._channel_key_for(channel_index)
+        if state.loaded_key == key:
+            return
+        if self.chat_store is None:
+            state.loaded_key = key
+            return
+        try:
+            page = self.chat_store.load_recent_page(
+                channel_index=channel_index,
+                limit=DEFAULT_HISTORY_LIMIT,
+                channel_key=key,
+            )
+        except ChatStoreError as error:
+            self._show_send_error(str(error))
+            return
+        fresh_ids = tuple(stored.id for stored in page.messages)
+        current_ids = tuple(entry.message_id for entry in state.entries)
+        # loaded_key is recorded regardless of whether content changed --
+        # this key has now been validated against the store either way,
+        # so the next reconcile has nothing left to re-check until the
+        # live identity changes again.
+        state.loaded_key = key
+        if fresh_ids == current_ids:
+            return
+        # A GENUINE difference: `state.entries`/self.chat_history are only
+        # ever replaced with fresh objects in THIS branch, never on the
+        # equal-content path above -- replacing them unconditionally would
+        # desync already-mounted ChatEntryWidgets (which hold references
+        # to the OLD entry objects) from self.chat_history's new objects,
+        # breaking every `widget.entry is entry` identity comparison
+        # elsewhere (e.g. _trim_mounted_chat_window) even though nothing
+        # actually needed to change.
+        state.entries = [stored_chat_entry(stored) for stored in page.messages]
+        state.has_older_history = page.has_older
+        state.open_scroll_pending = bool(page.messages)
+        state.loaded = True
+        self.chat_history = state.entries
+        self._has_older_history = state.has_older_history
+        await self._mount_channel_transcript(channel_index, state)
 
     def _append_chat_widget(self, entry: ChatEntry) -> None:
         """Compatibility wrapper for callers that already appended an entry."""
@@ -4902,9 +6981,16 @@ class MeshtasticPassApp(App[None]):
         older: bool,
     ) -> None:
         transcript = self.query_one("#chat-log", ChatTranscript)
+        # The empty-channel marker (StartOfChannelHistoryMarker) is only
+        # ever mounted when a channel has zero entries -- the first real
+        # entry inserted anywhere in the transcript makes it stale by
+        # definition, so it is removed unconditionally here rather than
+        # left for some later refresh to notice.
+        for marker in transcript.query(StartOfChannelHistoryMarker):
+            marker.remove()
         if not self._has_older_history and self.chat_store is not None:
             self._ensure_end_history_marker(transcript)
-        if self.current_tab != "chat":
+        if self.current_tab != "chat" or self._chat_mode != "channel":
             following = self._following_chat_widget(insert_index)
             transcript.mount(self._chat_entry_widget(entry), before=following)
             self._trim_mounted_chat_window(transcript)
@@ -5176,7 +7262,7 @@ class MeshtasticPassApp(App[None]):
         # (see _mesh_active_count -- it never touches the board/widget,
         # so this can never "reshuffle" the topology).
         self._update_tab_bar(current_time, mesh_working_set=working_set)
-        self._update_mesh_status_line(working_set, current_time)
+        self._update_mesh_node_bar(working_set, current_time)
         views = list(self.query(MeshTopologyView))
         statuses = list(self.query("#mesh-status"))
         if not views or not statuses:
@@ -5197,12 +7283,18 @@ class MeshtasticPassApp(App[None]):
             return
         view = views[0]
         status = statuses[0]
+        # TRACE ROUTE (Part C): a pending trace's animated "TRACING
+        # ROUTE TO SHN > > >" status, or a just-finished TRACE
+        # SUCCEEDED/TRACE FAILED banner, takes over this SAME top-left
+        # widget -- never a second one -- so it must win over whatever
+        # this method would otherwise show here, in EITHER branch below.
+        override = self._mesh_status_override_text()
         if not working_set:
             view.clear_nodes()
-            status.update("NO MESH DATA")
-            self._update_mesh_context_status()
+            status.update("NO MESH DATA" if override is None else override)
+            self._update_mesh_node_bar(working_set, current_time)
             return
-        status.update("")
+        status.update("" if override is None else override)
         # A real CLIENT with a truthful nonzero hop count is placed at
         # least hops_away+1 grid steps out -- never closer -- so its own
         # anonymous relay-stage placeholders have genuinely interior
@@ -5212,11 +7304,73 @@ class MeshtasticPassApp(App[None]):
         min_radius_by_id = {
             node_id: hops + 1 for node_id, hops in _mesh_hop_counts(working_set).items()
         }
+        # A total remote-population turnover (radio swap, or a NodeDB
+        # reset -- not one remote node's ID mismatch, but the entire
+        # current remote set sharing nothing with what was previously
+        # remembered) is exactly the "substantial logical topology
+        # change" stickiness is not meant to apply across: without this
+        # reset, unrelated leftover positions/extents from a completely
+        # different node population would otherwise still constrain
+        # this one's fresh placement. Never triggers on ordinary churn
+        # (one node joining/leaving among others that persist), only a
+        # clean break -- see MeshLayoutStabilityAppTests.
+        current_remote_ids = {
+            state.node.node_id.strip().lower()
+            for state in working_set
+            if not state.node.is_local
+        }
+        local_id = next(
+            (state.node.node_id.strip().lower() for state in working_set if state.node.is_local),
+            "",
+        )
+        previous_remote_ids = set(self._mesh_sticky_positions) - {local_id}
+        if previous_remote_ids and current_remote_ids and not (
+            current_remote_ids & previous_remote_ids
+        ):
+            self._mesh_sticky_positions = {}
+            self._mesh_extent_ratchet = {"up": 0, "down": 0, "left": 0, "right": 0}
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
             max_radius=DEFAULT_MAX_GRID_RADIUS,
             min_radius_by_id=min_radius_by_id,
+            sticky_positions=self._mesh_sticky_positions,
         )
+        # MESH LAYOUT STABILITY: remember this cycle's own positions,
+        # pruned to only currently-present nodes (a departed node's
+        # vacated cell simply becomes free for whoever's placed next --
+        # it never itself displaces anyone), so the NEXT call's sticky
+        # lookup reflects reality, not indefinitely-accumulating history.
+        self._mesh_sticky_positions = {
+            item.node.node_id.strip().lower(): (item.x, item.y, item.region)
+            for item in slots
+        }
+        # Ratchet (monotonic max, never shrinks) each axis's own
+        # farthest-logical-step extent -- see place_within_bounds'
+        # min_extent docstring: without this, a node aging out (making
+        # the axis's current farthest node closer) would immediately
+        # re-compact every other node sharing that axis, and a new
+        # farther node appearing would stretch (and so move) them
+        # outward -- both routine events, neither genuine topology
+        # information about any node OTHER than the one that
+        # appeared/departed.
+        self._mesh_extent_ratchet = {
+            "up": max(
+                self._mesh_extent_ratchet["up"],
+                max((-item.y for item in slots if item.y < 0), default=0),
+            ),
+            "down": max(
+                self._mesh_extent_ratchet["down"],
+                max((item.y for item in slots if item.y > 0), default=0),
+            ),
+            "left": max(
+                self._mesh_extent_ratchet["left"],
+                max((-item.x for item in slots if item.x < 0), default=0),
+            ),
+            "right": max(
+                self._mesh_extent_ratchet["right"],
+                max((item.x for item in slots if item.x > 0), default=0),
+            ),
+        }
         # Placed in the STABLE logical coordinate space, entirely
         # independent of the current viewport's own row/column count
         # (see MESH_LOGICAL_GRID_ROWS) -- MeshTopologyView.set_nodes is
@@ -5228,9 +7382,16 @@ class MeshtasticPassApp(App[None]):
             center_column=MESH_LOGICAL_GRID_CENTER_COLUMN,
             row_count=MESH_LOGICAL_GRID_ROWS,
             column_count=MESH_LOGICAL_GRID_COLUMNS,
+            min_extent=self._mesh_extent_ratchet,
         )
         view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
-        self._update_mesh_context_status()
+        # Called again here (the earlier call above only ever sees LAST
+        # cycle's selected_node_id, since set_nodes -- which can fix up
+        # selection, e.g. when the previously selected node just
+        # disappeared -- has not run yet at that point this cycle): this
+        # second call is what makes the bar's content reflect THIS
+        # cycle's actual selection, never a one-refresh-stale one.
+        self._update_mesh_node_bar(working_set, current_time)
 
     def _move_mesh_focus(self, direction: str) -> None:
         view = self.query_one(MeshTopologyView)
@@ -5256,7 +7417,10 @@ class MeshtasticPassApp(App[None]):
                 theme=self._current_theme,
                 now=time(),
             )
-            self._update_mesh_context_status()
+            # The unified bar is selected-node-specific -- it must switch
+            # to the newly selected node's own data immediately, not wait
+            # for the next periodic _refresh_mesh() tick (up to ~1s later).
+            self._update_mesh_node_bar(view.working_set, time())
 
     def _open_mesh_node_menu(self) -> None:
         """ENTER on the currently focused MESH node opens the shared
@@ -5274,7 +7438,10 @@ class MeshtasticPassApp(App[None]):
         REPLY/@mention-into-CHAT-composer -- but DM (open/create that
         node's own conversation, item 16) IS offered here, since
         _open_node_menu's allow_dm defaults to True and MESH does not
-        override it.
+        override it. allow_traceroute=True: TRACE ROUTE (Part C) is
+        offered ONLY from this MESH menu, never CHAT's own node-details
+        popup (open_user_menu's call site does not pass it, so it keeps
+        its own default of False).
         """
         view = self.query_one(MeshTopologyView)
         node_id = view.selected_node_id
@@ -5296,7 +7463,9 @@ class MeshtasticPassApp(App[None]):
         )
         if origin is None:
             return
-        self._open_node_menu(state.node, origin, None, allow_reply=False)
+        self._open_node_menu(
+            state.node, origin, None, allow_reply=False, allow_traceroute=True
+        )
 
     def _mesh_distance_is_metric(self) -> bool:
         """Whether MESH's own geographic distance display should read as
@@ -5315,50 +7484,275 @@ class MeshtasticPassApp(App[None]):
             self.radio.read_synced_config_field("display", "units") == DISPLAY_UNITS_METRIC
         )
 
-    def _update_mesh_context_status(self) -> None:
-        """Minimal truthful summary line for the currently selected MESH node.
+    def _update_mesh_node_bar(
+        self, working_set: tuple[MeshNodeState, ...], now: float
+    ) -> None:
+        """#mesh-node-bar: ONE physical line describing the currently
 
-        Shares its row with #mesh-last-update, anchored to the right (see
-        the #mesh-bottom-row Horizontal in compose()). This widget's own
-        `width: 1fr` already excludes LAST UPDATE's space from
-        `status_widget.size.width` -- so truncating to exactly that width
-        (grapheme-safe, never a raw slice) is enough to guarantee no
-        overlap, with no need to read LAST UPDATE's text/width directly.
+        selected MESH node (MESH GPS + UNIFIED BAR Part B) -- LONG NAME -
+        SHORT NAME - HOPS - GPS - DISTANCE - LINK - TIME, replacing the
+        previous separate bottom-left context line and bottom-right
+        LINK/LAST UPDATE line entirely (see mesh_state.
+        format_mesh_node_bar_fields/format_mesh_node_bar_line).
+
+        Also force-hides #mesh-connection-status (the OLD top-of-view
+        location) every ONLINE cycle, regardless of the current tab --
+        that widget is exclusively owned by _update_chat_connection_state()
+        while NOT ONLINE (see that method's own docstring), so once
+        ONLINE, nothing else would ever clear its stale text/display=True
+        from the last disconnected state. This mirrors the old
+        _update_mesh_status_line's identical unconditional-while-ONLINE
+        behavior.
+
+        The bar's own content, unlike that force-hide, IS gated on both
+        being on the MESH tab and being ONLINE -- matching the old
+        _update_mesh_context_status's precedent (blank rather than freeze
+        stale content while off-tab/disconnected), since this bar is now
+        entirely selected-node-identity-driven with no separate "board
+        freshness, independent of any one node" concept left to preserve
+        across a disconnect.
+
+        LINK is computed here (RadioService.get_link_quality -- zero RF
+        traffic) and passed into format_mesh_node_bar_fields; never
+        queried for YOU or when nothing is selected (a radio has no RF
+        link to itself).
+
+        Because this is now the ONLY widget in its row (no sibling to
+        share width with any more), `widget.size.width` is never
+        circularly dependent on another widget's content -- so, unlike
+        the old two-widget split, this can run synchronously with no
+        call_after_refresh layout-ordering workaround needed.
         """
-        widgets = list(self.query("#mesh-context-status"))
+        if self._radio_state is RadioState.ONLINE:
+            connection_widgets = list(self.query("#mesh-connection-status"))
+            if connection_widgets:
+                connection_widgets[0].display = False
+        widgets = list(self.query("#mesh-node-bar"))
         if not widgets:
             return
-        status_widget = widgets[0]
+        widget = widgets[0]
         if self.current_tab != "mesh" or self._radio_state is not RadioState.ONLINE:
-            status_widget.update("")
+            widget.update("")
             return
         views = list(self.query(MeshTopologyView))
         if not views:
-            status_widget.update("")
+            widget.update("")
             return
         view = views[0]
+        # An anonymous relay-stage placeholder can never be selected (see
+        # MeshRelayWidget/_move_mesh_focus), so `state` is None here only
+        # for a genuinely stale/invalid ID, never a relay stage.
         state = next(
             (
                 candidate
-                for candidate in view.working_set
+                for candidate in working_set
                 if candidate.node.node_id == view.selected_node_id
             ),
             None,
         )
-        # An anonymous relay-stage placeholder can never be selected (see
-        # MeshRelayWidget/_move_mesh_focus), so `state` is None here only
-        # for a genuinely stale/invalid ID, never a relay stage -- the
-        # bottom-left context is always either YOU or a real node's full
-        # LONG NAME / SHORT NAME / ROLE / HOPS / TIME / DISTANCE line.
-        text = (
-            format_mesh_context_line(state, now=time(), metric=self._mesh_distance_is_metric())
-            if state is not None
-            else ""
+        if state is None:
+            widget.update("")
+            return
+        link = (
+            self.radio.get_link_quality(state.node.node_id)
+            if not state.node.is_local
+            else None
         )
-        available = status_widget.size.width
-        if available > 0:
-            text = truncate_to_cells(text, available)
-        status_widget.update(text)
+        fields = format_mesh_node_bar_fields(
+            state, now=now, metric=self._mesh_distance_is_metric(), link=link
+        )
+        text = format_mesh_node_bar_line(fields, available_width=widget.size.width)
+        palette = THEME_PALETTES[self._current_theme]
+        widget.update(Text(text, style=palette.accent2 if fields.accent2 else palette.base))
+
+    def _mesh_status_override_text(self) -> Text | None:
+        """TRACE ROUTE (Part C): whatever must override the ordinary
+
+        #mesh-status content (NO MESH DATA / blank) this cycle, or None
+        if nothing does. A just-expired banner is cleared here (lazily,
+        on the next read) rather than needing its own extra timer beyond
+        the one that already schedules _dismiss_traceroute_banner --
+        this only matters for a caller that reads this directly without
+        going through that timer (none currently do, but it keeps this
+        function correct standalone).
+        """
+        if self._traceroute_banner is not None:
+            palette = THEME_PALETTES[self._current_theme]
+            color = (
+                palette.accent
+                if self._traceroute_banner.style_kind == "accent"
+                else palette.error
+            )
+            return Text(self._traceroute_banner.text, style=Style(color=color))
+        if self._active_traceroute is not None:
+            return self._traceroute_status_text()
+        return None
+
+    def _traceroute_status_text(self) -> Text:
+        """"TRACING ROUTE TO SHN  > > >", one active ACCENT arrow cycling
+
+        across TRACEROUTE_ARROW_POSITIONS positions -- reusing the exact
+        CHAT SENDING visual language (active=ACCENT, inactive=dim_quarter,
+        advanced by the SAME 0.45s _delivery_timer tick; see
+        _advance_delivery_states/SENDING_ARROW_FRAMES).
+        """
+        active = self._active_traceroute
+        assert active is not None
+        palette = THEME_PALETTES[self._current_theme]
+        text = Text(f"TRACING ROUTE TO {active.destination_short_name}  ", style=palette.dim)
+        for index in range(TRACEROUTE_ARROW_POSITIONS):
+            if index:
+                text.append(" ")
+            color = (
+                palette.accent
+                if index == self._traceroute_animation_frame
+                else palette.dim_quarter
+            )
+            text.append(TRACEROUTE_ARROW_GLYPH, style=Style(color=color))
+        return text
+
+    def _render_mesh_top_status(self) -> None:
+        """Force an immediate #mesh-status repaint for TRACE ROUTE state
+
+        changes that must appear right away -- never waiting for the
+        next periodic _refresh_mesh() tick (up to ~1s later). Safe to
+        call regardless of the current tab (the widget simply repaints
+        invisibly off-tab, exactly like [3] MESH (N) already does) and
+        regardless of ONLINE state (harmless to update a currently-
+        hidden widget; _refresh_mesh's own ONLINE gate is what actually
+        controls this widget's meaningful visibility).
+        """
+        widgets = list(self.query("#mesh-status"))
+        if not widgets:
+            return
+        override = self._mesh_status_override_text()
+        if override is not None:
+            widgets[0].update(override)
+
+    def _start_traceroute(self, node: NodeMetadata) -> None:
+        """TRACE ROUTE menu action (MESH's selected REMOTE node ENTER
+
+        menu only -- never offered/attempted for YOU). Explicit,
+        user-triggered RF traffic ONLY -- never called from MESH open,
+        selection, refresh, a timer, or a topology update.
+
+        V1 allows exactly one active trace at a time: a repeated
+        attempt while one is already pending is a deterministic no-op
+        (silently ignored), never queued or stacked.
+        """
+        if node.is_local or self._radio_state is not RadioState.ONLINE:
+            return
+        if self._active_traceroute is not None:
+            return
+        if self._traceroute_banner_timer is not None:
+            self._traceroute_banner_timer.stop()
+            self._traceroute_banner_timer = None
+        self._traceroute_banner = None
+        self._traceroute_request_seq += 1
+        request_token = self._traceroute_request_seq
+        destination_node_id = node.node_id
+        self._active_traceroute = ActiveTraceroute(
+            request_token=request_token,
+            destination_node_id=destination_node_id,
+            destination_short_name=_reply_mention_name(node),
+        )
+        self._traceroute_animation_frame = 0
+        self._render_mesh_top_status()
+        self._traceroute_timeout_timer = self.set_timer(
+            TRACEROUTE_TIMEOUT_SECONDS,
+            lambda: self._traceroute_timed_out(request_token),
+        )
+
+        def status_handler(status: TracerouteStatus) -> None:
+            self.post_message(TracerouteStatusReceived(request_token, status))
+
+        def send_from_thread() -> None:
+            try:
+                self.radio.send_traceroute(destination_node_id, status_handler)
+            except RadioSendError as error:
+                self.post_message(TracerouteRequestFailed(request_token, str(error)))
+
+        self.run_worker(send_from_thread, thread=True)
+
+    @on(TracerouteStatusReceived)
+    def traceroute_status_received(self, event: TracerouteStatusReceived) -> None:
+        active = self._active_traceroute
+        if active is None or active.request_token != event.request_token:
+            # Stale/late (this attempt already timed out, was superseded,
+            # or -- impossible in v1's one-at-a-time model, but checked
+            # anyway -- belongs to a different attempt entirely): ignored
+            # deterministically, never misattributed to whatever IS
+            # currently active/selected.
+            return
+        status = event.status
+        if status.state is TracerouteState.SUCCEEDED and status.result is not None:
+            self._finish_traceroute_success(status.result)
+        else:
+            self._finish_traceroute_failure(status.detail or "Traceroute failed.")
+
+    @on(TracerouteRequestFailed)
+    def traceroute_request_failed(self, event: TracerouteRequestFailed) -> None:
+        active = self._active_traceroute
+        if active is None or active.request_token != event.request_token:
+            return
+        self._finish_traceroute_failure(event.detail)
+
+    def _traceroute_timed_out(self, request_token: int) -> None:
+        active = self._active_traceroute
+        if active is None or active.request_token != request_token:
+            # Already resolved (success/failure/a disconnect) by the
+            # time this fires -- never overwrite a real outcome with a
+            # stale timeout (see _clear_active_traceroute, which always
+            # stops this SAME timer the instant a real outcome lands).
+            return
+        self._finish_traceroute_failure("Traceroute timed out.")
+
+    def _clear_active_traceroute(self) -> None:
+        if self._traceroute_timeout_timer is not None:
+            self._traceroute_timeout_timer.stop()
+            self._traceroute_timeout_timer = None
+        self._active_traceroute = None
+
+    def _finish_traceroute_success(self, result: TracerouteResult) -> None:
+        """Real protocol evidence only -- never "request sent" alone.
+
+        Stores the result keyed by canonical destination (replacing,
+        never duplicating, an earlier result for the SAME destination),
+        marks that node's board label with the ACCENT "*" (session
+        evidence only -- never a claim about currently-rendered
+        connectors; see mesh_topology.mesh_board_marker_label), and
+        never steals focus.
+        """
+        destination = result.destination_node_id
+        self._clear_active_traceroute()
+        self._traceroute_results[destination] = result
+        self.query_one(MeshTopologyView).mark_traced(destination)
+        self._show_traceroute_banner("TRACE SUCCEEDED", "accent")
+        # Repaints the board (for the new "*" marker) AND the top status
+        # (for the banner) in one pass -- see _mesh_status_override_text.
+        self._refresh_mesh()
+
+    def _finish_traceroute_failure(self, _detail: str) -> None:
+        """A failed/timed-out trace never creates a "*" marker and never
+
+        erases an EARLIER successful one for the same (or any other)
+        destination -- this never touches _traceroute_results/
+        mark_traced at all.
+        """
+        self._clear_active_traceroute()
+        self._show_traceroute_banner("TRACE FAILED", "error")
+        self._render_mesh_top_status()
+
+    def _show_traceroute_banner(self, text: str, style_kind: str) -> None:
+        self._traceroute_banner = TracerouteBanner(text, style_kind)
+        self._traceroute_banner_timer = self.set_timer(
+            TRACEROUTE_BANNER_SECONDS, self._dismiss_traceroute_banner
+        )
+
+    def _dismiss_traceroute_banner(self) -> None:
+        self._traceroute_banner = None
+        self._traceroute_banner_timer = None
+        self._render_mesh_top_status()
 
     def _advance_delivery_states(self) -> None:
         self._send_animation_frame = self._send_animation_frame % len(
@@ -5385,6 +7779,17 @@ class MeshtasticPassApp(App[None]):
                     self._set_delivery_state(entry, DeliveryState.UNCONFIRMED)
         for widget in self.query(ChatEntryWidget):
             widget.refresh_delivery_state(self._send_animation_frame)
+        # TRACE ROUTE (Part C): reuses this SAME pre-existing 0.45s tick
+        # for its own one-active-arrow-of-three animation -- never a
+        # second timer (see TRACEROUTE_ARROW_POSITIONS). A no-op
+        # (neither branch below runs) whenever no trace is pending, so
+        # this adds no work at all outside an active trace.
+        if self._active_traceroute is not None:
+            self._traceroute_animation_frame = (
+                self._traceroute_animation_frame + 1
+            ) % TRACEROUTE_ARROW_POSITIONS
+            if self._radio_state is RadioState.ONLINE:
+                self._render_mesh_top_status()
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)
@@ -5407,7 +7812,49 @@ class MeshtasticPassApp(App[None]):
         return ChatEntryWidget(
             entry,
             favorite=self.settings.is_favorite(entry.node_id),
+            mention=(
+                entry.dm_node_id is None
+                and not entry.outgoing
+                and message_mentions_short_name(entry.text, self.chat_local_short_name)
+            ),
         )
+
+    @property
+    def chat_local_short_name(self) -> str | None:
+        """The CONNECTED radio's own current SHORTNAME, zero-RF (item
+
+        27/33) -- self._radio_info is the exact same radio-swap-safe
+        cached identity source already used elsewhere (see YOU/MESH):
+        it is set fresh from event.info on every ONLINE transition and
+        cleared to None on every non-ONLINE state (see
+        _radio_event_from_thread), so a reconnect with a DIFFERENT
+        radio can never leak the PREVIOUS radio's SHORTNAME here, and
+        "not genuinely connected" naturally returns None -- callers
+        must then disable mention highlighting entirely rather than
+        guess (see message_mentions_short_name).
+        """
+        if self._radio_info is None:
+            return None
+        short_name = (self._radio_info.short_name or "").strip()
+        return short_name or None
+
+    def _refresh_chat_mentions(self) -> None:
+        """Recompute @mention highlighting for every currently-mounted
+
+        CHAT entry against whatever local SHORTNAME is now current
+        (item 28) -- called whenever the connected radio's own
+        identity changes, so a swap (e.g. OLD1 -> NEW1) updates
+        already-visible messages immediately rather than waiting for
+        the user to leave and re-enter the channel.
+        """
+        short_name = self.chat_local_short_name
+        for widget in self.query(ChatEntryWidget):
+            entry = widget.entry
+            widget.set_mention(
+                entry.dm_node_id is None
+                and not entry.outgoing
+                and message_mentions_short_name(entry.text, short_name)
+            )
 
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         """Vertical CHAT stops: every message is exactly ONE stop.
@@ -5668,6 +8115,35 @@ class MeshtasticPassApp(App[None]):
                         break
         return long_name, short_name
 
+    def dm_dropdown_conversations(self) -> tuple[DropdownOption, ...]:
+        """Real DM conversations for the DM dropdown (PR #46 follow-up
+
+        Part B), most-recent-activity first -- the SAME ordering
+        _refresh_dm_list already derives from ChatStore.list_dm_
+        conversations() (item 10: no independent ordering system).
+        Zero RF: a pure SQLite read plus the same cached-NodeDB lookup
+        _dm_identity already uses. Each option's own value is the
+        canonical node_id -- never a display name or list position
+        (item 8/30), so duplicate presentation names never collapse
+        distinct conversations.
+        """
+        try:
+            conversations = (
+                self.chat_store.list_dm_conversations()
+                if self.chat_store is not None
+                else []
+            )
+        except ChatStoreError as error:
+            self._show_dm_send_error(str(error))
+            conversations = []
+        options = []
+        for node_id, _time in conversations:
+            long_name, short_name = self._dm_identity(node_id)
+            options.append(
+                DropdownOption(_dm_dropdown_label(node_id, long_name, short_name), node_id)
+            )
+        return tuple(options)
+
     def _refresh_dm_list(self) -> None:
         """Rebuild the conversation list from persisted history -- zero
 
@@ -5733,10 +8209,13 @@ class MeshtasticPassApp(App[None]):
     ) -> None:
         """Public DM entry point: open/create this node's conversation and
 
-        switch to the DM tab -- used by the CHAT sender menu and the
-        MESH node menu (item 7/16), and directly by tests.
+        switch CHAT into DMS mode (CHAT/DM/MENTION UX item 7/16/14) --
+        used by the CHAT sender menu and the MESH node menu, and
+        directly by tests. Opens the EXACT conversation directly, never
+        merely the generic DM list.
         """
-        self.show_tab("dm")
+        self.show_tab("chat")
+        self._switch_chat_mode("dms")
         self._open_dm_conversation(node_id, long_name=long_name, short_name=short_name)
 
     def _open_dm_conversation(
@@ -5748,6 +8227,7 @@ class MeshtasticPassApp(App[None]):
     ) -> None:
         if self.current_dm_node_id == node_id:
             self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+            self._mark_dm_conversation_read(node_id)
             return
         self._capture_current_dm_state()
         state = self._ensure_dm_loaded(node_id)
@@ -5764,6 +8244,7 @@ class MeshtasticPassApp(App[None]):
         dm_input.value = state.draft
         dm_input.cursor_position = len(state.draft)
         self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+        self._mark_dm_conversation_read(node_id)
         self._update_tab_bar()
         self.call_after_refresh(transcript.scroll_end, animate=False)
         if not dm_input.disabled:
@@ -5869,6 +8350,9 @@ class MeshtasticPassApp(App[None]):
             lambda: self._send_from_thread(entry, generation),
             thread=True,
         )
+        # Mirrors send_chat_message's own neutral-focus return -- see
+        # its comment for why this never discards typed text.
+        self.query_one("#dm-log", ChatTranscript).focus()
 
     @on(Input.Changed, "#dm-input")
     def dm_input_changed(self, _event: Input.Changed) -> None:
@@ -5880,14 +8364,25 @@ class MeshtasticPassApp(App[None]):
         into channel history merely because packet.channel is present
         (item 12): this is only reached when RadioService's own
         packet-destination classification (message.is_direct) already
-        said so (see _accept_received_message).
+        said so (see _accept_received_message). Unread model (item
+        15/16): an incoming DM increments DM(N) unless this EXACT
+        conversation is actively visible right now (CHAT tab, DMS
+        mode, this node_id open) -- see _recount_dm_unread's own
+        docstring for the full chosen model, including why it is
+        deliberately session-local, never persisted.
         """
         node_id = message.sender_node_id
         state = self._ensure_dm_loaded(node_id)
+        dm_visible = (
+            self.current_tab == "chat"
+            and self._chat_mode == "dms"
+            and self.current_dm_node_id == node_id
+        )
         entry = received_chat_entry(
             message,
             app_received_at=time(),
             monotonic_now=monotonic(),
+            unread=not dm_visible,
             is_new=True,
         )
         self._assign_arrival_order(entry)
@@ -5895,13 +8390,68 @@ class MeshtasticPassApp(App[None]):
         if not inserted:
             return
         state.entries.append(entry)
-        is_open = self.current_tab == "dm" and self.current_dm_node_id == node_id
-        if is_open:
+        if entry.message_id is not None and not dm_visible:
+            state.unread_message_ids.add(entry.message_id)
+        if not dm_visible:
+            state.unread_count += 1
+            self._recount_dm_unread()
+        if dm_visible:
             transcript = self.query_one("#dm-log", ChatTranscript)
             transcript.mount(self._chat_entry_widget(entry))
             transcript.scroll_end(animate=False)
-        if self.current_tab == "dm" and self.current_dm_node_id is None:
+        if (
+            self.current_tab == "chat"
+            and self._chat_mode == "dms"
+            and self.current_dm_node_id is None
+        ):
             self._refresh_dm_list()
+        self._update_tab_bar()
+
+    def _mark_dm_conversation_read(self, node_id: str) -> None:
+        """Clear unread state for exactly this DM conversation (item
+
+        15/16) -- mirrors _mark_unread_messages_viewed's channel
+        equivalent, purely in-memory (see _recount_dm_unread).
+        """
+        state = self._dm_state_for(node_id)
+        for entry in state.entries:
+            if entry.unread:
+                entry.unread = False
+                if entry.message_id is not None:
+                    state.unread_message_ids.discard(entry.message_id)
+        state.unread_count = 0
+        self._recount_dm_unread()
+
+    def _recount_dm_unread(self) -> None:
+        """Sum every DM conversation's own unread_count into DM(N)'s
+
+        badge (item 15). Chosen unread model, documented per the
+        task's own request to decide and report it: reuses the EXACT
+        same in-memory, session-local, non-persisted mechanism channel
+        CHAT's own unread_count/unread_message_ids already use (see
+        _accept_received_message/_recount_unread) -- deliberately NOT
+        backed by a chat.db column/migration. Two reasons: (1) channel
+        CHAT's own unread state is ALREADY not persisted today (it
+        resets to 0 every restart, rebuilt only from messages that
+        arrive DURING the running session -- see _accept_received_
+        message's chat_is_visible/unread wiring), so a persisted DM
+        model would be a second, divergent unread architecture living
+        alongside a non-persisted one for the exact same conceptual
+        feature -- precisely the "fragile parallel state system" this
+        task's own Part E/item 17 warns against; (2) restart behavior
+        is still fully deterministic under this model: every unread
+        count -- channel AND DM alike -- resets to 0 on every restart,
+        consistently, not silently/accidentally.
+        """
+        self.dm_unread_count = sum(
+            state.unread_count for state in self._dm_states.values()
+        )
+        selectors = list(self.query(DMModeSelector))
+        if selectors:
+            selectors[0].set_options(
+                (DropdownOption(f"DM({self.dm_unread_count})", "dms"),),
+                value="dms",
+            )
 
     def _reposition_dm_entry(self, entry: ChatEntry) -> None:
         if entry.dm_node_id is None:
@@ -5911,7 +8461,11 @@ class MeshtasticPassApp(App[None]):
             return
         state.entries.remove(entry)
         self._insert_entry_in_order(state.entries, entry)
-        if self.current_dm_node_id != entry.dm_node_id or self.current_tab != "dm":
+        if (
+            self.current_dm_node_id != entry.dm_node_id
+            or self.current_tab != "chat"
+            or self._chat_mode != "dms"
+        ):
             return
         widget = next(
             (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
@@ -6117,6 +8671,7 @@ class MeshtasticPassApp(App[None]):
         include_rx_age: bool = False,
         allow_reply: bool = True,
         allow_dm: bool = True,
+        allow_traceroute: bool = False,
     ) -> None:
         """Open the shared CHAT/MESH node-details menu.
 
@@ -6134,6 +8689,13 @@ class MeshtasticPassApp(App[None]):
         says it cannot receive messages (metadata.is_unmessagable --
         see RadioService/NodeMetadata). Never offered for YOU (the
         is_local branch below has no actionable rows at all).
+
+        allow_traceroute defaults to False; TRACE ROUTE (Part C) is
+        explicit, user-triggered RF traffic offered ONLY from MESH's own
+        ENTER menu (see _open_mesh_node_menu), never CHAT's. Omitted
+        entirely (not merely shown-and-ignored) while a trace is already
+        pending -- v1 allows exactly one active trace at a time, and an
+        absent option is clearer feedback than a silent no-op.
         """
 
         items: list[PopupItem] = []
@@ -6181,6 +8743,8 @@ class MeshtasticPassApp(App[None]):
             # newly added item, reached with one extra arrow press, not
             # a change to what pressing Enter immediately does.
             highlighted = len(items) - 1
+            if allow_traceroute and self._active_traceroute is None:
+                items.append(PopupItem("TRACEROUTE", "traceroute", actionable=True))
         menu = ViewportMenu(
             items,
             highlighted_index=highlighted,
@@ -6211,6 +8775,10 @@ class MeshtasticPassApp(App[None]):
         """
         if action == "reply":
             self._activate_reply(metadata)
+            return
+        if action == "traceroute":
+            self._close_user_menu(restore_focus=False)
+            self._start_traceroute(metadata)
             return
         if action == "dm":
             self._close_user_menu(restore_focus=False)
@@ -6246,6 +8814,8 @@ class MeshtasticPassApp(App[None]):
         chat_input.value = new_value
         if self.current_tab != "chat":
             self.show_tab("chat")
+        if self._chat_mode != "channel":
+            self._switch_chat_mode("channel")
         chat_input.focus()
         chat_input.cursor_position = new_cursor
 
@@ -6456,13 +9026,7 @@ class MeshtasticPassApp(App[None]):
     def _load_chat_history(self) -> None:
         state = self._restore_channel_state(self.current_channel_index)
         transcript = self.query_one("#chat-log", ChatTranscript)
-        widgets: list[Static | ChatEntryWidget] = []
-        if state.has_older_history:
-            widgets.append(LoadOlderControl())
-        elif state.entries and self.chat_store is not None:
-            widgets.append(EndOfChatHistoryMarker())
-        for entry in state.entries:
-            widgets.append(self._chat_entry_widget(entry))
+        widgets = self._initial_chat_widgets(self.current_channel_index, state)
         if widgets:
             transcript.mount(*widgets)
 
@@ -6481,6 +9045,7 @@ class MeshtasticPassApp(App[None]):
                 oldest_id,
                 channel_index=self.current_channel_index,
                 limit=OLDER_HISTORY_PAGE_SIZE,
+                channel_key=self._channel_key_for(self.current_channel_index),
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -6566,6 +9131,11 @@ class MeshtasticPassApp(App[None]):
                 radio_rx_at=entry.radio_rx_at,
                 received_at=entry.app_received_at,
                 dm_node_id=entry.dm_node_id,
+                channel_key=(
+                    None
+                    if entry.dm_node_id
+                    else self._channel_key_for(entry.channel_index)
+                ),
             )
         except ChatStoreError as error:
             self._show_send_error(str(error))
@@ -6583,6 +9153,11 @@ class MeshtasticPassApp(App[None]):
                 local_sent_at=entry.local_sent_at or entry.app_received_at,
                 delivery_state=(entry.delivery_state or DeliveryState.SENDING).value,
                 dm_node_id=entry.dm_node_id,
+                channel_key=(
+                    None
+                    if entry.dm_node_id
+                    else self._channel_key_for(entry.channel_index)
+                ),
             )
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
@@ -6723,7 +9298,7 @@ class MeshtasticPassApp(App[None]):
             return
         self.chat_history.remove(entry)
         new_index = self._insert_entry_in_order(self.chat_history, entry)
-        if self.current_tab != "chat":
+        if self.current_tab != "chat" or self._chat_mode != "channel":
             return
         widget = next(
             (candidate for candidate in self.query(ChatEntryWidget) if candidate.entry is entry),
@@ -6773,20 +9348,27 @@ class MeshtasticPassApp(App[None]):
 
     def _update_footer(self) -> None:
         if self.current_tab == "chat" and isinstance(self.focused, Input):
-            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
+            # Matches the UPPERCASE-HOTKEY + lowercase-descriptor
+            # grammar every other footer line below already uses.
+            # CTRL+E (not a bare "E") is the real emoji-picker binding
+            # (see on_key's ctrl+e handling) -- printable "e" must stay
+            # typeable while the composer is focused, so the label
+            # reflects the actual binding rather than a shorter one
+            # that would collide with typing. #chat-input and #dm-input
+            # are both plain Input widgets on this tab, so this single
+            # branch already covers CHANNEL and DM identically.
+            text = "CTRL+E emojis    ESC cancel    ENTER send"
+        elif self.current_tab == "chat" and self._chat_mode == "channel":
+            text = "↑↓ navigate    C channel    D dms    ENTER action    F4 quit"
+        elif self.current_tab == "chat" and self.current_dm_node_id is None:
+            text = "↑↓ select    ENTER open    C channel    1-3 tabs    F4 quit"
         elif self.current_tab == "chat":
-            text = "↑↓ navigate    C channel    ENTER action    F4 quit"
-        elif self.current_tab == "dm" and isinstance(self.focused, Input):
-            text = "ENTER SEND    CTRL+E EMOJI    ESC CANCEL"
-        elif self.current_tab == "dm" and self.current_dm_node_id is None:
-            text = "↑↓ select    ENTER open    1-4 tabs    F4 quit"
-        elif self.current_tab == "dm":
-            text = "↑↓ navigate    ENTER action    ESC back    F4 quit"
+            text = "↑↓ navigate    C channel    ENTER action    ESC back    F4 quit"
         else:
             text = (
-                "↑↓←→ select    1-4 tabs    F4 quit"
+                "↑↓←→ select    1-3 tabs    F4 quit"
                 if self.current_tab == "mesh"
-                else "1-4 switch tabs    F4 quit"
+                else "1-3 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 
@@ -6808,6 +9390,36 @@ class MeshtasticPassApp(App[None]):
         was_online = self._radio_state is RadioState.ONLINE
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
+        # TRACE ROUTE (Part C): a disconnect (for any reason -- dropped
+        # connection, explicit device-path change, radio swap) leaves
+        # NOTHING behind to genuinely resolve a pending trace against
+        # (the interface object generating any real response is gone) --
+        # cancelled immediately rather than left to eventually expire via
+        # its own TRACEROUTE_TIMEOUT_SECONDS timer, so "TRACING ROUTE"
+        # never lingers stale through a visible reconnect. Silent (no
+        # TRACE FAILED banner): the disconnect itself is already
+        # communicated elsewhere (#mesh-connection-status).
+        if state is not RadioState.ONLINE and self._active_traceroute is not None:
+            self._clear_active_traceroute()
+            # Explicit blank (never left showing the just-cancelled
+            # "TRACING ROUTE..." text): _refresh_mesh's own status.update()
+            # calls are unreachable while not ONLINE (see its own
+            # early-return), so nothing else would ever clear this stale
+            # text otherwise. _mesh_status_override_text() is still
+            # consulted -- if a banner somehow ALSO exists, it wins
+            # (never true in practice: starting a trace already clears
+            # any banner -- see _start_traceroute -- so this branch
+            # never actually observes both set at once).
+            widgets = list(self.query("#mesh-status"))
+            if widgets:
+                override = self._mesh_status_override_text()
+                widgets[0].update(override if override is not None else "")
+        # Radio-swap safety (item 28): a reconnect (or a drop) that
+        # changes -- or clears -- the current local SHORTNAME must
+        # update already-mounted CHAT entries' mention highlighting
+        # immediately, never leave a PREVIOUS radio's stale identity
+        # highlighted or a NEWLY-matching one dark.
+        self._refresh_chat_mentions()
         # A genuine connection-state transition (anything except a
         # redundant "still ONLINE" event) must never leave an AUTO
         # SYNC write in flight/attributed to the OLD connection for the
@@ -6816,6 +9428,7 @@ class MeshtasticPassApp(App[None]):
         if not (state is RadioState.ONLINE and was_online):
             self._reset_clock_sync_state()
         if state is RadioState.ONLINE and info is not None and info.channels:
+            self._invalidate_reassigned_channel_caches(info.channels)
             self._channels = info.channels
             selector = self.query_one(ChannelSelector)
             available_indexes = {channel.index for channel in self._channels}
@@ -6834,6 +9447,16 @@ class MeshtasticPassApp(App[None]):
                     self._switch_channel(selected_index),
                     name="select-available-channel",
                 )
+            else:
+                # selected_index == current_channel_index tells us
+                # nothing about whether the CHANNEL at that index is
+                # still the same one -- a same-slot reconfiguration
+                # (see CHAT channel-history isolation) needs its own
+                # check here.
+                self.run_worker(
+                    self._reconcile_current_channel_identity(),
+                    name="reconcile-current-channel-identity",
+                )
         self._refresh_device_options()
         self._status_dot_count = 1
         if self._connection_animation_timer is not None:
@@ -6848,6 +9471,7 @@ class MeshtasticPassApp(App[None]):
         self._render_connection_details()
         self._render_identity(force_value=True)
         self._render_radio_settings()
+        self._on_connection_state_for_network_apply(state, was_online)
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
@@ -6927,12 +9551,12 @@ class MeshtasticPassApp(App[None]):
         never show different animation-dot phases (see
         _advance_connection_animation, which calls this on a fixed
         ~0.45s cadence). Once ONLINE (status_text == ""), this leaves
-        that widget untouched -- _update_mesh_status_line (called from
+        that widget untouched -- _update_mesh_node_bar (called from
         _refresh_mesh) force-hides it instead, unconditionally, since it
-        has no ONLINE-state purpose any more (LAST UPDATE now lives in
-        the separate bottom-right #mesh-last-update widget). The two
-        never fight over ownership: this function only ever writes while
-        NOT ONLINE, that one only ever touches the widget while ONLINE.
+        has no ONLINE-state purpose any more (the unified bottom bar now
+        lives in the separate #mesh-node-bar widget). The two never fight
+        over ownership: this function only ever writes while NOT ONLINE,
+        that one only ever touches the widget while ONLINE.
         """
         chat_inputs = list(self.query("#chat-input"))
         if chat_inputs:
@@ -6947,6 +9571,41 @@ class MeshtasticPassApp(App[None]):
             selectors[0].set_status_override(self._connection_status_rich_text())
 
         status_rich_text = self._connection_status_rich_text()
+        online = status_rich_text is None
+        # RECONNECT DELIVERY + CHAT HEADER FIX item 11: while not
+        # ONLINE, CHAT's header must show ONLY the connection-status
+        # text above (already handled by ChannelSelector's own
+        # set_status_override) -- the separator bullet and DM selector
+        # must not remain visible/interactive alongside it. Both are
+        # pure presentation toggles: value/options/unread count are
+        # never touched, so the normal header reappears exactly as it
+        # was the instant ONLINE returns (item 12/13), with no tab
+        # switch/manual refresh required -- this method already runs on
+        # every connection-state transition (see _show_connection) and
+        # every ~0.45s while not ONLINE (see
+        # _advance_connection_animation).
+        bullets = list(self.query("#chat-header-bullet"))
+        if bullets:
+            bullets[0].display = online
+        dm_selectors = list(self.query(DMModeSelector))
+        if dm_selectors:
+            dm_selector = dm_selectors[0]
+            was_focused = self.focused is dm_selector
+            if not online and dm_selector.is_open:
+                dm_selector.close_menu()
+            # disabled (not just display=False) so Textual's own
+            # dropdown/key handling can never treat it as interactive
+            # even if something reaches it directly (belt-and-suspenders
+            # alongside the "d" hotkey's own ONLINE check below, item
+            # 16) -- and so a stray Tab press cannot land focus back on
+            # a hidden widget while not ONLINE.
+            dm_selector.disabled = not online
+            dm_selector.display = online
+            if not online and was_focused:
+                # Item 15: never leave focus stranded on a now-hidden
+                # widget -- land on the SAME neutral per-mode target
+                # C/D/ESC already use elsewhere, never a dropdown.
+                self._focus_chat_mode(self._chat_mode)
         dm_status_widgets = list(self.query("#dm-connection-status"))
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
@@ -6960,61 +9619,6 @@ class MeshtasticPassApp(App[None]):
                 widget.display = True
         elif dm_status_widgets:
             dm_status_widgets[0].display = False
-
-    def _update_mesh_status_line(
-        self, working_set: tuple[MeshNodeState, ...], now: float
-    ) -> None:
-        """#mesh-last-update: a PERSISTENT "LAST UPDATE <age>"
-
-        mesh-freshness indicator, anchored bottom-right (see the
-        #mesh-bottom-row Horizontal in compose()), shown while the radio
-        is ONLINE -- not a stale-only warning. Answers "how long ago did
-        this radio last obtain meaningful information about the mesh",
-        so it keeps aging (1s, 2s, ... 1m, ...) between refreshes with no
-        new data, and only resets when a genuinely fresher timestamp
-        arrives -- never merely because this method itself ran again or
-        LAST UPDATE's own widget moved (see _refresh_mesh's 1Hz periodic
-        call).
-
-        The age comes from the single most recent NodeDB last_heard
-        among the working set's remote nodes (excluding YOU) -- never
-        derived from CHAT history (see build_mesh_working_set; CHAT is
-        enrichment, not the timing source of record here) and never a
-        fabricated value: if no working-set remote node carries a
-        trustworthy last_heard at all, this is omitted rather than
-        showing a made-up age.
-
-        Also force-hides #mesh-connection-status (the OLD top-of-view
-        location) every ONLINE cycle: that widget is exclusively owned
-        by _update_chat_connection_state() while NOT ONLINE (see that
-        method's own docstring), so once ONLINE, nothing else would ever
-        clear its stale text/display=True from the last disconnected
-        state -- left alone, it would stay visible and keep reserving
-        its top row forever. Forcing display=False here (never merely
-        "when there's no LAST UPDATE text", unlike the old behavior this
-        replaces) is what lets #mesh-view's own `height: 1fr` reclaim
-        that freed row automatically, with no hardcoded row math.
-        """
-        if self._radio_state is not RadioState.ONLINE:
-            return
-        connection_widgets = list(self.query("#mesh-connection-status"))
-        if connection_widgets:
-            connection_widgets[0].display = False
-        widgets = list(self.query("#mesh-last-update"))
-        if not widgets:
-            return
-        widget = widgets[0]
-        remote_last_heard = [
-            state.node.last_heard
-            for state in working_set
-            if not state.node.is_local and state.node.last_heard is not None
-        ]
-        text = ""
-        if remote_last_heard:
-            age = now - max(remote_last_heard)
-            if age >= 0:
-                text = f"LAST UPDATE {format_relative_age(age)}"
-        widget.update(text)
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:
@@ -7036,7 +9640,7 @@ class MeshtasticPassApp(App[None]):
         )
         palette = THEME_PALETTES[self._current_theme]
         status_style = (
-            palette.base
+            palette.accent
             if self._radio_state is RadioState.ONLINE
             else self._connection_status_color()
         )

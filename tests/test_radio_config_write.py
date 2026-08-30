@@ -12,6 +12,7 @@ technique.
 
 from __future__ import annotations
 
+import time
 import types
 import unittest
 
@@ -323,6 +324,232 @@ class ReadSyncedConfigFieldTests(unittest.TestCase):
 
         self.assertIsNone(service.read_synced_config_field("display", "not_a_real_field"))
         self.assertIsNone(service.read_synced_config_field("not_a_real_section", "x"))
+
+
+class _ChannelFakeNode(FakeLocalNode):
+    """FakeLocalNode that also answers get_channel_request, wired to a
+
+    REAL meshtastic Channel message so the 1-indexing / index==0 logic
+    is exercised against the real proto.
+    """
+
+    def __init__(self, iface: FakeInterface) -> None:
+        super().__init__(iface)
+        from meshtastic.protobuf import channel_pb2
+
+        primary = channel_pb2.Channel()
+        primary.index = 0
+        primary.role = channel_pb2.Channel.Role.PRIMARY
+        self.channels = [primary]
+        self.get_channel_requests: list[int] = []
+        self.answer_channel = True
+        # Real Node.writeConfig -- builds set_config.<section> from
+        # localConfig and fires it (onResponse=None for the local node).
+        self.writeConfig = types.MethodType(Node.writeConfig, self)
+
+    def writeChannel(self, channelIndex, adminIndex=0) -> None:
+        # The real Node.writeChannel calls ensureSessionKey() which needs
+        # interface internals the fake does not model -- inline just the
+        # fire-and-forget set_channel send.
+        from meshtastic.protobuf import admin_pb2
+
+        p = admin_pb2.AdminMessage()
+        p.set_channel.CopyFrom(self.channels[channelIndex])
+        self._sendAdmin(p)
+
+    def _sendAdmin(self, admin_message, onResponse=None, **_kwargs) -> None:
+        if admin_message.HasField("set_channel"):
+            self.sendAdmin_calls.append(admin_message)
+            self.channels[0].CopyFrom(admin_message.set_channel)
+            if onResponse is not None:
+                onResponse(
+                    {
+                        "decoded": {
+                            "portnum": "ROUTING_APP",
+                            "routing": {"errorReason": "NONE"},
+                            "requestId": 1,
+                        }
+                    }
+                )
+            return
+        if admin_message.HasField("get_channel_request"):
+            self.get_channel_requests.append(admin_message.get_channel_request)
+            self.sendAdmin_calls.append(admin_message)
+            if not self.answer_channel:
+                return
+            # Real firmware: get_channel_request N addresses channel N-1.
+            index = admin_message.get_channel_request - 1
+            if index != 0:
+                return  # invalid / not the primary channel -> no answer
+            from meshtastic.protobuf import admin_pb2
+            import google.protobuf.json_format as jf
+
+            response = admin_pb2.AdminMessage()
+            response.get_channel_response.CopyFrom(self.channels[0])
+            admin_dict = jf.MessageToDict(response)
+            admin_dict["raw"] = response
+            if onResponse is not None:
+                onResponse({"decoded": {"portnum": "ADMIN_APP", "admin": admin_dict}})
+            return
+        super()._sendAdmin(admin_message, onResponse=onResponse, **_kwargs)
+
+
+class WriteVerifiedPrimaryChannelTests(unittest.TestCase):
+    def _service(self) -> tuple[RadioService, _ChannelFakeNode]:
+        service = RadioService("/dev/test-radio")
+        interface = FakeInterface()
+        node = _ChannelFakeNode(interface)
+        service._interface = interface
+        return service, node
+
+    def test_readback_uses_one_indexed_get_channel_request(self) -> None:
+        service, node = self._service()
+
+        result = service.write_verified_primary_channel(name="", psk=bytes([1]))
+
+        self.assertTrue(result.applied)
+        # 1-indexed: primary channel (index 0) is requested as 1, never 0.
+        self.assertIn(1, node.get_channel_requests)
+        self.assertNotIn(0, node.get_channel_requests)
+
+    def test_default_psk_sentinel_matches_expanded_default_key_on_readback(self) -> None:
+        from meshtastic.util import DEFAULT_KEY
+
+        service, node = self._service()
+        # Firmware echoes the EXPANDED default key rather than the 0x01 sentinel.
+        real_send = node._sendAdmin
+
+        def echo_expanded(admin_message, onResponse=None, **kw):
+            if admin_message.HasField("set_channel"):
+                node.channels[0].CopyFrom(admin_message.set_channel)
+                node.channels[0].settings.psk = DEFAULT_KEY
+                if onResponse:
+                    onResponse({"decoded": {"routing": {"errorReason": "NONE"}}})
+                return
+            return real_send(admin_message, onResponse=onResponse, **kw)
+
+        node._sendAdmin = echo_expanded
+        result = service.write_verified_primary_channel(name="", psk=bytes([1]))
+        self.assertTrue(result.applied)  # semantic PSK match, not literal
+
+    def test_unanswered_channel_readback_times_out_cleanly(self) -> None:
+        service, node = self._service()
+        node.answer_channel = False
+
+        result = service.write_verified_primary_channel(
+            name="", psk=bytes([1]), timeout=0.2
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(result.reason, "timeout")
+
+
+class SettingsTransactionTests(unittest.TestCase):
+    def test_begin_commit_delegate_to_the_local_node_when_available(self) -> None:
+        service, node = make_service()
+        node.beginSettingsTransaction = lambda: node.sendAdmin_calls.append("begin")
+        node.commitSettingsTransaction = lambda: node.sendAdmin_calls.append("commit")
+
+        self.assertTrue(service.begin_settings_transaction())
+        self.assertTrue(service.commit_settings_transaction())
+        self.assertEqual(node.sendAdmin_calls, ["begin", "commit"])
+
+    def test_missing_sdk_methods_are_a_safe_no_op(self) -> None:
+        service, _node = make_service()
+        # FakeLocalNode has no begin/commitSettingsTransaction.
+        self.assertFalse(service.begin_settings_transaction())
+        self.assertFalse(service.commit_settings_transaction())
+
+    def test_not_connected_is_a_safe_no_op(self) -> None:
+        service = RadioService("/dev/test-radio")
+        self.assertFalse(service.begin_settings_transaction())
+        self.assertFalse(service.commit_settings_transaction())
+
+
+class ApplyNetworkConfigServiceTests(unittest.TestCase):
+    """RadioService.apply_network_config -- the fire-and-forget NETWORK
+
+    write. NONE of its calls block (no interface.waitForAckNak, no
+    per-field readback), so every stage completes promptly.
+    """
+
+    def _service(self):
+        service = RadioService("/dev/test-radio")
+        interface = FakeInterface()
+        node = _ChannelFakeNode(interface)
+        service._interface = interface
+        commits: list[str] = []
+        node.beginSettingsTransaction = lambda: commits.append("begin")
+        node.commitSettingsTransaction = lambda: commits.append("commit")
+        return service, node, commits
+
+    def test_stages_lora_then_channel_inside_a_transaction(self) -> None:
+        from meshtastic.protobuf import config_pb2
+
+        service, node, commits = self._service()
+        stages: list[str] = []
+
+        result = service.apply_network_config(
+            use_preset=True,
+            modem_preset=config_pb2.Config.LoRaConfig.ModemPreset.Value("MEDIUM_SLOW"),
+            channel_num=48,
+            channel_name="",
+            psk=bytes([1]),
+            stage_log=stages.append,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual(commits, ["begin", "commit"])
+        # localConfig.lora was staged with all three fields...
+        self.assertTrue(node.localConfig.lora.use_preset)
+        self.assertEqual(node.localConfig.lora.modem_preset, 3)
+        self.assertEqual(node.localConfig.lora.channel_num, 48)
+        # ...and writeConfig("lora") + writeChannel(0) were sent.
+        set_configs = [c for c in node.sendAdmin_calls if not isinstance(c, str)]
+        self.assertTrue(any(m.HasField("set_config") for m in set_configs))
+        self.assertTrue(any(m.HasField("set_channel") for m in set_configs))
+        # NETWORK NAME is never the channel name.
+        self.assertEqual(node.channels[0].settings.name, "")
+        self.assertEqual(bytes(node.channels[0].settings.psk), bytes([1]))
+        self.assertEqual(
+            [s.split()[0] for s in stages if s.endswith("START")],
+            ["begin", "lora", "channel", "commit"],
+        )
+
+    def test_completes_promptly_never_blocks(self) -> None:
+        from meshtastic.protobuf import config_pb2
+
+        service, _node, _c = self._service()
+        started = time.monotonic()
+        service.apply_network_config(
+            use_preset=True,
+            modem_preset=config_pb2.Config.LoRaConfig.ModemPreset.Value("LONG_FAST"),
+            channel_num=0,
+            channel_name="",
+            psk=b"",
+        )
+        self.assertLess(time.monotonic() - started, 1.0)  # no 300s ack wait
+
+    def test_not_connected_reports_the_connect_stage(self) -> None:
+        service = RadioService("/dev/test-radio")
+        result = service.apply_network_config(
+            use_preset=True, modem_preset=0, channel_num=0, channel_name="", psk=b""
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual(result.failed_step, "connect")
+
+
+class WaitForAckNakRemovedTests(unittest.TestCase):
+    def test_write_verified_config_field_does_not_call_waitForAckNak(self) -> None:
+        service, node = make_service()
+        node.respond_with_value = 240
+        called = {"n": 0}
+        service._interface.waitForAckNak = lambda: called.__setitem__("n", called["n"] + 1)
+
+        result = service.write_verified_config_field("display", "screen_on_secs", 240)
+
+        self.assertTrue(result.applied)  # verified purely by the readback
+        self.assertEqual(called["n"], 0)  # the unbounded 300s wait is gone
 
 
 if __name__ == "__main__":

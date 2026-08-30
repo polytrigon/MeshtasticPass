@@ -11,9 +11,12 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Mapping
 
+from rich.cells import cell_len
+
 from geo import distance_between, format_coordinates, format_distance
-from node_activity import is_node_active
-from radio_service import NodeMetadata
+from grapheme_text import truncate_to_cells
+from node_activity import ACTIVE_WINDOW_SECONDS, is_node_active
+from radio_service import LinkObservation, NodeMetadata
 from relative_time import format_relative_age
 
 
@@ -200,17 +203,20 @@ def build_mesh_working_set(
     A node that is only ever admitted from NodeDB and has never
     originated a message we received keeps is_client=False, is_relay=
     False -- the same "no observed role" shape YOU already uses -- and
-    is never fabricated as CLIENT merely for existing; see
-    format_mesh_context_line (ROLE renders "?") and glyph_is_solid
-    (renders STROKED). `last_interaction_at` remains specifically CHAT
-    interaction time (None when there is none) -- unchanged meaning
-    from before, still what is_stale() describes. format_mesh_context_
-    line's own LAST SEEN segment additionally considers `node.last_heard`
-    (taking whichever of the two is fresher), so a NodeDB-only node that
-    is_node_active() already counts as ACTIVE from last_heard alone can
-    never display "?" there just for lacking CHAT history. This same
-    `node.last_heard` recency is otherwise a separate signal, used below
-    for ranking only, never folded into this field.
+    is never fabricated as CLIENT merely for existing; is_client/
+    is_relay still drive glyph_is_solid's own STROKED-vs-FILLED node
+    styling even though the unified bottom bar (mesh_state.
+    format_mesh_node_bar_fields) no longer renders a ROLE field at all
+    (MESH GPS + UNIFIED BAR Part B). `last_interaction_at` remains
+    specifically CHAT interaction time (None when there is none) --
+    unchanged meaning from before, still what is_stale() describes.
+    format_mesh_node_bar_fields' own TIME field additionally considers
+    `node.last_heard` (taking whichever of the two is fresher), so a
+    NodeDB-only node that is_node_active() already counts as ACTIVE
+    from last_heard alone can never display "?" there just for lacking
+    CHAT history. This same `node.last_heard` recency is otherwise a
+    separate signal, used below for ranking only, never folded into
+    this field.
 
     Bounded to `max_remote_nodes` (never every known node -- readability
     over completeness), ranked by a single deterministic key so ranking
@@ -390,118 +396,333 @@ def _clean_text(value: object) -> str | None:
     return stripped or None
 
 
-def _name_segments(node: NodeMetadata) -> tuple[str, ...]:
-    """Long Name first, then Short Name, per the context-line name rule.
+# UI POLISH Part C: MESH's passive LINK quality display, for the
+# currently selected REMOTE node only (see app.py's
+# _update_mesh_node_bar -- YOU and "nothing selected" never call
+# any of this, since a radio has no RF link to itself).
+#
+# SNR, not RSSI, drives the meter: PROTOBUF-SOURCE-VERIFIED
+# (mesh_pb2.pyi), LoRa's spreading-gain means a link can stay fully
+# viable at a strongly negative SNR (unlike Wi-Fi, where RSSI alone is
+# a reasonable proxy) -- RSSI alone cannot tell a strong link on a
+# quiet channel from a weak one on a quiet channel. These thresholds
+# are this app's own reasoned mapping from realistic LoRa SNR ranges
+# (roughly +10 dB "clean, strong" down to roughly -20 dB "still
+# decodable, near the radio's own sensitivity floor" for the higher
+# spreading factors Meshtastic's default configs commonly use), not a
+# copied third-party constant:
+MESH_LINK_SNR_EXCELLENT_DB = 5.0
+MESH_LINK_SNR_GOOD_DB = 0.0
+MESH_LINK_SNR_WEAK_DB = -10.0
 
-    Short Name is included only when it is real and distinct from Long
-    Name -- never fabricated as "?"/"UNKNOWN"/"NONE" when absent, and
-    never duplicated when the two happen to be the same displayed value.
-    If Long Name is unavailable, the sole surviving segment falls back
-    to Short Name, then to the node ID itself -- never a blank segment.
-    Used for both YOU and remote nodes -- the rule itself has nothing
-    node-local-specific about it.
+# Placeholder meter for "no honest reading available" (no observation,
+# a stale one, or one with SNR missing) -- also the exact meter shown
+# in the "nothing to report" fallback line, matching UI POLISH Part C's
+# own example (`LINK  ----  -- / -- • LAST UPDATE 25s`).
+MESH_LINK_METER_UNKNOWN = "----"
+
+
+@dataclass(frozen=True)
+class MeshLinkDisplay:
+    """Display-ready LINK meter/raw-value text for the selected node.
+
+    Always resolvable to *something* displayable -- meter/rssi_text/
+    snr_text are each independently "--"-style placeholders when their
+    underlying value is missing, never a fabricated number. Raw values
+    are carried as already-formatted text (not a bare number) so a
+    caller never needs its own second "-- vs formatted" branch.
     """
-    long_name = _clean_text(node.long_name)
-    short_name = _clean_text(node.short_name)
-    if long_name and short_name and long_name != short_name:
-        return (long_name, short_name)
-    if long_name:
-        return (long_name,)
-    if short_name:
-        return (short_name,)
-    return (node.node_id,)
+
+    meter: str
+    rssi_text: str
+    snr_text: str
 
 
-def _format_distance(distance_miles: float | None, *, metric: bool) -> str:
-    if distance_miles is None:
-        return "? km" if metric else "? mi"
-    return format_distance(distance_miles, metric=metric)
+def _mesh_link_meter(snr: float | None) -> str:
+    """Deterministic SNR -> bar mapping: same SNR always yields the same
 
-
-def format_mesh_context_line(
-    state: MeshNodeState, *, now: float, metric: bool = False
-) -> str:
-    """Build the bottom-left status text for a selected REAL MESH node.
-
-    (An anonymous relay-stage placeholder is not a MeshNodeState at all
-    -- see mesh_topology.RelayStage -- and, being visual/topology-only,
-    can never be selected in the first place (see
-    MeshTopologyView.select_node()), so this function is never called
-    for one; there is no "RELAY" special case to handle here or in any
-    caller. A genuinely identified real RELAY-only node, should
-    trustworthy evidence for one ever exist, is an ordinary
-    MeshNodeState and renders through the normal path below with
-    ROLE=RELAY.)
-
-    YOU has no observed communication role, hop count, interaction
-    time, or distance of its own -- its line is instead:
-
-        YOU / LONG NAME [/ SHORT NAME] / GPS LOCATION
-
-    GPS LOCATION is exactly "NO GPS" (never "UNKNOWN GPS"/"N/A"/"NO
-    FIX") when the local node has no real position fix -- see
-    MeshNodeState.node.position, a GeoPosition only ever constructed by
-    geo.make_geo_position's own validated lat/lon (the SAME "valid
-    position" rule this module already applies when computing distance
-    -- never a second, divergent notion of "does YOU have a fix").
-    Segments are ordered least-droppable first: the existing generic
-    cell-width truncation this line already goes through (see app.py's
-    _update_mesh_context_status) therefore drops GPS LOCATION first on
-    a narrow viewport, then SHORT NAME, before ever touching YOU or
-    LONG NAME -- no separate truncation logic needed here.
-
-    A remote node's line is:
-
-        LONG NAME [/ SHORT NAME] / ROLE / N HOPS / AGE / DISTANCE
-
-    ROLE is CLIENT, RELAY, or CLIENT+RELAY. Unknown hop count,
-    interaction age, or distance each render as "?" rather than a
-    fabricated value -- see _name_segments, MeshNodeState.
-    distance_miles, and build_mesh_working_set for how each is derived.
-    DISTANCE is shown in km/mi according to `metric` -- the connected
-    radio's own synchronized UNITS setting, read by the caller -- but
-    is always derived from the SAME underlying haversine-miles value
-    regardless (see geo.format_distance).
+    bar, with no animation, randomization, or smoothing. The 4 glyphs
+    (U+2582/2584/2586/2588, "lower N eighths/full block") are ordinary
+    single-cell BMP symbols -- ASCII-adjacent block-drawing characters,
+    never a combining mark, variation selector, or multi-codepoint
+    emoji sequence, so they carry none of the terminal-cell-width risk
+    UI POLISH Part A investigates for keycap-style emoji.
     """
-    if state.node.is_local:
-        segments = ["YOU", *_name_segments(state.node)]
-        position = state.node.position
-        segments.append(format_coordinates(position) if position is not None else "NO GPS")
-        return " / ".join(segments)
+    if snr is None:
+        return MESH_LINK_METER_UNKNOWN
+    if snr >= MESH_LINK_SNR_EXCELLENT_DB:
+        return "▂▄▆█"
+    if snr >= MESH_LINK_SNR_GOOD_DB:
+        return "▂▄▆"
+    if snr >= MESH_LINK_SNR_WEAK_DB:
+        return "▂▄"
+    return "▂"
 
-    segments: list[str] = list(_name_segments(state.node))
 
-    role = "+".join(
-        name
-        for name, present in (("CLIENT", state.is_client), ("RELAY", state.is_relay))
-        if present
-    ) or "?"
-    segments.append(role)
+def format_mesh_link_display(
+    observation: LinkObservation | None, *, now: float
+) -> MeshLinkDisplay:
+    """Build the LINK meter/raw-value text for one directly-heard reading.
 
-    hops = state.node.hops_away
-    segments.append(f"{hops} HOPS" if hops is not None else "? HOPS")
+    Returns the honest "no data" placeholder (MeshLinkDisplay(
+    MESH_LINK_METER_UNKNOWN, "--", "--")) whenever `observation` is
+    None (never directly heard from this node -- see RadioService.
+    get_link_quality/LinkObservation for what "directly heard"
+    requires) OR its own age has reached ACTIVE_WINDOW_SECONDS -- the
+    SAME threshold MESH already uses to decide whether a node counts as
+    ACTIVE at all (see is_node_active), reused here rather than
+    inventing a second, hidden freshness model, so a LINK reading is
+    never shown as current once this board would already call the
+    underlying evidence stale. A negative age (a clock skew/ordering
+    edge case) is treated exactly like an over-age reading: honest
+    placeholder, never a fabricated "very fresh" claim.
+    """
+    if observation is not None:
+        age = now - observation.observed_at
+        if 0 <= age < ACTIVE_WINDOW_SECONDS:
+            return MeshLinkDisplay(
+                meter=_mesh_link_meter(observation.snr),
+                rssi_text=(
+                    str(observation.rssi) if observation.rssi is not None else "--"
+                ),
+                snr_text=(
+                    f"{round(observation.snr):+d}"
+                    if observation.snr is not None
+                    else "--"
+                ),
+            )
+    return MeshLinkDisplay(MESH_LINK_METER_UNKNOWN, "--", "--")
 
-    # LAST SEEN: the more recent of CHAT interaction time and NodeDB
-    # last_heard -- the SAME "freshest known signal" combination
-    # build_mesh_working_set's own ranking already uses (see its
-    # rank_key), so a NodeDB-only node that is_node_active() already
-    # counted as ACTIVE from last_heard alone can never display "?"
-    # here just because it has no CHAT history. Using
-    # state.last_interaction_at alone (CHAT-only) previously produced
-    # exactly that inconsistency: ACTIVE + FILLED + counted, yet LAST
-    # SEEN "?". A node with neither timestamp still renders "?", never
-    # a fabricated age.
-    last_seen_candidates = [
-        timestamp
-        for timestamp in (state.last_interaction_at, state.node.last_heard)
-        if timestamp is not None
-    ]
-    last_seen_at = max(last_seen_candidates) if last_seen_candidates else None
-    if last_seen_at is None or last_seen_at > now:
-        segments.append("?")
+
+@dataclass(frozen=True)
+class MeshNodeBarFields:
+    """Display-ready field values for MESH's single unified bottom bar
+
+    (MESH GPS + UNIFIED BAR Part B; label cleanup in the FINAL MESHTASTIC
+    POLISH pass), replacing the previous separate bottom-left node-context
+    line and bottom-right LINK/LAST UPDATE line. Every field independently
+    resolves to something displayable -- "?"/"--"/MESH_LINK_METER_UNKNOWN,
+    never blank or fabricated -- so format_mesh_node_bar_line never needs
+    a second per-field missing-data branch.
+
+    format_mesh_node_bar_line renders long_name/short_name as bare
+    values with no "LONG NAME"/"SHORT NAME" descriptor prefix (removed
+    in the FINAL MESHTASTIC POLISH pass as redundant -- position alone
+    already establishes which is which, long name always first);
+    hops_text/gps_text/distance_text/link_*/elapse_text keep their own
+    descriptor prefixes unchanged.
+    """
+
+    long_name: str
+    short_name: str
+    hops_text: str
+    gps_text: str
+    gps_text_compact: str
+    distance_text: str
+    link_meter: str
+    link_rssi_text: str
+    link_snr_text: str
+    elapse_text: str
+    accent2: bool
+
+
+def format_mesh_node_bar_fields(
+    state: MeshNodeState,
+    *,
+    now: float,
+    metric: bool = False,
+    link: LinkObservation | None = None,
+) -> MeshNodeBarFields:
+    """Resolve one selected node's raw field values for the unified bar.
+
+    YOU (state.node.is_local): HOPS is literally "0" (YOU is zero hops
+    from itself by definition, regardless of whatever raw hops_away a
+    NodeDB record happens to carry for the local node), DISTANCE is
+    always "--" (no distance from yourself), ELAPSE is literally "NOW",
+    and `link` is expected to already be None from the caller (a radio
+    has no RF link to itself -- see app.py's _update_mesh_node_bar,
+    which never even calls get_link_quality for YOU); format_mesh_link_
+    display(None, ...) already resolves to the same honest placeholder
+    a real "never heard directly" remote gets, so no extra branch is
+    needed here either way.
+
+    A remote's ELAPSE (renamed from TIME in the FINAL MESHTASTIC POLISH
+    pass -- same underlying freshness source and formatting, label only)
+    is the more recent of CHAT interaction time and NodeDB last_heard --
+    the SAME "freshest known signal" combination build_mesh_working_set's
+    own ranking already uses -- never CHAT interaction time alone (which
+    would wrongly show "?" for a NodeDB-only node last_heard already
+    knows is recent), and explicitly NOT LINK's own observed_at (a
+    directly-heard packet's timestamp is a different fact than "when did
+    we last hear anything at all from this node").
+    """
+    node = state.node
+    long_name = _clean_text(node.long_name) or _clean_text(node.short_name) or node.node_id
+    short_name = _clean_text(node.short_name) or node.node_id
+    gps_text = format_coordinates(node.position) if node.position is not None else "--"
+    gps_text_compact = (
+        f"{node.position.latitude:.2f},{node.position.longitude:.2f}"
+        if node.position is not None
+        else "--"
+    )
+    link_display = format_mesh_link_display(link, now=now)
+
+    if node.is_local:
+        hops_text = "0"
+        distance_text = "--"
+        elapse_text = "NOW"
     else:
-        segments.append(format_relative_age(now - last_seen_at))
+        hops_text = f"{node.hops_away}" if node.hops_away is not None else "?"
+        distance_text = (
+            format_distance(state.distance_miles, metric=metric)
+            if state.distance_miles is not None
+            else "--"
+        )
+        last_seen_candidates = [
+            timestamp
+            for timestamp in (state.last_interaction_at, node.last_heard)
+            if timestamp is not None
+        ]
+        last_seen_at = max(last_seen_candidates) if last_seen_candidates else None
+        if last_seen_at is None or last_seen_at > now:
+            elapse_text = "?"
+        else:
+            elapse_text = format_relative_age(now - last_seen_at)
 
-    segments.append(_format_distance(state.distance_miles, metric=metric))
+    return MeshNodeBarFields(
+        long_name=long_name,
+        short_name=short_name,
+        hops_text=hops_text,
+        gps_text=gps_text,
+        gps_text_compact=gps_text_compact,
+        distance_text=distance_text,
+        link_meter=link_display.meter,
+        link_rssi_text=link_display.rssi_text,
+        link_snr_text=link_display.snr_text,
+        elapse_text=elapse_text,
+        accent2=node.is_local,
+    )
 
-    return " / ".join(segments)
+
+def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int) -> str:
+    """Assemble MeshNodeBarFields into ONE physical line, degrading
+
+    deterministically through six explicit priority tiers -- compacting
+    precision first, then dropping lower-priority fields -- rather than
+    ever wrapping onto a second line:
+
+    1. FULL: long name - short name - HOPS - GPS (4dp) - DISTANCE - LINK
+       (spaced raw values) - ELAPSE
+    2. COMPACT VALUES: same fields, GPS at 2dp and LINK's raw values
+       tightened (no surrounding spaces)
+    3. drop GPS
+    4. drop GPS and DISTANCE
+    5. drop short name too (long name - HOPS - LINK - ELAPSE)
+    6. drop LINK too (long name - HOPS - ELAPSE) -- the bare minimum
+       that still identifies the node and its two most essential facts
+
+    long name/short name render as bare values (FINAL MESHTASTIC POLISH
+    pass: the "LONG NAME"/"SHORT NAME" descriptors were removed as
+    redundant -- position alone already establishes which is which,
+    long name always first); HOPS/GPS/DISTANCE/LINK/ELAPSE keep their
+    own descriptor prefixes unchanged (ELAPSE itself renamed from TIME,
+    same underlying freshness source and formatting -- see
+    format_mesh_node_bar_fields).
+
+    `available_width <= 0` (not yet laid out) shows the fullest tier
+    untouched, mirroring this MESH view's other width-aware lines
+    (see mesh_state.py's own established convention). If even tier 6
+    does not fit, grapheme-safe truncation is the final fallback.
+
+    The local YOU node (fields.accent2) is a deliberate exception:
+    DISTANCE ("no distance from yourself"), LINK ("no RF link to
+    itself") and ELAPSE ("NOW") carry no information for YOU, so they
+    are omitted entirely -- not shown as placeholders. YOU degrades
+    through its own short tier list (long name - short name - HOPS -
+    GPS, then drop GPS, then drop short name).
+    """
+    if fields.accent2:
+        you_candidates = (
+            " • ".join((
+                fields.long_name,
+                fields.short_name,
+                f"HOPS {fields.hops_text}",
+                f"GPS {fields.gps_text}",
+            )),
+            " • ".join((
+                fields.long_name,
+                fields.short_name,
+                f"HOPS {fields.hops_text}",
+                f"GPS {fields.gps_text_compact}",
+            )),
+            " • ".join((
+                fields.long_name,
+                fields.short_name,
+                f"HOPS {fields.hops_text}",
+            )),
+            " • ".join((
+                fields.long_name,
+                f"HOPS {fields.hops_text}",
+            )),
+        )
+        if available_width <= 0:
+            return you_candidates[0]
+        for candidate in you_candidates:
+            if cell_len(candidate) <= available_width:
+                return candidate
+        return truncate_to_cells(you_candidates[-1], available_width)
+
+    link_full = f"{fields.link_meter} {fields.link_rssi_text} / {fields.link_snr_text}"
+    link_compact = f"{fields.link_meter} {fields.link_rssi_text}/{fields.link_snr_text}"
+    candidates = (
+        " • ".join((
+            fields.long_name,
+            fields.short_name,
+            f"HOPS {fields.hops_text}",
+            f"GPS {fields.gps_text}",
+            f"DISTANCE {fields.distance_text}",
+            f"LINK {link_full}",
+            f"ELAPSE {fields.elapse_text}",
+        )),
+        " • ".join((
+            fields.long_name,
+            fields.short_name,
+            f"HOPS {fields.hops_text}",
+            f"GPS {fields.gps_text_compact}",
+            f"DISTANCE {fields.distance_text}",
+            f"LINK {link_compact}",
+            f"ELAPSE {fields.elapse_text}",
+        )),
+        " • ".join((
+            fields.long_name,
+            fields.short_name,
+            f"HOPS {fields.hops_text}",
+            f"DISTANCE {fields.distance_text}",
+            f"LINK {link_compact}",
+            f"ELAPSE {fields.elapse_text}",
+        )),
+        " • ".join((
+            fields.long_name,
+            fields.short_name,
+            f"HOPS {fields.hops_text}",
+            f"LINK {link_compact}",
+            f"ELAPSE {fields.elapse_text}",
+        )),
+        " • ".join((
+            fields.long_name,
+            f"HOPS {fields.hops_text}",
+            f"LINK {link_compact}",
+            f"ELAPSE {fields.elapse_text}",
+        )),
+        " • ".join((
+            fields.long_name,
+            f"HOPS {fields.hops_text}",
+            f"ELAPSE {fields.elapse_text}",
+        )),
+    )
+    if available_width <= 0:
+        return candidates[0]
+    for candidate in candidates:
+        if cell_len(candidate) <= available_width:
+            return candidate
+    return truncate_to_cells(candidates[-1], available_width)

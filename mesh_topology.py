@@ -276,6 +276,36 @@ def compact_node_label(node: NodeMetadata, max_cells: int = NODE_WIDTH - 2) -> s
     return f"…{node_id[-(max_cells - 1):]}"
 
 
+def mesh_board_marker_label(node: NodeMetadata, *, max_name_cells: int = NODE_WIDTH - 2) -> str:
+    """The MESH board's per-node label overlay: YOU renders as the
+
+    literal "YOU" (unchanged); a real remote renders as its bare SHORT
+    NAME (falling back to long name, then node ID). SHORT NAME is
+    preferred here (unlike compact_node_label's own long-name-preferred
+    choice, used elsewhere for sorting) to keep the compact overlay
+    short. UI / CHANNEL / RADIO CONFIG TUNING Part A: this label no
+    longer carries a "•"/"*" marker prefix at all -- that was a SECOND,
+    redundant dot rendered right beside the node's own existing grid
+    glyph (see MeshNodeWidget.refresh_visual, one cell below this
+    label). Successful-traceroute evidence now replaces the GRID
+    GLYPH itself with "*" at the same grid position instead, so there
+    is exactly one glyph per node, never two.
+    """
+    if node.is_local:
+        return "YOU"
+    for candidate in (node.short_name, node.long_name):
+        if candidate and cell_len(candidate) <= max_name_cells:
+            return candidate
+    if node.short_name:
+        return _truncate(node.short_name, max_name_cells)
+    if node.long_name:
+        return _truncate(node.long_name, max_name_cells)
+    node_id = node.node_id.strip()
+    if cell_len(node_id) <= max_name_cells:
+        return node_id or "UNKNOWN"
+    return f"…{node_id[-(max_name_cells - 1):]}"
+
+
 def _project_remote_gps_cluster(
     nodes: Iterable[NodeMetadata], *, max_radius: int
 ) -> dict[str, tuple[int, int]]:
@@ -363,11 +393,60 @@ def _apply_min_radius(x: int, y: int, min_radius: int) -> tuple[int, int]:
     return (round(x * scale), round(y * scale))
 
 
+def _place_group_sticky_first(
+    entries: list[tuple[NodeMetadata, int, int]],
+    region: str,
+    sticky_positions: Mapping[str, tuple[int, int, str]],
+    occupied: set[tuple[int, int]],
+) -> list[tuple[NodeMetadata, int, int]]:
+    """Place one region's worth of nodes (one compass direction,
+
+    GPS_RELATIVE, or UNKNOWN), giving every STICKY member first claim
+    on its remembered cell BEFORE any node -- sticky or not -- computes
+    a fresh ideal-or-nearest-free placement.
+
+    MESH LAYOUT STABILITY's core invariant: no new topology
+    information, no existing node movement. This two-pass order is
+    what makes that hold even when a brand-new node's own freshly
+    computed rank/index would otherwise land it on the exact cell an
+    EXISTING node's sticky memory wants -- interleaving sticky and
+    fresh placement in one pass (an earlier version of this function
+    did exactly that) lets whichever happens to be processed first, by
+    rank/alphabetical order, win the cell, silently displacing the
+    other; giving stickiness unconditional priority instead means a
+    node's own placement can never be disturbed by an unrelated node's
+    arrival, regardless of iteration order.
+
+    A node whose placement category (region) hasn't changed since the
+    last layout, and whose remembered cell nothing else has since
+    claimed, keeps that exact cell. Everyone else (no remembered cell,
+    a genuinely changed category -- real new topology information --
+    or a remembered cell a rare true collision already claimed) gets
+    the ordinary ideal-cell-or-nearest-free search (_reserve_slot).
+    """
+    sticky_claimed: list[tuple[NodeMetadata, int, int]] = []
+    fresh: list[tuple[NodeMetadata, int, int]] = []
+    for node, ideal_x, ideal_y in entries:
+        remembered = sticky_positions.get(node.node_id.strip().lower())
+        if remembered is not None and remembered[2] == region:
+            candidate = (remembered[0], remembered[1])
+            if candidate not in occupied:
+                occupied.add(candidate)
+                sticky_claimed.append((node, candidate[0], candidate[1]))
+                continue
+        fresh.append((node, ideal_x, ideal_y))
+    for node, ideal_x, ideal_y in fresh:
+        slot_x, slot_y = _reserve_slot(ideal_x, ideal_y, occupied)
+        sticky_claimed.append((node, slot_x, slot_y))
+    return sticky_claimed
+
+
 def assign_grid_slots(
     nodes: Iterable[NodeMetadata],
     *,
     max_radius: int = DEFAULT_MAX_GRID_RADIUS,
     min_radius_by_id: Mapping[str, int] | None = None,
+    sticky_positions: Mapping[str, tuple[int, int, str]] | None = None,
 ) -> tuple[PositionedNode, ...]:
     """Place YOU at (0, 0), then a bounded relative spatial grid outward.
 
@@ -402,6 +481,17 @@ def assign_grid_slots(
     geography, legitimately extends how far out a node's chain (and so
     the node itself) renders, without changing its actual direction.
 
+    `sticky_positions` (default: none) is the PREVIOUS call's own output,
+    keyed by lowercased node_id to (x, y, region) -- MESH LAYOUT
+    STABILITY: a node already placed once, whose placement category
+    (region) is unchanged this call, keeps its exact previous (x, y)
+    rather than being recomputed from a freshly re-sorted rank/index
+    (see _place_group_sticky_first). Omitting it (every caller that existed
+    before this parameter did) reproduces the exact prior fresh-every-
+    call behavior. Callers wanting stability across repeated calls are
+    expected to feed each call's own returned positions back in as the
+    next call's `sticky_positions` (see app.py's _refresh_mesh).
+
     This is the shared core reused both by build_topology() (which scales
     these steps into pixel positions for its own auto-sized board) and by
     any caller mapping them directly onto a different, e.g. fixed-size,
@@ -409,6 +499,7 @@ def assign_grid_slots(
     """
     max_radius = max(1, max_radius)
     min_radius_by_id = min_radius_by_id or {}
+    sticky_positions = sticky_positions or {}
     unique: dict[str, NodeMetadata] = {}
     for node in nodes:
         key = node.node_id.strip().lower()
@@ -456,13 +547,23 @@ def assign_grid_slots(
         entries = buckets.get(direction)
         if not entries:
             continue
+        # Sort order no longer determines radius (see
+        # _compress_distance_to_radius, which uses each node's own
+        # REAL distance directly) -- kept purely for deterministic
+        # _place_group_sticky_first/_reserve_slot collision resolution
+        # when two nodes compress to the identical radius.
         entries.sort(key=lambda item: (item[0], item[1].node_id.casefold()))
         dx, dy = _DIRECTION_VECTORS[direction]
-        for rank, (_distance, node) in enumerate(entries, start=1):
-            clamped_rank = max(
-                min(rank, max_radius), min_radius_by_id.get(node.node_id, 0)
+        ideal: list[tuple[NodeMetadata, int, int]] = []
+        for distance, node in entries:
+            radius = max(
+                _compress_distance_to_radius(distance, max_radius),
+                min_radius_by_id.get(node.node_id, 0),
             )
-            slot_x, slot_y = _reserve_slot(dx * clamped_rank, dy * clamped_rank, occupied)
+            ideal.append((node, dx * radius, dy * radius))
+        for node, slot_x, slot_y in _place_group_sticky_first(
+            ideal, direction, sticky_positions, occupied
+        ):
             logical.append((node, slot_x, slot_y, direction))
 
     # MODE B placement -- reserved BEFORE the unpositioned-fallback loop
@@ -471,6 +572,7 @@ def assign_grid_slots(
     # reservation; see _project_remote_gps_cluster). Deterministic
     # node_id order keeps this arrival-order independent, matching every
     # other placement loop in this function.
+    gps_ideal: list[tuple[NodeMetadata, int, int]] = []
     for node in sorted(
         (node for node in remotes if node.node_id in gps_cluster_positions),
         key=lambda node: node.node_id.casefold(),
@@ -479,15 +581,22 @@ def assign_grid_slots(
         boosted_x, boosted_y = _apply_min_radius(
             raw_x, raw_y, min_radius_by_id.get(node.node_id, 0)
         )
-        slot_x, slot_y = _reserve_slot(boosted_x, boosted_y, occupied)
+        gps_ideal.append((node, boosted_x, boosted_y))
+    for node, slot_x, slot_y in _place_group_sticky_first(
+        gps_ideal, "GPS_RELATIVE", sticky_positions, occupied
+    ):
         logical.append((node, slot_x, slot_y, "GPS_RELATIVE"))
 
     unknown.sort(key=_node_sort_key)
     if unknown:
         outer_ring = _square_ring(max_radius)
-        for index, node in enumerate(unknown):
-            grid_x, grid_y = outer_ring[index % len(outer_ring)]
-            slot_x, slot_y = _reserve_slot(grid_x, grid_y, occupied)
+        unknown_ideal = [
+            (node, outer_ring[index % len(outer_ring)][0], outer_ring[index % len(outer_ring)][1])
+            for index, node in enumerate(unknown)
+        ]
+        for node, slot_x, slot_y in _place_group_sticky_first(
+            unknown_ideal, "UNKNOWN", sticky_positions, occupied
+        ):
             logical.append((node, slot_x, slot_y, "UNKNOWN"))
 
     return tuple(
@@ -542,6 +651,7 @@ def place_within_bounds(
     row_count: int,
     column_count: int,
     margin: int = 1,
+    min_extent: Mapping[str, int] | None = None,
 ) -> dict[str, tuple[int, int]]:
     """Map assign_grid_slots()'s unbounded logical (x, y) steps from LOCAL
 
@@ -578,21 +688,50 @@ def place_within_bounds(
     expanding ring within bounds, falling back to the first free cell in
     the grid in the extreme case (guaranteed to exist for any working set
     much smaller than the grid's total cell count).
+
+    `min_extent` (default: none; keys "up"/"down"/"left"/"right") is a
+    floor on the farthest-logical-step distance this call treats each
+    half-axis as having -- MESH LAYOUT STABILITY: without it, an
+    axis's stretch factor is a pure function of whichever node is
+    CURRENTLY farthest out, so a farther node newly appearing (or the
+    previous farthest one aging out) rescales -- and so visibly moves
+    -- every OTHER already-placed node sharing that axis, even though
+    none of their own logical (x, y) changed. Callers wanting stability
+    across repeated calls are expected to ratchet this monotonically
+    from each call's own actually-used farthest-step values (see
+    app.py's _refresh_mesh) -- this function itself stays pure/
+    stateless; it only ever takes the floor it's given, never invents
+    or remembers one. Omitting it (every caller that existed before
+    this parameter did) reproduces the exact prior fresh-every-call
+    behavior.
     """
+    min_extent = min_extent or {}
     up_scale = _spread_scale(
-        max((-item.y for item in slots if item.y < 0), default=0),
+        max(
+            max((-item.y for item in slots if item.y < 0), default=0),
+            min_extent.get("up", 0),
+        ),
         max(0, center_row - 1 - margin),
     )
     down_scale = _spread_scale(
-        max((item.y for item in slots if item.y > 0), default=0),
+        max(
+            max((item.y for item in slots if item.y > 0), default=0),
+            min_extent.get("down", 0),
+        ),
         max(0, row_count - center_row - margin),
     )
     left_scale = _spread_scale(
-        max((-item.x for item in slots if item.x < 0), default=0),
+        max(
+            max((-item.x for item in slots if item.x < 0), default=0),
+            min_extent.get("left", 0),
+        ),
         max(0, center_column - 1 - margin),
     )
     right_scale = _spread_scale(
-        max((item.x for item in slots if item.x > 0), default=0),
+        max(
+            max((item.x for item in slots if item.x > 0), default=0),
+            min_extent.get("right", 0),
+        ),
         max(0, column_count - center_column - margin),
     )
 
@@ -946,6 +1085,42 @@ def _direction_bucket(bearing: float) -> str:
     """Map a compass bearing to one of eight 45-degree direction buckets."""
     index = int(((bearing % 360.0) + 22.5) // 45.0) % 8
     return _DIRECTION_ORDER[index]
+
+
+# MESH GPS PLACEMENT: real-world distance (miles) compressed onto the
+# fixed, small [1, max_radius] grid-step scale topology placement
+# already uses -- never a literal to-scale map. LoRa's realistic
+# effective range spans from well under a mile (dense urban/indoor) to
+# tens of miles (rural/line-of-sight), so a linear map would either
+# crowd every practical node into radius 1 or need an enormous board;
+# a base-5 geometric compression instead gives each grid step a full
+# order-of-magnitude-ish real distance range, so farther nodes always
+# land farther out while still fitting the same handful of usable grid
+# steps every non-GPS node already renders within. Deliberately a
+# fixed, documented breakpoint ladder rather than a continuous
+# log(distance) formula -- easier to reason about and test exactly,
+# and no less principled for it.
+_GPS_DISTANCE_RADIUS_GEOMETRIC_BASE = 5.0
+_GPS_DISTANCE_RADIUS_FIRST_BREAKPOINT_MILES = 1.0
+
+
+def _compress_distance_to_radius(distance_miles: float, max_radius: int) -> int:
+    """Deterministic real-distance -> grid-step-radius compression.
+
+    radius 1 for anything under the first breakpoint (default: 1
+    mile), then one additional grid step every time distance crosses
+    the next breakpoint (5x the previous one), capped at max_radius --
+    the same cap every other placement path in this module already
+    respects. Bearing (which direction bucket a node is even in) is
+    computed entirely separately; this only ever affects how far out
+    along that direction's ray a node sits.
+    """
+    radius = 1
+    breakpoint_miles = _GPS_DISTANCE_RADIUS_FIRST_BREAKPOINT_MILES
+    while distance_miles > breakpoint_miles and radius < max_radius:
+        radius += 1
+        breakpoint_miles *= _GPS_DISTANCE_RADIUS_GEOMETRIC_BASE
+    return radius
 
 
 def _reserve_slot(

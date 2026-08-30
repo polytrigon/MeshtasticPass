@@ -613,9 +613,9 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             chat_input = app.query_one("#chat-input", Input)
-            self.assertEqual(chat_input.value, "@ALICE ")
+            self.assertEqual(chat_input.value, "@ALCE ")
 
-            chat_input.value = "@ALICE that's really cool "
+            chat_input.value = "@ALCE that's really cool "
             chat_input.cursor_position = len(chat_input.value)
 
             await pilot.press("ctrl+e")
@@ -625,7 +625,7 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
 
-            self.assertEqual(chat_input.value, "@ALICE that's really cool 🔥")
+            self.assertEqual(chat_input.value, "@ALCE that's really cool 🔥")
             self.assertTrue(chat_input.has_focus)
 
     async def test_theme_switching_updates_picker_palette(self) -> None:

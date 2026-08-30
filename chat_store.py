@@ -9,7 +9,7 @@ import sqlite3
 from threading import RLock
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
 
@@ -43,6 +43,21 @@ class StoredMessage:
     # populated on a DM row (0) but carries no meaning there -- every
     # DM query filters by dm_node_id, never channel_index.
     dm_node_id: str | None = None
+    # This row's own CHANNEL's stable identity (ChannelInfo.stable_key)
+    # at the time it was written -- NULL for a DM row (channel_key
+    # carries no meaning there, mirroring how channel_index carries no
+    # meaning on a DM row) and also NULL for any row written before
+    # this column existed, or while the live radio's real channel
+    # identity was not yet known (e.g. the pre-connection placeholder
+    # channel list). A NULL channel_key is deliberately treated as
+    # "matches any channel_key filter" by load_recent_page/
+    # load_older_page (grandfathered) rather than hidden -- there is no
+    # way to retroactively recover which physical channel an old NULL
+    # row actually belonged to, so the honest choice is to keep
+    # showing it rather than silently discard already-collected
+    # history. See CHAT channel-history isolation (FINAL MESHTASTIC
+    # POLISH pass) and this field's own precedent, dm_node_id.
+    channel_key: str | None = None
 
     @property
     def message_time(self) -> float | None:
@@ -197,20 +212,22 @@ class ChatStore:
         received_at: float,
         origin_sent_at: float | None = None,
         dm_node_id: str | None = None,
+        channel_key: str | None = None,
     ) -> InsertResult:
         """Persist one incoming packet, deduplicating stable packet identities.
 
         `dm_node_id` set (to the sender's own canonical ID) marks this
         row as belonging to a Direct Message conversation rather than a
-        channel -- see StoredMessage.dm_node_id.
+        channel -- see StoredMessage.dm_node_id. `channel_key` should
+        stay None for a DM row -- see StoredMessage.channel_key.
         """
         created_at = received_at
         sql = """
             INSERT OR IGNORE INTO messages (
                 direction, packet_id, node_id, sender_name, sender_short_name,
                 channel_index, text, origin_sent_at, radio_rx_at, received_at, local_sent_at,
-                delivery_state, created_at, dm_node_id
-            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                delivery_state, created_at, dm_node_id, channel_key
+            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
         """
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -227,6 +244,7 @@ class ChatStore:
                     received_at,
                     created_at,
                     dm_node_id,
+                    channel_key,
                 ),
             )
             if cursor.rowcount:
@@ -251,6 +269,7 @@ class ChatStore:
         local_sent_at: float,
         delivery_state: str,
         dm_node_id: str | None = None,
+        channel_key: str | None = None,
     ) -> int:
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -258,8 +277,9 @@ class ChatStore:
                 INSERT INTO messages (
                     direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
-                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
-                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id,
+                    channel_key
+                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel_index,
@@ -269,6 +289,7 @@ class ChatStore:
                     delivery_state,
                     local_sent_at,
                     dm_node_id,
+                    channel_key,
                 ),
             )
             return int(cursor.lastrowid)
@@ -371,8 +392,23 @@ class ChatStore:
         self,
         channel_index: int = 0,
         limit: int = DEFAULT_HISTORY_LIMIT,
+        channel_key: str | None = None,
     ) -> HistoryPage:
-        """Load only the newest bounded page, in chronological order."""
+        """Load only the newest bounded page, in chronological order.
+
+        `channel_key` (CHAT channel-history isolation) is the LIVE
+        radio's current stable identity for `channel_index`. When it is
+        a real value, only rows recorded under that same key -- plus
+        any legacy row whose channel_key is still NULL, grandfathered
+        rather than hidden (see StoredMessage.channel_key) -- are
+        returned, so a same-slot radio reconfiguration (e.g. index 0
+        LongFast -> MediumSlow) can no longer surface the OTHER
+        channel's history under this one. When `channel_key` is None
+        (identity not yet known -- e.g. this app's own pre-connection
+        placeholder), no channel_key filtering is applied at all: there
+        is nothing trustworthy to filter against yet, so every row for
+        this index is returned exactly like before this column existed.
+        """
         self._validate_history_limit(limit)
         try:
             with self._lock:
@@ -381,10 +417,12 @@ class ChatStore:
                     """
                     SELECT id, direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
-                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id,
+                    channel_key
                     FROM (
                         SELECT * FROM messages
                         WHERE channel_index = ? AND dm_node_id IS NULL
+                            AND (? IS NULL OR channel_key = ? OR channel_key IS NULL)
                         ORDER BY
                             COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
                             received_at DESC,
@@ -396,7 +434,7 @@ class ChatStore:
                         received_at ASC,
                         id ASC
                     """,
-                    (channel_index, limit + 1),
+                    (channel_index, channel_key, channel_key, limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load CHAT history: {error}") from error
@@ -452,8 +490,13 @@ class ChatStore:
         before_message_id: int,
         channel_index: int = 0,
         limit: int = OLDER_HISTORY_PAGE_SIZE,
+        channel_key: str | None = None,
     ) -> HistoryPage:
-        """Load a bounded page immediately older than a stable message ID."""
+        """Load a bounded page immediately older than a stable message ID.
+
+        `channel_key` filters exactly like load_recent_page's own --
+        see its docstring.
+        """
         if (
             isinstance(before_message_id, bool)
             or not isinstance(before_message_id, int)
@@ -479,9 +522,11 @@ class ChatStore:
                     SELECT messages.id, direction, packet_id, node_id, sender_name,
                         sender_short_name, messages.channel_index, text, origin_sent_at,
                         radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
-                        dm_node_id
+                        dm_node_id, channel_key
                     FROM messages CROSS JOIN cursor
-                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL AND (
+                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL
+                        AND (? IS NULL OR messages.channel_key = ? OR messages.channel_key IS NULL)
+                        AND (
                         COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
                             < cursor.order_time
                         OR (
@@ -506,6 +551,8 @@ class ChatStore:
                         before_message_id,
                         channel_index,
                         channel_index,
+                        channel_key,
+                        channel_key,
                         limit + 1,
                     ),
                 ).fetchall()
@@ -787,7 +834,8 @@ class ChatStore:
                         local_sent_at REAL,
                         delivery_state TEXT,
                         created_at REAL NOT NULL,
-                        dm_node_id TEXT
+                        dm_node_id TEXT,
+                        channel_key TEXT
                     );
 
                     CREATE TABLE IF NOT EXISTS send_attempts (
@@ -814,7 +862,7 @@ class ChatStore:
                     )
                 else:
                     current_version = int(row["version"])
-                    if current_version not in (1, 2, SCHEMA_VERSION):
+                    if current_version not in (1, 2, 3, SCHEMA_VERSION):
                         raise ChatStoreError(
                             f"Unsupported CHAT schema version {current_version}."
                         )
@@ -836,6 +884,19 @@ class ChatStore:
                         # stays correctly excluded from every DM query.
                         connection.execute(
                             "ALTER TABLE messages ADD COLUMN dm_node_id TEXT"
+                        )
+                    if current_version <= 3 and "channel_key" not in columns:
+                        # v3 -> v4: add stable CHANNEL identity (CHAT
+                        # channel-history isolation), mirroring
+                        # dm_node_id's own precedent. Existing rows get
+                        # channel_key = NULL -- "written before this
+                        # column existed" -- which load_recent_page/
+                        # load_older_page treat as matching any live
+                        # channel_key rather than hiding already-
+                        # collected history that never had a chance to
+                        # record which physical channel it belonged to.
+                        connection.execute(
+                            "ALTER TABLE messages ADD COLUMN channel_key TEXT"
                         )
                     if current_version != SCHEMA_VERSION:
                         connection.execute(

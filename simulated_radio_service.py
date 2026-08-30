@@ -15,6 +15,7 @@ from radio_service import (
     ChannelInfo,
     ClockSyncResult,
     ConfigWriteResult,
+    RadioApplyResult,
     RadioEvent,
     DeliveryState,
     DISPLAY_UNITS_METRIC,
@@ -22,10 +23,14 @@ from radio_service import (
     RadioIdentityError,
     RadioSendError,
     RadioState,
+    LinkObservation,
     NodeMetadata,
     ReceivedMessage,
     SentMessage,
     SendStatus,
+    TracerouteResult,
+    TracerouteState,
+    TracerouteStatus,
     validate_send_request,
     validate_long_name,
     validate_short_name,
@@ -34,8 +39,8 @@ from radio_service import (
 
 SIMULATED_DEVICE_PATHS = ("/dev/ttyUSB0", "/dev/ttyUSB1")
 SIMULATED_CHANNELS = (
-    ChannelInfo(0, "LongFast"),
-    ChannelInfo(1, "Hiking"),
+    ChannelInfo(0, "LongFast", stable_key="sim-longfast"),
+    ChannelInfo(1, "Hiking", stable_key="sim-hiking"),
 )
 
 
@@ -48,6 +53,19 @@ class SimulatedSendOutcome(Enum):
     FAILED = "failed"
 
 
+class SimulatedTracerouteOutcome(Enum):
+    """Explicit deterministic result for one simulated traceroute attempt.
+
+    NO_RESPONSE never calls the status_handler at all -- for exercising
+    the app's own TRACEROUTE_TIMEOUT_SECONDS path without an artificial
+    real-time wait.
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    NO_RESPONSE = "no_response"
+
+
 @dataclass(frozen=True)
 class SimulatedNode:
     """Stable fake node information for repeatable development and tests."""
@@ -58,6 +76,15 @@ class SimulatedNode:
     position: GeoPosition | None
     last_heard_age_seconds: object | None
     hops_away: int | None = None
+    # Fake directly-heard RF signal quality (see RadioService.
+    # LinkObservation/get_link_quality) -- only meaningful, and only
+    # ever surfaced by get_link_quality below, when hops_away == 0, the
+    # same "zero relays traveled" honesty rule the real radio enforces
+    # via traversed_hops(). Every existing node below predates MESH
+    # LINK and deliberately keeps hops_away >= 1 or None, so none of
+    # them gain LINK data by accident.
+    rssi: int | None = None
+    snr: float | None = None
 
 
 SIMULATED_LOCAL_POSITION = GeoPosition(40.7128, -74.0060, 1_700_000_000.0)
@@ -84,6 +111,16 @@ SIMULATED_NODES = (
     SimulatedNode("!none0005", "Missing Clock", "NONE", None, None),
     SimulatedNode("!10a60006", None, "NOLN", None, 600.0, 2),
     SimulatedNode("!5a070007", "No Short Name", None, None, 600.0, None),
+    SimulatedNode(
+        "!d1ec7008",
+        "Direct Neighbor",
+        "DIRN",
+        GeoPosition(40.7300, -73.9950, 1_700_000_300.0),
+        45.0,
+        0,
+        rssi=-52,
+        snr=9.5,
+    ),
 )
 
 _SIMULATED_REFERENCE_TIME = time.time()
@@ -173,6 +210,11 @@ class SimulatedRadioService:
         message_interval: float = 0.75,
         scripted_messages: tuple[ReceivedMessage, ...] = SIMULATED_MESSAGES,
         send_outcomes: tuple[SimulatedSendOutcome, ...] = (),
+        traceroute_outcomes: tuple[SimulatedTracerouteOutcome, ...] = (),
+        traceroute_forward_route: tuple[str, ...] = (),
+        traceroute_forward_snr: tuple[float | None, ...] = (),
+        traceroute_return_route: tuple[str, ...] = (),
+        traceroute_return_snr: tuple[float | None, ...] = (),
     ) -> None:
         if device_path not in SIMULATED_DEVICE_PATHS:
             device_path = SIMULATED_DEVICE_PATHS[0]
@@ -190,6 +232,12 @@ class SimulatedRadioService:
         self.message_interval = message_interval
         self.scripted_messages = scripted_messages
         self.send_outcomes = send_outcomes
+        self.traceroute_outcomes = traceroute_outcomes
+        self.traceroute_forward_route = traceroute_forward_route
+        self.traceroute_forward_snr = traceroute_forward_snr
+        self.traceroute_return_route = traceroute_return_route
+        self.traceroute_return_snr = traceroute_return_snr
+        self._traceroute_count = 0
         self._message_handlers: list[Callable[[ReceivedMessage], None]] = []
         self._state_events: Queue[RadioEvent] = Queue()
         self._stop_event = Event()
@@ -220,8 +268,20 @@ class SimulatedRadioService:
             # (Config.LoRaConfig.hop_limit docstring), but a fully valid
             # 0-7 range (see app.HOP_LIMIT_CHOICES) -- this fake radio's
             # own "current value" for the HOP LIMIT RADIO setting, never
-            # a display-side default.
-            "lora": {"hop_limit": 3},
+            # a display-side default. use_preset/modem_preset/
+            # channel_num (ADVANCED RADIO CONFIG) mirror LONG_FAST's own
+            # real default (Config.LoRaConfig.ModemPreset.LONG_FAST == 0,
+            # channel_num 0 == "radio auto-selects") -- these three MUST
+            # already exist here, never only appear once first written,
+            # since write_verified_config_field's own simulated
+            # implementation (below) refuses to write a field this dict
+            # doesn't already declare.
+            "lora": {
+                "hop_limit": 3,
+                "use_preset": True,
+                "modem_preset": 0,
+                "channel_num": 0,
+            },
             # A deterministic, always-present POSITION config section --
             # see item 9: "no current fix" is itself a real, common,
             # honest state, not an error, so the simulated snapshot
@@ -235,6 +295,13 @@ class SimulatedRadioService:
         }
         self._connection_generation = 0
         self._config_snapshot = None
+        # Deterministic fake PRIMARY channel state (ADVANCED RADIO
+        # CONFIG) -- mirrors a real freshly-flashed radio's own default
+        # open "LongFast" primary channel, PSK byte 0x01 (Meshtastic's
+        # own "default channel psk" sentinel -- see meshtastic.util.
+        # fromPSK("default")), matching base64 "AQ==" exactly.
+        self._primary_channel_name = "LongFast"
+        self._primary_channel_psk = bytes([1])
 
     def available_device_paths(self) -> tuple[str, ...]:
         """Return fake ports without asking the host operating system."""
@@ -323,6 +390,35 @@ class SimulatedRadioService:
                     position=node.position,
                 )
         return NodeMetadata(node_id.strip())
+
+    def get_link_quality(self, node_id: str) -> LinkObservation | None:
+        """Return fixture-defined directly-heard signal quality.
+
+        Mirrors RadioService.get_link_quality's own honesty rule: only
+        a node with hops_away == 0 (SIMULATED_NODES' fake analog of
+        traversed_hops(...) == 0 -- a genuine zero-relay reception) can
+        ever have LINK data, and only when the fixture actually
+        supplies rssi/snr. observed_at is anchored to this connection's
+        own activity_reference_time (falling back to the current time
+        the app is already free to treat as fresh) rather than a fixed
+        constant, so --simulate's LINK display ages exactly like real
+        last_heard/LAST UPDATE do.
+        """
+        normalized = node_id.strip().lower()
+        for node in SIMULATED_NODES:
+            if node.node_id.lower() != normalized:
+                continue
+            if node.hops_away != 0:
+                return None
+            if node.rssi is None and node.snr is None:
+                return None
+            observed_at = (
+                self._activity_reference_time
+                if self._activity_reference_time is not None
+                else time.time()
+            )
+            return LinkObservation(rssi=node.rssi, snr=node.snr, observed_at=observed_at)
+        return None
 
     def get_known_nodes(self) -> tuple[NodeMetadata, ...]:
         """Return stable fake topology data without hardware or transmissions."""
@@ -439,6 +535,88 @@ class SimulatedRadioService:
         section_values[field] = value
         self._rebuild_config_snapshot()
         return ConfigWriteResult(True, value, value, "")
+
+    def read_primary_channel_settings(self) -> tuple[str, bytes] | None:
+        """Deterministic fake read, mirroring RadioService's real method."""
+        if not self._online:
+            return None
+        return (self._primary_channel_name, self._primary_channel_psk)
+
+    def write_verified_primary_channel(
+        self,
+        *,
+        name: str,
+        psk: bytes,
+        timeout: float = 15.0,
+    ) -> ConfigWriteResult:
+        """Deterministic fake write, mirroring RadioService's real method
+        (--simulate always succeeds while online -- see
+        write_verified_config_field's own docstring for why).
+        """
+        if not self._online:
+            return ConfigWriteResult(False, (name, psk), None, "not_connected")
+        self._primary_channel_name = name
+        self._primary_channel_psk = psk
+        self._rebuild_config_snapshot()
+        return ConfigWriteResult(True, (name, psk), (name, psk), "")
+
+    def begin_settings_transaction(self) -> bool:
+        """No-op stub (the simulator has no firmware transaction/reboot);
+
+        returns True so apply_radio_config_preset exercises its
+        begin/commit path identically under --simulate.
+        """
+        return self._online
+
+    def commit_settings_transaction(self) -> bool:
+        return self._online
+
+    def reread_lora_and_primary_channel(self, *, timeout: float = 8.0) -> bool:
+        """No-op: the simulator's _config_sections / primary-channel
+
+        state is always live, so a "fresh re-read" is whatever
+        read_synced_config_field / read_primary_channel_settings
+        already return.
+        """
+        return self._online
+
+    def apply_network_config(
+        self,
+        *,
+        use_preset: bool,
+        modem_preset: int,
+        channel_num: int,
+        channel_name: str,
+        psk: bytes,
+        stage_log=None,
+    ) -> RadioApplyResult:
+        """Deterministic fire-and-forget NETWORK write -- mirrors
+
+        RadioService.apply_network_config's staging/logging shape
+        (--simulate always succeeds while online) so ADVANCED RADIO's
+        apply path behaves identically without hardware.
+        """
+        log = stage_log or (lambda _message: None)
+        if not self._online:
+            log("connect ERROR not_connected")
+            return RadioApplyResult(
+                False, "connect", {"connect": ConfigWriteResult(False, None, None, "not_connected")}
+            )
+        results: dict[str, ConfigWriteResult] = {}
+        for stage in ("begin", "lora", "channel", "commit"):
+            log(f"{stage} START")
+            if stage == "lora":
+                lora = self._config_sections.setdefault("lora", {})
+                lora["use_preset"] = use_preset
+                lora["modem_preset"] = modem_preset
+                lora["channel_num"] = channel_num
+            elif stage == "channel":
+                self._primary_channel_name = channel_name
+                self._primary_channel_psk = psk
+            results[stage] = ConfigWriteResult(True, None, None, "")
+            log(f"{stage} DONE")
+        self._rebuild_config_snapshot()
+        return RadioApplyResult(True, "", results)
 
     def config_snapshot(self):
         """The current connection's cached fake RadioConfigurationSnapshot,
@@ -620,6 +798,57 @@ class SimulatedRadioService:
         )
         self._sent_messages.append(sent)
         return sent
+
+    def send_traceroute(
+        self,
+        destination_node_id: str,
+        status_handler: Callable[[TracerouteStatus], None],
+    ) -> int:
+        """Record a traceroute using the next explicitly scripted outcome.
+
+        Calls `status_handler` synchronously, before returning, exactly
+        like RadioService's own async callback eventually would -- the
+        caller (MeshtasticPassApp._start_traceroute) never relies on
+        that ordering: its own request_token is captured in the
+        status_handler closure BEFORE this method is even called, so a
+        synchronous callback here can never race anything (see
+        TracerouteStatusReceived's own docstring).
+        """
+        if not self._online or self._stop_event.is_set():
+            raise RadioSendError("The simulated radio is not connected.")
+        outcome = (
+            self.traceroute_outcomes[self._traceroute_count]
+            if self._traceroute_count < len(self.traceroute_outcomes)
+            else SimulatedTracerouteOutcome.SUCCEEDED
+        )
+        self._traceroute_count += 1
+        packet_id = 460000000 + self._traceroute_count
+        if outcome is SimulatedTracerouteOutcome.NO_RESPONSE:
+            return packet_id
+        if outcome is SimulatedTracerouteOutcome.FAILED:
+            status_handler(
+                TracerouteStatus(
+                    TracerouteState.FAILED,
+                    packet_id,
+                    detail="Simulated routing failure.",
+                )
+            )
+            return packet_id
+        status_handler(
+            TracerouteStatus(
+                TracerouteState.SUCCEEDED,
+                packet_id,
+                result=TracerouteResult(
+                    destination_node_id=destination_node_id,
+                    forward_route=self.traceroute_forward_route,
+                    forward_snr=self.traceroute_forward_snr,
+                    return_route=self.traceroute_return_route,
+                    return_snr=self.traceroute_return_snr,
+                    completed_at=time.time(),
+                ),
+            )
+        )
+        return packet_id
 
     def emit_message(self, message: ReceivedMessage) -> None:
         """Deliver one fake message to every registered consumer."""
