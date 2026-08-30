@@ -9,7 +9,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from threading import Thread
-from time import monotonic, time
+from time import monotonic, sleep, time
 from typing import Any, Callable
 
 from rich.cells import cell_len
@@ -5797,37 +5797,111 @@ class MeshtasticPassApp(App[None]):
             f"apply#{token} write returned applied={result.applied} "
             f"failed_step={result.failed_step or '-'}"
         )
-        # The write path is fire-and-forget and never blocks, so we are
-        # here within ~1s of a healthy radio (no reboot). Verify with
-        # ONE fresh readback (on THIS worker thread -- get_config /
-        # get_channel round-trips block on RF, never the UI). Skipped
-        # only when a stage already saw the interface drop
-        # ("disconnected") -- that is Path A, the reconnect handler
-        # owns the verify.
+        # A genuine write/commit/API stage error fails immediately --
+        # no point verifying a write that did not go out. Only a write
+        # that RETURNED applied gets the post-commit convergence poll.
         verification: RadioConfigVerification | None = None
-        step_result = (
-            result.results.get(result.failed_step) if not result.applied else None
-        )
-        disconnected = step_result is not None and step_result.reason == "disconnected"
-        if not disconnected:
-            try:
-                self._log_netcfg(f"apply#{token} READBACK START")
-                reread = getattr(self.radio, "reread_lora_and_primary_channel", None)
-                reread_ok = bool(reread()) if callable(reread) else True
-                self._log_netcfg(f"apply#{token} READBACK DONE ok={reread_ok}")
-                # A fresh readback that never answered while the radio is
-                # still connected is a genuine verify failure, NOT a
-                # reboot -- leave `verification` None so the handler
-                # reports a terminal error (never WAITING FOR RECONNECT).
-                if reread_ok:
-                    verification = verify_radio_config_preset(self.radio, preset)
-            except Exception as error:
-                self._log_netcfg(
-                    f"apply#{token} READBACK ERROR {error.__class__.__name__}"
-                )
+        if result.applied:
+            verification = self._verify_network_apply_converge(token, preset)
         self.post_message(
             RadioConfigPresetApplied(token, name, result, saved, verification)
         )
+
+    # A fire-and-forget set_config + commit takes a moment to propagate
+    # into the SDK's synced state on real hardware, so the FIRST fresh
+    # readback can still show the OLD config -- which is what made a
+    # switch "work only every few tries". After a write that returned
+    # applied, poll a genuinely fresh readback ~once/second until it
+    # converges on the requested NETWORK, or the bounded window passes.
+    # Never a single big sleep; never blocks the UI thread (runs on the
+    # apply worker). Well within the 90s overall safety timeout.
+    _NETWORK_VERIFY_SETTLE_SECONDS = 0.5
+    _NETWORK_VERIFY_DEADLINE_SECONDS = 12.0
+    _NETWORK_VERIFY_INTERVAL_SECONDS = 1.0
+    _NETWORK_VERIFY_REREAD_TIMEOUT = 3.0
+
+    def _verify_network_apply_converge(
+        self, token: int, preset: RadioConfigPreset
+    ) -> RadioConfigVerification | None:
+        """Post-commit convergence poll (apply worker thread).
+
+        Returns the matching RadioConfigVerification the moment the
+        radio's fresh readback matches the requested NETWORK; None if
+        the radio dropped mid-window (the reconnect path then owns the
+        verify -- see _on_connection_state_for_network_apply); or, at
+        the deadline, the last mismatch (-> terminal field-named error)
+        or None if the readback never answered (-> VERIFY READBACK
+        TIMEOUT). Every attempt asks the radio for CURRENT values
+        (reread_lora_and_primary_channel = fresh get_config +
+        get_channel), never a re-check of one cached object. Zero
+        config writes -- readback only.
+        """
+        sleep(self._NETWORK_VERIFY_SETTLE_SECONDS)
+        started = monotonic()
+        deadline = started + self._NETWORK_VERIFY_DEADLINE_SECONDS
+        reread = getattr(self.radio, "reread_lora_and_primary_channel", None)
+        last: RadioConfigVerification | None = None
+        attempt = 0
+        while True:
+            attempt += 1
+            current = self._network_apply
+            if current is None or current.token != token:
+                # This apply was superseded by a newer one, cancelled,
+                # or already resolved -- stop polling the radio.
+                self._log_netcfg(f"apply#{token} verify cancelled (superseded)")
+                return None
+            if self._radio_state is not RadioState.ONLINE:
+                self._log_netcfg(
+                    f"apply#{token} verify attempt={attempt} radio not ONLINE "
+                    "-> reconnect path owns verify"
+                )
+                return None
+            answered = True
+            try:
+                if callable(reread):
+                    answered = bool(
+                        reread(timeout=self._NETWORK_VERIFY_REREAD_TIMEOUT)
+                    )
+            except Exception as error:
+                self._log_netcfg(
+                    f"apply#{token} verify attempt={attempt} reread ERROR "
+                    f"{error.__class__.__name__}"
+                )
+                answered = False
+            if answered:
+                last = verify_radio_config_preset(self.radio, preset)
+                for check in last.checks:
+                    self._log_netcfg(
+                        f"apply#{token} verify attempt={attempt} {check.field} "
+                        f"requested={check.requested} actual={check.actual} "
+                        f"match={check.match}"
+                    )
+                if last.ok:
+                    self._log_netcfg(
+                        f"apply#{token} converged attempt={attempt} "
+                        f"elapsed={monotonic() - started:.1f}s"
+                    )
+                    return last
+            else:
+                self._log_netcfg(
+                    f"apply#{token} verify attempt={attempt} readback did not answer"
+                )
+            if monotonic() >= deadline:
+                if last is not None:
+                    unconverged = [c.field for c in last.checks if not c.match]
+                    actual = ", ".join(f"{c.field}={c.actual}" for c in last.checks)
+                    self._log_netcfg(
+                        f"apply#{token} did NOT converge after {attempt} attempts "
+                        f"{monotonic() - started:.1f}s -- unconverged={unconverged} "
+                        f"final actual: {actual}"
+                    )
+                else:
+                    self._log_netcfg(
+                        f"apply#{token} did NOT converge -- readback never answered "
+                        f"in {monotonic() - started:.1f}s"
+                    )
+                return last
+            sleep(self._NETWORK_VERIFY_INTERVAL_SECONDS)
 
     @on(RadioConfigPresetApplied)
     def radio_config_preset_applied(self, event: RadioConfigPresetApplied) -> None:
@@ -5835,6 +5909,16 @@ class MeshtasticPassApp(App[None]):
         if apply is None or apply.token != event.token:
             # A late return from a superseded / already-timed-out
             # attempt: never misattributed to whatever is current now.
+            return
+        if apply.awaiting_reconnect:
+            # A disconnect was already observed while the worker ran
+            # (commit rebooted the radio). Its verification -- if any --
+            # is pre-reboot and stale; the reconnect full-sync + verify
+            # is authoritative (see _resolve_network_apply_after_reconnect).
+            self._log_netcfg(
+                f"apply#{apply.token} worker returned but disconnect already "
+                "observed -- reconnect owns the verify"
+            )
             return
         result = event.result
         step_result = (
@@ -5890,12 +5974,15 @@ class MeshtasticPassApp(App[None]):
         apply = self._network_apply
         if apply is None:
             return
-        for check in verification.checks:
-            self._log_netcfg(
-                f"apply#{apply.token} verify[{source}] {check.field} "
-                f"requested={check.requested} actual={check.actual} "
-                f"match={check.match}"
-            )
+        # The post-write convergence poll already logged every attempt's
+        # per-field lines; only the reconnect path needs them here.
+        if source != "post-write":
+            for check in verification.checks:
+                self._log_netcfg(
+                    f"apply#{apply.token} verify[{source}] {check.field} "
+                    f"requested={check.requested} actual={check.actual} "
+                    f"match={check.match}"
+                )
         self._log_netcfg(
             f"apply#{apply.token} verify[{source}] {verification.channel_name_note}"
         )

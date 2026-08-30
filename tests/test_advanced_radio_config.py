@@ -332,6 +332,23 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
         self.settings = AppSettings.load(
             config_path=self.config_path, profile_path=self.root / "terminal.conf"
         )
+        # The post-write readback-converge poll has a real settle/retry
+        # cadence for hardware; keep it near-instant under --simulate/tests.
+        for attr, value in (
+            ("_NETWORK_VERIFY_SETTLE_SECONDS", 0.0),
+            ("_NETWORK_VERIFY_INTERVAL_SECONDS", 0.02),
+            ("_NETWORK_VERIFY_DEADLINE_SECONDS", 0.4),
+        ):
+            original = getattr(MeshtasticPassApp, attr)
+            setattr(MeshtasticPassApp, attr, value)
+            self.addCleanup(setattr, MeshtasticPassApp, attr, original)
+
+    @staticmethod
+    async def _wait_apply_settled(pilot, app, tries: int = 120) -> None:
+        for _ in range(tries):
+            await pilot.pause(0.05)
+            if app._network_apply is None:
+                return
 
     @staticmethod
     def radio() -> SimulatedRadioService:
@@ -742,10 +759,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
             # Radio comes back STILL on the old config.
             radio.simulate_reconnect()
-            for _ in range(20):
-                await pilot.pause()
-                if app._network_apply is None:
-                    break
+            await self._wait_apply_settled(pilot, app)
 
             self.assertIsNone(app._network_apply)
             self.assertEqual(app._selected_network, BUILTIN_LONGFAST_NETWORK)
@@ -890,10 +904,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             radio._config_sections["lora"]["channel_num"] = 48
             radio._primary_channel_psk = bytes([1])
             radio.simulate_reconnect()
-            for _ in range(20):
-                await pilot.pause()
-                if app._network_apply is None:
-                    break
+            await self._wait_apply_settled(pilot, app)
 
             self.assertIsNone(app._network_apply)  # terminal
             self.assertEqual(app._selected_network, "NYC MS48")
@@ -923,10 +934,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
             # Radio reconnects but STILL on the old config.
             radio.simulate_reconnect()
-            for _ in range(20):
-                await pilot.pause()
-                if app._network_apply is None:
-                    break
+            await self._wait_apply_settled(pilot, app)
 
             self.assertIsNone(app._network_apply)
             status = str(app.query_one("#advanced-radio-status", Static).render())
@@ -1014,10 +1022,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             )
 
             app._on_network_selected("NYC MS48")
-            for _ in range(15):
-                await pilot.pause()
-                if app._network_apply is None:
-                    break
+            await self._wait_apply_settled(pilot, app)
 
             self.assertIsNone(app._network_apply)  # terminal, no reboot wait
             self.assertNotIn(
@@ -1045,16 +1050,185 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             app._on_network_selected("NYC MS48")
-            for _ in range(15):
-                await pilot.pause()
-                if app._network_apply is None:
-                    break
+            await self._wait_apply_settled(pilot, app)
 
             self.assertIsNone(app._network_apply)
             self.assertEqual(app._selected_network, BUILTIN_LONGFAST_NETWORK)  # reverted
             status = str(app.query_one("#advanced-radio-status", Static).render())
             self.assertIn("FREQ. SLOT MISMATCH", status)
             self.assertNotIn("NYC MS48 APPLIED", status)
+
+    # ---- Post-commit convergence ---------------------------------------
+
+    @staticmethod
+    def _readback_converges_on(radio, attempt, *, field="channel_num", stale=0):
+        """The lora readback returns `stale` for `field` until the Nth
+
+        verify call, then the real committed value -- models delayed
+        SDK/radio state propagation after a fire-and-forget commit.
+        Spies reread_lora_and_primary_channel so a test can assert each
+        convergence attempt does a genuinely fresh readback.
+        """
+        radio.reread_lora_and_primary_channel = Mock(
+            wraps=radio.reread_lora_and_primary_channel
+        )
+        real = radio.read_synced_config_field
+        counter = {"n": 0}
+
+        def fake(section, f):
+            if (section, f) == ("lora", field):
+                counter["n"] += 1
+                if counter["n"] < attempt:
+                    return stale
+            return real(section, f)
+
+        radio.read_synced_config_field = fake
+
+    async def test_first_post_commit_mismatch_does_not_fail_then_converges(
+        self,
+    ) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        # channel_num reads stale (0) on attempt 1, correct (48) from 2.
+        self._readback_converges_on(radio, 2, field="channel_num", stale=0)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+
+            app._on_network_selected("NYC MS48")
+            await self._wait_apply_settled(pilot, app)
+
+            self.assertIsNone(app._network_apply)
+            self.assertEqual(app._selected_network, "NYC MS48")
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("APPLIED", status)
+            self.assertNotIn("NOT APPLIED", status)
+            # Each attempt re-read the radio (>= 2 attempts here).
+            self.assertGreaterEqual(radio.reread_lora_and_primary_channel.call_count, 2)
+
+    async def test_convergence_stops_immediately_on_match(self) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        self._readback_converges_on(radio, 2, field="channel_num", stale=0)
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            app._on_network_selected("NYC MS48")
+            await self._wait_apply_settled(pilot, app)
+            # Converged on attempt 2 -> a small, bounded number of
+            # rereads, never the whole window.
+            self.assertLessEqual(radio.reread_lora_and_primary_channel.call_count, 4)
+
+    async def test_persistent_mismatch_reaches_terminal_error_naming_the_field(
+        self,
+    ) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        self._apply_commits_wrong_lora(radio, channel_num=99)  # never converges
+        radio.reread_lora_and_primary_channel = Mock(
+            wraps=radio.reread_lora_and_primary_channel
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            app._on_network_selected("NYC MS48")
+            await self._wait_apply_settled(pilot, app)
+
+            self.assertIsNone(app._network_apply)
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("FREQ. SLOT MISMATCH", status)
+            self.assertEqual(app._selected_network, BUILTIN_LONGFAST_NETWORK)
+            # It RETRIED (more than one readback) before giving up.
+            self.assertGreaterEqual(radio.reread_lora_and_primary_channel.call_count, 2)
+
+    async def test_genuine_write_error_fails_immediately_without_convergence(
+        self,
+    ) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        radio.apply_network_config = lambda **k: RadioApplyResult(
+            False, "commit", {"commit": ConfigWriteResult(False, None, None, "error: X")}
+        )
+        radio.reread_lora_and_primary_channel = Mock(
+            wraps=radio.reread_lora_and_primary_channel
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            app._on_network_selected("NYC MS48")
+            await self._wait_apply_settled(pilot, app)
+
+            self.assertIsNone(app._network_apply)
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("NOT APPLIED", status)
+            self.assertIn("COMMIT", status)
+            # No convergence poll for a write that never went out.
+            radio.reread_lora_and_primary_channel.assert_not_called()
+
+    async def test_convergence_retries_perform_zero_config_writes(self) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        self._readback_converges_on(radio, 3, field="channel_num", stale=0)
+        radio.apply_network_config = Mock(wraps=radio.apply_network_config)
+        radio.write_verified_config_field = Mock(wraps=radio.write_verified_config_field)
+        radio.write_verified_primary_channel = Mock(
+            wraps=radio.write_verified_primary_channel
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            app._on_network_selected("NYC MS48")
+            await self._wait_apply_settled(pilot, app)
+
+            self.assertEqual(radio.apply_network_config.call_count, 1)  # ONE write
+            radio.write_verified_config_field.assert_not_called()
+            radio.write_verified_primary_channel.assert_not_called()
+
+    async def test_disconnect_during_convergence_enters_reconnect_path(self) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        self._apply_commits_wrong_lora(radio, channel_num=99)  # would never converge
+        app = MeshtasticPassApp(radio, self.settings)
+        # widen the window so the disconnect lands mid-convergence
+        app._NETWORK_VERIFY_DEADLINE_SECONDS = 3.0
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            app._on_network_selected("NYC MS48")
+            await pilot.pause(0.1)
+            radio.simulate_disconnect()
+            for _ in range(40):
+                await pilot.pause(0.05)
+                if app._network_apply and app._network_apply.awaiting_reconnect:
+                    break
+
+            self.assertIsNotNone(app._network_apply)
+            self.assertTrue(app._network_apply.awaiting_reconnect)
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("WAITING FOR RECONNECT", status)
 
     async def test_switch_status_scrolls_into_view_when_below_the_fold(self) -> None:
         radio = self.radio()
