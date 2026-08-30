@@ -93,7 +93,10 @@ Develop and test without radio hardware:
 python app.py --simulate
 ```
 
-Press `1` through `4` to open CONNECTION, CHAT, PROFILE, or MESH. CHAT
+Press `1` through `4` to open CONNECTION, CHAT, MESH, or DM (Direct
+Messages -- a conversation list keyed by stable node ID, separate from
+channel CHAT). PROFILE remains fully implemented but is hidden from the
+visible tabs and unreachable via any digit key. CHAT
 shows and sends on the currently selected configured broadcast channel. Press
 `C` outside the input to open the channel dropdown; use Up/Down and Enter to
 select, or Escape to cancel. While the chat input is focused, normal text and

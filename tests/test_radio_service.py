@@ -95,6 +95,92 @@ class RadioServiceTests(unittest.TestCase):
             (ChannelInfo(0, "LongFast"), ChannelInfo(1, "Hiking")),
         )
 
+    def test_duplicate_channel_names_remain_safe_identity_is_index(self) -> None:
+        """Item 17/32: TWO different channel indexes sharing the same
+
+        configured name must both survive, distinct by index -- never
+        collapsed/deduplicated by name.
+        """
+        channels = [
+            SimpleNamespace(index=0, role=1, settings=SimpleNamespace(name="Camp")),
+            SimpleNamespace(index=1, role=2, settings=SimpleNamespace(name="Camp")),
+        ]
+        local_node = SimpleNamespace(
+            channels=channels,
+            localConfig=SimpleNamespace(lora=SimpleNamespace(use_preset=False)),
+        )
+
+        result = RadioService._read_channel_info(local_node)
+
+        self.assertEqual(result, (ChannelInfo(0, "Camp"), ChannelInfo(1, "Camp")))
+        self.assertEqual({channel.index for channel in result}, {0, 1})
+
+    def test_three_enabled_channels_all_shown_not_just_primary(self) -> None:
+        """Item 17: a radio with LongFast + two secondary channels must
+
+        show all three -- never hardcoded to a single channel.
+        """
+        channels = [
+            SimpleNamespace(index=0, role=1, settings=SimpleNamespace(name="LongFast")),
+            SimpleNamespace(index=1, role=2, settings=SimpleNamespace(name="Hiking")),
+            SimpleNamespace(index=2, role=2, settings=SimpleNamespace(name="Hoboken")),
+        ]
+        local_node = SimpleNamespace(
+            channels=channels,
+            localConfig=SimpleNamespace(lora=SimpleNamespace(use_preset=False)),
+        )
+
+        result = RadioService._read_channel_info(local_node)
+
+        self.assertEqual(
+            result,
+            (
+                ChannelInfo(0, "LongFast"),
+                ChannelInfo(1, "Hiking"),
+                ChannelInfo(2, "Hoboken"),
+            ),
+        )
+
+    def test_longfast_only_radio_shows_exactly_one_channel(self) -> None:
+        """Item 18: a radio with only the default (unnamed) primary
+
+        channel configured correctly shows exactly one channel -- never
+        fabricating additional ones.
+        """
+        channels = [
+            SimpleNamespace(index=0, role=1, settings=SimpleNamespace(name="")),
+        ]
+        local_node = SimpleNamespace(
+            channels=channels,
+            localConfig=SimpleNamespace(
+                lora=SimpleNamespace(use_preset=True, modem_preset=0)
+            ),
+        )
+
+        result = RadioService._read_channel_info(local_node)
+
+        self.assertEqual(result, (ChannelInfo(0, "LongFast"),))
+
+    def test_reading_channel_info_touches_only_already_synced_data(self) -> None:
+        """Item 20/33: _read_channel_info is a pure function over the
+
+        ALREADY-SYNCED local_node.channels/localConfig -- it has no
+        interface/radio parameter at all, so it cannot generate RF
+        traffic by construction; confirmed by using a plain
+        SimpleNamespace with no send/request methods whatsoever.
+        """
+        channels = [
+            SimpleNamespace(index=0, role=1, settings=SimpleNamespace(name="LongFast")),
+        ]
+        local_node = SimpleNamespace(
+            channels=channels,
+            localConfig=SimpleNamespace(lora=SimpleNamespace(use_preset=False)),
+        )
+
+        result = RadioService._read_channel_info(local_node)
+
+        self.assertEqual(result, (ChannelInfo(0, "LongFast"),))
+
     def test_close_does_not_crash_after_unplug(self) -> None:
         service = RadioService()
         interface = make_interface()
@@ -388,6 +474,40 @@ class RadioServiceTests(unittest.TestCase):
 
     def test_active_node_count_is_unavailable_while_disconnected(self) -> None:
         self.assertIsNone(RadioService().active_node_count(now=1_000))
+
+    def test_is_unmessagable_propagates_from_nodedb(self) -> None:
+        """PROTOBUF-SOURCE-VERIFIED: User.is_unmessagable ("Whether or
+
+        not the node can be messaged") -- MeshtasticPass DM item 27.
+        Absent/false by default so incomplete metadata never suppresses
+        a legitimate DM target.
+        """
+        service = RadioService()
+        interface = make_interface()
+        interface.nodesByNum[0xC0FFEE01] = {
+            "user": {"id": "!c0ffee01", "isUnmessagable": True},
+        }
+        interface.nodesByNum[0xC0FFEE02] = {
+            "user": {"id": "!c0ffee02"},
+        }
+        service._interface = interface
+
+        nodes = {node.node_id: node for node in service.get_known_nodes()}
+
+        self.assertTrue(nodes["!c0ffee01"].is_unmessagable)
+        self.assertFalse(nodes["!c0ffee02"].is_unmessagable)
+
+    def test_get_node_metadata_reports_is_unmessagable(self) -> None:
+        service = RadioService()
+        interface = make_interface()
+        interface.nodesByNum[0xC0FFEE01] = {
+            "user": {"id": "!c0ffee01", "isUnmessagable": True},
+        }
+        service._interface = interface
+
+        metadata = service.get_node_metadata("!c0ffee01")
+
+        self.assertTrue(metadata.is_unmessagable)
 
     def test_known_nodes_are_normalized_passively_and_include_local(self) -> None:
         service = RadioService()

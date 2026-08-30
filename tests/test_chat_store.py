@@ -180,9 +180,10 @@ class ChatStoreTests(unittest.TestCase):
             "SELECT version FROM schema_version"
         ).fetchone()[0]
 
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
         self.assertEqual([message.text for message in messages], ["preserved"])
         self.assertIsNone(messages[0].origin_sent_at)
+        self.assertIsNone(messages[0].dm_node_id)
 
     def test_cursor_pages_are_bounded_and_chronological(self) -> None:
         for index in range(175):
@@ -781,6 +782,297 @@ class ReconcileAbandonedSendingTests(unittest.TestCase):
         self.assertEqual(self._raw_delivery_state(message_id), "INTERRUPTED")
         stored = second_restart.load_recent()[0]
         self.assertEqual(stored.delivery_state, "INTERRUPTED")
+
+
+class DirectMessagePersistenceTests(unittest.TestCase):
+    """DM history is keyed by the remote party's stable node ID, kept
+
+    entirely separate from channel history in the SAME database (item
+    12: extend the existing store, never a parallel one).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "chat.db"
+        self.store = ChatStore.open(self.path)
+        self.addCleanup(self.store.close)
+
+    def test_dm_row_never_appears_in_channel_history(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="a channel message",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="a DM",
+            radio_rx_at=101.0,
+            received_at=101.0,
+            dm_node_id="!a11ce001",
+        )
+        channel_texts = [m.text for m in self.store.load_recent(channel_index=0)]
+        self.assertEqual(channel_texts, ["a channel message"])
+        dm_texts = [m.text for m in self.store.load_recent_dm_page("!a11ce001").messages]
+        self.assertEqual(dm_texts, ["a DM"])
+
+    def test_alice_and_bob_dm_histories_are_isolated(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="from alice",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        self.store.add_incoming(
+            packet_id=2,
+            node_id="!b0b00002",
+            sender_name="Bob",
+            sender_short_name="BOB",
+            channel_index=0,
+            text="from bob",
+            radio_rx_at=101.0,
+            received_at=101.0,
+            dm_node_id="!b0b00002",
+        )
+        alice = [m.text for m in self.store.load_recent_dm_page("!a11ce001").messages]
+        bob = [m.text for m in self.store.load_recent_dm_page("!b0b00002").messages]
+        self.assertEqual(alice, ["from alice"])
+        self.assertEqual(bob, ["from bob"])
+
+    def test_outgoing_dm_records_the_destination(self) -> None:
+        message_id = self.store.add_outgoing(
+            text="hi alice",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENDING",
+            dm_node_id="!a11ce001",
+        )
+        stored = self.store.load_recent_dm_page("!a11ce001").messages
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].id, message_id)
+        self.assertEqual(stored[0].dm_node_id, "!a11ce001")
+        self.assertTrue(stored[0].direction == "outgoing")
+
+    def test_incoming_dm_deduplicates_by_packet_id_like_channel_messages(self) -> None:
+        first = self.store.add_incoming(
+            packet_id=42,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="hello",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        duplicate = self.store.add_incoming(
+            packet_id=42,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="hello again",
+            radio_rx_at=101.0,
+            received_at=101.0,
+            dm_node_id="!a11ce001",
+        )
+        self.assertTrue(first.inserted)
+        self.assertFalse(duplicate.inserted)
+        self.assertEqual(duplicate.message_id, first.message_id)
+
+    def test_same_packet_id_never_collides_between_channel_and_dm(self) -> None:
+        """A packet_id landing in BOTH a channel row and a DM row (same
+
+        sender, same packet_id, coincidentally) must never be treated
+        as one duplicate of the other -- proves the COALESCE(dm_node_id,
+        '') dedup index correctly distinguishes them (see _create_schema).
+        """
+        channel_result = self.store.add_incoming(
+            packet_id=7,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="channel version",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        dm_result = self.store.add_incoming(
+            packet_id=7,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="dm version",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        self.assertTrue(channel_result.inserted)
+        self.assertTrue(dm_result.inserted)
+        self.assertNotEqual(channel_result.message_id, dm_result.message_id)
+
+    def test_list_dm_conversations_sorted_by_most_recent_activity(self) -> None:
+        self.store.add_outgoing(
+            text="old to alice",
+            channel_index=0,
+            local_sent_at=100.0,
+            delivery_state="SENT",
+            dm_node_id="!a11ce001",
+        )
+        self.store.add_outgoing(
+            text="newer to bob",
+            channel_index=0,
+            local_sent_at=200.0,
+            delivery_state="SENT",
+            dm_node_id="!b0b00002",
+        )
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="alice replies, now newest",
+            radio_rx_at=300.0,
+            received_at=300.0,
+            dm_node_id="!a11ce001",
+        )
+        conversations = self.store.list_dm_conversations()
+        self.assertEqual(
+            [node_id for node_id, _time in conversations],
+            ["!a11ce001", "!b0b00002"],
+        )
+
+    def test_list_dm_conversations_excludes_channel_only_nodes(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="channel only, never DMed",
+            radio_rx_at=100.0,
+            received_at=100.0,
+        )
+        self.assertEqual(self.store.list_dm_conversations(), [])
+
+    def test_older_dm_page_pages_correctly(self) -> None:
+        for index in range(5):
+            self.store.add_incoming(
+                packet_id=index + 1,
+                node_id="!a11ce001",
+                sender_name="Alice",
+                sender_short_name="ALC",
+                channel_index=0,
+                text=f"dm {index}",
+                radio_rx_at=100.0 + index,
+                received_at=100.0 + index,
+                dm_node_id="!a11ce001",
+            )
+        recent = self.store.load_recent_dm_page("!a11ce001", limit=2)
+        self.assertEqual([m.text for m in recent.messages], ["dm 3", "dm 4"])
+        self.assertTrue(recent.has_older)
+        older = self.store.load_older_dm_page(
+            recent.messages[0].id, "!a11ce001", limit=2
+        )
+        self.assertEqual([m.text for m in older.messages], ["dm 1", "dm 2"])
+
+    def test_dm_does_not_affect_latest_incoming_message_at(self) -> None:
+        """MESH's own last-interaction signal must stay channel-only --
+
+        this pass makes no MESH changes, so a DM must never feed it.
+        """
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="a DM",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            origin_sent_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        self.assertEqual(self.store.latest_incoming_message_at(), {})
+
+    def test_v2_database_without_dm_column_migrates_cleanly(self) -> None:
+        """A v2 database (post origin_sent_at, pre dm_node_id) gains the
+
+        column and the widened dedup index without losing history.
+        """
+        self.store.close()
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """
+            DROP TABLE IF EXISTS send_attempts;
+            DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS schema_version;
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (2);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                packet_id INTEGER,
+                node_id TEXT,
+                sender_name TEXT,
+                sender_short_name TEXT,
+                channel_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                origin_sent_at REAL,
+                radio_rx_at REAL,
+                received_at REAL NOT NULL,
+                local_sent_at REAL,
+                delivery_state TEXT,
+                created_at REAL NOT NULL
+            );
+            INSERT INTO messages VALUES (
+                1, 'incoming', 88, '!v2node', 'V2 Node', 'V2', 0,
+                'v2 preserved', 200, 201, 201, NULL, NULL, 201
+            );
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        reopened = ChatStore.open(self.path)
+        self.addCleanup(reopened.close)
+        version = reopened._connection.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        self.assertEqual(version, 3)
+        messages = reopened.load_recent()
+        self.assertEqual([m.text for m in messages], ["v2 preserved"])
+        self.assertIsNone(messages[0].dm_node_id)
+        # The migrated store must correctly support new DM traffic too.
+        reopened.add_incoming(
+            packet_id=1,
+            node_id="!newdm01",
+            sender_name="New DM",
+            sender_short_name="NDM",
+            channel_index=0,
+            text="works after migration",
+            radio_rx_at=300.0,
+            received_at=300.0,
+            dm_node_id="!newdm01",
+        )
+        dm_messages = reopened.load_recent_dm_page("!newdm01").messages
+        self.assertEqual([m.text for m in dm_messages], ["works after migration"])
 
 
 if __name__ == "__main__":
