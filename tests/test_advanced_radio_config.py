@@ -11,16 +11,21 @@ discard, zero-RF browsing, and HOP LIMIT independence).
 
 from __future__ import annotations
 
+import contextlib
+import io
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock
 
+from textual.containers import Horizontal
 from textual.widgets import Input, Static
 
 from app import (
     BUILTIN_LONGFAST_NETWORK,
+    CONNECTION_VALUE_COLUMN_INDENT,
     CancelNetworkControl,
+    ConnectionPage,
     HopLimitSelector,
     MeshtasticPassApp,
     NetworkSelector,
@@ -611,6 +616,244 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
             radio.write_verified_config_field.assert_not_called()
             radio.write_verified_primary_channel.assert_not_called()
+
+    # ---- SAVE/APPLY state machine (the hardware stall regression) --------
+
+    async def test_save_writes_psk_bytes_and_leaves_channel_name_blank(self) -> None:
+        radio = self.radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            self._fill_editor(
+                app, name="NYC MS48", radio_mode="MEDIUM_SLOW", freq_slot="48", key="AQ=="
+            )
+            hop_before = radio._config_sections["lora"]["hop_limit"]
+            app.query_one(SaveNetworkControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(12):
+                await pilot.pause()
+
+            # AQ== -> single byte 0x01 (decoded, not literal ASCII), and
+            # the NETWORK NAME is never written as the channel name.
+            self.assertEqual(radio.read_primary_channel_settings(), ("", bytes([1])))
+            self.assertEqual(radio._config_sections["lora"]["modem_preset"], 3)
+            self.assertEqual(radio._config_sections["lora"]["channel_num"], 48)
+            self.assertEqual(radio._config_sections["lora"]["hop_limit"], hop_before)
+            self.assertIsNone(app._network_apply)
+
+    async def test_expected_reboot_reconnect_does_not_strand_the_apply(self) -> None:
+        radio = self.radio()
+        original = radio.write_verified_config_field
+
+        def reboots_on_modem_preset(section, field, value, **kwargs):
+            if field == "modem_preset":
+                # Real firmware reboots here -> the verify readback sees
+                # the interface drop.
+                return ConfigWriteResult(False, value, None, "disconnected")
+            return original(section, field, value, **kwargs)
+
+        radio.write_verified_config_field = reboots_on_modem_preset
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            self._fill_editor(
+                app, name="NYC MS48", radio_mode="MEDIUM_SLOW", freq_slot="48", key="AQ=="
+            )
+            app.query_one(SaveNetworkControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(12):
+                await pilot.pause()
+
+            # Not stranded in "SAVING & APPLYING": it moved to the
+            # awaiting-reconnect phase, still non-terminal but honest.
+            self.assertIsNotNone(app._network_apply)
+            self.assertTrue(app._network_apply.awaiting_reconnect)
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("WAITING FOR RECONNECT", status)
+
+            # The radio comes back with the new config already applied.
+            radio._config_sections["lora"]["modem_preset"] = 3
+            radio._config_sections["lora"]["channel_num"] = 48
+            radio._primary_channel_psk = bytes([1])
+            radio.simulate_reconnect()
+            for _ in range(20):
+                await pilot.pause()
+                if app._network_apply is None:
+                    break
+
+            self.assertIsNone(app._network_apply)  # terminal
+            self.assertEqual(app._selected_network, "NYC MS48")
+            self.assertEqual(app.query_one(NetworkSelector).value, "NYC MS48")
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("APPLIED", status)
+            self.assertNotIn("NOT APPLIED", status)
+
+    async def test_reconnect_with_wrong_config_reports_error_not_success(self) -> None:
+        radio = self.radio()
+        original = radio.write_verified_config_field
+
+        def reboots(section, field, value, **kwargs):
+            if field == "modem_preset":
+                return ConfigWriteResult(False, value, None, "disconnected")
+            return original(section, field, value, **kwargs)
+
+        radio.write_verified_config_field = reboots
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            self._fill_editor(
+                app, name="NYC MS48", radio_mode="MEDIUM_SLOW", freq_slot="48", key=""
+            )
+            app.query_one(SaveNetworkControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(12):
+                await pilot.pause()
+
+            # Radio reconnects but STILL on the old config.
+            radio.simulate_reconnect()
+            for _ in range(20):
+                await pilot.pause()
+                if app._network_apply is None:
+                    break
+
+            self.assertIsNone(app._network_apply)
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("NOT APPLIED", status)
+
+    async def test_apply_timeout_reaches_terminal_error(self) -> None:
+        radio = self.radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            self._fill_editor(
+                app, name="NYC MS48", radio_mode="MEDIUM_SLOW", freq_slot="48", key=""
+            )
+            # Freeze the worker so no RadioConfigPresetApplied ever posts.
+            app._apply_network_from_thread = lambda *a, **k: None
+            app.query_one(SaveNetworkControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertIsNotNone(app._network_apply)
+            token = app._network_apply.token
+            app._network_apply_timed_out(token)
+            await pilot.pause()
+
+            self.assertIsNone(app._network_apply)
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("NOT APPLIED", status)
+            self.assertIn("timed out", status)
+
+    async def test_apply_diagnostics_never_print_key_material(self) -> None:
+        radio = self.radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        buffer = io.StringIO()
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            self._fill_editor(
+                app, name="NYC MS48", radio_mode="MEDIUM_SLOW", freq_slot="48",
+                key="AQ==",
+            )
+            with contextlib.redirect_stdout(buffer):
+                app.query_one(SaveNetworkControl).focus()
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                for _ in range(12):
+                    await pilot.pause()
+
+        printed = buffer.getvalue()
+        self.assertIn("[NETCFG]", printed)
+        self.assertIn("decoded_len=1", printed)
+        self.assertNotIn("AQ==", printed)
+        self.assertNotIn("\\x01", printed)
+
+    # ---- UI polish -----------------------------------------------------
+
+    async def test_new_network_aligns_with_the_network_control(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            rendered = str(app.query_one(NewNetworkControl).render())
+            self.assertTrue(rendered.startswith(CONNECTION_VALUE_COLUMN_INDENT))
+            self.assertIn("[ NEW NETWORK ]", rendered)
+
+    async def test_save_and_cancel_share_one_row(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            actions = app.query_one("#advanced-radio-actions", Horizontal)
+            self.assertEqual(actions.styles.height.value, 1)
+            save = app.query_one(SaveNetworkControl)
+            cancel = app.query_one(CancelNetworkControl)
+            self.assertEqual(save.region.y, cancel.region.y)
+            self.assertLess(save.region.x, cancel.region.x)
+
+    async def test_opening_editor_focuses_name_without_jumping_to_top(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(60, 12)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            page = app.query_one(ConnectionPage)
+            page.scroll_end(animate=False)
+            await pilot.pause()
+            app.query_one(NewNetworkControl).focus()
+            await pilot.press("enter")
+            for _ in range(6):
+                await pilot.pause()
+
+            self.assertTrue(app._network_editor_open)
+            self.assertIsInstance(app.focused, Input)
+            self.assertEqual(app.focused.id, "network-name-input")
+            self.assertGreater(page.scroll_offset.y, 0)  # did not jump to top
+
+    async def test_status_line_is_indented_to_the_control_column(self) -> None:
+        radio = self.radio()
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            self._fill_editor(
+                app, name="NYC MS48", radio_mode="MEDIUM_SLOW", freq_slot="48", key=""
+            )
+            app.query_one(SaveNetworkControl).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            status_widget = app.query_one("#advanced-radio-status", Static)
+            rendered = str(status_widget.render())
+            self.assertTrue(rendered.startswith(CONNECTION_VALUE_COLUMN_INDENT))
+            self.assertNotIn("setting-error", status_widget.classes)
 
 
 if __name__ == "__main__":

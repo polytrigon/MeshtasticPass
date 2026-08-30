@@ -81,6 +81,7 @@ from node_activity import is_node_active
 from radio_capabilities import (
     format_hw_model_name,
     modem_preset_choices,
+    modem_preset_enum_name,
     role_choices,
 )
 from radio_service import (
@@ -177,6 +178,14 @@ IDENTITY_STATUS_AUTO_DISMISS_SECONDS = 10.0
 # deliberate second press, short enough that an armed-but-abandoned
 # confirmation never lingers as a trap for a later, unrelated ENTER.
 ADVANCED_RADIO_CONFIRM_SECONDS = 6.0
+# Hard upper bound on ONE NETWORK apply (SAVE or switch). Writing LoRa
+# modem_preset / channel_num / primary-channel PSK reboots real
+# Meshtastic firmware, so this must comfortably cover the write +
+# reboot + serial reconnect + config re-sync + readback. If no terminal
+# result (success or failure) is reached within this window the
+# operation is force-resolved to an honest ERROR -- there is never a
+# permanent "SAVING & APPLYING..." state (see _network_apply_timed_out).
+NETWORK_APPLY_TIMEOUT_SECONDS = 90.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -798,8 +807,12 @@ class NewNetworkControl(Static):
         pass
 
     def __init__(self) -> None:
+        # Indented to the same control/value column the NETWORK selector's
+        # "[ LongFast ▾ ]" starts at (CONNECTION_VALUE_COLUMN_INDENT),
+        # derived from CONNECTION_LABEL_WIDTH so it tracks UI scale rather
+        # than a hardcoded gap.
         super().__init__(
-            "[ NEW NETWORK ]",
+            f"{CONNECTION_VALUE_COLUMN_INDENT}[ NEW NETWORK ]",
             id="advanced-radio-new-network",
             classes="connection-action-row",
             markup=False,
@@ -1283,21 +1296,50 @@ class RadioSettingApplied(Message):
 
 
 class RadioConfigPresetApplied(Message):
-    """One ADVANCED RADIO NETWORK apply (radio_service.
+    """One ADVANCED RADIO NETWORK apply-worker (radio_service.
 
-    apply_radio_config_preset) finished, successfully or not. `saved`
-    distinguishes a SAVE (persist + apply a new NETWORK) from a bare
-    NETWORK switch, so the status line can say "SAVED & APPLIED" vs
-    "APPLIED" and the failure path knows whether to revert the selector.
+    apply_radio_config_preset) RETURNED -- successfully, with a genuine
+    failure, or with a "disconnected"/"timeout" step that just means the
+    radio rebooted to apply LoRa config and the operation now has to
+    wait for the reconnect + readback (see radio_config_preset_applied).
+    `token` correlates this against the ONE outstanding
+    _network_apply -- a late return from a superseded/timed-out attempt
+    is ignored. `saved` distinguishes a SAVE from a bare NETWORK switch.
     """
 
     def __init__(
-        self, preset_name: str, result: RadioApplyResult, saved: bool = False
+        self,
+        token: int,
+        preset_name: str,
+        result: RadioApplyResult,
+        saved: bool = False,
     ) -> None:
         super().__init__()
+        self.token = token
         self.preset_name = preset_name
         self.result = result
         self.saved = saved
+
+
+@dataclass
+class NetworkApply:
+    """The ONE outstanding ADVANCED RADIO NETWORK apply (SAVE or switch).
+
+    Held on MeshtasticPassApp._network_apply from the moment SAVE/switch
+    is confirmed until a terminal SUCCESS or ERROR is reached. `token`
+    correlates the worker return and the timeout timer; `saved` picks
+    the "SAVED & APPLIED" vs "APPLIED" wording and whether a failure
+    reverts the NETWORK selector; `awaiting_reconnect` means the apply
+    write already landed the radio in a reboot/reconnect and the
+    operation is now waiting for the interface to come back so it can
+    read the new config back (see _resolve_network_apply_after_reconnect).
+    """
+
+    token: int
+    name: str
+    preset: RadioConfigPreset
+    saved: bool
+    awaiting_reconnect: bool = False
 
 
 class ClockSyncApplied(Message):
@@ -3380,6 +3422,31 @@ class MeshtasticPassApp(App[None]):
 
     #advanced-radio-actions {
         height: 1;
+        /* CONNECTION_VALUE_COLUMN_INDENT (2 row-prefix + 12 label + 1)
+           minus each button's own margin-left:2 -- so [ SAVE ] lands in
+           the same column the form controls' "[ ... ]" start at, and
+           [ CANCEL ] follows on the SAME row after a 2-cell gap. */
+        padding-left: 13;
+    }
+
+    #advanced-radio-actions .connection-action-row {
+        width: auto;
+        margin-left: 2;
+    }
+
+    /* Spec D/J: pending ("SAVING & APPLYING...") and normal success
+       ("... APPLIED") both use ACCENT; a genuine failure uses ERROR and
+       never ACCENT. */
+    #advanced-radio-status.setting-accent {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber #advanced-radio-status.setting-accent {
+        color: $amber_accent;
+    }
+
+    #advanced-radio-status.setting-error {
+        color: $error;
     }
 
     .setting-success {
@@ -3938,6 +4005,14 @@ class MeshtasticPassApp(App[None]):
         # unrelated confirmation.
         self._advanced_radio_confirm: str | None = None
         self._advanced_radio_confirm_timer: Timer | None = None
+        # The ONE outstanding NETWORK apply (SAVE or switch), its
+        # monotonic correlation token source, and its hard-timeout
+        # Timer. Cleared the instant a terminal SUCCESS/ERROR is
+        # reached, so "SAVING & APPLYING..." can never persist (see
+        # NetworkApply / _network_apply_timed_out).
+        self._network_apply: NetworkApply | None = None
+        self._network_apply_seq = 0
+        self._network_apply_timer: Timer | None = None
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -4196,6 +4271,10 @@ class MeshtasticPassApp(App[None]):
             self._delivery_timer.stop()
         if self._send_error_dismiss_timer is not None:
             self._send_error_dismiss_timer.stop()
+        if self._network_apply_timer is not None:
+            self._network_apply_timer.stop()
+        if self._advanced_radio_confirm_timer is not None:
+            self._advanced_radio_confirm_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
         self._reconcile_interrupted_sends_before_shutdown()
@@ -5370,12 +5449,22 @@ class MeshtasticPassApp(App[None]):
         self._set_network_editor_open(False)
 
     def _set_advanced_radio_status(self, text: str, css_class: str | None) -> None:
+        """#advanced-radio-status. Non-empty text is indented to the same
+
+        control/value column the form controls' "[ ... ]" start at
+        (CONNECTION_VALUE_COLUMN_INDENT), never the far-left label
+        column (spec J). `css_class`: "setting-accent" for pending AND
+        normal success (spec D/J both say ACCENT), "setting-error" for a
+        genuine failure (never ACCENT), None for a neutral confirm
+        prompt.
+        """
         status = self.query_one("#advanced-radio-status", Static)
         status.remove_class("setting-error")
         status.remove_class("setting-success")
+        status.remove_class("setting-accent")
         if css_class:
             status.add_class(css_class)
-        status.update(text)
+        status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
 
     def _arm_advanced_radio_confirm(self, action: str) -> None:
         self._advanced_radio_confirm = action
@@ -5405,14 +5494,33 @@ class MeshtasticPassApp(App[None]):
 
     @on(NewNetworkControl.Activated)
     def open_new_network(self, _event: NewNetworkControl.Activated) -> None:
-        """[ NEW NETWORK ] -- reveal a blank transient editor. Zero RF."""
+        """[ NEW NETWORK ] -- reveal a blank transient editor. Zero RF.
+
+        Brings the newly revealed editor into view and focuses NETWORK
+        NAME -- scrolling only as much as needed, never jumping the
+        CONNECTION view back to the top (spec H).
+        """
         self._disarm_advanced_radio_confirm()
         self._reset_network_editor_fields()
         self._set_network_editor_open(True)
         self._set_advanced_radio_status("", None)
-        self.call_after_refresh(
-            lambda: self.query_one("#network-name-input", Input).focus()
-        )
+        self._reveal_network_editor()
+
+    def _reveal_network_editor(self) -> None:
+        def _do() -> None:
+            try:
+                name_input = self.query_one("#network-name-input", Input)
+            except Exception:
+                return
+            # Expose the whole revealed form, scrolling the minimum
+            # amount: the SAVE/CANCEL row (its bottom edge) first, then
+            # settle on NETWORK NAME so the first field and its cursor
+            # are what the user actually lands on.
+            self.query_one("#advanced-radio-actions").scroll_visible(animate=False)
+            name_input.focus()
+            name_input.scroll_visible(animate=False)
+
+        self.call_after_refresh(_do)
 
     @on(CancelNetworkControl.Activated)
     def cancel_new_network(self, _event: CancelNetworkControl.Activated) -> None:
@@ -5476,6 +5584,18 @@ class MeshtasticPassApp(App[None]):
             channel_psk_base64=key_text,
         )
 
+    @staticmethod
+    def _log_netcfg(line: str) -> None:
+        """One concise ADVANCED RADIO apply diagnostic line -- rare (only
+
+        a deliberate, confirmed SAVE/switch triggers any), never a
+        continuous stream, and never secret key material (see
+        _begin_network_apply's PSK line: length only). Plain print,
+        matching rx_debug_log's own "lightweight terminal trace, not
+        logging.*" precedent.
+        """
+        print(f"[NETCFG] {line}", flush=True)
+
     @on(SaveNetworkControl.Activated)
     def save_network(self, _event: SaveNetworkControl.Activated) -> None:
         """[ SAVE ] -- validate, confirm (RF/config WILL change), persist
@@ -5485,6 +5605,11 @@ class MeshtasticPassApp(App[None]):
         """
         preset = self._validated_network_from_editor()
         if preset is None:
+            return
+        if self._network_apply is not None:
+            self._set_advanced_radio_status(
+                f"APPLY IN PROGRESS — {self._network_apply.name}", None
+            )
             return
         if self._advanced_radio_confirm != "save":
             self._arm_advanced_radio_confirm("save")
@@ -5515,11 +5640,7 @@ class MeshtasticPassApp(App[None]):
                 f"{preset.name} SAVED — RADIO OFFLINE, NOT APPLIED", "setting-error"
             )
             return
-        self._set_advanced_radio_status(f"SAVING & APPLYING {preset.name}...", None)
-        self._run_radio_worker(
-            "apply-network",
-            lambda: self._apply_network_from_thread(preset.name, preset, saved=True),
-        )
+        self._begin_network_apply(preset.name, preset, saved=True)
 
     def _on_network_selected(self, value: str) -> None:
         """NETWORK dropdown selection. Browsing/opening/navigating never
@@ -5531,7 +5652,13 @@ class MeshtasticPassApp(App[None]):
         """
         if value == self._selected_network:
             self._disarm_advanced_radio_confirm()
-            self._set_advanced_radio_status("", None)
+            if self._network_apply is None:
+                self._set_advanced_radio_status("", None)
+            return
+        if self._network_apply is not None:
+            # An apply is already in flight -- ignore the stray
+            # selection and put the selector back where it was.
+            self._refresh_network_options()
             return
         confirm_key = f"switch:{value}"
         if self._advanced_radio_confirm != confirm_key:
@@ -5561,14 +5688,55 @@ class MeshtasticPassApp(App[None]):
             )
             self._refresh_network_options()
             return
-        self._set_advanced_radio_status(f"SWITCHING TO {value}...", None)
+        self._begin_network_apply(value, preset, saved=False)
+
+    # ---- NETWORK apply state machine (SAVE + switch share this) ----------
+
+    def _begin_network_apply(
+        self, name: str, preset: RadioConfigPreset, *, saved: bool
+    ) -> None:
+        """Start the ONE outstanding NETWORK apply. Writing LoRa
+
+        modem_preset / channel_num / PSK reboots real Meshtastic
+        firmware, so this operation is explicitly bounded: a
+        NETWORK_APPLY_TIMEOUT_SECONDS timer guarantees a terminal
+        SUCCESS/ERROR even if the SDK call never returns, and an
+        expected mid-apply disconnect is folded into the lifecycle (see
+        _on_connection_state_for_network_apply) rather than treated as
+        failure.
+        """
+        self._network_apply_seq += 1
+        token = self._network_apply_seq
+        self._network_apply = NetworkApply(token, name, preset, saved)
+        try:
+            decoded_len = (
+                len(base64.b64decode(preset.channel_psk_base64))
+                if preset.channel_psk_base64
+                else 0
+            )
+        except Exception:
+            decoded_len = -1
+        self._log_netcfg(
+            f"apply#{token} begin name={name!r} saved={saved} "
+            f"modem_preset={preset.modem_preset} freq_slot={preset.frequency_slot} "
+            f"psk={'present' if preset.channel_psk_base64 else 'absent'} "
+            f"decoded_len={decoded_len}"
+        )
+        if self._network_apply_timer is not None:
+            self._network_apply_timer.stop()
+        self._network_apply_timer = self.set_timer(
+            NETWORK_APPLY_TIMEOUT_SECONDS,
+            lambda: self._network_apply_timed_out(token),
+        )
+        verb = "SAVING & APPLYING" if saved else "SWITCHING TO"
+        self._set_advanced_radio_status(f"{verb} {name}...", "setting-accent")
         self._run_radio_worker(
-            "switch-network",
-            lambda: self._apply_network_from_thread(value, preset, saved=False),
+            f"network-apply-{token}",
+            lambda: self._apply_network_from_thread(token, name, preset, saved),
         )
 
     def _apply_network_from_thread(
-        self, name: str, preset: RadioConfigPreset, *, saved: bool
+        self, token: int, name: str, preset: RadioConfigPreset, saved: bool
     ) -> None:
         try:
             result = apply_radio_config_preset(self.radio, preset)
@@ -5579,29 +5747,147 @@ class MeshtasticPassApp(App[None]):
                 "error",
                 {"error": ConfigWriteResult(False, None, None, f"error: {detail}")},
             )
-        self.post_message(RadioConfigPresetApplied(name, result, saved))
+        self._log_netcfg(
+            f"apply#{token} worker returned applied={result.applied} "
+            f"failed_step={result.failed_step or '-'}"
+        )
+        self.post_message(RadioConfigPresetApplied(token, name, result, saved))
+
+    # Step reasons that just mean "the radio rebooted to apply LoRa
+    # config" -- the apply write itself very likely LANDED; the
+    # operation now waits for the reconnect + a config readback rather
+    # than reporting failure (see radio_config_preset_applied).
+    _NETWORK_APPLY_REBOOT_REASONS = frozenset(
+        {"disconnected", "timeout", "not_connected"}
+    )
 
     @on(RadioConfigPresetApplied)
     def radio_config_preset_applied(self, event: RadioConfigPresetApplied) -> None:
-        prefix = "SAVED & " if event.saved else ""
+        apply = self._network_apply
+        if apply is None or apply.token != event.token:
+            # A late return from a superseded / already-timed-out
+            # attempt: never misattributed to whatever is current now.
+            return
         if event.result.applied:
-            self._selected_network = event.preset_name
-            self._refresh_network_options()
-            self._set_advanced_radio_status(
-                f"{event.preset_name} {prefix}APPLIED", "setting-success"
-            )
+            self._finish_network_apply(success=True, detail="write-verified")
             return
         failure = event.result.results.get(event.result.failed_step)
         raw_reason = failure.reason if failure is not None else "unknown"
+        if (
+            raw_reason in self._NETWORK_APPLY_REBOOT_REASONS
+            or self._radio_state is not RadioState.ONLINE
+        ):
+            apply.awaiting_reconnect = True
+            self._log_netcfg(
+                f"apply#{apply.token} step={event.result.failed_step or '-'} "
+                f"reason={raw_reason} -> awaiting radio reboot/reconnect"
+            )
+            self._set_advanced_radio_status(
+                f"APPLYING {apply.name} — RADIO REBOOTED, WAITING FOR RECONNECT...",
+                "setting-accent",
+            )
+            return
         reason = self._RADIO_FAILURE_REASONS.get(raw_reason, raw_reason.upper())
-        detail = f"{prefix}NOT APPLIED — {reason} ({event.result.failed_step})".strip()
-        # A saved NETWORK stays saved and selected; a bare switch reverts
-        # the selector to the actual current NETWORK. Either way the
-        # status honestly reports that RF did NOT take effect.
-        if not event.saved:
+        self._finish_network_apply(
+            success=False, detail=f"{reason} ({event.result.failed_step})"
+        )
+
+    def _on_connection_state_for_network_apply(
+        self, state: RadioState, was_online: bool
+    ) -> None:
+        """Fold an EXPECTED mid-apply disconnect/reconnect into the
+
+        NETWORK apply lifecycle -- called from _show_connection on every
+        radio-state transition. A disconnect while applying is the LoRa-
+        config reboot, not a failure; the following reconnect is where
+        the new config is read back and the operation finally resolves.
+        Scoped entirely to a live _network_apply -- ordinary connects/
+        reconnects with nothing outstanding are untouched.
+        """
+        apply = self._network_apply
+        if apply is None:
+            return
+        if state is not RadioState.ONLINE:
+            if not apply.awaiting_reconnect:
+                apply.awaiting_reconnect = True
+                self._log_netcfg(
+                    f"apply#{apply.token} disconnect observed during apply "
+                    "-> awaiting reconnect"
+                )
+            self._set_advanced_radio_status(
+                f"APPLYING {apply.name} — RADIO REBOOTED, WAITING FOR RECONNECT...",
+                "setting-accent",
+            )
+            return
+        # ONLINE again. Only a genuine reconnect after the expected
+        # reboot triggers readback -- never a redundant "still ONLINE".
+        if apply.awaiting_reconnect and not was_online:
+            self._resolve_network_apply_after_reconnect()
+
+    def _resolve_network_apply_after_reconnect(self) -> None:
+        apply = self._network_apply
+        if apply is None:
+            return
+        preset = apply.preset
+        raw_modem = self.radio.read_synced_config_field("lora", "modem_preset")
+        modem_name = modem_preset_enum_name(raw_modem) if raw_modem is not None else None
+        channel_num = self.radio.read_synced_config_field("lora", "channel_num") or 0
+        ok = modem_name == preset.modem_preset and channel_num == preset.frequency_slot
+        if ok and preset.channel_psk_base64:
+            primary = self.radio.read_primary_channel_settings()
+            try:
+                want_psk = base64.b64decode(preset.channel_psk_base64)
+            except Exception:
+                want_psk = None
+            if primary is None or want_psk is None or primary[1] != want_psk:
+                ok = False
+        self._log_netcfg(
+            f"apply#{apply.token} readback modem_preset={modem_name} "
+            f"channel_num={channel_num} match={ok}"
+        )
+        if ok:
+            self._finish_network_apply(success=True, detail="readback-verified")
+        else:
+            self._finish_network_apply(
+                success=False, detail="readback mismatch after reconnect"
+            )
+
+    def _network_apply_timed_out(self, token: int) -> None:
+        if self._network_apply is None or self._network_apply.token != token:
+            return
+        self._log_netcfg(f"apply#{token} timed out after {NETWORK_APPLY_TIMEOUT_SECONDS}s")
+        self._finish_network_apply(success=False, detail="timed out")
+
+    def _finish_network_apply(self, *, success: bool, detail: str) -> None:
+        apply = self._network_apply
+        if apply is None:
+            return
+        if self._network_apply_timer is not None:
+            self._network_apply_timer.stop()
+            self._network_apply_timer = None
+        self._network_apply = None
+        self._log_netcfg(
+            f"apply#{apply.token} FINAL success={success} ({detail})"
+        )
+        if success:
+            self._selected_network = apply.name
             self._refresh_network_options()
+            prefix = "SAVED & " if apply.saved else ""
+            # Spec D/J: normal success uses ACCENT here, not the
+            # confirm-green .setting-success other CONNECTION rows use.
+            self._set_advanced_radio_status(
+                f"{apply.name} {prefix}APPLIED", "setting-accent"
+            )
+            return
+        # Failure. A SAVE stays saved+selected locally (honest: "SAVED
+        # -- NOT APPLIED"); a bare switch reverts the selector to the
+        # actual current NETWORK. Never claims the failed NETWORK is
+        # active.
+        if not apply.saved:
+            self._refresh_network_options()
+        prefix = "SAVED — " if apply.saved else ""
         self._set_advanced_radio_status(
-            f"{event.preset_name} {detail}", "setting-error"
+            f"{apply.name} {prefix}NOT APPLIED: {detail}", "setting-error"
         )
 
     def _reset_clock_sync_state(self) -> None:
@@ -8997,6 +9283,7 @@ class MeshtasticPassApp(App[None]):
         self._render_connection_details()
         self._render_identity(force_value=True)
         self._render_radio_settings()
+        self._on_connection_state_for_network_apply(state, was_online)
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
