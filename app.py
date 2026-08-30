@@ -81,7 +81,6 @@ from node_activity import is_node_active
 from radio_capabilities import (
     format_hw_model_name,
     modem_preset_choices,
-    modem_preset_enum_name,
     role_choices,
 )
 from radio_service import (
@@ -94,13 +93,16 @@ from radio_service import (
     LONG_NAME_MAX_UTF8_BYTES,
     SCREEN_ON_SECS_ALWAYS_ON,
     SHORT_NAME_MAX_UTF8_BYTES,
+    NETWORK_FIELD_LABELS,
     RadioApplyResult,
+    RadioConfigVerification,
     RadioEvent,
     RadioIdentityError,
     RadioInfo,
     NodeMetadata,
     RadioSendError,
     apply_radio_config_preset,
+    verify_radio_config_preset,
     RadioState,
     ReceivedMessage,
     SendStatus,
@@ -1298,13 +1300,15 @@ class RadioSettingApplied(Message):
 class RadioConfigPresetApplied(Message):
     """One ADVANCED RADIO NETWORK apply-worker (radio_service.
 
-    apply_radio_config_preset) RETURNED -- successfully, with a genuine
-    failure, or with a "disconnected"/"timeout" step that just means the
-    radio rebooted to apply LoRa config and the operation now has to
-    wait for the reconnect + readback (see radio_config_preset_applied).
-    `token` correlates this against the ONE outstanding
-    _network_apply -- a late return from a superseded/timed-out attempt
-    is ignored. `saved` distinguishes a SAVE from a bare NETWORK switch.
+    apply_radio_config_preset, then -- while still on the worker thread
+    -- a fresh readback via reread_lora_and_primary_channel +
+    verify_radio_config_preset) RETURNED. The write may have completed
+    cleanly with no reboot (Path B: `verification` is populated and
+    authoritative), or the radio may have rebooted to commit LoRa
+    config (Path A: `verification` is None / the radio is no longer
+    ONLINE, and the operation now waits for the reconnect full-sync).
+    `token` correlates this against the ONE outstanding _network_apply.
+    `saved` distinguishes a SAVE from a bare NETWORK switch.
     """
 
     def __init__(
@@ -1313,12 +1317,14 @@ class RadioConfigPresetApplied(Message):
         preset_name: str,
         result: RadioApplyResult,
         saved: bool = False,
+        verification: RadioConfigVerification | None = None,
     ) -> None:
         super().__init__()
         self.token = token
         self.preset_name = preset_name
         self.result = result
         self.saved = saved
+        self.verification = verification
 
 
 @dataclass
@@ -5490,6 +5496,11 @@ class MeshtasticPassApp(App[None]):
         normal success (spec D/J both say ACCENT), "setting-error" for a
         genuine failure (never ACCENT), None for a neutral confirm
         prompt.
+
+        Non-empty status is scrolled just into view (minimal scroll, no
+        jump to the top) so the user can always see the result of the
+        NETWORK action they just triggered -- SWITCHING..., WAITING FOR
+        RECONNECT..., APPLIED, NOT APPLIED... (spec item 6).
         """
         status = self.query_one("#advanced-radio-status", Static)
         status.remove_class("setting-error")
@@ -5498,6 +5509,14 @@ class MeshtasticPassApp(App[None]):
         if css_class:
             status.add_class(css_class)
         status.update(f"{CONNECTION_VALUE_COLUMN_INDENT}{text}" if text else "")
+        if text and self.current_tab == "connection":
+            self.call_after_refresh(self._scroll_advanced_radio_status_into_view)
+
+    def _scroll_advanced_radio_status_into_view(self) -> None:
+        try:
+            self.query_one("#advanced-radio-status").scroll_visible(animate=False)
+        except Exception:
+            pass
 
     def _arm_advanced_radio_confirm(self, action: str) -> None:
         self._advanced_radio_confirm = action
@@ -5752,9 +5771,7 @@ class MeshtasticPassApp(App[None]):
             lambda: self._network_apply_timed_out(token),
         )
         opening = (
-            f"SAVING & APPLYING {name}..."
-            if saved
-            else f"SWITCHING TO {name}... REBOOTING"
+            f"SAVING & APPLYING {name}..." if saved else f"SWITCHING TO {name}..."
         )
         self._set_advanced_radio_status(opening, "setting-accent")
         self._run_radio_worker(
@@ -5778,15 +5795,32 @@ class MeshtasticPassApp(App[None]):
             f"apply#{token} worker returned applied={result.applied} "
             f"failed_step={result.failed_step or '-'}"
         )
-        self.post_message(RadioConfigPresetApplied(token, name, result, saved))
-
-    # Step reasons that just mean "the radio rebooted to apply LoRa
-    # config" -- the apply write itself very likely LANDED; the
-    # operation now waits for the reconnect + a config readback rather
-    # than reporting failure (see radio_config_preset_applied).
-    _NETWORK_APPLY_REBOOT_REASONS = frozenset(
-        {"disconnected", "timeout", "not_connected"}
-    )
+        # Path B (no observed reboot): the connection survived the
+        # write + commit, so there is no reconnect full-sync to refresh
+        # the SDK's config cache -- do a FRESH readback here on the
+        # worker thread (never the UI thread; this blocks on RF), then a
+        # semantic field-by-field verify. Skipped only when a step
+        # already reported the interface dropped ("disconnected") --
+        # that is Path A and the reconnect handler owns the verify.
+        verification: RadioConfigVerification | None = None
+        step_result = (
+            result.results.get(result.failed_step) if not result.applied else None
+        )
+        disconnected = step_result is not None and step_result.reason == "disconnected"
+        if not disconnected:
+            try:
+                reread = getattr(self.radio, "reread_lora_and_primary_channel", None)
+                if callable(reread):
+                    reread()
+                verification = verify_radio_config_preset(self.radio, preset)
+            except Exception as error:
+                self._log_netcfg(
+                    f"apply#{token} post-write verify errored: "
+                    f"{error.__class__.__name__}"
+                )
+        self.post_message(
+            RadioConfigPresetApplied(token, name, result, saved, verification)
+        )
 
     @on(RadioConfigPresetApplied)
     def radio_config_preset_applied(self, event: RadioConfigPresetApplied) -> None:
@@ -5795,29 +5829,72 @@ class MeshtasticPassApp(App[None]):
             # A late return from a superseded / already-timed-out
             # attempt: never misattributed to whatever is current now.
             return
-        if event.result.applied:
-            self._finish_network_apply(success=True, detail="write-verified")
-            return
-        failure = event.result.results.get(event.result.failed_step)
-        raw_reason = failure.reason if failure is not None else "unknown"
-        if (
-            raw_reason in self._NETWORK_APPLY_REBOOT_REASONS
-            or self._radio_state is not RadioState.ONLINE
-        ):
+        result = event.result
+        step_result = (
+            result.results.get(result.failed_step) if not result.applied else None
+        )
+        raw_reason = step_result.reason if step_result is not None else ""
+        radio_down = (
+            self._radio_state is not RadioState.ONLINE or raw_reason == "disconnected"
+        )
+        if radio_down:
+            # PATH A: an actual disconnect correlated with THIS apply is
+            # the expected LoRa-config reboot -- never a failure. Wait
+            # for the reconnect full-sync, then verify (see
+            # _on_connection_state_for_network_apply).
             apply.awaiting_reconnect = True
             self._log_netcfg(
-                f"apply#{apply.token} step={event.result.failed_step or '-'} "
-                f"reason={raw_reason} -> awaiting radio reboot/reconnect"
+                f"apply#{apply.token} radio down after "
+                f"{result.failed_step or 'commit'} ({raw_reason or '-'}) "
+                "-> awaiting reboot/reconnect"
             )
             self._set_advanced_radio_status(
                 f"APPLYING {apply.name} — RADIO REBOOTED, WAITING FOR RECONNECT...",
                 "setting-accent",
             )
             return
-        reason = self._RADIO_FAILURE_REASONS.get(raw_reason, raw_reason.upper())
-        self._finish_network_apply(
-            success=False, detail=f"{reason} ({event.result.failed_step})"
+        # PATH B: the connection survived. The radio's own fresh readback
+        # is authoritative -- neither a bare "write verified" claim nor a
+        # wait for a reboot that is not coming.
+        if event.verification is None:
+            self._log_netcfg(
+                f"apply#{apply.token} connected but no readback -- "
+                "holding for reconnect/timeout"
+            )
+            apply.awaiting_reconnect = True
+            self._set_advanced_radio_status(
+                f"APPLYING {apply.name} — VERIFYING...", "setting-accent"
+            )
+            return
+        self._finish_network_apply_from_verification(
+            event.verification, source="post-write"
         )
+
+    def _finish_network_apply_from_verification(
+        self, verification: RadioConfigVerification, *, source: str
+    ) -> None:
+        apply = self._network_apply
+        if apply is None:
+            return
+        for check in verification.checks:
+            self._log_netcfg(
+                f"apply#{apply.token} verify[{source}] {check.field} "
+                f"requested={check.requested} actual={check.actual} "
+                f"match={check.match}"
+            )
+        self._log_netcfg(
+            f"apply#{apply.token} verify[{source}] {verification.channel_name_note}"
+        )
+        if verification.ok:
+            self._finish_network_apply(
+                success=True, detail=f"readback-verified ({source})"
+            )
+            return
+        label = NETWORK_FIELD_LABELS.get(
+            verification.mismatched_field,
+            f"{verification.mismatched_field.upper() or 'READBACK'} MISMATCH",
+        )
+        self._finish_network_apply(success=False, detail=label)
 
     def _on_connection_state_for_network_apply(
         self, state: RadioState, was_online: bool
@@ -5825,11 +5902,12 @@ class MeshtasticPassApp(App[None]):
         """Fold an EXPECTED mid-apply disconnect/reconnect into the
 
         NETWORK apply lifecycle -- called from _show_connection on every
-        radio-state transition. A disconnect while applying is the LoRa-
-        config reboot, not a failure; the following reconnect is where
-        the new config is read back and the operation finally resolves.
-        Scoped entirely to a live _network_apply -- ordinary connects/
-        reconnects with nothing outstanding are untouched.
+        radio-state transition. A disconnect while an apply is
+        outstanding is the LoRa-config reboot, not a failure; the
+        following reconnect is where the new config is read back and the
+        operation finally resolves. Scoped entirely to a live
+        _network_apply -- ordinary connects/reconnects with nothing
+        outstanding are untouched.
         """
         apply = self._network_apply
         if apply is None:
@@ -5855,29 +5933,11 @@ class MeshtasticPassApp(App[None]):
         apply = self._network_apply
         if apply is None:
             return
-        preset = apply.preset
-        raw_modem = self.radio.read_synced_config_field("lora", "modem_preset")
-        modem_name = modem_preset_enum_name(raw_modem) if raw_modem is not None else None
-        channel_num = self.radio.read_synced_config_field("lora", "channel_num") or 0
-        ok = modem_name == preset.modem_preset and channel_num == preset.frequency_slot
-        if ok and preset.channel_psk_base64:
-            primary = self.radio.read_primary_channel_settings()
-            try:
-                want_psk = base64.b64decode(preset.channel_psk_base64)
-            except Exception:
-                want_psk = None
-            if primary is None or want_psk is None or primary[1] != want_psk:
-                ok = False
-        self._log_netcfg(
-            f"apply#{apply.token} readback modem_preset={modem_name} "
-            f"channel_num={channel_num} match={ok}"
-        )
-        if ok:
-            self._finish_network_apply(success=True, detail="readback-verified")
-        else:
-            self._finish_network_apply(
-                success=False, detail="readback mismatch after reconnect"
-            )
+        # The reconnect already ran a full config sync, so the SDK's
+        # already-synced cache is fresh -- verify_radio_config_preset
+        # only reads it (zero RF), safe on the UI thread.
+        verification = verify_radio_config_preset(self.radio, apply.preset)
+        self._finish_network_apply_from_verification(verification, source="reconnect")
 
     def _network_apply_timed_out(self, token: int) -> None:
         if self._network_apply is None or self._network_apply.token != token:

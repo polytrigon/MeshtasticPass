@@ -40,7 +40,13 @@ from radio_capabilities import (
     modem_preset_enum_name,
     modem_preset_friendly_label,
 )
-from radio_service import ConfigWriteResult, RadioState, apply_radio_config_preset
+from radio_service import (
+    ConfigWriteResult,
+    RadioState,
+    apply_radio_config_preset,
+    psk_matches_request,
+    verify_radio_config_preset,
+)
 from simulated_radio_service import SimulatedRadioService
 
 
@@ -181,6 +187,150 @@ class ApplyRadioConfigPresetServiceTests(unittest.TestCase):
 
         self.assertFalse(result.applied)
         self.assertEqual(result.results["use_preset"].reason, "not_connected")
+
+    def test_apply_wraps_the_writes_in_a_settings_transaction(self) -> None:
+        radio = self._radio()
+        calls: list[str] = []
+        radio.begin_settings_transaction = lambda: calls.append("begin") or True
+        radio.commit_settings_transaction = lambda: calls.append("commit") or True
+        original = radio.write_verified_config_field
+        radio.write_verified_config_field = (
+            lambda *a, **k: calls.append("write") or original(*a, **k)
+        )
+        preset = RadioConfigPreset(name="Home", modem_preset="LONG_FAST", frequency_slot=0)
+
+        result = apply_radio_config_preset(radio, preset)
+
+        self.assertTrue(result.applied)
+        self.assertEqual(calls[0], "begin")
+        self.assertEqual(calls[-1], "commit")
+        self.assertEqual(calls.count("begin"), 1)
+        self.assertEqual(calls.count("commit"), 1)
+
+    def test_transaction_is_committed_even_when_a_write_fails(self) -> None:
+        radio = self._radio()
+        committed: list[bool] = []
+        radio.begin_settings_transaction = lambda: True
+        radio.commit_settings_transaction = lambda: committed.append(True) or True
+        original = radio.write_verified_config_field
+
+        def failing(section, field, value, **kwargs):
+            if field == "modem_preset":
+                return ConfigWriteResult(False, value, None, "nak")
+            return original(section, field, value, **kwargs)
+
+        radio.write_verified_config_field = failing
+        result = apply_radio_config_preset(
+            radio, RadioConfigPreset(name="Home", modem_preset="LONG_FAST")
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(committed, [True])  # never left dangling on the radio
+
+
+class VerifyRadioConfigPresetTests(unittest.TestCase):
+    @staticmethod
+    def _radio() -> SimulatedRadioService:
+        radio = SimulatedRadioService(connect_delay=0, message_interval=0)
+        radio.connect()
+        radio._online = True
+        return radio
+
+    def test_psk_matches_request_semantics(self) -> None:
+        default_key = __import__("meshtastic.util", fromlist=["DEFAULT_KEY"]).DEFAULT_KEY
+        self.assertTrue(psk_matches_request(bytes([1]), bytes([1])))
+        self.assertTrue(psk_matches_request(bytes([1]), default_key))  # expanded
+        self.assertTrue(psk_matches_request(default_key, bytes([1])))
+        self.assertTrue(psk_matches_request(b"", b""))
+        self.assertTrue(psk_matches_request(b"", bytes([0])))  # "no encryption"
+        self.assertFalse(psk_matches_request(bytes([1]), b"random-16-bytes!"))
+
+    def test_longfast_channel_num_zero_is_semantically_verified(self) -> None:
+        radio = self._radio()
+        apply_radio_config_preset(
+            radio,
+            RadioConfigPreset(
+                name="LongFast",
+                modem_preset="LONG_FAST",
+                frequency_slot=0,
+                channel_psk_base64="AQ==",
+            ),
+        )
+        # channel_num is the auto-select sentinel 0.
+        radio._config_sections["lora"]["channel_num"] = 0
+        v = verify_radio_config_preset(
+            radio,
+            RadioConfigPreset(
+                name="LongFast",
+                modem_preset="LONG_FAST",
+                frequency_slot=0,
+                channel_psk_base64="AQ==",
+            ),
+        )
+        self.assertTrue(v.ok)
+        self.assertEqual(v.mismatched_field, "")
+        # And an unavailable channel_num readback still verifies for a
+        # requested 0 (never a false literal-equality failure).
+        radio.read_synced_config_field = (
+            lambda s, f: None if (s, f) == ("lora", "channel_num")
+            else SimulatedRadioService.read_synced_config_field(radio, s, f)
+        )
+        v2 = verify_radio_config_preset(
+            radio, RadioConfigPreset(name="LF", modem_preset="LONG_FAST", frequency_slot=0)
+        )
+        slot_check = next(c for c in v2.checks if c.field == "frequency_slot")
+        self.assertTrue(slot_check.match)
+
+    def test_ms48_slot_48_verification_is_strict(self) -> None:
+        radio = self._radio()
+        preset = RadioConfigPreset(
+            name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48
+        )
+        apply_radio_config_preset(radio, preset)
+        radio._config_sections["lora"]["channel_num"] = 20  # wrong slot
+        v = verify_radio_config_preset(radio, preset)
+        self.assertFalse(v.ok)
+        self.assertEqual(v.mismatched_field, "frequency_slot")
+
+    def test_verification_identifies_the_specific_mismatched_field(self) -> None:
+        radio = self._radio()
+        preset = RadioConfigPreset(
+            name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48
+        )
+        apply_radio_config_preset(radio, preset)
+        radio._config_sections["lora"]["modem_preset"] = 0  # reverted to LONG_FAST
+        v = verify_radio_config_preset(radio, preset)
+        self.assertEqual(v.mismatched_field, "modem_preset")
+        modem_check = next(c for c in v.checks if c.field == "modem_preset")
+        self.assertEqual(modem_check.requested, "MEDIUM_SLOW")
+        self.assertEqual(modem_check.actual, "LONG_FAST")
+
+    def test_verification_strings_never_contain_psk_bytes(self) -> None:
+        radio = self._radio()
+        preset = RadioConfigPreset(
+            name="Keyed",
+            modem_preset="LONG_FAST",
+            channel_psk_base64="AQ==",
+        )
+        apply_radio_config_preset(radio, preset)
+        v = verify_radio_config_preset(radio, preset)
+        psk_check = next(c for c in v.checks if c.field == "channel_psk")
+        self.assertEqual(psk_check.requested, "len=1")
+        self.assertTrue(psk_check.actual.startswith("len="))
+        self.assertNotIn("AQ==", str(v))
+        self.assertNotIn("\\x01", repr(v))
+
+    def test_network_name_is_never_the_channel_name_note(self) -> None:
+        radio = self._radio()
+        preset = RadioConfigPreset(
+            name="NYC MS48",  # local-only network name
+            modem_preset="LONG_FAST",
+            channel_name="",  # channel name stays blank
+        )
+        apply_radio_config_preset(radio, preset)
+        v = verify_radio_config_preset(radio, preset)
+        self.assertNotIn("NYC MS48", v.channel_name_note)
+        self.assertIn("blank", v.channel_name_note)
 
 
 class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
@@ -517,12 +667,11 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             app._on_network_selected("NYC MS48")
             self.assertEqual(begin_calls, [("NYC MS48", False)])
             self.assertIsNone(app._advanced_radio_confirm)
-            self.assertIn(
-                ("SWITCHING TO NYC MS48... REBOOTING", "setting-accent"), statuses
-            )
-            self.assertNotIn(
-                "AGAIN TO CONFIRM", " ".join(text for text, _ in statuses)
-            )
+            # Initial status makes NO premature reboot claim.
+            self.assertIn(("SWITCHING TO NYC MS48...", "setting-accent"), statuses)
+            joined = " ".join(text for text, _ in statuses)
+            self.assertNotIn("AGAIN TO CONFIRM", joined)
+            self.assertNotIn("SWITCHING TO NYC MS48... REBOOTING", joined)
 
             for _ in range(12):
                 await pilot.pause()
@@ -845,8 +994,109 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
         printed = buffer.getvalue()
         self.assertIn("[NETCFG]", printed)
         self.assertIn("decoded_len=1", printed)
+        self.assertIn("verify[", printed)  # field-by-field verification logged
         self.assertNotIn("AQ==", printed)
         self.assertNotIn("\\x01", printed)
+        self.assertNotIn("1PG7OiAp", printed)  # never the expanded default key
+
+    async def test_no_reboot_apply_completes_via_fresh_readback(self) -> None:
+        """PATH B: the write + commit succeed and the connection stays
+
+        up -- the operation resolves from a fresh readback immediately,
+        never waiting for a reboot that is not coming.
+        """
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(
+                name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48
+            )
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            statuses: list[str] = []
+            orig = app._set_advanced_radio_status
+            app._set_advanced_radio_status = (
+                lambda t, c: statuses.append(t) or orig(t, c)
+            )
+
+            app._on_network_selected("NYC MS48")
+            for _ in range(15):
+                await pilot.pause()
+                if app._network_apply is None:
+                    break
+
+            self.assertIsNone(app._network_apply)  # terminal, no reboot wait
+            self.assertNotIn(
+                "WAITING FOR RECONNECT", " ".join(statuses)
+            )
+            self.assertEqual(app._selected_network, "NYC MS48")
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("APPLIED", status)
+            self.assertNotIn("NOT APPLIED", status)
+
+    async def test_no_reboot_apply_with_wrong_readback_names_the_field(self) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(
+                name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48
+            )
+        )
+        # Writes "succeed" (verified) but the radio's actual slot is wrong.
+        original = radio.write_verified_config_field
+
+        def lying_write(section, field, value, **kwargs):
+            r = original(section, field, value, **kwargs)
+            if field == "channel_num":
+                radio._config_sections["lora"]["channel_num"] = 20  # not 48
+            return r
+
+        radio.write_verified_config_field = lying_write
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+
+            app._on_network_selected("NYC MS48")
+            for _ in range(15):
+                await pilot.pause()
+                if app._network_apply is None:
+                    break
+
+            self.assertIsNone(app._network_apply)
+            self.assertEqual(app._selected_network, BUILTIN_LONGFAST_NETWORK)  # reverted
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("FREQ. SLOT MISMATCH", status)
+            self.assertNotIn("NYC MS48 APPLIED", status)
+
+    async def test_switch_status_scrolls_into_view_when_below_the_fold(self) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(60, 12)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            page = app.query_one(ConnectionPage)
+            page.scroll_home(animate=False)  # status is far below the fold
+            await pilot.pause()
+
+            status_widget = app.query_one("#advanced-radio-status", Static)
+            app._on_network_selected("NYC MS48")
+            for _ in range(8):
+                await pilot.pause()
+
+            region = status_widget.region
+            viewport = page.scrollable_content_region
+            self.assertTrue(
+                viewport.contains_region(region) or region.y < viewport.bottom,
+                f"status region {region} not brought into viewport {viewport}",
+            )
 
     # ---- UI polish -----------------------------------------------------
 

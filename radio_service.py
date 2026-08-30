@@ -362,6 +362,35 @@ DISPLAY_UNITS_IMPERIAL = 1
 # on" -- confirmed via the installed .pyi stub, never invented.
 SCREEN_ON_SECS_ALWAYS_ON = 4294967295
 
+# Meshtastic primary-channel PSK sentinels (see meshtastic.util.fromPSK):
+# a single byte 0x01 means "use the well-known default public key", a
+# single byte 0x00 means "no encryption". The 16-byte well-known default
+# key itself (meshtastic.util.DEFAULT_KEY) -- some firmware/SDK paths
+# echo the expanded form on readback, others keep the 0x01 sentinel, so
+# PSK verification treats the two as equivalent (see psk_matches_request).
+PSK_DEFAULT_SENTINEL = bytes([1])
+PSK_NONE_SENTINEL = bytes([0])
+DEFAULT_CHANNEL_PSK = base64.b64decode("1PG7OiApB1nwvP+rz05pAQ==")
+
+
+def psk_matches_request(requested: bytes, actual: bytes) -> bool:
+    """Semantic PSK comparison for readback verification.
+
+    Exact bytes match, OR both sides resolve to the same well-known
+    channel key: a requested 0x01 sentinel is satisfied by an actual
+    0x01 OR the expanded 16-byte DEFAULT_CHANNEL_PSK (and vice versa);
+    a requested "" (leave unset) is satisfied by "" or the 0x00
+    ("no encryption") sentinel. Never inspects/logs the raw key bytes
+    beyond this equality decision.
+    """
+    if requested == actual:
+        return True
+    default_family = {PSK_DEFAULT_SENTINEL, DEFAULT_CHANNEL_PSK}
+    if requested in default_family and actual in default_family:
+        return True
+    unset_family = {b"", PSK_NONE_SENTINEL}
+    return requested in unset_family and actual in unset_family
+
 
 @dataclass(frozen=True)
 class ConfigWriteResult:
@@ -1184,7 +1213,13 @@ class RadioService:
             return ConfigWriteResult(False, (name, psk), None, "nak")
 
         read_request = admin_pb2.AdminMessage()
-        read_request.get_channel_request = 0
+        # AdminMessage.get_channel_request is 1-INDEXED on the wire:
+        # meshtastic.node.Node._requestChannel sends `channelNum + 1`,
+        # so requesting the PRIMARY channel (index 0) means a value of
+        # 1. A value of 0 addresses no valid channel, the firmware never
+        # answers, and this readback silently times out on real hardware
+        # (the observed "NETWORK apply never completes" bug).
+        read_request.get_channel_request = 1
         found: dict[str, Any] = {}
 
         def on_response(packet: Any) -> None:
@@ -1196,6 +1231,8 @@ class RadioService:
             if raw is None or not raw.HasField("get_channel_response"):
                 return
             response_channel = raw.get_channel_response
+            if getattr(response_channel, "index", 0) != 0:
+                return  # not the primary channel's response
             found["name"] = response_channel.settings.name
             found["psk"] = bytes(response_channel.settings.psk)
 
@@ -1210,13 +1247,114 @@ class RadioService:
                 return ConfigWriteResult(False, (name, psk), None, "disconnected")
             if "name" in found:
                 readback = (found["name"], found["psk"])
-                if readback == (name, psk):
+                if found["name"] == name and psk_matches_request(psk, found["psk"]):
                     self._rebuild_config_snapshot()
                     return ConfigWriteResult(True, (name, psk), readback, "")
                 return ConfigWriteResult(False, (name, psk), readback, "mismatch")
             time.sleep(0.05)
 
         return ConfigWriteResult(False, (name, psk), None, "timeout")
+
+    def begin_settings_transaction(self) -> bool:
+        """Open a Meshtastic settings-edit transaction
+
+        (AdminMessage.begin_edit_settings) -- exactly what
+        `meshtastic --set` does before a MULTI-field config change (see
+        meshtastic.__main__: it wraps >1 writeConfig() calls in
+        begin/commitSettingsTransaction). Best-effort: returns False and
+        never raises if there is no connection or the installed SDK
+        predates the method. apply_radio_config_preset uses this so a
+        NETWORK apply is committed the same way the CLI commits one,
+        rather than as loose, individually-persisted set_config writes.
+        """
+        local_node = getattr(self._interface, "localNode", None)
+        begin = getattr(local_node, "beginSettingsTransaction", None)
+        if begin is None:
+            return False
+        try:
+            begin()
+            return True
+        except Exception:
+            return False
+
+    def commit_settings_transaction(self) -> bool:
+        """Commit the open settings-edit transaction
+
+        (AdminMessage.commit_edit_settings). The firmware persists the
+        batch of edits -- and reboots if any of them require it -- on
+        THIS message, not on the individual set_config writes. Always
+        paired with begin_settings_transaction() so a transaction is
+        never left dangling on the radio. Best-effort / never raises.
+        """
+        local_node = getattr(self._interface, "localNode", None)
+        commit = getattr(local_node, "commitSettingsTransaction", None)
+        if commit is None:
+            return False
+        try:
+            commit()
+            return True
+        except Exception:
+            return False
+
+    def reread_lora_and_primary_channel(self, *, timeout: float = 8.0) -> bool:
+        """Ask the radio for a FRESH copy of localConfig.lora and the
+
+        primary channel (get_config_request LORA + get_channel_request
+        1) and fold it into the SDK's synced objects -- so a following
+        read_synced_config_field("lora", ...) / read_primary_channel_
+        settings() reflects the radio's CURRENT state, not a stale
+        connect-time snapshot. Used to verify a NETWORK apply that
+        completed WITHOUT an observed reboot (there was no reconnect
+        full-sync to refresh the cache). Best-effort; returns True if
+        both responses arrived. Never raises.
+        """
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        if interface is None or local_node is None:
+            return False
+        try:
+            from meshtastic.protobuf import admin_pb2
+        except Exception:
+            return False
+        got = {"lora": False, "channel": False}
+
+        def on_config(packet: Any) -> None:
+            try:
+                local_node.onResponseRequestSettings(packet)
+            except Exception:
+                pass
+            got["lora"] = True
+
+        def on_channel(packet: Any) -> None:
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            raw = admin.get("raw") if isinstance(admin, dict) else None
+            if raw is not None and raw.HasField("get_channel_response"):
+                channel = raw.get_channel_response
+                if getattr(channel, "index", 0) == 0 and local_node.channels:
+                    local_node.channels[0].CopyFrom(channel)
+            got["channel"] = True
+
+        lora_request = admin_pb2.AdminMessage()
+        lora_request.get_config_request = admin_pb2.AdminMessage.ConfigType.Value(
+            "LORA_CONFIG"
+        )
+        channel_request = admin_pb2.AdminMessage()
+        channel_request.get_channel_request = 1  # 1-indexed: primary == 0
+        try:
+            local_node._sendAdmin(lora_request, onResponse=on_config)
+            local_node._sendAdmin(channel_request, onResponse=on_channel)
+        except Exception:
+            return False
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._connection_lost.is_set():
+                return False
+            if got["lora"] and got["channel"]:
+                self._rebuild_config_snapshot()
+                return True
+            time.sleep(0.05)
+        return False
 
     def supports_clock_sync(self) -> bool:
         """Whether the installed SDK/protobuf schema exposes
@@ -2361,6 +2499,15 @@ def apply_radio_config_preset(radio: Any, preset: Any) -> RadioApplyResult:
     coding_rate from the chosen modem_preset) matches the task's own
     "Use preset mode" requirement -- those three raw LoRa physics
     fields are left for the radio's own preset table to fill in.
+
+    The whole sequence is wrapped in a Meshtastic settings-edit
+    transaction (begin_settings_transaction/commit_settings_transaction
+    -- best-effort, a no-op on an SDK/simulator that lacks it), exactly
+    as `meshtastic --set` wraps a multi-field config change: the
+    firmware persists (and reboots if required) on the COMMIT, not on
+    each loose set_config. The commit runs in a `finally` so a
+    transaction is never left dangling on the radio even when a write
+    fails partway.
     """
     try:
         from meshtastic.protobuf import config_pb2
@@ -2380,39 +2527,179 @@ def apply_radio_config_preset(radio: Any, preset: Any) -> RadioApplyResult:
         )
 
     results: dict[str, ConfigWriteResult] = {}
-
-    results["use_preset"] = radio.write_verified_config_field("lora", "use_preset", True)
-    if not results["use_preset"].applied:
-        return RadioApplyResult(False, "use_preset", results)
-
-    results["modem_preset"] = radio.write_verified_config_field(
-        "lora", "modem_preset", modem_preset_value
-    )
-    if not results["modem_preset"].applied:
-        return RadioApplyResult(False, "modem_preset", results)
-
-    results["frequency_slot"] = radio.write_verified_config_field(
-        "lora", "channel_num", preset.frequency_slot
-    )
-    if not results["frequency_slot"].applied:
-        return RadioApplyResult(False, "frequency_slot", results)
+    begin = getattr(radio, "begin_settings_transaction", None)
+    commit = getattr(radio, "commit_settings_transaction", None)
+    in_transaction = bool(begin()) if callable(begin) else False
 
     try:
-        psk_bytes = (
+        results["use_preset"] = radio.write_verified_config_field(
+            "lora", "use_preset", True
+        )
+        if not results["use_preset"].applied:
+            return RadioApplyResult(False, "use_preset", results)
+
+        results["modem_preset"] = radio.write_verified_config_field(
+            "lora", "modem_preset", modem_preset_value
+        )
+        if not results["modem_preset"].applied:
+            return RadioApplyResult(False, "modem_preset", results)
+
+        results["frequency_slot"] = radio.write_verified_config_field(
+            "lora", "channel_num", preset.frequency_slot
+        )
+        if not results["frequency_slot"].applied:
+            return RadioApplyResult(False, "frequency_slot", results)
+
+        try:
+            psk_bytes = (
+                base64.b64decode(preset.channel_psk_base64)
+                if preset.channel_psk_base64
+                else b""
+            )
+        except Exception:
+            results["channel"] = ConfigWriteResult(
+                False, preset.channel_psk_base64, None, "invalid"
+            )
+            return RadioApplyResult(False, "channel", results)
+
+        results["channel"] = radio.write_verified_primary_channel(
+            name=preset.channel_name, psk=psk_bytes
+        )
+        if not results["channel"].applied:
+            return RadioApplyResult(False, "channel", results)
+
+        return RadioApplyResult(True, "", results)
+    finally:
+        if in_transaction and callable(commit):
+            commit()
+
+
+@dataclass(frozen=True)
+class RadioConfigFieldCheck:
+    """One field of a NETWORK-apply readback verification."""
+
+    field: str          # "modem_preset" | "frequency_slot" | "channel_psk"
+    requested: str       # already display-safe (PSK is a length note only)
+    actual: str
+    match: bool
+
+
+@dataclass(frozen=True)
+class RadioConfigVerification:
+    ok: bool
+    checks: tuple[RadioConfigFieldCheck, ...]
+    mismatched_field: str          # "" when ok
+    channel_name_note: str         # diagnostic only, never a pass/fail input
+
+
+# The three LoRa/channel apply steps a mismatch can be attributed to,
+# mapped to the compact UI wording the failure status uses.
+NETWORK_FIELD_LABELS = {
+    "modem_preset": "RADIO MODE MISMATCH",
+    "frequency_slot": "FREQ. SLOT MISMATCH",
+    "channel_psk": "KEY MISMATCH",
+}
+
+
+def verify_radio_config_preset(radio: Any, preset: Any) -> RadioConfigVerification:
+    """Compare the connected radio's ACTUAL already-synced lora +
+
+    primary-channel state against `preset`, field by field and
+    SEMANTICALLY -- for the post-apply verification step (after a
+    reconnect full-sync, or after RadioService.reread_lora_and_primary_
+    channel for a no-reboot apply). Duck-typed against read_synced_
+    config_field / read_primary_channel_settings, like
+    apply_radio_config_preset, so it behaves identically in --simulate.
+
+    channel_num: a requested 0 is the Meshtastic "auto-select" sentinel
+    (the firmware derives the real frequency from region + modem preset
+    + a hash of the primary channel name; the stored config field stays
+    0), so requested 0 matches an actual 0 OR an unavailable/unset
+    readback -- never a false literal-equality failure. An explicit
+    slot (MS48 -> 48) must match exactly.
+
+    PSK: compared with psk_matches_request (0x01 default sentinel <->
+    expanded default key; "" <-> 0x00). Only a decoded LENGTH is ever
+    put in the returned strings -- never key bytes.
+    """
+    checks: list[RadioConfigFieldCheck] = []
+
+    raw_modem = radio.read_synced_config_field("lora", "modem_preset")
+    try:
+        from radio_capabilities import modem_preset_enum_name
+
+        actual_modem = (
+            modem_preset_enum_name(raw_modem) if raw_modem is not None else None
+        )
+    except Exception:
+        actual_modem = None
+    checks.append(
+        RadioConfigFieldCheck(
+            "modem_preset",
+            str(preset.modem_preset),
+            actual_modem or "unavailable",
+            actual_modem == preset.modem_preset,
+        )
+    )
+
+    raw_slot = radio.read_synced_config_field("lora", "channel_num")
+    requested_slot = int(getattr(preset, "frequency_slot", 0) or 0)
+    if raw_slot is None:
+        slot_match = requested_slot == 0
+        actual_slot_text = "unset"
+    else:
+        actual_slot = int(raw_slot)
+        slot_match = actual_slot == requested_slot or (
+            requested_slot == 0 and actual_slot == 0
+        )
+        actual_slot_text = str(actual_slot)
+    checks.append(
+        RadioConfigFieldCheck(
+            "frequency_slot", str(requested_slot), actual_slot_text, slot_match
+        )
+    )
+
+    try:
+        requested_psk = (
             base64.b64decode(preset.channel_psk_base64)
             if preset.channel_psk_base64
             else b""
         )
     except Exception:
-        results["channel"] = ConfigWriteResult(
-            False, preset.channel_psk_base64, None, "invalid"
+        requested_psk = b""
+    primary = None
+    reader = getattr(radio, "read_primary_channel_settings", None)
+    if callable(reader):
+        primary = reader()
+    actual_name = primary[0] if primary else ""
+    actual_psk = primary[1] if primary else b""
+    psk_match = psk_matches_request(requested_psk, actual_psk)
+    checks.append(
+        RadioConfigFieldCheck(
+            "channel_psk",
+            f"len={len(requested_psk)}",
+            f"len={len(actual_psk)}",
+            psk_match,
         )
-        return RadioApplyResult(False, "channel", results)
-
-    results["channel"] = radio.write_verified_primary_channel(
-        name=preset.channel_name, psk=psk_bytes
     )
-    if not results["channel"].applied:
-        return RadioApplyResult(False, "channel", results)
 
-    return RadioApplyResult(True, "", results)
+    # NETWORK NAME is local-only and must never be written as the
+    # Meshtastic primary-channel name -- this is a diagnostic breadcrumb
+    # only (report if the channel name unexpectedly changed), never a
+    # verification failure.
+    requested_channel_name = getattr(preset, "channel_name", "") or ""
+    if actual_name == requested_channel_name:
+        channel_name_note = f"channel_name={actual_name or 'blank'} (as requested)"
+    else:
+        channel_name_note = (
+            f"channel_name={actual_name or 'blank'} "
+            f"(requested {requested_channel_name or 'blank'})"
+        )
+
+    mismatched = next((c.field for c in checks if not c.match), "")
+    return RadioConfigVerification(
+        ok=not mismatched,
+        checks=tuple(checks),
+        mismatched_field=mismatched,
+        channel_name_note=channel_name_note,
+    )

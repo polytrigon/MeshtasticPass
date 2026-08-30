@@ -559,6 +559,26 @@ class SimulatedRadioService:
         self._rebuild_config_snapshot()
         return ConfigWriteResult(True, (name, psk), (name, psk), "")
 
+    def begin_settings_transaction(self) -> bool:
+        """No-op stub (the simulator has no firmware transaction/reboot);
+
+        returns True so apply_radio_config_preset exercises its
+        begin/commit path identically under --simulate.
+        """
+        return self._online
+
+    def commit_settings_transaction(self) -> bool:
+        return self._online
+
+    def reread_lora_and_primary_channel(self, *, timeout: float = 8.0) -> bool:
+        """No-op: the simulator's _config_sections / primary-channel
+
+        state is always live, so a "fresh re-read" is whatever
+        read_synced_config_field / read_primary_channel_settings
+        already return.
+        """
+        return self._online
+
     def config_snapshot(self):
         """The current connection's cached fake RadioConfigurationSnapshot,
 
