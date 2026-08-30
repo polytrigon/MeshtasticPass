@@ -633,7 +633,45 @@ def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int
     untouched, mirroring this MESH view's other width-aware lines
     (see mesh_state.py's own established convention). If even tier 6
     does not fit, grapheme-safe truncation is the final fallback.
+
+    The local YOU node (fields.accent2) is a deliberate exception:
+    DISTANCE ("no distance from yourself"), LINK ("no RF link to
+    itself") and ELAPSE ("NOW") carry no information for YOU, so they
+    are omitted entirely -- not shown as placeholders. YOU degrades
+    through its own short tier list (long name - short name - HOPS -
+    GPS, then drop GPS, then drop short name).
     """
+    if fields.accent2:
+        you_candidates = (
+            " • ".join((
+                fields.long_name,
+                fields.short_name,
+                f"HOPS {fields.hops_text}",
+                f"GPS {fields.gps_text}",
+            )),
+            " • ".join((
+                fields.long_name,
+                fields.short_name,
+                f"HOPS {fields.hops_text}",
+                f"GPS {fields.gps_text_compact}",
+            )),
+            " • ".join((
+                fields.long_name,
+                fields.short_name,
+                f"HOPS {fields.hops_text}",
+            )),
+            " • ".join((
+                fields.long_name,
+                f"HOPS {fields.hops_text}",
+            )),
+        )
+        if available_width <= 0:
+            return you_candidates[0]
+        for candidate in you_candidates:
+            if cell_len(candidate) <= available_width:
+                return candidate
+        return truncate_to_cells(you_candidates[-1], available_width)
+
     link_full = f"{fields.link_meter} {fields.link_rssi_text} / {fields.link_snr_text}"
     link_compact = f"{fields.link_meter} {fields.link_rssi_text}/{fields.link_snr_text}"
     candidates = (

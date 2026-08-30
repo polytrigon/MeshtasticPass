@@ -4586,8 +4586,35 @@ class MeshtasticPassApp(App[None]):
                         event.stop()
                         return
 
+        if (
+            self.current_tab == "connection"
+            and self._network_editor_open
+            and event.key in ("left", "right")
+        ):
+            # [ SAVE ] [ CANCEL ] share one row -- RIGHT/LEFT moves
+            # within the pair so the user never has to press DOWN to
+            # reach CANCEL (see _connection_nav_controls).
+            save = self.query_one(SaveNetworkControl)
+            cancel = self.query_one(CancelNetworkControl)
+            if self.focused is save and event.key == "right":
+                cancel.focus()
+                event.stop()
+                return
+            if self.focused is cancel and event.key == "left":
+                save.focus()
+                event.stop()
+                return
+
         if self.current_tab == "connection" and event.key in ("up", "down"):
             step = -1 if event.key == "up" else 1
+            if isinstance(self.focused, CancelNetworkControl):
+                # CANCEL is not its own vertical stop: vertical nav from
+                # it behaves exactly as from its SAVE sibling.
+                self._move_connection_focus(
+                    step, origin=self.query_one(SaveNetworkControl)
+                )
+                event.stop()
+                return
             if self._move_connection_focus(step):
                 event.stop()
                 return
@@ -5139,9 +5166,12 @@ class MeshtasticPassApp(App[None]):
 
         Only ONE of the ADVANCED RADIO tails is ever included: the
         collapsed [ NEW NETWORK ] row, or -- when the transient editor
-        is open -- the NETWORK NAME/RADIO MODE/FREQ. SLOT/KEY/SAVE/
-        CANCEL rows. The hidden side is left out entirely so a
-        `display: none` row never becomes an unreachable focus stop.
+        is open -- NETWORK NAME/RADIO MODE/FREQ. SLOT/KEY then SAVE. The
+        hidden side is left out entirely so a `display: none` row never
+        becomes an unreachable focus stop. CANCEL is deliberately NOT a
+        vertical stop -- [ SAVE ] [ CANCEL ] share one row and CANCEL is
+        reached from SAVE with RIGHT (see on_key); vertical nav from
+        CANCEL is delegated to its SAVE sibling.
         """
         base: tuple[Widget, ...] = (
             self.query_one(DeviceSelector),
@@ -5168,7 +5198,6 @@ class MeshtasticPassApp(App[None]):
                 self.query_one("#freq-slot-input", Input),
                 self.query_one("#key-input", Input),
                 self.query_one(SaveNetworkControl),
-                self.query_one(CancelNetworkControl),
             )
         else:
             tail = (self.query_one(NewNetworkControl),)
@@ -5178,16 +5207,20 @@ class MeshtasticPassApp(App[None]):
             if not getattr(control, "disabled", False)
         ]
 
-    def _move_connection_focus(self, step: int) -> bool:
+    def _move_connection_focus(self, step: int, *, origin: Widget | None = None) -> bool:
         """Move focus to the previous/next CONNECTION row; True if it did
 
         (the caller's own responsibility to check self.current_tab ==
-        "connection" first and event.stop() on a True return).
+        "connection" first and event.stop() on a True return). `origin`
+        overrides "which row we're moving FROM" -- used for CANCEL,
+        whose vertical movement is measured from its SAVE sibling since
+        CANCEL itself is not in the vertical list.
         """
         controls = self._connection_nav_controls()
-        if self.focused not in controls:
+        current_widget = origin if origin is not None else self.focused
+        if current_widget not in controls:
             return False
-        current = controls.index(self.focused)
+        current = controls.index(current_widget)
         target = controls[(current + step) % len(controls)]
         target.focus()
         target.scroll_visible(animate=False)
@@ -5481,16 +5514,13 @@ class MeshtasticPassApp(App[None]):
             self._advanced_radio_confirm_timer = None
 
     def _advanced_radio_confirm_expired(self) -> None:
+        # Only the NEW NETWORK [ SAVE ] press-again-to-confirm is ever
+        # armed now -- switching between saved NETWORKs is a single
+        # ENTER with no confirmation (see _on_network_selected).
         self._advanced_radio_confirm_timer = None
-        if self._advanced_radio_confirm is None:
-            return
-        was_switch = self._advanced_radio_confirm.startswith("switch:")
-        self._advanced_radio_confirm = None
-        self._set_advanced_radio_status("", None)
-        if was_switch:
-            # The abandoned selector value reverts to the actual
-            # selected NETWORK -- nothing was applied.
-            self._refresh_network_options()
+        if self._advanced_radio_confirm is not None:
+            self._advanced_radio_confirm = None
+            self._set_advanced_radio_status("", None)
 
     @on(NewNetworkControl.Activated)
     def open_new_network(self, _event: NewNetworkControl.Activated) -> None:
@@ -5643,15 +5673,17 @@ class MeshtasticPassApp(App[None]):
         self._begin_network_apply(preset.name, preset, saved=True)
 
     def _on_network_selected(self, value: str) -> None:
-        """NETWORK dropdown selection. Browsing/opening/navigating never
+        """NETWORK dropdown ENTER-selection. Opening the dropdown and
 
-        reaches here (KeyboardDropdown only posts Selected on ENTER);
-        the first Selected for a new value arms a confirm, and
-        re-selecting that same value confirms and applies (spec J). No
-        separate APPLY button; zero RF until confirmed.
+        moving through choices never reaches here (KeyboardDropdown only
+        posts Selected on ENTER), and ESC just closes it -- both are
+        zero RF. Selecting a DIFFERENT saved NETWORK is itself the
+        commitment: it immediately begins the reboot-aware apply
+        lifecycle with NO second ENTER and NO confirmation prompt. The
+        NETWORK is not treated as active until post-reconnect readback
+        verification succeeds (see _resolve_network_apply_after_reconnect).
         """
         if value == self._selected_network:
-            self._disarm_advanced_radio_confirm()
             if self._network_apply is None:
                 self._set_advanced_radio_status("", None)
             return
@@ -5660,20 +5692,11 @@ class MeshtasticPassApp(App[None]):
             # selection and put the selector back where it was.
             self._refresh_network_options()
             return
-        confirm_key = f"switch:{value}"
-        if self._advanced_radio_confirm != confirm_key:
-            # Starting a NETWORK switch abandons any unfinished NEW
-            # NETWORK editor (spec K) -- same transient discard rules,
-            # never an accidental SAVE of half-entered values.
-            if self._network_editor_open:
-                self._collapse_network_editor()
-            self._arm_advanced_radio_confirm(confirm_key)
-            self._set_advanced_radio_status(
-                f"SELECT {value} AGAIN TO CONFIRM — RADIO WILL CHANGE NETWORK/RF "
-                "CONFIGURATION AND MAY STOP HEARING THE CURRENT NETWORK",
-                None,
-            )
-            return
+        # Selecting a NETWORK abandons any unfinished NEW NETWORK editor
+        # (spec K) -- same transient discard rules, never an accidental
+        # SAVE of half-entered values.
+        if self._network_editor_open:
+            self._collapse_network_editor()
         self._disarm_advanced_radio_confirm()
         preset = self._network_preset(value)
         if preset is None:
@@ -5728,8 +5751,12 @@ class MeshtasticPassApp(App[None]):
             NETWORK_APPLY_TIMEOUT_SECONDS,
             lambda: self._network_apply_timed_out(token),
         )
-        verb = "SAVING & APPLYING" if saved else "SWITCHING TO"
-        self._set_advanced_radio_status(f"{verb} {name}...", "setting-accent")
+        opening = (
+            f"SAVING & APPLYING {name}..."
+            if saved
+            else f"SWITCHING TO {name}... REBOOTING"
+        )
+        self._set_advanced_radio_status(opening, "setting-accent")
         self._run_radio_worker(
             f"network-apply-{token}",
             lambda: self._apply_network_from_thread(token, name, preset, saved),

@@ -2441,29 +2441,29 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
     # ---- Unified bottom bar (MESH GPS + UNIFIED BAR Part B) -----------
 
     async def test_node_bar_for_you(self) -> None:
-        """YOU's bar carries no literal "YOU" label, HOPS 0, real GPS
+        """YOU's bar carries no literal "YOU" label, HOPS 0, and real GPS
 
         (SimulatedRadioService's local node record carries
-        SIMULATED_LOCAL_POSITION, a real fix), DISTANCE "--", and ELAPSE
-        "NOW" -- SimulatedRadioService reports the connected radio's
-        own identity as "Simulated Node"/"SIM" (see RadioInfo). No
-        "LONG NAME"/"SHORT NAME" descriptor labels (FINAL MESHTASTIC
-        POLISH pass) -- just the bare values, long name first.
+        SIMULATED_LOCAL_POSITION, a real fix). DISTANCE / LINK / ELAPSE
+        are omitted ENTIRELY for YOU -- no placeholders -- since none of
+        the three carries information about the local node. No "LONG
+        NAME"/"SHORT NAME" descriptor labels -- just the bare values,
+        long name first.
         """
         app = self._make_app()
-        # A wide terminal so the bar renders its fullest (tier 1) form --
-        # see FormatMeshNodeBarLineTests/MeshNodeBarResponsiveWidthTests
-        # for the width-tiered degradation itself.
+        # A wide terminal so the bar renders its fullest form -- see
+        # FormatMeshNodeBarLineTests for the width-tiered degradation.
         async with app.run_test(size=(160, 28)) as pilot:
             await self._open_mesh(pilot)
             status = _bar_text(app)
-            self.assertNotIn("YOU", status)
             self.assertEqual(
                 status,
-                "Simulated Node • SIM • HOPS 0 • "
-                "GPS 40.7128, -74.0060 • DISTANCE -- • "
-                "LINK ---- -- / -- • ELAPSE NOW",
+                "Simulated Node • SIM • HOPS 0 • GPS 40.7128, -74.0060",
             )
+            self.assertNotIn("YOU", status)
+            self.assertNotIn("DISTANCE", status)
+            self.assertNotIn("LINK", status)
+            self.assertNotIn("ELAPSE", status)
 
     async def test_node_bar_for_client(self) -> None:
         app = self._make_app()
@@ -3035,7 +3035,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(view.selected_node_id, you_id)
             status = _bar_text(app)
             self.assertIn("HOPS 0", status)
-            self.assertIn("ELAPSE NOW", status)
+            self.assertNotIn("ELAPSE", status)  # omitted for YOU
 
             self.assertEqual(view.board.styles.offset, board_offset_before)
             self.assertFalse(view.show_vertical_scrollbar)
@@ -3115,7 +3115,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(int(relay_widget.styles.width.value), 1)
             status = _bar_text(app)
             self.assertIn("HOPS 0", status)
-            self.assertIn("ELAPSE NOW", status)
+            self.assertNotIn("ELAPSE", status)  # omitted for YOU
 
     async def test_select_node_accepts_only_real_working_set_nodes(self) -> None:
         """MeshTopologyView.select_node() is authoritative: only a real
@@ -3568,7 +3568,8 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             status_widget = app.query_one("#mesh-connection-status")
             self.assertFalse(status_widget.display)
             text = _bar_text(app)
-            self.assertIn("ELAPSE", text)
+            # The bar is populated (YOU selected), never blank or STATUS text.
+            self.assertIn("HOPS 0", text)
             self.assertNotIn("STATUS", text)
 
     async def test_mesh_topology_not_rebuilt_by_connection_status_change(
@@ -5882,7 +5883,10 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             app._show_connection(RadioState.ONLINE, app.radio.info)
             app._refresh_mesh(wall_now=now)
+            _mesh_select_node(app, "!re1turn0")
+            app._refresh_mesh(wall_now=now)
             await pilot.pause()
+            # Remote node re-selected -> full bar returns (ELAPSE etc.).
             self.assertIn("ELAPSE", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
             self.assertEqual(len(list(app.query("#mesh-connection-status"))), 1)
@@ -6122,11 +6126,12 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_bar_field(text, "ELAPSE"), "3s")
 
     async def test_you_selected_never_queries_link(self) -> None:
-        """A radio has no RF link to itself -- selecting YOU must show
+        """A radio has no RF link to itself -- YOU's bar omits the LINK
 
-        the honest placeholder LINK segment, and get_link_quality must
-        never even be called for YOU's own node ID (no self-LINK claim
-        of any kind, not merely "displayed as unknown").
+        field entirely (never even a placeholder), and get_link_quality
+        must never be called for YOU's own node ID (no self-LINK claim
+        of any kind, not merely "displayed as unknown", and not even a
+        wasted lookup for a field that is no longer rendered).
         """
         app = self._make_app()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -6149,8 +6154,8 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, local.node_id)
             await pilot.pause()
             text = _bar_text(app)
-            self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
-            self.assertEqual(_bar_field(text, "ELAPSE"), "NOW")
+            self.assertNotIn("LINK", text)
+            self.assertNotIn("ELAPSE", text)
             self.assertNotIn(local.node_id, queried_ids)
 
     async def test_changing_selection_switches_link_data_immediately(self) -> None:

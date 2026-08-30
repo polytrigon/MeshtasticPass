@@ -484,7 +484,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
     # ---- NETWORK switch -------------------------------------------------
 
-    async def test_network_switch_requires_confirmation_then_applies(self) -> None:
+    async def test_network_switch_applies_immediately_on_one_selection(self) -> None:
         radio = self.radio()
         self.settings.save_radio_config_preset(
             RadioConfigPreset(
@@ -499,17 +499,31 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             await self._wait_online(pilot, app)
             app.show_tab("connection")
             await pilot.pause()
-            radio.write_verified_config_field = Mock(
-                wraps=radio.write_verified_config_field
+
+            statuses: list[tuple[str, object]] = []
+            orig_status = app._set_advanced_radio_status
+            app._set_advanced_radio_status = (
+                lambda text, cls: statuses.append((text, cls)) or orig_status(text, cls)
+            )
+            begin_calls: list[tuple[str, bool]] = []
+            orig_begin = app._begin_network_apply
+            app._begin_network_apply = (
+                lambda name, preset, *, saved: begin_calls.append((name, saved))
+                or orig_begin(name, preset, saved=saved)
             )
 
+            # ONE selection is the whole commitment -- no confirm state,
+            # no second ENTER.
             app._on_network_selected("NYC MS48")
-            await pilot.pause()
-            status = str(app.query_one("#advanced-radio-status", Static).render())
-            self.assertIn("SELECT NYC MS48 AGAIN TO CONFIRM", status)
-            radio.write_verified_config_field.assert_not_called()
+            self.assertEqual(begin_calls, [("NYC MS48", False)])
+            self.assertIsNone(app._advanced_radio_confirm)
+            self.assertIn(
+                ("SWITCHING TO NYC MS48... REBOOTING", "setting-accent"), statuses
+            )
+            self.assertNotIn(
+                "AGAIN TO CONFIRM", " ".join(text for text, _ in statuses)
+            )
 
-            app._on_network_selected("NYC MS48")
             for _ in range(12):
                 await pilot.pause()
 
@@ -517,7 +531,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(radio._config_sections["lora"]["modem_preset"], 3)
             self.assertEqual(radio._config_sections["lora"]["channel_num"], 48)
 
-    async def test_network_switch_cancelled_by_timeout_causes_zero_writes(self) -> None:
+    async def test_network_dropdown_browsing_and_current_selection_zero_writes(self) -> None:
         radio = self.radio()
         self.settings.save_radio_config_preset(
             RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
@@ -530,16 +544,59 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             radio.write_verified_config_field = Mock(
                 wraps=radio.write_verified_config_field
             )
+            selector = app.query_one(NetworkSelector)
+
+            # Open + navigate + ESC: KeyboardDropdown never posts
+            # Selected for any of this.
+            selector.focus()
+            await pilot.press("enter")   # open
+            await pilot.press("down")
+            await pilot.press("up")
+            await pilot.press("escape")  # cancel
+            await pilot.pause()
+            self.assertIsNone(app._network_apply)
+            radio.write_verified_config_field.assert_not_called()
+
+            # Selecting the currently-active NETWORK is a no-op.
+            app._on_network_selected(BUILTIN_LONGFAST_NETWORK)
+            await pilot.pause()
+            self.assertIsNone(app._network_apply)
+            radio.write_verified_config_field.assert_not_called()
+
+    async def test_failed_switch_verification_does_not_claim_target_active(self) -> None:
+        radio = self.radio()
+        self.settings.save_radio_config_preset(
+            RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
+        )
+        original = radio.write_verified_config_field
+
+        def reboots(section, field, value, **kwargs):
+            if field == "modem_preset":
+                return ConfigWriteResult(False, value, None, "disconnected")
+            return original(section, field, value, **kwargs)
+
+        radio.write_verified_config_field = reboots
+        app = MeshtasticPassApp(radio, self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
 
             app._on_network_selected("NYC MS48")
-            await pilot.pause()
-            app._advanced_radio_confirm_expired()
-            await pilot.pause()
+            for _ in range(12):
+                await pilot.pause()
+            # Radio comes back STILL on the old config.
+            radio.simulate_reconnect()
+            for _ in range(20):
+                await pilot.pause()
+                if app._network_apply is None:
+                    break
 
-            self.assertIsNone(app._advanced_radio_confirm)
+            self.assertIsNone(app._network_apply)
             self.assertEqual(app._selected_network, BUILTIN_LONGFAST_NETWORK)
             self.assertEqual(app.query_one(NetworkSelector).value, BUILTIN_LONGFAST_NETWORK)
-            radio.write_verified_config_field.assert_not_called()
+            status = str(app.query_one("#advanced-radio-status", Static).render())
+            self.assertIn("NOT APPLIED", status)
 
     # ---- Persistence / independence ------------------------------------
 
@@ -816,6 +873,44 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             cancel = app.query_one(CancelNetworkControl)
             self.assertEqual(save.region.y, cancel.region.y)
             self.assertLess(save.region.x, cancel.region.x)
+
+    async def test_save_cancel_left_right_navigation(self) -> None:
+        app = MeshtasticPassApp(self.radio(), self.settings)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._wait_online(pilot, app)
+            app.show_tab("connection")
+            await pilot.pause()
+            await self._open_editor(app, pilot)
+            save = app.query_one(SaveNetworkControl)
+            cancel = app.query_one(CancelNetworkControl)
+
+            save.focus()
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIs(app.focused, cancel)
+
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertIs(app.focused, save)
+
+            # DOWN through the form lands on SAVE (not CANCEL); UP from
+            # the action row returns to the KEY field.
+            app.query_one("#key-input", Input).focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertIs(app.focused, save)
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "key-input")
+
+            # ENTER still activates each control.
+            cancel.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertFalse(app._network_editor_open)  # CANCEL fired
 
     async def test_opening_editor_focuses_name_without_jumping_to_top(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)

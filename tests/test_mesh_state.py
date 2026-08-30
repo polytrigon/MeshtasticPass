@@ -846,18 +846,48 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
         self.assertNotIn("SHORT NAME", text)
         self.assertTrue(text.startswith("SomeNode • NODE • HOPS"))
 
-    def test_you_bar_never_shows_a_you_label_and_uses_now_for_elapse(self) -> None:
+    def test_you_bar_omits_distance_link_and_elapse_entirely(self) -> None:
+        """YOU carries no distance-from-self, no self-link, and no
+
+        meaningful ELAPSE ("NOW"), so those three fields are dropped
+        outright -- never shown as placeholders. Only long name / short
+        name / HOPS / GPS remain.
+        """
+        node = NodeMetadata("!you", "Polytrigon", "POLY", 0, NOW, True, position=YOU_POSITION)
         state = MeshNodeState(
-            node=YOU, is_client=False, is_relay=False, last_interaction_at=None
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
         text = format_mesh_node_bar_line(fields, available_width=200)
+        self.assertEqual(
+            text, "Polytrigon • POLY • HOPS 0 • GPS 40.7128, -74.0060"
+        )
         self.assertNotIn("YOU", text)
-        self.assertIn("ELAPSE NOW", text)
-        self.assertIn("HOPS 0", text)
-        self.assertIn("DISTANCE --", text)
-        self.assertIn("LINK ---- -- / --", text)
+        self.assertNotIn("DISTANCE", text)
+        self.assertNotIn("LINK", text)
+        self.assertNotIn("ELAPSE", text)
         self.assertTrue(fields.accent2)
+
+    def test_you_bar_degrades_to_hops_and_gps_then_drops_gps(self) -> None:
+        node = NodeMetadata("!you", "Polytrigon", "POLY", 0, NOW, True, position=YOU_POSITION)
+        state = MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
+        )
+        fields = format_mesh_node_bar_fields(state, now=NOW)
+        full = format_mesh_node_bar_line(fields, available_width=200)
+        narrower = format_mesh_node_bar_line(fields, available_width=len(full) - 1)
+        self.assertIn("GPS 40.71,-74.01", narrower)  # 2dp compaction
+        keep_short = "Polytrigon • POLY • HOPS 0"
+        no_gps = format_mesh_node_bar_line(fields, available_width=len(keep_short))
+        self.assertEqual(no_gps, keep_short)
+        drop_short = format_mesh_node_bar_line(fields, available_width=len(keep_short) - 1)
+        self.assertEqual(drop_short, "Polytrigon • HOPS 0")
+
+    def test_remote_bar_still_includes_distance_link_and_elapse(self) -> None:
+        text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=200)
+        self.assertIn("DISTANCE 3.2 km", text)
+        self.assertIn("LINK ▂▄▆█ -87 / +6", text)
+        self.assertIn("ELAPSE 25s", text)
 
     def test_link_meter_glyphs_are_single_cell_narrow(self) -> None:
         """The bar glyphs are ordinary block-drawing characters -- never
