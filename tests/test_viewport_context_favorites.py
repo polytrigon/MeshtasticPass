@@ -377,7 +377,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             page = app.query_one(ConnectionPage)
             titles = [str(item.render()) for item in page.query(".page-title")]
             self.assertEqual(
-                titles, ["CONNECTION", "STYLE", "RADIO", "ADVANCED RADIO CONFIG"]
+                titles, ["CONNECTION", "STYLE", "RADIO", "ADVANCED RADIO"]
             )
             self.assertEqual(len(page.query("#identity-title")), 0)
             self.assertEqual(len(page.query("#identity-waiting")), 0)

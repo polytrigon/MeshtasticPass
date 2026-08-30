@@ -8729,7 +8729,7 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- Menu gating ---------------------------------------------------
 
-    async def test_remote_menu_offers_trace_route_you_never_does(self) -> None:
+    async def test_remote_menu_offers_traceroute_you_never_does(self) -> None:
         app = self._make_app(
             traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
         )
@@ -8743,7 +8743,10 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIn("TRACE ROUTE", [item.label for item in app._user_menu.items])
+            self.assertIn("TRACEROUTE", [item.label for item in app._user_menu.items])
+            self.assertNotIn(
+                "TRACE ROUTE", [item.label for item in app._user_menu.items]
+            )
             await pilot.press("escape")
             await pilot.pause()
 
@@ -8751,9 +8754,9 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            self.assertNotIn("TRACE ROUTE", [item.label for item in app._user_menu.items])
+            self.assertNotIn("TRACEROUTE", [item.label for item in app._user_menu.items])
 
-    async def test_trace_route_omitted_from_menu_while_one_is_pending(self) -> None:
+    async def test_traceroute_omitted_from_menu_while_one_is_pending(self) -> None:
         app = self._make_app(
             traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
         )
@@ -8770,7 +8773,7 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
             await pilot.press("enter")
             await pilot.pause()
-            self.assertNotIn("TRACE ROUTE", [item.label for item in app._user_menu.items])
+            self.assertNotIn("TRACEROUTE", [item.label for item in app._user_menu.items])
 
     # ---- No automatic tracing -------------------------------------------
 

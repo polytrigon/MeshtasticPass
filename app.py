@@ -81,8 +81,6 @@ from node_activity import is_node_active
 from radio_capabilities import (
     format_hw_model_name,
     modem_preset_choices,
-    modem_preset_enum_name,
-    modem_preset_friendly_label,
     role_choices,
 )
 from radio_service import (
@@ -174,10 +172,10 @@ SEND_ERROR_AUTO_DISMISS_SECONDS = 10.0
 # Same lifecycle again for LONG NAME SAVED/SHORT NAME SAVED (see
 # _set_long_name_status/_set_short_name_status).
 IDENTITY_STATUS_AUTO_DISMISS_SECONDS = 10.0
-# ADVANCED RADIO CONFIG (Part D): how long DEL/APPLY stay armed after a
-# first press before auto-disarming -- long enough for a deliberate
-# second press, short enough that an armed-but-abandoned confirmation
-# never lingers as a trap for a later, unrelated ENTER.
+# ADVANCED RADIO: how long a SAVE / NETWORK-switch confirmation stays
+# armed after the first press before auto-disarming -- long enough for a
+# deliberate second press, short enough that an armed-but-abandoned
+# confirmation never lingers as a trap for a later, unrelated ENTER.
 ADVANCED_RADIO_CONFIRM_SECONDS = 6.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
@@ -720,69 +718,78 @@ class AutoSyncSelector(KeyboardDropdown):
         )
 
 
-# UI / CHANNEL / RADIO CONFIG TUNING Part D: the sentinel "no saved
-# preset selected -- show the radio's own live modem preset" value for
-# SavedRadioConfigSelector. "" can never collide with a real saved
-# preset name (RadioConfigPreset.name is required non-empty -- see
-# AppSettings.save_radio_config_preset).
-LIVE_RADIO_CONFIG_SENTINEL = ""
+# ADVANCED RADIO: the built-in "LongFast" NETWORK. Always available in
+# the NETWORK selector without the user creating it, and the default
+# selection. It represents the normal public LongFast configuration
+# using Meshtastic's own defaults: the LONG_FAST modem preset, no
+# explicit frequency slot (0 == "let the radio auto-select"), a blank
+# primary-channel name, and the SDK's own default public-channel PSK
+# sentinel byte 0x01 (base64 "AQ=="). Selecting it is never applied to
+# the radio automatically -- only an explicit, confirmed NETWORK switch
+# or SAVE ever writes RF/config (see _apply_network_from_thread).
+BUILTIN_LONGFAST_NETWORK = "LongFast"
+_LONGFAST_DEFAULT_PSK_BASE64 = "AQ=="
 
 
-class SavedRadioConfigSelector(KeyboardDropdown):
-    """ADVANCED RADIO CONFIG's TOP "MODEM PRESET [ ... ]" dropdown.
+def builtin_longfast_preset() -> "RadioConfigPreset":
+    return RadioConfigPreset(
+        name=BUILTIN_LONGFAST_NETWORK,
+        modem_preset="LONG_FAST",
+        frequency_slot=0,
+        channel_name="",
+        channel_psk_base64=_LONGFAST_DEFAULT_PSK_BASE64,
+    )
 
-    Despite the compact "MODEM PRESET" label (kept for the mockup's own
-    terminology -- see the task's own "keep the internal model explicit
-    even if the compact UI uses 'preset' language"), this selects
-    between the user's own SAVED radio/network configurations
-    (RadioConfigPreset.name) -- never the raw Meshtastic ModemPreset
-    enum directly (see ModemPresetFieldSelector, the EDITOR's own
-    distinct "PRESET" dropdown for that). Its first option is always
-    the LIVE_RADIO_CONFIG_SENTINEL entry, labeled with whatever the
-    CONNECTED radio's own modem preset actually is right now (see
-    _refresh_saved_radio_config_options) -- a locally saved preset is
-    never silently treated as "the same as" the radio's actual live
-    state (item: "must not be silently treated as identical if they
-    differ").
+
+class NetworkSelector(KeyboardDropdown):
+    """ADVANCED RADIO's "NETWORK [ ... ]" dropdown -- the mechanism for
+
+    switching between complete saved Meshtastic network configurations
+    (RadioConfigPreset.name) plus the built-in BUILTIN_LONGFAST_NETWORK
+    entry. Merely focusing it, opening it, or navigating its choices is
+    zero RF/config; only re-selecting a different NETWORK to confirm it
+    ever applies anything (see MeshtasticPassApp.dropdown_selected's
+    "network" branch).
     """
 
     def __init__(self, options: Iterable[DropdownOption]) -> None:
         super().__init__(
-            "saved_radio_config",
-            "MODEM PRESET",
+            "network",
+            "NETWORK",
             options,
-            LIVE_RADIO_CONFIG_SENTINEL,
-            widget_id="advanced-radio-saved-config-selector",
+            BUILTIN_LONGFAST_NETWORK,
+            widget_id="advanced-radio-network-selector",
             label_width=CONNECTION_LABEL_WIDTH,
             classes="keyboard-dropdown connection-action-row",
         )
 
 
-class ModemPresetFieldSelector(KeyboardDropdown):
-    """The PRESET EDITOR's own "PRESET [ ... ]" dropdown -- the actual
+class RadioModeSelector(KeyboardDropdown):
+    """The NEW NETWORK editor's "RADIO MODE [ ... ]" dropdown -- a
 
-    Meshtastic ModemPreset enum NAME (see radio_capabilities.
-    modem_preset_choices), distinct from the page's TOP "MODEM PRESET"
-    saved-config selector above.
+    friendly UI label ("LONG FAST", "MEDIUM SLOW", ...) over Meshtastic's
+    actual modem_preset enum NAME (see radio_capabilities.
+    modem_preset_choices), which is what is stored and applied.
     """
 
     def __init__(self, modem_preset_name: str) -> None:
         super().__init__(
-            "preset_modem_preset_field",
-            "PRESET",
+            "radio_mode",
+            "RADIO MODE",
             (DropdownOption(label, name) for label, name in modem_preset_choices()),
             modem_preset_name,
-            widget_id="advanced-radio-preset-field-selector",
+            widget_id="advanced-radio-mode-selector",
             label_width=CONNECTION_LABEL_WIDTH,
-            classes="keyboard-dropdown connection-action-row",
+            classes="keyboard-dropdown connection-action-row advanced-radio-editor",
         )
 
 
-class CreateNewPresetControl(Static):
-    """[CREATE NEW PRESET] -- clears the editor for a brand-new draft.
+class NewNetworkControl(Static):
+    """[ NEW NETWORK ] -- reveals the transient NEW NETWORK editor.
 
-    Zero RF, zero persistence by itself (see _reset_preset_editor) --
-    the user must still explicitly SAVE.
+    Zero RF, zero persistence by itself: it only shows the editor rows
+    (see MeshtasticPassApp._set_network_editor_open). The user must
+    still explicitly SAVE, and abandoning the editor discards it.
     """
 
     can_focus = True
@@ -792,8 +799,8 @@ class CreateNewPresetControl(Static):
 
     def __init__(self) -> None:
         super().__init__(
-            "[ CREATE NEW PRESET ]",
-            id="advanced-radio-create-preset",
+            "[ NEW NETWORK ]",
+            id="advanced-radio-new-network",
             classes="connection-action-row",
             markup=False,
         )
@@ -804,12 +811,12 @@ class CreateNewPresetControl(Static):
             event.stop()
 
 
-class SavePresetControl(Static):
-    """[ SAVE ] -- persists the editor's current draft locally.
+class SaveNetworkControl(Static):
+    """[ SAVE ] -- validate the NEW NETWORK editor, then (after a
 
-    Never writes to the radio (see the task's own explicit "SAVE MUST
-    NOT silently apply RF changes"; only ApplyPresetControl/APPLY ever
-    does that).
+    press-again-to-confirm cycle, because RF/config will change) persist
+    the NETWORK locally and apply it through radio_service.
+    apply_radio_config_preset. There is no separate APPLY button.
     """
 
     can_focus = True
@@ -820,7 +827,7 @@ class SavePresetControl(Static):
     def __init__(self) -> None:
         super().__init__(
             "[ SAVE ]",
-            id="advanced-radio-save-preset",
+            id="advanced-radio-save",
             classes="connection-action-row",
             markup=False,
         )
@@ -831,16 +838,11 @@ class SavePresetControl(Static):
             event.stop()
 
 
-class DeletePresetControl(Static):
-    """[ DEL ] -- removes the currently selected SAVED preset, after a
+class CancelNetworkControl(Static):
+    """[ CANCEL ] -- discard the NEW NETWORK editor's unsaved contents,
 
-    press-again-to-confirm arm/confirm cycle (see
-    _advanced_radio_confirm/_advanced_radio_confirm_expired). Disabled
-    (see .disabled, set by _refresh_preset_editor_controls) whenever no
-    real saved preset is currently loaded -- there is nothing to
-    delete for an unsaved draft, and a disabled control is
-    automatically skipped by both Textual's own focus system and this
-    app's own CONNECTION up/down navigation list.
+    collapse it, and restore [ NEW NETWORK ]. Zero RF/config, no
+    confirmation, leaves the currently selected NETWORK unchanged.
     """
 
     can_focus = True
@@ -850,8 +852,8 @@ class DeletePresetControl(Static):
 
     def __init__(self) -> None:
         super().__init__(
-            "[ DEL ]",
-            id="advanced-radio-delete-preset",
+            "[ CANCEL ]",
+            id="advanced-radio-cancel",
             classes="connection-action-row",
             markup=False,
         )
@@ -862,46 +864,13 @@ class DeletePresetControl(Static):
             event.stop()
 
 
-class ApplyPresetControl(Static):
-    """[ APPLY ] -- the ONLY control in ADVANCED RADIO CONFIG that ever
+class NetworkFieldInput(Horizontal):
+    """One labeled text-entry row inside the transient NEW NETWORK
 
-    writes to the connected radio (LoRaConfig.use_preset/modem_preset/
-    channel_num, then the PRIMARY channel's name/psk -- see
-    radio_service.apply_radio_config_preset), and only after a genuine
-    RF-changing confirmation (press-again-to-confirm, same mechanism as
-    DeletePresetControl) -- never merely because the editor's fields
-    changed, a different preset was browsed, or the radio (re)connected.
-    """
-
-    can_focus = True
-
-    class Activated(Message):
-        pass
-
-    def __init__(self) -> None:
-        super().__init__(
-            "[ APPLY ]",
-            id="advanced-radio-apply-preset",
-            classes="connection-action-row",
-            markup=False,
-        )
-
-    def on_key(self, event: Key) -> None:
-        if event.key == "enter":
-            self.post_message(self.Activated())
-            event.stop()
-
-
-class PresetFieldInput(Horizontal):
-    """One labeled text-entry row inside the ADVANCED RADIO CONFIG
-
-    preset editor (PRESET NAME / FREQ. SLOT / CHANNEL / KEY) -- a
-    plain, always-enabled LOCAL DRAFT field. Unlike IdentityNameControl
-    (used for fields written to the radio per-submit), this is never
-    itself written anywhere by being edited: SavePresetControl/
-    ApplyPresetControl are the only two actions that ever persist/
-    apply the editor's current values, so no two-state nav/edit toggle
-    is needed here.
+    editor (NETWORK NAME / FREQ. SLOT / KEY) -- a plain, always-enabled
+    LOCAL DRAFT field. Never itself written anywhere by being edited:
+    SAVE is the only action that persists/applies the editor's values,
+    so no two-state nav/edit toggle is needed here.
     """
 
     can_focus = False
@@ -914,7 +883,9 @@ class PresetFieldInput(Horizontal):
         input_id: str,
         max_length: int | None = None,
     ) -> None:
-        super().__init__(id=widget_id, classes="connection-action-row")
+        super().__init__(
+            id=widget_id, classes="connection-action-row advanced-radio-editor"
+        )
         self._label = label
         self._input_id = input_id
         self._max_length = max_length
@@ -1312,15 +1283,21 @@ class RadioSettingApplied(Message):
 
 
 class RadioConfigPresetApplied(Message):
-    """One ADVANCED RADIO CONFIG APPLY (radio_service.
+    """One ADVANCED RADIO NETWORK apply (radio_service.
 
-    apply_radio_config_preset) finished, successfully or not.
+    apply_radio_config_preset) finished, successfully or not. `saved`
+    distinguishes a SAVE (persist + apply a new NETWORK) from a bare
+    NETWORK switch, so the status line can say "SAVED & APPLIED" vs
+    "APPLIED" and the failure path knows whether to revert the selector.
     """
 
-    def __init__(self, preset_name: str, result: RadioApplyResult) -> None:
+    def __init__(
+        self, preset_name: str, result: RadioApplyResult, saved: bool = False
+    ) -> None:
         super().__init__()
         self.preset_name = preset_name
         self.result = result
+        self.saved = saved
 
 
 class ClockSyncApplied(Message):
@@ -3218,8 +3195,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #long-name-input, #short-name-input,
-    #preset-name-input, #preset-freq-slot-input,
-    #preset-channel-input, #preset-key-input {
+    #network-name-input, #freq-slot-input, #key-input {
         width: 16;
         height: 1;
         border: none;
@@ -3234,11 +3210,17 @@ class MeshtasticPassApp(App[None]):
 
     Screen.theme-amber #long-name-input,
     Screen.theme-amber #short-name-input,
-    Screen.theme-amber #preset-name-input,
-    Screen.theme-amber #preset-freq-slot-input,
-    Screen.theme-amber #preset-channel-input,
-    Screen.theme-amber #preset-key-input {
+    Screen.theme-amber #network-name-input,
+    Screen.theme-amber #freq-slot-input,
+    Screen.theme-amber #key-input {
         color: $amber_base;
+    }
+
+    .advanced-radio-editor {
+        /* Collapsed by default (spec B): the NEW NETWORK editor rows
+           are revealed only by _set_network_editor_open, which flips
+           each widget's inline display to override this. */
+        display: none;
     }
 
     #long-name-input:disabled, #short-name-input:disabled {
@@ -3389,11 +3371,11 @@ class MeshtasticPassApp(App[None]):
 
     #advanced-radio-status {
         /* auto, not a fixed 2 like #radio-status: the press-again-to-
-           confirm APPLY message is long enough to wrap across several
-           lines at typical terminal widths, and must never be
+           confirm SAVE/switch message is long enough to wrap across
+           several lines at typical terminal widths, and must never be
            clipped. */
         height: auto;
-        min-height: 1;
+        min-height: 0;
     }
 
     #advanced-radio-actions {
@@ -3937,22 +3919,23 @@ class MeshtasticPassApp(App[None]):
         # without depending on Textual's own worker exclusivity (which
         # cannot actually interrupt a blocking thread either way).
         self._radio_workers: dict[str, Thread] = {}
-        # ADVANCED RADIO CONFIG (Part D): the SAVED preset name currently
-        # loaded into the editor -- None means "new, unsaved draft" (see
-        # CreateNewPresetControl/_reset_preset_editor), which also gates
-        # DeletePresetControl's own .disabled state (nothing saved yet
-        # to delete). Never the radio's own live state -- selecting
-        # LIVE_RADIO_CONFIG_SENTINEL in SavedRadioConfigSelector loads
-        # the live values into the editor as a READ-ONLY starting point
-        # but leaves this None (there is no saved NAME for it).
-        self._editing_preset_name: str | None = None
-        # Press-again-to-confirm arming for DEL/APPLY (see
-        # _arm_advanced_radio_confirm/_advanced_radio_confirm_expired)
-        # -- "delete" or "apply" while armed, else None. Auto-disarms
-        # after ADVANCED_RADIO_CONFIRM_SECONDS via a Timer, and is
-        # explicitly disarmed by ANY other editor action (browsing a
-        # different preset, CREATE NEW, editing a field, SAVE) so a
-        # stale arm can never survive into an unrelated confirmation.
+        # ADVANCED RADIO: the currently selected NETWORK name (app-side
+        # notion of "which NETWORK this app would apply / last applied",
+        # never a live radio readback -- see _refresh_network_options).
+        # Starts on the built-in LongFast; changes ONLY on a confirmed
+        # NETWORK switch or a confirmed SAVE, never on connect/reconnect.
+        self._selected_network: str = BUILTIN_LONGFAST_NETWORK
+        # Whether the transient NEW NETWORK editor is currently revealed
+        # (see _set_network_editor_open). Purely local UI state -- never
+        # persisted, discarded on leaving CONNECTION (see show_tab).
+        self._network_editor_open = False
+        # Press-again-to-confirm arming (see _arm_advanced_radio_confirm/
+        # _advanced_radio_confirm_expired) -- "save" or "switch:<name>"
+        # while armed, else None. Auto-disarms after
+        # ADVANCED_RADIO_CONFIRM_SECONDS via a Timer, and is explicitly
+        # disarmed by ANY other editor action (editing a field, CANCEL,
+        # leaving the view) so a stale arm can never survive into an
+        # unrelated confirmation.
         self._advanced_radio_confirm: str | None = None
         self._advanced_radio_confirm_timer: Timer | None = None
         self._status_dot_count = 1
@@ -4053,46 +4036,58 @@ class MeshtasticPassApp(App[None]):
                 yield HopLimitSelector(3)
                 yield AutoSyncSelector(self.settings.clock_auto_sync)
                 yield Static(id="radio-status")
-                # ADVANCED RADIO CONFIG (UI / CHANNEL / RADIO CONFIG
-                # TUNING Part D): a distinct sub-section for saved
-                # radio/network configurations -- HOP LIMIT above stays
-                # completely independent (never folded into a saved
-                # preset; see RadioConfigPreset's own docstring).
+                # ADVANCED RADIO: a compact sub-section for switching
+                # between complete saved Meshtastic NETWORK configs --
+                # HOP LIMIT above stays completely independent (never
+                # folded into a saved NETWORK; see RadioConfigPreset's
+                # own docstring). Collapsed by default: only the NETWORK
+                # selector and [ NEW NETWORK ] are visible; the
+                # .advanced-radio-editor rows below are hidden until
+                # NEW NETWORK is activated and discarded on leaving the
+                # view (see _set_network_editor_open / show_tab).
                 yield Static(
-                    "ADVANCED RADIO CONFIG",
+                    "ADVANCED RADIO",
                     id="advanced-radio-title",
                     classes="page-title",
                 )
-                yield SavedRadioConfigSelector(
-                    (DropdownOption(name, name) for name in ()),
+                yield NetworkSelector(
+                    (
+                        DropdownOption(
+                            BUILTIN_LONGFAST_NETWORK, BUILTIN_LONGFAST_NETWORK
+                        ),
+                    ),
                 )
-                yield CreateNewPresetControl()
-                yield PresetFieldInput(
-                    label="PRESET NAME",
-                    widget_id="preset-name-row",
-                    input_id="preset-name-input",
+                yield NewNetworkControl()
+                # The one blank row that separates the NETWORK selector
+                # from the revealed editor (spec D).
+                yield Static(
+                    " ",
+                    id="advanced-radio-editor-spacer",
+                    classes="connection-action-row advanced-radio-editor",
+                    markup=False,
                 )
-                yield ModemPresetFieldSelector("LONG_FAST")
-                yield PresetFieldInput(
+                yield NetworkFieldInput(
+                    label="NETWORK NAME",
+                    widget_id="network-name-row",
+                    input_id="network-name-input",
+                )
+                yield RadioModeSelector("LONG_FAST")
+                yield NetworkFieldInput(
                     label="FREQ. SLOT",
-                    widget_id="preset-freq-slot-row",
-                    input_id="preset-freq-slot-input",
+                    widget_id="freq-slot-row",
+                    input_id="freq-slot-input",
                     max_length=3,
                 )
-                yield PresetFieldInput(
-                    label="CHANNEL",
-                    widget_id="preset-channel-row",
-                    input_id="preset-channel-input",
-                )
-                yield PresetFieldInput(
+                yield NetworkFieldInput(
                     label="KEY",
-                    widget_id="preset-key-row",
-                    input_id="preset-key-input",
+                    widget_id="key-row",
+                    input_id="key-input",
                 )
-                with Horizontal(id="advanced-radio-actions"):
-                    yield SavePresetControl()
-                    yield DeletePresetControl()
-                    yield ApplyPresetControl()
+                with Horizontal(
+                    id="advanced-radio-actions", classes="advanced-radio-editor"
+                ):
+                    yield SaveNetworkControl()
+                    yield CancelNetworkControl()
                 yield Static(id="advanced-radio-status", markup=False)
             with Vertical(id="chat", classes="tab-page"):
                 # Peer selectors (CHAT/DM/MENTION UX Part B): LEFT is the
@@ -4320,14 +4315,13 @@ class MeshtasticPassApp(App[None]):
                 self.current_tab == "connection"
                 and self.focused.id
                 in (
-                    "preset-name-input",
-                    "preset-freq-slot-input",
-                    "preset-channel-input",
-                    "preset-key-input",
+                    "network-name-input",
+                    "freq-slot-input",
+                    "key-input",
                 )
                 and event.key in ("up", "down")
             ):
-                # ADVANCED RADIO CONFIG's plain editor Input fields join
+                # ADVANCED RADIO's plain editor Input fields join
                 # the ordinary CONNECTION row up/down order (see
                 # _move_connection_focus) -- otherwise this whole
                 # isinstance(Input) branch's own unconditional `return`
@@ -4838,6 +4832,19 @@ class MeshtasticPassApp(App[None]):
                 self._mark_new_messages_read()
             else:
                 self._capture_current_dm_state()
+        if self.current_tab == "connection" and tab_id != "connection":
+            # ADVANCED RADIO (spec E): an unfinished NEW NETWORK editor
+            # is transient UI state -- leaving the view by ANY path
+            # discards its unsaved contents, collapses it, restores
+            # [ NEW NETWORK ], and shows no unsaved-changes prompt.
+            # Zero RF/config, creates no NETWORK. A no-op when the
+            # editor was never opened. Any pending SAVE/switch confirm
+            # is disarmed here too (via _collapse_network_editor).
+            if self._network_editor_open:
+                self._collapse_network_editor()
+                self._set_advanced_radio_status("", None)
+            else:
+                self._disarm_advanced_radio_confirm()
         if self._emoji_picker is not None:
             # Reachable only from the composer of whichever of CHAT/DM
             # is currently active (Ctrl+E requires that Input to be
@@ -4986,22 +4993,12 @@ class MeshtasticPassApp(App[None]):
             self.settings.set_clock_auto_sync(bool(event.value))
             self.settings.save()
             return
-        if event.setting_name == "saved_radio_config":
-            # ADVANCED RADIO CONFIG's TOP selector -- browsing is zero
-            # RF and zero persistence, purely loading a preset (or the
-            # live radio's own values) into the editor for inspection/
-            # editing (see SavedRadioConfigSelector's own docstring).
-            self._disarm_advanced_radio_confirm()
-            value = str(event.value)
-            if value == LIVE_RADIO_CONFIG_SENTINEL:
-                self._reset_preset_editor(prefill_from_live=True)
-            else:
-                preset = self.settings.get_radio_config_preset(value)
-                if preset is not None:
-                    self._load_preset_into_editor(preset)
-            self._set_advanced_radio_status("", None)
+        if event.setting_name == "network":
+            self._on_network_selected(str(event.value))
             return
-        if event.setting_name == "preset_modem_preset_field":
+        if event.setting_name == "radio_mode":
+            # Editing the RADIO MODE draft disarms any pending SAVE
+            # confirm, exactly like the plain editor fields do.
             self._disarm_advanced_radio_confirm()
             return
 
@@ -5056,40 +5053,49 @@ class MeshtasticPassApp(App[None]):
 
         shared by the plain up/down dispatch (for non-Input rows) and
         the isinstance(self.focused, Input) branch above (for the
-        ADVANCED RADIO CONFIG preset editor's own plain Input fields,
+        ADVANCED RADIO NEW NETWORK editor's own plain Input fields,
         which that branch's own early-return would otherwise swallow
         up/down for) -- one definition, never two independently
         maintained copies of this order.
+
+        Only ONE of the ADVANCED RADIO tails is ever included: the
+        collapsed [ NEW NETWORK ] row, or -- when the transient editor
+        is open -- the NETWORK NAME/RADIO MODE/FREQ. SLOT/KEY/SAVE/
+        CANCEL rows. The hidden side is left out entirely so a
+        `display: none` row never becomes an unreachable focus stop.
         """
+        base: tuple[Widget, ...] = (
+            self.query_one(DeviceSelector),
+            self.query_one(LongNameControl),
+            self.query_one(ShortNameControl),
+            self.query_one(FontSizeSelector),
+            self.query_one(ColorSelector),
+            self.query_one(RoleSelector),
+            self.query_one(BluetoothSelector),
+            self.query_one(TimezoneSelector),
+            self.query_one(ScreenTimeoutSelector),
+            self.query_one(UnitsSelector),
+            self.query_one(CompassSelector),
+            self.query_one(FlipScreenSelector),
+            self.query_one(Clock24HSelector),
+            self.query_one(HopLimitSelector),
+            self.query_one(AutoSyncSelector),
+            self.query_one(NetworkSelector),
+        )
+        if self._network_editor_open:
+            tail: tuple[Widget, ...] = (
+                self.query_one("#network-name-input", Input),
+                self.query_one(RadioModeSelector),
+                self.query_one("#freq-slot-input", Input),
+                self.query_one("#key-input", Input),
+                self.query_one(SaveNetworkControl),
+                self.query_one(CancelNetworkControl),
+            )
+        else:
+            tail = (self.query_one(NewNetworkControl),)
         return [
             control
-            for control in (
-                self.query_one(DeviceSelector),
-                self.query_one(LongNameControl),
-                self.query_one(ShortNameControl),
-                self.query_one(FontSizeSelector),
-                self.query_one(ColorSelector),
-                self.query_one(RoleSelector),
-                self.query_one(BluetoothSelector),
-                self.query_one(TimezoneSelector),
-                self.query_one(ScreenTimeoutSelector),
-                self.query_one(UnitsSelector),
-                self.query_one(CompassSelector),
-                self.query_one(FlipScreenSelector),
-                self.query_one(Clock24HSelector),
-                self.query_one(HopLimitSelector),
-                self.query_one(AutoSyncSelector),
-                self.query_one(SavedRadioConfigSelector),
-                self.query_one(CreateNewPresetControl),
-                self.query_one("#preset-name-input", Input),
-                self.query_one(ModemPresetFieldSelector),
-                self.query_one("#preset-freq-slot-input", Input),
-                self.query_one("#preset-channel-input", Input),
-                self.query_one("#preset-key-input", Input),
-                self.query_one(SavePresetControl),
-                self.query_one(DeletePresetControl),
-                self.query_one(ApplyPresetControl),
-            )
+            for control in (*base, *tail)
             if not getattr(control, "disabled", False)
         ]
 
@@ -5266,127 +5272,102 @@ class MeshtasticPassApp(App[None]):
                     value=spec.from_schema_value(authoritative),
                 )
 
-    # ---- ADVANCED RADIO CONFIG (UI / CHANNEL / RADIO CONFIG TUNING Part D)
+    # ---- ADVANCED RADIO (NETWORK selector + transient NEW NETWORK editor)
 
-    def _live_radio_config_label(self) -> str:
-        if self._radio_state is not RadioState.ONLINE:
-            return "UNKNOWN — NOT CONNECTED"
-        raw = self.radio.read_synced_config_field("lora", "modem_preset")
-        if raw is None:
-            return "UNKNOWN"
-        return modem_preset_friendly_label(raw)
+    def _network_preset(self, name: str) -> RadioConfigPreset | None:
+        """The RadioConfigPreset for a NETWORK name -- a user-saved one
 
-    def _matching_saved_preset_name(self) -> str | None:
-        """A saved preset whose (modem_preset, frequency_slot) matches
-
-        the CONNECTED radio's own live values exactly -- never merely
-        assumed identical (see the task's own "a locally selected saved
-        configuration and the radio's actual current configuration
-        must not be silently treated as identical if they differ").
+        if it exists, else the built-in LongFast, else None. A user
+        NETWORK saved under the name "LongFast" deliberately shadows the
+        built-in (spec M: the built-in only has to remain *available*).
         """
-        if self._radio_state is not RadioState.ONLINE:
-            return None
-        raw = self.radio.read_synced_config_field("lora", "modem_preset")
-        if raw is None:
-            return None
-        modem_preset_name = modem_preset_enum_name(raw)
-        if modem_preset_name is None:
-            return None
-        channel_num = self.radio.read_synced_config_field("lora", "channel_num") or 0
-        for preset in self.settings.radio_config_presets:
-            if (
-                preset.modem_preset == modem_preset_name
-                and preset.frequency_slot == channel_num
-            ):
-                return preset.name
+        saved = self.settings.get_radio_config_preset(name)
+        if saved is not None:
+            return saved
+        if name == BUILTIN_LONGFAST_NETWORK:
+            return builtin_longfast_preset()
         return None
 
-    def _refresh_saved_radio_config_options(self) -> None:
-        """Rebuild the TOP "MODEM PRESET" dropdown's options from the
+    def _network_options(self) -> list[DropdownOption]:
+        names = list(self.settings.radio_config_preset_names())
+        options: list[DropdownOption] = []
+        if BUILTIN_LONGFAST_NETWORK not in names:
+            options.append(
+                DropdownOption(BUILTIN_LONGFAST_NETWORK, BUILTIN_LONGFAST_NETWORK)
+            )
+        options.extend(DropdownOption(name, name) for name in names)
+        return options
 
-        current saved-preset list plus the radio's own live state --
-        called on mount, on every connection-state change (see
-        _render_radio_settings), and after SAVE/DEL, so it is never
-        left stale relative to either.
+    def _refresh_network_options(self) -> None:
+        """Rebuild the NETWORK dropdown from the built-in LongFast plus
+
+        the saved NETWORK list, and re-assert the app's own selected
+        NETWORK (_selected_network) as the shown value -- never a live
+        radio readback, and never auto-applied. Called on mount, on
+        every connection-state change (see _render_radio_settings), and
+        after a SAVE/switch, so it is never left stale relative to the
+        saved list or a pending-then-abandoned selector choice.
         """
-        selector = self.query_one(SavedRadioConfigSelector)
-        options = [
-            DropdownOption(self._live_radio_config_label(), LIVE_RADIO_CONFIG_SENTINEL)
-        ]
-        options.extend(
-            DropdownOption(name, name)
-            for name in self.settings.radio_config_preset_names()
-        )
-        matched = self._matching_saved_preset_name()
-        value = matched if matched is not None else LIVE_RADIO_CONFIG_SENTINEL
-        selector.set_options(options, value=value)
+        selector = self.query_one(NetworkSelector)
+        options = self._network_options()
+        valid = {option.value for option in options}
+        if self._selected_network not in valid:
+            self._selected_network = BUILTIN_LONGFAST_NETWORK
+        selector.set_options(options, value=self._selected_network)
 
-    def _preset_editor_fields(
+    def _network_editor_fields(
         self,
-    ) -> tuple[Input, ModemPresetFieldSelector, Input, Input, Input]:
+    ) -> tuple[Input, RadioModeSelector, Input, Input]:
         return (
-            self.query_one("#preset-name-input", Input),
-            self.query_one(ModemPresetFieldSelector),
-            self.query_one("#preset-freq-slot-input", Input),
-            self.query_one("#preset-channel-input", Input),
-            self.query_one("#preset-key-input", Input),
+            self.query_one("#network-name-input", Input),
+            self.query_one(RadioModeSelector),
+            self.query_one("#freq-slot-input", Input),
+            self.query_one("#key-input", Input),
         )
 
-    def _load_preset_into_editor(self, preset: RadioConfigPreset) -> None:
-        self._editing_preset_name = preset.name
-        name_input, modem_selector, freq_input, channel_input, key_input = (
-            self._preset_editor_fields()
-        )
-        name_input.value = preset.name
-        modem_selector.set_options(
-            (DropdownOption(label, value) for label, value in modem_preset_choices()),
-            value=preset.modem_preset,
-        )
-        freq_input.value = str(preset.frequency_slot) if preset.frequency_slot else ""
-        channel_input.value = preset.channel_name
-        key_input.value = preset.channel_psk_base64
-        self._refresh_preset_editor_controls()
+    def _network_editor_rows(self) -> list[Widget]:
+        return [
+            self.query_one("#advanced-radio-editor-spacer", Static),
+            self.query_one("#network-name-row", NetworkFieldInput),
+            self.query_one(RadioModeSelector),
+            self.query_one("#freq-slot-row", NetworkFieldInput),
+            self.query_one("#key-row", NetworkFieldInput),
+            self.query_one("#advanced-radio-actions", Horizontal),
+        ]
 
-    def _reset_preset_editor(self, *, prefill_from_live: bool = False) -> None:
-        """CREATE NEW PRESET (or selecting the LIVE_RADIO_CONFIG_SENTINEL
+    def _set_network_editor_open(self, is_open: bool) -> None:
+        """Reveal/hide the transient NEW NETWORK editor rows. Toggles
 
-        entry) -- clears the editor to a blank draft, or, when
-        `prefill_from_live` and actually connected, prefills it with
-        the CONNECTED radio's own current values as a READ-ONLY
-        starting point (there is no saved NAME for these values, so
-        _editing_preset_name stays None either way -- the user must
-        type a name and SAVE to keep them).
+        each widget's inline `display` (overriding the
+        .advanced-radio-editor `display: none` default), and mirrors
+        the [ NEW NETWORK ] control the opposite way, so exactly one of
+        the two is ever visible/focusable.
         """
-        self._editing_preset_name = None
-        self._disarm_advanced_radio_confirm()
-        name_input, modem_selector, freq_input, channel_input, key_input = (
-            self._preset_editor_fields()
-        )
-        modem_preset_name = None
-        channel_num = 0
-        channel_name = ""
-        channel_psk_base64 = ""
-        if prefill_from_live and self._radio_state is RadioState.ONLINE:
-            raw = self.radio.read_synced_config_field("lora", "modem_preset")
-            modem_preset_name = modem_preset_enum_name(raw) if raw is not None else None
-            channel_num = self.radio.read_synced_config_field("lora", "channel_num") or 0
-            primary = self.radio.read_primary_channel_settings()
-            if primary is not None:
-                channel_name, psk_bytes = primary
-                if psk_bytes:
-                    channel_psk_base64 = base64.b64encode(psk_bytes).decode("ascii")
-        name_input.value = ""
-        modem_selector.set_options(
-            (DropdownOption(label, value) for label, value in modem_preset_choices()),
-            value=modem_preset_name or "LONG_FAST",
-        )
-        freq_input.value = str(channel_num) if channel_num else ""
-        channel_input.value = channel_name
-        key_input.value = channel_psk_base64
-        self._refresh_preset_editor_controls()
+        self._network_editor_open = is_open
+        for row in self._network_editor_rows():
+            row.display = is_open
+        self.query_one(NewNetworkControl).display = not is_open
 
-    def _refresh_preset_editor_controls(self) -> None:
-        self.query_one(DeletePresetControl).disabled = self._editing_preset_name is None
+    def _reset_network_editor_fields(self) -> None:
+        name_input, mode_selector, freq_input, key_input = self._network_editor_fields()
+        name_input.value = ""
+        freq_input.value = ""
+        key_input.value = ""
+        mode_selector.set_options(
+            (DropdownOption(label, value) for label, value in modem_preset_choices()),
+            value="LONG_FAST",
+        )
+
+    def _collapse_network_editor(self) -> None:
+        """Discard the NEW NETWORK editor's unsaved contents and hide it.
+
+        Zero RF, zero persistence, creates no NETWORK, shows no
+        unsaved-changes confirmation -- see spec E/F. Safe to call when
+        the editor is already collapsed (an idempotent no-op).
+        """
+        self._disarm_advanced_radio_confirm()
+        self._reset_network_editor_fields()
+        self._set_network_editor_open(False)
 
     def _set_advanced_radio_status(self, text: str, css_class: str | None) -> None:
         status = self.query_one("#advanced-radio-status", Static)
@@ -5412,49 +5393,62 @@ class MeshtasticPassApp(App[None]):
 
     def _advanced_radio_confirm_expired(self) -> None:
         self._advanced_radio_confirm_timer = None
-        if self._advanced_radio_confirm is not None:
-            self._advanced_radio_confirm = None
-            self._set_advanced_radio_status("", None)
-
-    @on(CreateNewPresetControl.Activated)
-    def create_new_preset(self, _event: CreateNewPresetControl.Activated) -> None:
-        self._reset_preset_editor()
-        self.query_one(SavedRadioConfigSelector).value = LIVE_RADIO_CONFIG_SENTINEL
+        if self._advanced_radio_confirm is None:
+            return
+        was_switch = self._advanced_radio_confirm.startswith("switch:")
+        self._advanced_radio_confirm = None
         self._set_advanced_radio_status("", None)
+        if was_switch:
+            # The abandoned selector value reverts to the actual
+            # selected NETWORK -- nothing was applied.
+            self._refresh_network_options()
 
-    @on(Input.Changed, "#preset-name-input")
-    def preset_name_changed(self, _event: Input.Changed) -> None:
+    @on(NewNetworkControl.Activated)
+    def open_new_network(self, _event: NewNetworkControl.Activated) -> None:
+        """[ NEW NETWORK ] -- reveal a blank transient editor. Zero RF."""
         self._disarm_advanced_radio_confirm()
-
-    @on(Input.Changed, "#preset-freq-slot-input")
-    def preset_freq_slot_changed(self, _event: Input.Changed) -> None:
-        self._disarm_advanced_radio_confirm()
-
-    @on(Input.Changed, "#preset-channel-input")
-    def preset_channel_changed(self, _event: Input.Changed) -> None:
-        self._disarm_advanced_radio_confirm()
-
-    @on(Input.Changed, "#preset-key-input")
-    def preset_key_changed(self, _event: Input.Changed) -> None:
-        self._disarm_advanced_radio_confirm()
-
-    @on(SavePresetControl.Activated)
-    def save_preset(self, _event: SavePresetControl.Activated) -> None:
-        """Persist the editor's current draft locally -- zero RF (see
-
-        the task's own explicit "SAVE MUST NOT silently apply RF
-        changes").
-        """
-        self._disarm_advanced_radio_confirm()
-        name_input, modem_selector, freq_input, channel_input, key_input = (
-            self._preset_editor_fields()
+        self._reset_network_editor_fields()
+        self._set_network_editor_open(True)
+        self._set_advanced_radio_status("", None)
+        self.call_after_refresh(
+            lambda: self.query_one("#network-name-input", Input).focus()
         )
+
+    @on(CancelNetworkControl.Activated)
+    def cancel_new_network(self, _event: CancelNetworkControl.Activated) -> None:
+        """[ CANCEL ] -- discard + collapse the editor. Zero RF, no
+
+        confirmation, selected NETWORK unchanged (spec F).
+        """
+        self._collapse_network_editor()
+        self._set_advanced_radio_status("", None)
+        self.call_after_refresh(lambda: self.query_one(NewNetworkControl).focus())
+
+    @on(Input.Changed, "#network-name-input")
+    def network_name_changed(self, _event: Input.Changed) -> None:
+        self._disarm_advanced_radio_confirm()
+
+    @on(Input.Changed, "#freq-slot-input")
+    def network_freq_slot_changed(self, _event: Input.Changed) -> None:
+        self._disarm_advanced_radio_confirm()
+
+    @on(Input.Changed, "#key-input")
+    def network_key_changed(self, _event: Input.Changed) -> None:
+        self._disarm_advanced_radio_confirm()
+
+    def _validated_network_from_editor(self) -> RadioConfigPreset | None:
+        """Build a RadioConfigPreset from the editor, or set an error
+
+        status and return None. NETWORK NAME is never written as the
+        Meshtastic primary-channel name (channel_name stays "").
+        """
+        name_input, mode_selector, freq_input, key_input = self._network_editor_fields()
         name = name_input.value.strip()
         if not name:
             self._set_advanced_radio_status(
-                "PRESET NOT SAVED — NAME REQUIRED", "setting-error"
+                "NOT SAVED — NETWORK NAME REQUIRED", "setting-error"
             )
-            return
+            return None
         freq_text = freq_input.value.strip()
         try:
             frequency_slot = int(freq_text) if freq_text else 0
@@ -5462,112 +5456,119 @@ class MeshtasticPassApp(App[None]):
                 raise ValueError
         except ValueError:
             self._set_advanced_radio_status(
-                "PRESET NOT SAVED — INVALID FREQ. SLOT", "setting-error"
+                "NOT SAVED — INVALID FREQ. SLOT", "setting-error"
             )
-            return
+            return None
         key_text = key_input.value.strip()
         if key_text:
             try:
                 base64.b64decode(key_text, validate=True)
             except Exception:
                 self._set_advanced_radio_status(
-                    "PRESET NOT SAVED — INVALID KEY (MUST BE BASE64)", "setting-error"
+                    "NOT SAVED — INVALID KEY (MUST BE BASE64)", "setting-error"
                 )
-                return
-        preset = RadioConfigPreset(
+                return None
+        return RadioConfigPreset(
             name=name,
-            modem_preset=str(modem_selector.value),
+            modem_preset=str(mode_selector.value),
             frequency_slot=frequency_slot,
-            channel_name=channel_input.value,
+            channel_name="",
             channel_psk_base64=key_text,
         )
+
+    @on(SaveNetworkControl.Activated)
+    def save_network(self, _event: SaveNetworkControl.Activated) -> None:
+        """[ SAVE ] -- validate, confirm (RF/config WILL change), persist
+
+        the NETWORK locally, then apply it through the radio-service
+        boundary. There is no separate APPLY button (spec I).
+        """
+        preset = self._validated_network_from_editor()
+        if preset is None:
+            return
+        if self._advanced_radio_confirm != "save":
+            self._arm_advanced_radio_confirm("save")
+            self._set_advanced_radio_status(
+                "PRESS SAVE AGAIN TO CONFIRM — SAVING WILL CHANGE THE CONNECTED "
+                "RADIO'S NETWORK/RF CONFIGURATION AND MAY MOVE IT OFF ITS "
+                "CURRENT NETWORK",
+                None,
+            )
+            return
+        self._disarm_advanced_radio_confirm()
         try:
             self.settings.save_radio_config_preset(preset)
             self.settings.save()
         except (OSError, ValueError) as error:
-            self._set_advanced_radio_status(f"PRESET NOT SAVED — {error}", "setting-error")
+            # Local persistence failed -- keep the editor open so the
+            # user can retry; nothing was applied.
+            self._set_advanced_radio_status(f"NOT SAVED — {error}", "setting-error")
             return
-        self._editing_preset_name = name
-        self._refresh_saved_radio_config_options()
-        self.query_one(SavedRadioConfigSelector).value = name
-        self._refresh_preset_editor_controls()
-        self._set_advanced_radio_status(f"{name} SAVED", "setting-success")
-
-    @on(DeletePresetControl.Activated)
-    def delete_preset(self, _event: DeletePresetControl.Activated) -> None:
-        """Delete the currently loaded SAVED preset -- local-only, never
-
-        rewrites the connected radio -- after a press-again-to-confirm
-        arm/confirm cycle.
-        """
-        if self._editing_preset_name is None:
-            return
-        name = self._editing_preset_name
-        if self._advanced_radio_confirm != "delete":
-            self._arm_advanced_radio_confirm("delete")
-            self._set_advanced_radio_status(
-                f"PRESS DEL AGAIN TO CONFIRM — DELETE {name}?", None
-            )
-            return
-        self._disarm_advanced_radio_confirm()
-        self.settings.delete_radio_config_preset(name)
-        self.settings.save()
-        self._reset_preset_editor()
-        self._refresh_saved_radio_config_options()
-        self.query_one(SavedRadioConfigSelector).value = LIVE_RADIO_CONFIG_SENTINEL
-        self._set_advanced_radio_status(f"{name} DELETED", "setting-success")
-
-    @on(ApplyPresetControl.Activated)
-    def apply_preset(self, _event: ApplyPresetControl.Activated) -> None:
-        """The ONLY action in ADVANCED RADIO CONFIG that ever writes to
-
-        the connected radio -- requires ONLINE and a genuine press-
-        again-to-confirm arm/confirm cycle naming exactly what will
-        change (see radio_service.apply_radio_config_preset for the
-        controlled, individually-verified write sequence this
-        triggers).
-        """
+        # Persisted. Select it, collapse the editor, restore NEW NETWORK
+        # (spec I steps 6-8) -- the RF result is reported honestly in
+        # the status line, never by falsely claiming it was applied.
+        self._selected_network = preset.name
+        self._refresh_network_options()
+        self._collapse_network_editor()
         if self._radio_state is not RadioState.ONLINE:
             self._set_advanced_radio_status(
-                "APPLY UNAVAILABLE — RADIO NOT CONNECTED", "setting-error"
+                f"{preset.name} SAVED — RADIO OFFLINE, NOT APPLIED", "setting-error"
             )
             return
-        if self._advanced_radio_confirm != "apply":
-            self._arm_advanced_radio_confirm("apply")
+        self._set_advanced_radio_status(f"SAVING & APPLYING {preset.name}...", None)
+        self._run_radio_worker(
+            "apply-network",
+            lambda: self._apply_network_from_thread(preset.name, preset, saved=True),
+        )
+
+    def _on_network_selected(self, value: str) -> None:
+        """NETWORK dropdown selection. Browsing/opening/navigating never
+
+        reaches here (KeyboardDropdown only posts Selected on ENTER);
+        the first Selected for a new value arms a confirm, and
+        re-selecting that same value confirms and applies (spec J). No
+        separate APPLY button; zero RF until confirmed.
+        """
+        if value == self._selected_network:
+            self._disarm_advanced_radio_confirm()
+            self._set_advanced_radio_status("", None)
+            return
+        confirm_key = f"switch:{value}"
+        if self._advanced_radio_confirm != confirm_key:
+            # Starting a NETWORK switch abandons any unfinished NEW
+            # NETWORK editor (spec K) -- same transient discard rules,
+            # never an accidental SAVE of half-entered values.
+            if self._network_editor_open:
+                self._collapse_network_editor()
+            self._arm_advanced_radio_confirm(confirm_key)
             self._set_advanced_radio_status(
-                "PRESS APPLY AGAIN TO CONFIRM — RADIO WILL CHANGE NETWORK/RF "
+                f"SELECT {value} AGAIN TO CONFIRM — RADIO WILL CHANGE NETWORK/RF "
                 "CONFIGURATION AND MAY STOP HEARING THE CURRENT NETWORK",
                 None,
             )
             return
         self._disarm_advanced_radio_confirm()
-        name_input, modem_selector, freq_input, channel_input, key_input = (
-            self._preset_editor_fields()
-        )
-        name = name_input.value.strip() or "UNSAVED PRESET"
-        freq_text = freq_input.value.strip()
-        try:
-            frequency_slot = int(freq_text) if freq_text else 0
-        except ValueError:
+        preset = self._network_preset(value)
+        if preset is None:
             self._set_advanced_radio_status(
-                "APPLY FAILED — INVALID FREQ. SLOT", "setting-error"
+                f"UNKNOWN NETWORK — {value}", "setting-error"
             )
+            self._refresh_network_options()
             return
-        preset = RadioConfigPreset(
-            name=name,
-            modem_preset=str(modem_selector.value),
-            frequency_slot=frequency_slot,
-            channel_name=channel_input.value,
-            channel_psk_base64=key_input.value.strip(),
-        )
-        self._set_advanced_radio_status(f"APPLYING {name}...", None)
+        if self._radio_state is not RadioState.ONLINE:
+            self._set_advanced_radio_status(
+                "NOT APPLIED — RADIO NOT CONNECTED", "setting-error"
+            )
+            self._refresh_network_options()
+            return
+        self._set_advanced_radio_status(f"SWITCHING TO {value}...", None)
         self._run_radio_worker(
-            "apply-radio-config-preset",
-            lambda: self._apply_radio_config_preset_from_thread(name, preset),
+            "switch-network",
+            lambda: self._apply_network_from_thread(value, preset, saved=False),
         )
 
-    def _apply_radio_config_preset_from_thread(
-        self, name: str, preset: RadioConfigPreset
+    def _apply_network_from_thread(
+        self, name: str, preset: RadioConfigPreset, *, saved: bool
     ) -> None:
         try:
             result = apply_radio_config_preset(self.radio, preset)
@@ -5578,22 +5579,29 @@ class MeshtasticPassApp(App[None]):
                 "error",
                 {"error": ConfigWriteResult(False, None, None, f"error: {detail}")},
             )
-        self.post_message(RadioConfigPresetApplied(name, result))
+        self.post_message(RadioConfigPresetApplied(name, result, saved))
 
     @on(RadioConfigPresetApplied)
     def radio_config_preset_applied(self, event: RadioConfigPresetApplied) -> None:
+        prefix = "SAVED & " if event.saved else ""
         if event.result.applied:
+            self._selected_network = event.preset_name
+            self._refresh_network_options()
             self._set_advanced_radio_status(
-                f"{event.preset_name} APPLIED", "setting-success"
+                f"{event.preset_name} {prefix}APPLIED", "setting-success"
             )
-            self._refresh_saved_radio_config_options()
             return
         failure = event.result.results.get(event.result.failed_step)
         raw_reason = failure.reason if failure is not None else "unknown"
         reason = self._RADIO_FAILURE_REASONS.get(raw_reason, raw_reason.upper())
+        detail = f"{prefix}NOT APPLIED — {reason} ({event.result.failed_step})".strip()
+        # A saved NETWORK stays saved and selected; a bare switch reverts
+        # the selector to the actual current NETWORK. Either way the
+        # status honestly reports that RF did NOT take effect.
+        if not event.saved:
+            self._refresh_network_options()
         self._set_advanced_radio_status(
-            f"{event.preset_name} NOT APPLIED — {reason} ({event.result.failed_step})",
-            "setting-error",
+            f"{event.preset_name} {detail}", "setting-error"
         )
 
     def _reset_clock_sync_state(self) -> None:
@@ -5766,7 +5774,7 @@ class MeshtasticPassApp(App[None]):
         write_verified_config_field, to verify a write this session
         just made.
         """
-        self._refresh_saved_radio_config_options()
+        self._refresh_network_options()
         info_widget = self.query_one("#radio-info", Static)
         timezone_dropdown = self.query_one(TimezoneSelector)
         dropdowns: tuple[tuple[KeyboardDropdown, RadioSettingSpec], ...] = (
@@ -8262,7 +8270,7 @@ class MeshtasticPassApp(App[None]):
             # a change to what pressing Enter immediately does.
             highlighted = len(items) - 1
             if allow_traceroute and self._active_traceroute is None:
-                items.append(PopupItem("TRACE ROUTE", "traceroute", actionable=True))
+                items.append(PopupItem("TRACEROUTE", "traceroute", actionable=True))
         menu = ViewportMenu(
             items,
             highlighted_index=highlighted,
