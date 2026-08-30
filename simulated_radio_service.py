@@ -216,6 +216,12 @@ class SimulatedRadioService:
             # radio_capabilities.role_choices) -- matches this fake
             # radio's own hardware_identity() role_name="CLIENT" below.
             "device": {"tzdef": "", "role": 0},
+            # lora.hop_limit -- PROTOBUF-SOURCE-VERIFIED default of 3
+            # (Config.LoRaConfig.hop_limit docstring), but a fully valid
+            # 0-7 range (see app.HOP_LIMIT_CHOICES) -- this fake radio's
+            # own "current value" for the HOP LIMIT RADIO setting, never
+            # a display-side default.
+            "lora": {"hop_limit": 3},
             # A deterministic, always-present POSITION config section --
             # see item 9: "no current fix" is itself a real, common,
             # honest state, not an error, so the simulated snapshot

@@ -14,6 +14,7 @@ from radio_service import (
     RadioInfo,
     RadioService,
     RadioState,
+    traversed_hops,
 )
 
 
@@ -1053,6 +1054,43 @@ class LocalNodeIdentityRadioSwapTests(unittest.TestCase):
         self.assertFalse(nodes["!aaaaaaaa"].is_local)
         self.assertFalse(nodes["!c0000001"].is_local)
         self.assertFalse(nodes["!d0000001"].is_local)
+
+
+class TraversedHopsTests(unittest.TestCase):
+    """PART D item 18: hop_start - hop_limit, source-verified against
+
+    mesh_pb2.pyi's own MeshPacket.hop_start docstring -- never clamped
+    at 3, 7 remains a fully valid result, missing/impossible inputs are
+    an honest None (never a fabricated 0/1/3/7).
+    """
+
+    def test_no_hops_traveled_yet(self) -> None:
+        self.assertEqual(traversed_hops(3, 3), 0)
+
+    def test_one_hop_traveled(self) -> None:
+        self.assertEqual(traversed_hops(3, 2), 1)
+
+    def test_full_seven_hops_traveled_not_clamped_at_three(self) -> None:
+        self.assertEqual(traversed_hops(7, 0), 7)
+
+    def test_missing_hop_start_is_indeterminate(self) -> None:
+        self.assertIsNone(traversed_hops(None, 2))
+
+    def test_missing_hop_limit_is_indeterminate(self) -> None:
+        self.assertIsNone(traversed_hops(3, None))
+
+    def test_both_missing_is_indeterminate(self) -> None:
+        self.assertIsNone(traversed_hops(None, None))
+
+    def test_impossible_hop_limit_exceeding_hop_start_is_indeterminate(self) -> None:
+        """A single packet only ever travels forward -- hop_limit can
+
+        never legitimately exceed the hop_start it started from.
+        """
+        self.assertIsNone(traversed_hops(3, 5))
+
+    def test_zero_hop_start_and_limit(self) -> None:
+        self.assertEqual(traversed_hops(0, 0), 0)
 
 
 if __name__ == "__main__":
