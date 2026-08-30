@@ -15,6 +15,7 @@ from radio_service import (
     ChannelInfo,
     ClockSyncResult,
     ConfigWriteResult,
+    RadioApplyResult,
     RadioEvent,
     DeliveryState,
     DISPLAY_UNITS_METRIC,
@@ -578,6 +579,44 @@ class SimulatedRadioService:
         already return.
         """
         return self._online
+
+    def apply_network_config(
+        self,
+        *,
+        use_preset: bool,
+        modem_preset: int,
+        channel_num: int,
+        channel_name: str,
+        psk: bytes,
+        stage_log=None,
+    ) -> RadioApplyResult:
+        """Deterministic fire-and-forget NETWORK write -- mirrors
+
+        RadioService.apply_network_config's staging/logging shape
+        (--simulate always succeeds while online) so ADVANCED RADIO's
+        apply path behaves identically without hardware.
+        """
+        log = stage_log or (lambda _message: None)
+        if not self._online:
+            log("connect ERROR not_connected")
+            return RadioApplyResult(
+                False, "connect", {"connect": ConfigWriteResult(False, None, None, "not_connected")}
+            )
+        results: dict[str, ConfigWriteResult] = {}
+        for stage in ("begin", "lora", "channel", "commit"):
+            log(f"{stage} START")
+            if stage == "lora":
+                lora = self._config_sections.setdefault("lora", {})
+                lora["use_preset"] = use_preset
+                lora["modem_preset"] = modem_preset
+                lora["channel_num"] = channel_num
+            elif stage == "channel":
+                self._primary_channel_name = channel_name
+                self._primary_channel_psk = psk
+            results[stage] = ConfigWriteResult(True, None, None, "")
+            log(f"{stage} DONE")
+        self._rebuild_config_snapshot()
+        return RadioApplyResult(True, "", results)
 
     def config_snapshot(self):
         """The current connection's cached fake RadioConfigurationSnapshot,

@@ -94,6 +94,7 @@ from radio_service import (
     SCREEN_ON_SECS_ALWAYS_ON,
     SHORT_NAME_MAX_UTF8_BYTES,
     NETWORK_FIELD_LABELS,
+    NETWORK_STAGE_LABELS,
     RadioApplyResult,
     RadioConfigVerification,
     RadioEvent,
@@ -5759,7 +5760,7 @@ class MeshtasticPassApp(App[None]):
         except Exception:
             decoded_len = -1
         self._log_netcfg(
-            f"apply#{token} begin name={name!r} saved={saved} "
+            f"apply#{token} REQUEST name={name!r} saved={saved} "
             f"modem_preset={preset.modem_preset} freq_slot={preset.frequency_slot} "
             f"psk={'present' if preset.channel_psk_base64 else 'absent'} "
             f"decoded_len={decoded_len}"
@@ -5782,8 +5783,9 @@ class MeshtasticPassApp(App[None]):
     def _apply_network_from_thread(
         self, token: int, name: str, preset: RadioConfigPreset, saved: bool
     ) -> None:
+        stage_log = lambda message: self._log_netcfg(f"apply#{token} {message}")
         try:
-            result = apply_radio_config_preset(self.radio, preset)
+            result = apply_radio_config_preset(self.radio, preset, stage_log=stage_log)
         except Exception as error:
             detail = str(error).strip() or error.__class__.__name__
             result = RadioApplyResult(
@@ -5792,16 +5794,16 @@ class MeshtasticPassApp(App[None]):
                 {"error": ConfigWriteResult(False, None, None, f"error: {detail}")},
             )
         self._log_netcfg(
-            f"apply#{token} worker returned applied={result.applied} "
+            f"apply#{token} write returned applied={result.applied} "
             f"failed_step={result.failed_step or '-'}"
         )
-        # Path B (no observed reboot): the connection survived the
-        # write + commit, so there is no reconnect full-sync to refresh
-        # the SDK's config cache -- do a FRESH readback here on the
-        # worker thread (never the UI thread; this blocks on RF), then a
-        # semantic field-by-field verify. Skipped only when a step
-        # already reported the interface dropped ("disconnected") --
-        # that is Path A and the reconnect handler owns the verify.
+        # The write path is fire-and-forget and never blocks, so we are
+        # here within ~1s of a healthy radio (no reboot). Verify with
+        # ONE fresh readback (on THIS worker thread -- get_config /
+        # get_channel round-trips block on RF, never the UI). Skipped
+        # only when a stage already saw the interface drop
+        # ("disconnected") -- that is Path A, the reconnect handler
+        # owns the verify.
         verification: RadioConfigVerification | None = None
         step_result = (
             result.results.get(result.failed_step) if not result.applied else None
@@ -5809,14 +5811,19 @@ class MeshtasticPassApp(App[None]):
         disconnected = step_result is not None and step_result.reason == "disconnected"
         if not disconnected:
             try:
+                self._log_netcfg(f"apply#{token} READBACK START")
                 reread = getattr(self.radio, "reread_lora_and_primary_channel", None)
-                if callable(reread):
-                    reread()
-                verification = verify_radio_config_preset(self.radio, preset)
+                reread_ok = bool(reread()) if callable(reread) else True
+                self._log_netcfg(f"apply#{token} READBACK DONE ok={reread_ok}")
+                # A fresh readback that never answered while the radio is
+                # still connected is a genuine verify failure, NOT a
+                # reboot -- leave `verification` None so the handler
+                # reports a terminal error (never WAITING FOR RECONNECT).
+                if reread_ok:
+                    verification = verify_radio_config_preset(self.radio, preset)
             except Exception as error:
                 self._log_netcfg(
-                    f"apply#{token} post-write verify errored: "
-                    f"{error.__class__.__name__}"
+                    f"apply#{token} READBACK ERROR {error.__class__.__name__}"
                 )
         self.post_message(
             RadioConfigPresetApplied(token, name, result, saved, verification)
@@ -5834,14 +5841,13 @@ class MeshtasticPassApp(App[None]):
             result.results.get(result.failed_step) if not result.applied else None
         )
         raw_reason = step_result.reason if step_result is not None else ""
-        radio_down = (
-            self._radio_state is not RadioState.ONLINE or raw_reason == "disconnected"
-        )
-        if radio_down:
-            # PATH A: an actual disconnect correlated with THIS apply is
-            # the expected LoRa-config reboot -- never a failure. Wait
-            # for the reconnect full-sync, then verify (see
-            # _on_connection_state_for_network_apply).
+        # WAITING FOR RECONNECT is entered ONLY on a real observed
+        # ONLINE -> non-ONLINE transition correlated with this apply --
+        # never merely because a write/ACK/readback timed out. A generic
+        # "timeout"/"not_connected" service string is NOT evidence the
+        # radio rebooted (hardware has shown these writes do NOT reboot
+        # it).
+        if self._radio_state is not RadioState.ONLINE or raw_reason == "disconnected":
             apply.awaiting_reconnect = True
             self._log_netcfg(
                 f"apply#{apply.token} radio down after "
@@ -5853,17 +5859,25 @@ class MeshtasticPassApp(App[None]):
                 "setting-accent",
             )
             return
-        # PATH B: the connection survived. The radio's own fresh readback
-        # is authoritative -- neither a bare "write verified" claim nor a
-        # wait for a reboot that is not coming.
+        # The radio is still connected. A write STAGE that failed is a
+        # terminal error naming that stage.
+        if not result.applied:
+            label = NETWORK_STAGE_LABELS.get(
+                result.failed_step, (result.failed_step or "WRITE").upper()
+            )
+            self._finish_network_apply(
+                success=False, detail=f"{label} {(raw_reason or 'FAILED').upper()}"
+            )
+            return
+        # Writes went out; verify from the fresh readback. A readback
+        # that never answered while still connected is itself a terminal
+        # failure -- NOT a reboot, NOT an indefinite wait.
         if event.verification is None:
             self._log_netcfg(
-                f"apply#{apply.token} connected but no readback -- "
-                "holding for reconnect/timeout"
+                f"apply#{apply.token} connected but readback did not answer"
             )
-            apply.awaiting_reconnect = True
-            self._set_advanced_radio_status(
-                f"APPLYING {apply.name} — VERIFYING...", "setting-accent"
+            self._finish_network_apply(
+                success=False, detail="VERIFY READBACK TIMEOUT"
             )
             return
         self._finish_network_apply_from_verification(

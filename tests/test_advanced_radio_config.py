@@ -42,6 +42,7 @@ from radio_capabilities import (
 )
 from radio_service import (
     ConfigWriteResult,
+    RadioApplyResult,
     RadioState,
     apply_radio_config_preset,
     psk_matches_request,
@@ -129,55 +130,82 @@ class ApplyRadioConfigPresetServiceTests(unittest.TestCase):
         self.assertTrue(result.applied)
         self.assertEqual(radio.read_primary_channel_settings(), ("", b""))
 
-    def test_each_write_is_called_exactly_once(self) -> None:
+    def test_apply_delegates_to_apply_network_config_fire_and_forget(self) -> None:
         radio = self._radio()
-        radio.write_verified_config_field = Mock(wraps=radio.write_verified_config_field)
-        radio.write_verified_primary_channel = Mock(
-            wraps=radio.write_verified_primary_channel
-        )
+        captured: dict = {}
+        stages: list[str] = []
+        original = radio.apply_network_config
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            log = kwargs.get("stage_log")
+
+            def tap(message):
+                stages.append(message)
+                if log:
+                    log(message)
+
+            kwargs["stage_log"] = tap
+            return original(**kwargs)
+
+        radio.apply_network_config = spy
         preset = RadioConfigPreset(
-            name="Home", modem_preset="LONG_FAST", frequency_slot=0, channel_name="Home"
+            name="NYC MS48",
+            modem_preset="MEDIUM_SLOW",
+            frequency_slot=48,
+            channel_name="",
+            channel_psk_base64="AQ==",
         )
 
         result = apply_radio_config_preset(radio, preset)
 
         self.assertTrue(result.applied)
-        self.assertEqual(radio.write_verified_config_field.call_count, 3)
-        self.assertEqual(radio.write_verified_primary_channel.call_count, 1)
-
-    def test_stops_at_first_failing_step_never_writes_later_fields(self) -> None:
-        radio = self._radio()
-        original = radio.write_verified_config_field
-
-        def failing_write(section, field, value, **kwargs):
-            if field == "modem_preset":
-                return ConfigWriteResult(False, value, None, "nak")
-            return original(section, field, value, **kwargs)
-
-        radio.write_verified_config_field = failing_write
-        radio.write_verified_primary_channel = Mock(
-            wraps=radio.write_verified_primary_channel
+        self.assertEqual(captured["modem_preset"], 3)  # MEDIUM_SLOW enum
+        self.assertEqual(captured["channel_num"], 48)
+        self.assertEqual(captured["channel_name"], "")  # NETWORK NAME not written
+        self.assertEqual(captured["psk"], bytes([1]))  # AQ== decoded ONCE
+        # begin -> lora -> channel -> commit, each START'd once, in order.
+        self.assertEqual(
+            [s.split()[0] for s in stages if s.endswith("START")],
+            ["begin", "lora", "channel", "commit"],
         )
-        preset = RadioConfigPreset(name="Home", modem_preset="LONG_FAST", frequency_slot=5)
+        self.assertIn("lora DONE", stages)
+        self.assertIn("commit DONE", stages)
 
-        result = apply_radio_config_preset(radio, preset)
-
-        self.assertFalse(result.applied)
-        self.assertEqual(result.failed_step, "modem_preset")
-        self.assertNotIn("frequency_slot", result.results)
-        self.assertNotIn("channel", result.results)
-        radio.write_verified_primary_channel.assert_not_called()
-
-    def test_invalid_modem_preset_name_fails_before_any_write(self) -> None:
+    def test_apply_reports_the_failed_stage(self) -> None:
         radio = self._radio()
-        radio.write_verified_config_field = Mock(wraps=radio.write_verified_config_field)
+        radio.apply_network_config = lambda **k: RadioApplyResult(
+            False, "lora", {"lora": ConfigWriteResult(False, None, None, "error: X")}
+        )
+        result = apply_radio_config_preset(
+            radio, RadioConfigPreset(name="Home", modem_preset="LONG_FAST")
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual(result.failed_step, "lora")
+
+    def test_invalid_modem_preset_name_fails_before_any_rf(self) -> None:
+        radio = self._radio()
+        radio.apply_network_config = Mock()
         preset = RadioConfigPreset(name="Bad", modem_preset="NOT_A_REAL_PRESET")
 
         result = apply_radio_config_preset(radio, preset)
 
         self.assertFalse(result.applied)
         self.assertEqual(result.failed_step, "modem_preset")
-        radio.write_verified_config_field.assert_not_called()
+        radio.apply_network_config.assert_not_called()
+
+    def test_invalid_psk_fails_before_any_rf(self) -> None:
+        radio = self._radio()
+        radio.apply_network_config = Mock()
+        preset = RadioConfigPreset(
+            name="Bad", modem_preset="LONG_FAST", channel_psk_base64="not!base64!"
+        )
+
+        result = apply_radio_config_preset(radio, preset)
+
+        self.assertFalse(result.applied)
+        self.assertEqual(result.failed_step, "channel")
+        radio.apply_network_config.assert_not_called()
 
     def test_not_connected_fails_cleanly(self) -> None:
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
@@ -186,46 +214,8 @@ class ApplyRadioConfigPresetServiceTests(unittest.TestCase):
         result = apply_radio_config_preset(radio, preset)
 
         self.assertFalse(result.applied)
-        self.assertEqual(result.results["use_preset"].reason, "not_connected")
-
-    def test_apply_wraps_the_writes_in_a_settings_transaction(self) -> None:
-        radio = self._radio()
-        calls: list[str] = []
-        radio.begin_settings_transaction = lambda: calls.append("begin") or True
-        radio.commit_settings_transaction = lambda: calls.append("commit") or True
-        original = radio.write_verified_config_field
-        radio.write_verified_config_field = (
-            lambda *a, **k: calls.append("write") or original(*a, **k)
-        )
-        preset = RadioConfigPreset(name="Home", modem_preset="LONG_FAST", frequency_slot=0)
-
-        result = apply_radio_config_preset(radio, preset)
-
-        self.assertTrue(result.applied)
-        self.assertEqual(calls[0], "begin")
-        self.assertEqual(calls[-1], "commit")
-        self.assertEqual(calls.count("begin"), 1)
-        self.assertEqual(calls.count("commit"), 1)
-
-    def test_transaction_is_committed_even_when_a_write_fails(self) -> None:
-        radio = self._radio()
-        committed: list[bool] = []
-        radio.begin_settings_transaction = lambda: True
-        radio.commit_settings_transaction = lambda: committed.append(True) or True
-        original = radio.write_verified_config_field
-
-        def failing(section, field, value, **kwargs):
-            if field == "modem_preset":
-                return ConfigWriteResult(False, value, None, "nak")
-            return original(section, field, value, **kwargs)
-
-        radio.write_verified_config_field = failing
-        result = apply_radio_config_preset(
-            radio, RadioConfigPreset(name="Home", modem_preset="LONG_FAST")
-        )
-
-        self.assertFalse(result.applied)
-        self.assertEqual(committed, [True])  # never left dangling on the radio
+        self.assertEqual(result.failed_step, "connect")
+        self.assertEqual(result.results["connect"].reason, "not_connected")
 
 
 class VerifyRadioConfigPresetTests(unittest.TestCase):
@@ -368,6 +358,34 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
         app.query_one(RadioModeSelector).value = radio_mode
         app.query_one("#freq-slot-input", Input).value = freq_slot
         app.query_one("#key-input", Input).value = key
+
+    @staticmethod
+    def _apply_commits_wrong_lora(radio, **overrides) -> None:
+        """Wrap apply_network_config so the writes 'succeed' but the
+
+        radio ends up with DIFFERENT lora values -- so the post-write
+        readback verify legitimately fails (radio still connected).
+        """
+        original = radio.apply_network_config
+
+        def wrapper(**kwargs):
+            result = original(**kwargs)
+            radio._config_sections.setdefault("lora", {}).update(overrides)
+            radio._rebuild_config_snapshot()
+            return result
+
+        radio.apply_network_config = wrapper
+
+    @staticmethod
+    def _apply_reports_disconnected(radio) -> None:
+        """apply_network_config returns a 'disconnected' stage -- i.e.
+
+        the interface dropped mid-write (a genuine observed disconnect,
+        the ONLY thing that may enter the reconnect path).
+        """
+        radio.apply_network_config = lambda **k: RadioApplyResult(
+            False, "lora", {"lora": ConfigWriteResult(False, None, None, "disconnected")}
+        )
 
     # ---- Collapsed default -------------------------------------------------
 
@@ -554,14 +572,9 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_save_rf_failure_never_falsely_reports_applied(self) -> None:
         radio = self.radio()
-        original = radio.write_verified_config_field
-
-        def failing_write(section, field, value, **kwargs):
-            if field == "channel_num":
-                return ConfigWriteResult(False, value, None, "mismatch")
-            return original(section, field, value, **kwargs)
-
-        radio.write_verified_config_field = failing_write
+        # Writes go out, radio stays connected, but ends up on the wrong
+        # slot -> the fresh readback verify legitimately fails.
+        self._apply_commits_wrong_lora(radio, channel_num=99)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
@@ -717,14 +730,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
         self.settings.save_radio_config_preset(
             RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
         )
-        original = radio.write_verified_config_field
-
-        def reboots(section, field, value, **kwargs):
-            if field == "modem_preset":
-                return ConfigWriteResult(False, value, None, "disconnected")
-            return original(section, field, value, **kwargs)
-
-        radio.write_verified_config_field = reboots
+        self._apply_reports_disconnected(radio)  # interface dropped mid-write
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
@@ -854,16 +860,8 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expected_reboot_reconnect_does_not_strand_the_apply(self) -> None:
         radio = self.radio()
-        original = radio.write_verified_config_field
-
-        def reboots_on_modem_preset(section, field, value, **kwargs):
-            if field == "modem_preset":
-                # Real firmware reboots here -> the verify readback sees
-                # the interface drop.
-                return ConfigWriteResult(False, value, None, "disconnected")
-            return original(section, field, value, **kwargs)
-
-        radio.write_verified_config_field = reboots_on_modem_preset
+        # The rare case: the interface actually drops during the write.
+        self._apply_reports_disconnected(radio)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
@@ -906,14 +904,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconnect_with_wrong_config_reports_error_not_success(self) -> None:
         radio = self.radio()
-        original = radio.write_verified_config_field
-
-        def reboots(section, field, value, **kwargs):
-            if field == "modem_preset":
-                return ConfigWriteResult(False, value, None, "disconnected")
-            return original(section, field, value, **kwargs)
-
-        radio.write_verified_config_field = reboots
+        self._apply_reports_disconnected(radio)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
@@ -1044,16 +1035,9 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
                 name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48
             )
         )
-        # Writes "succeed" (verified) but the radio's actual slot is wrong.
-        original = radio.write_verified_config_field
-
-        def lying_write(section, field, value, **kwargs):
-            r = original(section, field, value, **kwargs)
-            if field == "channel_num":
-                radio._config_sections["lora"]["channel_num"] = 20  # not 48
-            return r
-
-        radio.write_verified_config_field = lying_write
+        # Writes go out, radio stays connected, but the slot ends up
+        # wrong -> the fresh readback verify names FREQ. SLOT.
+        self._apply_commits_wrong_lora(radio, channel_num=20)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)

@@ -1081,11 +1081,19 @@ class RadioService:
 
         try:
             local_node._sendAdmin(write_message, onResponse=on_ack)
-            interface.waitForAckNak()
         except Exception:
-            # A missing/weak ack must not by itself fail OR pass the
-            # write -- only the fresh readback below is authoritative.
             pass
+        # NOTE: no interface.waitForAckNak() here. That call is bounded
+        # only by the interface's 300s Timeout, and for a LOCAL-node
+        # admin write the SDK never delivers the routing ACK to a
+        # callback that is not literally named "onAckNak" -- so it
+        # blocked for the full 300s on real hardware unless a stale
+        # receivedAck from an unrelated prior response happened to still
+        # be set. A routing ACK was never verification here anyway (see
+        # this method's docstring); the fresh readback below is, and it
+        # -- plus the NAK poll in its loop -- bounds the whole call to
+        # `timeout`. Mirrors Node.writeConfig()'s own local-node path
+        # (onResponse=None, fire and forget).
 
         if self._interface is not target_interface or self._connection_lost.is_set():
             return ConfigWriteResult(False, value, None, "disconnected")
@@ -1122,6 +1130,8 @@ class RadioService:
         while time.monotonic() - start < timeout:
             if self._interface is not target_interface or self._connection_lost.is_set():
                 return ConfigWriteResult(False, value, None, "disconnected")
+            if nak_seen["nak"]:
+                return ConfigWriteResult(False, value, None, "nak")
             if "value" in found:
                 readback = found["value"]
                 if readback == value:
@@ -1203,9 +1213,11 @@ class RadioService:
 
         try:
             local_node._sendAdmin(write_message, onResponse=on_ack)
-            interface.waitForAckNak()
         except Exception:
             pass
+        # No interface.waitForAckNak() -- see write_verified_config_field
+        # for why (unbounded 300s local-node stall). Bounded by the
+        # readback loop + NAK poll below.
 
         if self._interface is not target_interface or self._connection_lost.is_set():
             return ConfigWriteResult(False, (name, psk), None, "disconnected")
@@ -1245,6 +1257,8 @@ class RadioService:
         while time.monotonic() - start < timeout:
             if self._interface is not target_interface or self._connection_lost.is_set():
                 return ConfigWriteResult(False, (name, psk), None, "disconnected")
+            if nak_seen["nak"]:
+                return ConfigWriteResult(False, (name, psk), None, "nak")
             if "name" in found:
                 readback = (found["name"], found["psk"])
                 if found["name"] == name and psk_matches_request(psk, found["psk"]):
@@ -1355,6 +1369,91 @@ class RadioService:
                 return True
             time.sleep(0.05)
         return False
+
+    def apply_network_config(
+        self,
+        *,
+        use_preset: bool,
+        modem_preset: int,
+        channel_num: int,
+        channel_name: str,
+        psk: bytes,
+        stage_log: "Callable[[str], None] | None" = None,
+    ) -> RadioApplyResult:
+        """FIRE-AND-FORGET NETWORK write, matching the meshtastic CLI's
+
+        local-node path (`--set lora.*` switches this hardware without a
+        reboot): stage lora fields -> writeConfig("lora") -> stage the
+        primary channel -> writeChannel(0), inside begin/commit
+        SettingsTransaction. NO interface.waitForAckNak(), NO per-field
+        readback -- none of the SDK calls here block, so no stage can
+        leave the UI pending. Verification is a SEPARATE step the caller
+        runs afterwards (reread_lora_and_primary_channel +
+        verify_radio_config_preset). Every stage boundary is reported
+        through `stage_log` ("<stage> START" / "<stage> DONE" /
+        "<stage> ERROR ...") for hardware diagnosis; PSK bytes are never
+        passed to it.
+        """
+        log = stage_log or (lambda _message: None)
+        interface = self._interface
+        local_node = getattr(interface, "localNode", None)
+        local_config = getattr(local_node, "localConfig", None) if local_node else None
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if interface is None or local_config is None or not channels:
+            log("connect ERROR not_connected")
+            return RadioApplyResult(
+                False, "connect", {"connect": ConfigWriteResult(False, None, None, "not_connected")}
+            )
+        target_interface = interface
+        results: dict[str, ConfigWriteResult] = {}
+
+        def stage(name: str, action: "Callable[[], Any]") -> bool:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                results[name] = ConfigWriteResult(False, None, None, "disconnected")
+                log(f"{name} ERROR disconnected")
+                return False
+            log(f"{name} START")
+            try:
+                action()
+            except Exception as error:
+                detail = error.__class__.__name__
+                results[name] = ConfigWriteResult(False, None, None, f"error: {detail}")
+                log(f"{name} ERROR {detail}")
+                return False
+            results[name] = ConfigWriteResult(True, None, None, "")
+            log(f"{name} DONE")
+            return True
+
+        # begin: best-effort -- an SDK without the transaction methods,
+        # or a benign failure, must not block the actual writes (the
+        # CLI itself only opens a transaction opportunistically).
+        stage("begin", self.begin_settings_transaction)
+
+        def write_lora() -> None:
+            lora = local_config.lora
+            lora.use_preset = use_preset
+            lora.modem_preset = modem_preset
+            lora.channel_num = channel_num
+            local_node.writeConfig("lora")
+
+        if not stage("lora", write_lora):
+            self.commit_settings_transaction()
+            return RadioApplyResult(False, "lora", results)
+
+        def write_channel() -> None:
+            primary = channels[0]
+            primary.settings.name = channel_name
+            primary.settings.psk = psk
+            local_node.writeChannel(0)
+
+        if not stage("channel", write_channel):
+            self.commit_settings_transaction()
+            return RadioApplyResult(False, "channel", results)
+
+        if not stage("commit", self.commit_settings_transaction):
+            return RadioApplyResult(False, "commit", results)
+
+        return RadioApplyResult(True, "", results)
 
     def supports_clock_sync(self) -> bool:
         """Whether the installed SDK/protobuf schema exposes
@@ -2472,43 +2571,41 @@ class RadioService:
         return "".join(part.title() for part in enum_name.split("_"))
 
 
-def apply_radio_config_preset(radio: Any, preset: Any) -> RadioApplyResult:
-    """Apply one saved radio/network configuration as a controlled,
+# Compact UI wording for the write STAGE a NETWORK apply failed at
+# (as opposed to a post-write verification field mismatch --
+# NETWORK_FIELD_LABELS covers those).
+NETWORK_STAGE_LABELS = {
+    "connect": "RADIO NOT CONNECTED",
+    "begin": "BEGIN TRANSACTION",
+    "lora": "WRITE RADIO MODE / FREQ. SLOT",
+    "channel": "WRITE PRIMARY CHANNEL",
+    "commit": "COMMIT",
+}
 
-    sequential, individually-write-verified multi-field operation --
-    LoRaConfig.use_preset=True, then modem_preset, then channel_num
-    (frequency slot), then the PRIMARY channel's name/psk. Stops at
-    the first failing step (see RadioApplyResult's own docstring).
 
-    `radio` is duck-typed against RadioService/SimulatedRadioService's
-    identical write_verified_config_field/write_verified_primary_
-    channel methods (never imported/type-checked against either class
-    directly) -- this is a free function, not a RadioService method,
-    specifically so ADVANCED RADIO CONFIG's APPLY behaves IDENTICALLY
-    in --simulate and on real hardware, sharing this exact sequencing
-    and stop-at-first-failure reporting rather than two independently
-    maintained copies of it.
+def apply_radio_config_preset(
+    radio: Any, preset: Any, *, stage_log: "Callable[[str], None] | None" = None
+) -> RadioApplyResult:
+    """Apply one saved radio/network configuration, following the SAME
 
-    `preset` is duck-typed against app_settings.RadioConfigPreset's own
-    attributes (modem_preset/frequency_slot/channel_name/
-    channel_psk_base64) -- never imported from app_settings, to keep
-    this module's existing zero-dependency-on-app_settings boundary
-    intact.
+    local-node semantics the installed meshtastic CLI uses for
+    `--set lora.modem_preset X` / `--set lora.channel_num N` (which
+    switch this hardware WITHOUT a reboot): stage the LoRa fields into
+    localConfig, `writeConfig("lora")`, stage the primary channel,
+    `writeChannel(0)`, all FIRE-AND-FORGET (Node.writeConfig for the
+    local node passes onResponse=None -- no ACK wait, no per-field
+    readback), wrapped in begin/commitSettingsTransaction so the batch
+    commits atomically. NONE of these calls block; the operation is
+    verified afterwards by ONE fresh readback (see
+    RadioService.reread_lora_and_primary_channel + verify_radio_config_
+    preset), never by an intermediate per-field ACK/readback that could
+    stall.
 
-    use_preset=True (never manually inferring bandwidth/spread_factor/
-    coding_rate from the chosen modem_preset) matches the task's own
-    "Use preset mode" requirement -- those three raw LoRa physics
-    fields are left for the radio's own preset table to fill in.
-
-    The whole sequence is wrapped in a Meshtastic settings-edit
-    transaction (begin_settings_transaction/commit_settings_transaction
-    -- best-effort, a no-op on an SDK/simulator that lacks it), exactly
-    as `meshtastic --set` wraps a multi-field config change: the
-    firmware persists (and reboots if required) on the COMMIT, not on
-    each loose set_config. The commit runs in a `finally` so a
-    transaction is never left dangling on the radio even when a write
-    fails partway.
+    Validation (invalid modem preset name / PSK) happens here, before
+    any RF. `radio` is duck-typed against RadioService/
+    SimulatedRadioService's `apply_network_config`.
     """
+    log = stage_log or (lambda _message: None)
     try:
         from meshtastic.protobuf import config_pb2
 
@@ -2525,53 +2622,30 @@ def apply_radio_config_preset(radio: Any, preset: Any) -> RadioApplyResult:
                 )
             },
         )
-
-    results: dict[str, ConfigWriteResult] = {}
-    begin = getattr(radio, "begin_settings_transaction", None)
-    commit = getattr(radio, "commit_settings_transaction", None)
-    in_transaction = bool(begin()) if callable(begin) else False
-
     try:
-        results["use_preset"] = radio.write_verified_config_field(
-            "lora", "use_preset", True
+        psk_bytes = (
+            base64.b64decode(preset.channel_psk_base64)
+            if preset.channel_psk_base64
+            else b""
         )
-        if not results["use_preset"].applied:
-            return RadioApplyResult(False, "use_preset", results)
-
-        results["modem_preset"] = radio.write_verified_config_field(
-            "lora", "modem_preset", modem_preset_value
+    except Exception:
+        return RadioApplyResult(
+            False,
+            "channel",
+            {"channel": ConfigWriteResult(False, preset.channel_psk_base64, None, "invalid")},
         )
-        if not results["modem_preset"].applied:
-            return RadioApplyResult(False, "modem_preset", results)
 
-        results["frequency_slot"] = radio.write_verified_config_field(
-            "lora", "channel_num", preset.frequency_slot
-        )
-        if not results["frequency_slot"].applied:
-            return RadioApplyResult(False, "frequency_slot", results)
-
-        try:
-            psk_bytes = (
-                base64.b64decode(preset.channel_psk_base64)
-                if preset.channel_psk_base64
-                else b""
-            )
-        except Exception:
-            results["channel"] = ConfigWriteResult(
-                False, preset.channel_psk_base64, None, "invalid"
-            )
-            return RadioApplyResult(False, "channel", results)
-
-        results["channel"] = radio.write_verified_primary_channel(
-            name=preset.channel_name, psk=psk_bytes
-        )
-        if not results["channel"].applied:
-            return RadioApplyResult(False, "channel", results)
-
-        return RadioApplyResult(True, "", results)
-    finally:
-        if in_transaction and callable(commit):
-            commit()
+    return radio.apply_network_config(
+        use_preset=True,
+        modem_preset=modem_preset_value,
+        channel_num=int(getattr(preset, "frequency_slot", 0) or 0),
+        # NETWORK NAME is local-only -- the Meshtastic primary channel
+        # name is never derived from it (stays exactly what the preset
+        # carries, normally blank).
+        channel_name=getattr(preset, "channel_name", "") or "",
+        psk=psk_bytes,
+        stage_log=log,
+    )
 
 
 @dataclass(frozen=True)
