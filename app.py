@@ -334,6 +334,34 @@ def _dm_dropdown_label(
     return long_name or short_name or node_id
 
 
+_NODE_ID_HEX = frozenset("0123456789abcdef")
+
+
+def canonical_entered_node_id(raw: str) -> str | None:
+    """Validate and canonicalize a hand-typed Meshtastic node ID.
+
+    Accepts the standard "!"-prefixed 8-hex-digit form (case-insensitive,
+    e.g. "!A11Ce001") or a bare 8-hex-digit form, and returns the app's
+    canonical lowercase "!xxxxxxxx" form -- the SAME stable node identity
+    every other part of the app keys DMs/favorites/MESH by (see
+    mesh_state.normalize_mesh_node_id). Returns None for anything else
+    (empty, wrong length, non-hex), so a caller can reject the input
+    without creating a conversation or sending any RF.
+    """
+    candidate = raw.strip().lower()
+    if candidate.startswith("!"):
+        candidate = candidate[1:]
+    if len(candidate) != 8 or any(char not in _NODE_ID_HEX for char in candidate):
+        return None
+    return f"!{candidate}"
+
+
+# The DM dropdown's synthetic "NEW DM" action row value -- never a real
+# node ID, so it can never collide with a stored conversation.
+NEW_DM_ACTION_VALUE = "__new_dm__"
+
+
+
 class ThinScrollBarRender(ScrollBarRender):
     """Use one aligned narrow glyph for both track and draggable thumb.
 
@@ -985,18 +1013,28 @@ class DMModeSelector(KeyboardDropdown):
 
     def open_menu(self) -> None:
         conversations = self.app.dm_dropdown_conversations()
-        empty = not conversations
-        self._conversation_items = conversations or (DropdownOption("NO DMS", None),)
+        # The popup rows are the real stored conversations (or a single
+        # non-actionable "NO DMS" placeholder when none exist) plus ONE
+        # synthetic trailing "NEW DM" action row. `_conversation_items`
+        # must mirror the popup rows index-for-index (KeyboardDropdown.
+        # on_key's own `% len(self.options)` math and _activate_popup_item
+        # both index into it), so the NEW DM row is included here too --
+        # its value is the NEW_DM_ACTION_VALUE sentinel, never a real node
+        # ID, so it can never be mistaken for a stored conversation.
+        items_list = list(conversations) if conversations else [DropdownOption("NO DMS", None)]
+        items_list.append(DropdownOption("NEW DM", NEW_DM_ACTION_VALUE))
+        self._conversation_items = tuple(items_list)
         # Swapped in only so KeyboardDropdown's own on_key navigation
         # math (`% len(self.options)`) operates against the REAL
-        # conversation count while open -- restored by close_menu.
+        # conversation + NEW DM row count while open -- restored by
+        # close_menu.
         self.options = self._conversation_items
         self.value = self._conversation_items[0].value
         self.is_open = True
         self._highlighted_index = 0
         self.add_class("open")
         items = tuple(
-            PopupItem(option.label, option.value, actionable=not empty)
+            PopupItem(option.label, option.value, actionable=option.value is not None)
             for option in self._conversation_items
         )
         self.popup = ViewportMenu(
@@ -1030,6 +1068,12 @@ class DMModeSelector(KeyboardDropdown):
             # (KeyboardDropdown.on_key calls _activate_popup_item
             # directly, bypassing that actionable check -- so this
             # explicit guard is the one that actually matters there).
+            return
+        if node_id == NEW_DM_ACTION_VALUE:
+            # NEW DM: open the transient node-ID entry surface, never a
+            # stored conversation. Zero RF; no conversation is created
+            # until a valid node ID is actually entered.
+            self.app._start_new_dm()
             return
         self.post_message(self.Selected(self, node_id))
 
@@ -2038,15 +2082,23 @@ class MeshNodeLabelWidget(Static):
         self.node_id = state.node.node_id
         super().__init__(classes="mesh-node", markup=False)
 
-    def refresh_visual(self, *, selected: bool, theme: str, now: float) -> None:
+    def refresh_visual(
+        self, *, selected: bool, theme: str, now: float, highlighted: bool = False
+    ) -> None:
         # UI / CHANNEL / RADIO CONFIG TUNING Part A: the label is now
         # always the bare name in this node's ordinary ACTIVE/STALE/
         # selected color -- no marker prefix, no traced-specific
         # branch. Successful-traceroute evidence is shown entirely on
         # the GRID GLYPH one cell below (see MeshNodeWidget.
         # refresh_visual) instead, so there is no second color/glyph
-        # decision to make here any more.
-        color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
+        # decision to make here any more. A HIGHLIGHTED (local favorite)
+        # node's NAME renders in ACCENT2 -- presentation only, applied
+        # to the label, never the glyph/topology geometry below.
+        color = (
+            THEME_PALETTES[theme].accent2
+            if highlighted
+            else _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
+        )
         label = mesh_board_marker_label(
             self.state.node, max_name_cells=MESH_BOARD_LABEL_MAX_CELLS
         )
@@ -2594,7 +2646,10 @@ class MeshTopologyView(Container):
             widget.styles.height = 1
             widget.styles.offset = (grid_x - label_width // 2, grid_y - 1)
             selected = widget.node_id == self._selected_node_id
-            widget.refresh_visual(selected=selected, theme=theme, now=now)
+            highlighted = self.app.settings.is_favorite(widget.node_id)
+            widget.refresh_visual(
+                selected=selected, theme=theme, now=now, highlighted=highlighted
+            )
 
         # Connector semantics: a YOU-to-node path means "we currently
         # believe this node is active in the mesh" -- CLIENT history
@@ -3249,15 +3304,10 @@ class MeshtasticPassApp(App[None]):
     }
 
     /* Every section heading after the first (CONNECTION -> NETWORK ->
-       RADIO -> STYLE) gets one blank line of separation above it;
-       NETWORK gets an extra one so the section break after the
-       CONNECTION identity rows reads clearly. */
-    #radio-title, #style-title {
+       RADIO -> STYLE) gets exactly ONE blank line of separation above
+       it -- no section receives special extra spacing. */
+    #radio-title, #style-title, #advanced-radio-title {
         margin-top: 1;
-    }
-
-    #advanced-radio-title {
-        margin-top: 2;
     }
 
     .identity-name-control {
@@ -3806,11 +3856,11 @@ class MeshtasticPassApp(App[None]):
     }
 
     .chat-entry.favorite-sender .chat-entry-author {
-        color: $snow_accent;
+        color: $snow_accent2;
     }
 
     Screen.theme-amber .chat-entry.favorite-sender .chat-entry-author {
-        color: $amber_accent;
+        color: $amber_accent2;
     }
 
     .chat-entry-separator, .chat-entry-delivery {
@@ -4000,6 +4050,13 @@ class MeshtasticPassApp(App[None]):
         self.current_dm_node_id: str | None = None
         self._dm_conversation_order: list[str] = []
         self._dm_list_highlighted_index = 0
+        # NEW DM: transient "create a DM by typing a node ID" state. While
+        # True, CHAT's DMS mode shows the temporary DM / NEW entry surface
+        # (header "DM / NEW", instruction text, and the composer repurposed
+        # as a node-ID field) instead of a real conversation. Never a
+        # persisted conversation: cleared the moment a valid ID opens a
+        # real DM, on ESC, or on any mode/tab leave. Zero RF.
+        self._new_dm_mode = False
         # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
         # tab -- it is a MODE inside CHAT, alongside "channel" (the
         # default). current_tab stays "chat" for both; only this and
@@ -4278,6 +4335,11 @@ class MeshtasticPassApp(App[None]):
                             yield VerticalScroll(id="dm-list")
                             with Vertical(id="dm-conversation"):
                                 yield Static(id="dm-header", markup=False)
+                                yield Static(
+                                    id="dm-new-instruction",
+                                    markup=False,
+                                    classes="dm-new-instruction",
+                                )
                                 yield ChatTranscript(id="dm-log")
                                 yield Static(id="dm-send-error")
                                 yield ChatMessageInput(
@@ -4310,6 +4372,10 @@ class MeshtasticPassApp(App[None]):
         self._terminal_cursor.hide()
         self._apply_color_theme(self.settings.color)
         self._update_tab_bar()
+        # The NEW DM instruction line is only visible during the transient
+        # node-ID entry surface (see _start_new_dm), never in a normal DM
+        # conversation or the DM list.
+        self.query_one("#dm-new-instruction", Static).display = False
         # UI SCALE/COLOR are local settings, independent of the radio
         # connection lifecycle -- collapsed here once at startup, unlike
         # the RADIO-section per-field rows _show_connection resets on
@@ -4450,6 +4516,21 @@ class MeshtasticPassApp(App[None]):
                 event.stop()
                 event.prevent_default()
             return
+        if (
+            event.key == "ctrl+d"
+            and self.current_tab == "chat"
+            and self._chat_mode == "dms"
+            and self.current_dm_node_id is not None
+        ):
+            # CTRL+D deletes the DM conversation currently being viewed.
+            # Handled here (before the Input branch below) so it works
+            # whether the composer or the transcript has focus. Zero RF,
+            # and never offered in NEW DM mode or the DM list (both have
+            # current_dm_node_id None). CTRL+D has no Textual/Input
+            # editing meaning, so there is no default to conflict with.
+            self._delete_current_dm()
+            event.stop()
+            return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
         if isinstance(self.focused, Input):
@@ -4460,7 +4541,10 @@ class MeshtasticPassApp(App[None]):
                 self._move_chat_focus(-1)
                 event.stop()
             elif self.focused.id == "dm-input" and event.key == "escape":
-                self.query_one("#dm-log", ChatTranscript).focus()
+                if self._new_dm_mode:
+                    self._cancel_new_dm()
+                else:
+                    self.query_one("#dm-log", ChatTranscript).focus()
                 event.stop()
             elif self.focused.id == "dm-input" and event.key == "up":
                 self._move_dm_focus(-1)
@@ -4602,6 +4686,14 @@ class MeshtasticPassApp(App[None]):
             return
 
         if self.current_tab == "chat" and self._chat_mode == "dms":
+            if self._new_dm_mode:
+                # NEW DM entry: only ESC (cancel) is handled here; typing
+                # and ENTER are owned by the composer's Input branch above
+                # (focus is on #dm-input) and dm_input_submitted.
+                if event.key == "escape":
+                    self._cancel_new_dm()
+                    event.stop()
+                return
             if self.current_dm_node_id is None:
                 # Conversation LIST mode: UP/DOWN move the highlight,
                 # ENTER opens the highlighted conversation. Any other
@@ -5019,6 +5111,8 @@ class MeshtasticPassApp(App[None]):
                 self._mark_new_messages_read()
             else:
                 self._capture_current_dm_state()
+            if self._new_dm_mode:
+                self._exit_new_dm_mode()
         if self.current_tab == "connection" and tab_id != "connection":
             # ADVANCED RADIO (spec E): an unfinished NEW NETWORK editor
             # is transient UI state -- leaving the view by ANY path
@@ -5110,6 +5204,11 @@ class MeshtasticPassApp(App[None]):
             self._mark_new_messages_read()
         else:
             self._capture_current_dm_state()
+        # Leaving DMS (or a transient NEW DM entry surface) clears the
+        # NEW DM state so it can never linger into channel CHAT or a
+        # later re-entry.
+        if self._new_dm_mode:
+            self._exit_new_dm_mode()
         self._chat_mode = mode
         self.query_one("#chat-content", ContentSwitcher).current = (
             "chat-channel" if mode == "channel" else "chat-dms"
@@ -8447,7 +8546,21 @@ class MeshtasticPassApp(App[None]):
             return f"DM / {node_id}"
         return f"DM / {display_name} / {node_id}"
 
+    def _refresh_dm_header(self, node_id: str) -> None:
+        """Re-resolve a DM conversation's best-known identity and re-render
+
+        its header. Zero RF (a cached NodeDB read, exactly like
+        _dm_identity). Used to pick up a node's newly-learned/renamed name
+        while its conversation is open; the conversation's canonical node
+        ID identity never changes.
+        """
+        long_name, short_name = self._dm_identity(node_id)
+        self.query_one("#dm-header", Static).update(
+            self._dm_header_text(node_id, long_name, short_name)
+        )
+
     def _close_dm_conversation(self) -> None:
+        self._exit_new_dm_mode()
         self._capture_current_dm_state()
         self.current_dm_node_id = None
         self.query_one("#dm-content", ContentSwitcher).current = "dm-list"
@@ -8455,6 +8568,95 @@ class MeshtasticPassApp(App[None]):
         list_container = self.query_one("#dm-list", VerticalScroll)
         list_container.focus()
         self._update_tab_bar()
+
+    def _exit_new_dm_mode(self) -> None:
+        """Clear the transient NEW DM entry surface (if it is showing).
+
+        Only ever touches presentation state: hides the instruction line
+        and resets the flag. Zero RF, creates no conversation. Safe to
+        call when NEW DM was never opened.
+        """
+        self._new_dm_mode = False
+        widgets = list(self.query("#dm-new-instruction"))
+        if widgets:
+            widgets[0].display = False
+
+    def _start_new_dm(self) -> None:
+        """Open the transient NEW DM node-ID entry surface (see DMModeSelector).
+
+        Shows "DM / NEW" in the header and the instruction text, empties
+        the transcript, and repurposes the normal DM composer as a node-ID
+        field. Zero RF: nothing is created or sent until a valid node ID
+        is actually entered.
+        """
+        self._switch_chat_mode("dms")
+        self._capture_current_dm_state()
+        self.current_dm_node_id = None
+        self._new_dm_mode = True
+        self.query_one("#dm-content", ContentSwitcher).current = "dm-conversation"
+        self.query_one("#dm-header", Static).update("DM / NEW")
+        self.query_one("#dm-new-instruction", Static).update(
+            "TYPE THE NODE ID AND HIT ENTER TO CREATE DM"
+        )
+        self.query_one("#dm-new-instruction", Static).display = True
+        transcript = self.query_one("#dm-log", ChatTranscript)
+        transcript.remove_children()
+        self._show_dm_send_error("")
+        dm_input = self.query_one("#dm-input", Input)
+        dm_input.value = ""
+        dm_input.cursor_position = 0
+        self._update_tab_bar()
+        if not dm_input.disabled:
+            self.call_after_refresh(dm_input.focus)
+
+    def _cancel_new_dm(self) -> None:
+        """ESC from the NEW DM surface: return to the DM list, zero RF."""
+        self._close_dm_conversation()
+
+    def _submit_new_dm_node_id(self, raw: str) -> None:
+        """ENTER in NEW DM mode: validate + canonicalize the node ID.
+
+        A valid ID opens (or creates) the DM conversation locally, keyed
+        by the canonical node ID -- never a display name, never a probe/
+        traceroute/NodeInfo request, never any RF. An invalid ID stays in
+        NEW DM mode and shows a compact ERROR, creating nothing.
+        """
+        canonical = canonical_entered_node_id(raw)
+        if canonical is None:
+            # Keep the typed text (the user may want to fix it) and just
+            # show a compact error while remaining in NEW DM mode. Clearing
+            # the field here would fire Input.Changed, whose own handler
+            # clears the error we are about to show.
+            self._show_dm_send_error("INVALID NODE ID")
+            self.query_one("#dm-input", Input).focus()
+            return
+        self._exit_new_dm_mode()
+        long_name, short_name = self._dm_identity(canonical)
+        self._open_dm_conversation(canonical, long_name=long_name, short_name=short_name)
+
+    def _delete_current_dm(self) -> None:
+        """CTRL+D: permanently delete the DM conversation currently viewed.
+
+        Only acts while CHAT is showing an actual DM conversation (a real
+        current_dm_node_id) -- never in NEW DM mode or the DM list. Deletes
+        the persisted history for that one conversation (keyed by canonical
+        node ID, never display name), drops its session-local state/unread,
+        and returns to the DM list. Zero RF; nothing is deleted from the
+        radio/NodeDB; channel history is untouched; a future message with
+        that node naturally recreates the conversation.
+        """
+        node_id = self.current_dm_node_id
+        if node_id is None:
+            return
+        if self.chat_store is not None:
+            try:
+                self.chat_store.delete_dm_conversation(node_id)
+            except ChatStoreError as error:
+                self._show_dm_send_error(str(error))
+                return
+        self._dm_states.pop(node_id, None)
+        self._close_dm_conversation()
+        self._recount_dm_unread()
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         targets: list[Static | ChatEntryWidget] = []
@@ -8527,6 +8729,9 @@ class MeshtasticPassApp(App[None]):
 
     @on(Input.Submitted, "#dm-input")
     def dm_input_submitted(self, event: Input.Submitted) -> None:
+        if self._new_dm_mode:
+            self._submit_new_dm_node_id(event.value)
+            return
         if self.current_dm_node_id is None or self._radio_state is not RadioState.ONLINE:
             return
         text = event.value
@@ -8588,6 +8793,11 @@ class MeshtasticPassApp(App[None]):
             transcript = self.query_one("#dm-log", ChatTranscript)
             transcript.mount(self._chat_entry_widget(entry))
             transcript.scroll_end(animate=False)
+            # A node whose identity was unknown when its DM was created
+            # (or was since renamed) updates its header presentation as
+            # soon as a real message from it arrives -- the conversation
+            # identity (canonical node ID) never changes, only the name.
+            self._refresh_dm_header(node_id)
         if (
             self.current_tab == "chat"
             and self._chat_mode == "dms"
@@ -8923,11 +9133,12 @@ class MeshtasticPassApp(App[None]):
             if allow_reply:
                 items.append(PopupItem("REPLY", "reply", actionable=True))
             if allow_dm and not metadata.is_unmessagable:
-                items.append(PopupItem("DM", "dm", actionable=True))
+                items.append(PopupItem("DIRECT MSG", "dm", actionable=True))
             favorite = self.settings.is_favorite(metadata.node_id)
             action = "unfavorite" if favorite else "favorite"
-            items.append(PopupItem(action.upper(), action, actionable=True))
-            # Preserve the existing FAVORITE/UNFAVORITE default highlight
+            label = "UNHIGHLIGHT" if favorite else "HIGHLIGHT"
+            items.append(PopupItem(label, action, actionable=True))
+            # Preserve the existing HIGHLIGHT/UNHIGHLIGHT default highlight
             # (the established Enter-Enter toggle gesture) -- REPLY is a
             # newly added item, reached with one extra arrow press, not
             # a change to what pressing Enter immediately does.

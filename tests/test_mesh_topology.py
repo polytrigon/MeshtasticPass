@@ -8782,7 +8782,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(app._user_menu)
             labels = [item.label for item in app._user_menu.items]
             self.assertIn("Old V3", labels)
-            self.assertIn("FAVORITE", labels)
+            self.assertIn("HIGHLIGHT", labels)
             self.assertFalse(app.settings.is_favorite("!aaaaaaaa"))
             await pilot.press("enter")
             await pilot.pause()

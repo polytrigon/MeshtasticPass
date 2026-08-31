@@ -796,7 +796,7 @@ class DmDropdownTests(ChatDmMentionAppTestsBase):
             # ("Alice"/"ALC") -- matching open_user_menu's own,
             # already-established precedence.
             self.assertEqual(
-                [item.label for item in selector.popup.items], ["Alice Trail / ALCE"]
+                [item.label for item in selector.popup.items], ["Alice Trail / ALCE", "NEW DM"]
             )
             self.assertEqual(transcript.scroll_y, scroll_before)
 
@@ -893,7 +893,7 @@ class DmDropdownTests(ChatDmMentionAppTestsBase):
             await pilot.pause()
             selector = app.query_one(DMModeSelector)
             self.assertTrue(selector.is_open)
-            self.assertEqual([item.label for item in selector.popup.items], ["NO DMS"])
+            self.assertEqual([item.label for item in selector.popup.items], ["NO DMS", "NEW DM"])
             await pilot.press("up", "down")
             await pilot.pause()
             await pilot.press("enter")
