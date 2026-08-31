@@ -46,6 +46,8 @@ from app import (
     ShortNameControl,
     MessageActionControl,
     MeshtasticPassApp,
+    NetworkSelector,
+    NewNetworkControl,
     RoleSelector,
     ScreenTimeoutSelector,
     ThinScrollBarRender,
@@ -1736,7 +1738,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test(size=(100, 45)) as pilot:
             await pilot.pause()
-            app.query_one(ColorSelector).focus()
+            # RADIO now follows the NETWORK section (CONNECTION ->
+            # NETWORK -> RADIO -> STYLE): its first dropdown is reached
+            # from the collapsed [ NEW PRESET ] row.
+            app.query_one(NewNetworkControl).focus()
             await pilot.press("down")
             self.assertIs(app.focused, app.query_one(RoleSelector))
             await pilot.press("down")
@@ -2872,8 +2877,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(editor.value, "SIM")
             await pilot.press("left", "right")
             self.assertIs(app.focused, control)
+            # SHORT NAME's next row is now the NETWORK section's PRESET
+            # selector (CONNECTION -> NETWORK -> RADIO -> STYLE order).
             await pilot.press("down")
-            self.assertIs(app.focused, font)
+            self.assertIs(app.focused, app.query_one(NetworkSelector))
             await pilot.press("up", "enter")
             self.assertTrue(control.editing)
             self.assertIs(app.focused, editor)
@@ -3079,6 +3086,11 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             font_selector = app.query_one(FontSizeSelector)
             color_selector = app.query_one(ColorSelector)
+            # STYLE sits at the bottom of the reordered page now, so
+            # the app lands on USB DEVICE at startup -- enter STYLE
+            # explicitly before exercising its own navigation.
+            font_selector.focus()
+            await pilot.pause()
             self.assertTrue(font_selector.has_focus)
             self.assertEqual(color_selector.color, "snow")
             self.assertTrue(app.screen.has_class("theme-snow"))
