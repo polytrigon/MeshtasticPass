@@ -8734,11 +8734,12 @@ class MeshtasticPassApp(App[None]):
             if allow_reply:
                 items.append(PopupItem("REPLY", "reply", actionable=True))
             if allow_dm and not metadata.is_unmessagable:
-                items.append(PopupItem("DM", "dm", actionable=True))
+                items.append(PopupItem("DIRECT MSG", "dm", actionable=True))
             favorite = self.settings.is_favorite(metadata.node_id)
             action = "unfavorite" if favorite else "favorite"
-            items.append(PopupItem(action.upper(), action, actionable=True))
-            # Preserve the existing FAVORITE/UNFAVORITE default highlight
+            label = "UNHIGHLIGHT" if favorite else "HIGHLIGHT"
+            items.append(PopupItem(label, action, actionable=True))
+            # Preserve the existing HIGHLIGHT/UNHIGHLIGHT default highlight
             # (the established Enter-Enter toggle gesture) -- REPLY is a
             # newly added item, reached with one extra arrow press, not
             # a change to what pressing Enter immediately does.

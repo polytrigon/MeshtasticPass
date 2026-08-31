@@ -149,7 +149,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             labels = [item.label for item in menu.items]
             self.assertEqual(
                 labels,
-                ["Alice Trail", "ALCE", "1 HOP AWAY", "REPLY", "DM", "FAVORITE"],
+                ["Alice Trail", "ALCE", "1 HOP AWAY", "REPLY", "DIRECT MSG", "HIGHLIGHT"],
             )
             self.assertEqual(
                 [item.actionable for item in menu.items],
@@ -293,7 +293,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             menu = app.query_one("#node-context-menu", ViewportMenu)
-            self.assertEqual(menu.items[-1].label, "UNFAVORITE")
+            self.assertEqual(menu.items[-1].label, "UNHIGHLIGHT")
             await pilot.press("enter")
             await pilot.pause()
             self.assertFalse(self.settings.is_favorite("!a11ce001"))
@@ -319,7 +319,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             labels = [item.label for item in app._user_menu.items]
-            self.assertEqual(labels, ["NOLN", "2 HOPS AWAY", "REPLY", "DM", "FAVORITE"])
+            self.assertEqual(labels, ["NOLN", "2 HOPS AWAY", "REPLY", "DIRECT MSG", "HIGHLIGHT"])
             await pilot.press("escape")
 
             missing_short_unknown_hops = replace(
@@ -335,7 +335,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             labels = [item.label for item in app._user_menu.items]
-            self.assertEqual(labels, ["No Short Name", "REPLY", "DM", "FAVORITE"])
+            self.assertEqual(labels, ["No Short Name", "REPLY", "DIRECT MSG", "HIGHLIGHT"])
 
     async def test_right_and_end_jump_newest_without_footer_hint(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
