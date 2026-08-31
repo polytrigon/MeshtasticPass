@@ -3704,17 +3704,17 @@ class MeshtasticPassApp(App[None]):
     .editor-actions {
         height: 1;
         /* CONNECTION_VALUE_COLUMN_INDENT (2 row-prefix + 12 label + 1)
-           minus each button's own margin-left:2 -- so [ SAVE ] lands in
+           minus each button's own margin-left:1 -- so [ SAVE ] lands in
            the same column the form controls' "[ ... ]" start at, and
-           [ CANCEL ] follows on the SAME row after a 2-cell gap. Shared
-           by NEW PRESET and NEW CHANNEL so both action rows align
-           identically. */
-        padding-left: 13;
+           [ CANCEL ] follows on the SAME row after exactly ONE cell gap:
+           [ SAVE ] [ CANCEL ]. Shared by NEW PRESET and NEW CHANNEL so both
+           action rows align identically. */
+        padding-left: 14;
     }
 
     .editor-actions .connection-action-row {
         width: auto;
-        margin-left: 2;
+        margin-left: 1;
     }
 
     .editor-hint {
@@ -3755,6 +3755,14 @@ class MeshtasticPassApp(App[None]):
 
     #send-error.older-message-notice {
         color: $snow_accent;
+    }
+
+    #send-error.setting-accent {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber #send-error.setting-accent {
+        color: $amber_accent;
     }
 
     Screen.theme-amber #send-error.older-message-notice {
@@ -9369,7 +9377,9 @@ class MeshtasticPassApp(App[None]):
         Reuses Textual's built-in clipboard mechanism (App.copy_to_clipboard,
         OSC 52) -- no new dependency. Returns True when a private-channel PSK
         was available and copied; the PSK is never printed/logged. A compact
-        confirmation uses the existing CHAT status row (#send-error).
+        ACCENT confirmation uses the existing CHAT status row (#send-error) with
+        the app's established timed-dismiss convention; a genuine clipboard
+        failure uses ERROR.
         """
         psk = self._channel_psk_metadata_text()
         if not psk:
@@ -9377,11 +9387,30 @@ class MeshtasticPassApp(App[None]):
         try:
             self.copy_to_clipboard(psk)
         except Exception:
+            self._show_send_error("PSK COPY FAILED")
             return False
-        send_error_widgets = list(self.query("#send-error"))
-        if send_error_widgets:
-            send_error_widgets[0].update("PSK COPIED")
+        self._show_psk_copy_status("PSK COPIED")
         return True
+
+    def _show_psk_copy_status(self, message: str) -> None:
+        """Show a compact ACCENT PSK-copy confirmation on the CHAT status row.
+
+        Reuses the existing timed-dismiss convention (_send_error_dismiss_timer
+        + _auto_dismiss_send_error, SEND_ERROR_AUTO_DISMISS_SECONDS) so the
+        confirmation clears itself without any focus/navigation change. The PSK
+        itself is never part of the message.
+        """
+        if self._send_error_dismiss_timer is not None:
+            self._send_error_dismiss_timer.stop()
+            self._send_error_dismiss_timer = None
+        self._send_error_message = message
+        widgets = list(self.query("#send-error"))
+        if widgets:
+            widgets[0].add_class("setting-accent")
+        self._send_error_dismiss_timer = self.set_timer(
+            SEND_ERROR_AUTO_DISMISS_SECONDS, self._auto_dismiss_send_error
+        )
+        self._render_chat_status()
 
     def _filter_hidden_channels(
         self, channels: tuple[ChannelInfo, ...]
@@ -10582,27 +10611,27 @@ class MeshtasticPassApp(App[None]):
             # branch already covers CHANNEL and DM identically.
             text = "CTRL+E emojis    ESC cancel    ENTER send"
         elif self.current_tab == "chat" and self._chat_mode == "channel":
-            text = "↑↓ navigate    C channel    D dms    ENTER action    F4 quit"
+            text = "C channel    D dms    F4 quit"
             # A configured private/configured (non-PRIMARY) channel offers
             # copy-PSK and CTRL+D (local list deletion). The public/default
             # PRIMARY channel offers neither.
             if self.current_channel_index > 0 and self._channel_psk_metadata_text():
                 text = (
-                    "↑↓ navigate    C channel    D dms    ENTER action    "
+                    "C channel    D dms    "
                     "CTRL+D delete    P copy psk    F4 quit"
                 )
             elif self.current_channel_index > 0:
                 text = (
-                    "↑↓ navigate    C channel    D dms    ENTER action    "
+                    "C channel    D dms    "
                     "CTRL+D delete    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
-            text = "↑↓ select    ENTER open    C channel    1-3 tabs    F4 quit"
+            text = "C channel    1-3 tabs    F4 quit"
         elif self.current_tab == "chat":
-            text = "↑↓ navigate    C channel    ENTER action    CTRL+D delete    ESC back    F4 quit"
+            text = "C channel    CTRL+D delete    ESC back    F4 quit"
         else:
             text = (
-                "↑↓←→ select    1-3 tabs    F4 quit"
+                "1-3 tabs    F4 quit"
                 if self.current_tab == "mesh"
                 else "1-3 switch tabs    F4 quit"
             )
@@ -10971,6 +11000,11 @@ class MeshtasticPassApp(App[None]):
 
     def _show_send_error(self, message: str) -> None:
         self._send_error_message = message
+        # A genuine error status always uses ERROR, never a leftover ACCENT
+        # copy-confirmation style.
+        widgets = list(self.query("#send-error"))
+        if widgets:
+            widgets[0].remove_class("setting-accent")
         # Replace, never accumulate, the auto-dismiss timer: any earlier
         # attempt's callback is stopped outright before a new one (if
         # any) is scheduled, so a stale timer can never later clear a
@@ -10987,6 +11021,11 @@ class MeshtasticPassApp(App[None]):
 
     def _auto_dismiss_send_error(self) -> None:
         self._send_error_dismiss_timer = None
+        # Restore the normal status: drop the ACCENT copy-confirmation class so
+        # the row returns to its default (empty/ERROR) state for the view.
+        widgets = list(self.query("#send-error"))
+        if widgets:
+            widgets[0].remove_class("setting-accent")
         self._show_send_error("")
 
     def _show_older_message_notice(

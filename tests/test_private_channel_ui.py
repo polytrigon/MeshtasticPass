@@ -1036,6 +1036,105 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertIn("CTRL+D delete", footer)
             self.assertIn("P copy psk", footer)
 
+    async def test_channel_footer_omits_arrow_and_enter_labels(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertNotIn("↑↓", footer)
+            self.assertNotIn("ENTER action", footer)
+            self.assertNotIn("ENTER open", footer)
+
+    async def test_mesh_and_dm_list_footers_omit_arrow_and_enter_labels(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("mesh")
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertNotIn("↑↓", footer)
+            # DM list footer
+            app.show_tab("chat")
+            await pilot.pause()
+            app._switch_chat_mode("dms")
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertNotIn("↑↓", footer)
+            self.assertNotIn("ENTER open", footer)
+
+
+class SaveCancelSpacingTests(PrivateChannelUiBase):
+    async def test_save_cancel_action_row_has_one_cell_gap(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._start_new_channel()
+            await pilot.pause()
+            save = app.query_one("#new-channel-save")
+            cancel = app.query_one("#new-channel-cancel")
+            self.assertEqual(
+                cancel.region.x - (save.region.x + save.region.width), 1
+            )
+
+
+class PskCopyConfirmationTests(PrivateChannelUiBase):
+    def _private(self, app):
+        import base64 as _b64
+        from radio_service import ChannelInfo
+
+        b64 = _b64.b64encode(bytes(range(16))).decode("ascii")
+        app._channels = (ChannelInfo(1, "SECRET"),)
+        app.current_channel_index = 1
+        app.radio.channel_psk_text = lambda index: b64
+        return b64
+
+    async def test_psk_copy_success_uses_accent_and_dismisses(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            b64 = self._private(app)
+            copied = []
+            app.copy_to_clipboard = lambda text: copied.append(text)
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(copied, [b64])
+            w = app.query_one("#send-error")
+            self.assertTrue(w.has_class("setting-accent"))
+            self.assertEqual(str(w.render()), "PSK COPIED")
+            # Simulate the 10s auto-dismiss timer firing.
+            app._auto_dismiss_send_error()
+            await pilot.pause()
+            self.assertFalse(w.has_class("setting-accent"))
+            self.assertEqual(str(w.render()), "")
+
+    async def test_psk_copy_failure_uses_error(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self._private(app)
+            app.copy_to_clipboard = lambda text: (_ for _ in ()).throw(
+                OSError("clipboard unavailable")
+            )
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            w = app.query_one("#send-error")
+            self.assertEqual(str(w.render()), "PSK COPY FAILED")
+            self.assertFalse(w.has_class("setting-accent"))
+
 
 if __name__ == "__main__":
     unittest.main()
