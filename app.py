@@ -4523,46 +4523,80 @@ class MeshtasticPassApp(App[None]):
                     yield DMModeSelector(0)
                 with ContentSwitcher(initial="chat-channel", id="chat-content"):
                     with Vertical(id="chat-channel"):
-                        yield ChatTranscript(id="chat-log")
-                        yield Static(id="chat-new-below")
-                        yield Static(id="send-error")
-                        with Vertical(id="new-channel-editor", classes="new-channel-editor"):
-                            yield Static("NEW CHANNEL", classes="new-channel-title", markup=False)
-                            yield Static("CHANNEL NAME", classes="new-channel-label", markup=False)
-                            yield Input(
-                                id="new-channel-name",
-                                placeholder="channel name",
-                                select_on_focus=False,
-                            )
-                            yield Static("KEY", classes="new-channel-label", markup=False)
-                            yield Input(
-                                id="new-channel-key",
-                                placeholder="key",
-                                select_on_focus=False,
-                            )
-                            yield Static(
-                                "LEAVE BLANK TO CREATE CHANNEL",
-                                classes="new-channel-hint",
-                                markup=False,
-                            )
-                            yield Static(
-                                "NOT YET APPLIED TO RADIO",
-                                id="new-channel-pending",
-                                classes="new-channel-hint",
-                                markup=False,
-                            )
-                            yield Static(id="new-channel-error", markup=False)
-                            with Horizontal(
-                                id="new-channel-actions", classes="new-channel-actions"
+                        with ContentSwitcher(
+                            initial="chat-conversation", id="chat-channel-content"
+                        ):
+                            with Vertical(id="chat-conversation"):
+                                yield Static(id="new-channel-pending", markup=False)
+                                yield ChatTranscript(id="chat-log")
+                                yield Static(id="chat-new-below")
+                                yield Static(id="send-error")
+                                yield ChatMessageInput(
+                                    placeholder="> message",
+                                    id="chat-input",
+                                    select_on_focus=False,
+                                )
+                            with Vertical(
+                                id="new-channel-editor", classes="new-channel-editor"
                             ):
-                                yield NewChannelCancel()
-                                yield NewChannelSave()
-                                yield NewChannelApply()
-                        yield ChatMessageInput(
-                            placeholder="> message",
-                            id="chat-input",
-                            select_on_focus=False,
-                        )
+                                yield Static(
+                                    "NEW CHANNEL",
+                                    classes="page-title",
+                                    markup=False,
+                                )
+                                with Horizontal(
+                                    classes="connection-action-row"
+                                ):
+                                    yield Static(
+                                        " ",
+                                        classes="connection-selection-gutter",
+                                        markup=False,
+                                    )
+                                    yield Static(
+                                        "CHANNEL NAME",
+                                        classes="connection-label",
+                                        markup=False,
+                                    )
+                                    yield Static(
+                                        "[ ", classes="identity-bracket", markup=False
+                                    )
+                                    yield Input(id="new-channel-name")
+                                    yield Static(
+                                        " ]", classes="identity-bracket", markup=False
+                                    )
+                                with Horizontal(
+                                    classes="connection-action-row"
+                                ):
+                                    yield Static(
+                                        " ",
+                                        classes="connection-selection-gutter",
+                                        markup=False,
+                                    )
+                                    yield Static(
+                                        "KEY",
+                                        classes="connection-label",
+                                        markup=False,
+                                    )
+                                    yield Static(
+                                        "[ ", classes="identity-bracket", markup=False
+                                    )
+                                    yield Input(id="new-channel-key")
+                                    yield Static(
+                                        " ]", classes="identity-bracket", markup=False
+                                    )
+                                yield Static(
+                                    "LEAVE BLANK TO CREATE CHANNEL",
+                                    classes="new-channel-hint",
+                                    markup=False,
+                                )
+                                yield Static(id="new-channel-error", markup=False)
+                                with Horizontal(
+                                    id="new-channel-actions",
+                                    classes="connection-action-row",
+                                ):
+                                    yield NewChannelCancel()
+                                    yield NewChannelSave()
+                                    yield NewChannelApply()
                     with Vertical(id="chat-dms"):
                         yield Static(
                             id="dm-connection-status",
@@ -9059,41 +9093,29 @@ class MeshtasticPassApp(App[None]):
         writes. NAME/KEY Input values are only ever set here on open/cancel
         (never cleared on validation error, so the user's entries survive).
 
-        When a pending config exists (SAVE succeeded), the editor collapses
-        to a compact "NOT YET APPLIED TO RADIO + PSK" strip -- clearly not a
-        radio-configured channel, never added to the configured-channel
-        selector, never given CHAT history.
+        When a pending config exists (SAVE succeeded), the editor closes and
+        the "NOT YET APPLIED TO RADIO + PSK" strip shows in the normal CHAT
+        view -- clearly not a radio-configured channel, never added to the
+        configured-channel selector, never given CHAT history.
         """
-        editor_widgets = list(self.query("#new-channel-editor"))
-        if not editor_widgets:
-            return
-        editor = editor_widgets[0]
-        editor.display = self._new_channel_editor_open
+        switcher_widgets = list(self.query("#chat-channel-content"))
+        if switcher_widgets:
+            switcher_widgets[0].current = (
+                "new-channel-editor"
+                if self._new_channel_editor_open
+                else "chat-conversation"
+            )
 
-        name_inputs = list(self.query("#new-channel-name"))
-        key_inputs = list(self.query("#new-channel-key"))
         pending = self._pending_channel
-        if pending is not None:
-            # Successful local SAVE: show the pending strip, not the fields.
-            if name_inputs:
-                name_inputs[0].display = False
-            if key_inputs:
-                key_inputs[0].display = False
-            pending_widgets = list(self.query("#new-channel-pending"))
-            if pending_widgets:
+        pending_widgets = list(self.query("#new-channel-pending"))
+        if pending_widgets:
+            pending_widgets[0].display = pending is not None
+            if pending is not None:
                 pending_widgets[0].update(
-                    "NOT YET APPLIED TO RADIO\n"
-                    f"PSK  {pending.psk_base64}"
+                    "NOT YET APPLIED TO RADIO\nPSK  " + pending.psk_base64
                 )
-                pending_widgets[0].display = True
-        else:
-            if name_inputs:
-                name_inputs[0].display = True
-            if key_inputs:
-                key_inputs[0].display = True
-            pending_widgets = list(self.query("#new-channel-pending"))
-            if pending_widgets:
-                pending_widgets[0].display = False
+            else:
+                pending_widgets[0].update("")
 
         error_widgets = list(self.query("#new-channel-error"))
         if error_widgets:

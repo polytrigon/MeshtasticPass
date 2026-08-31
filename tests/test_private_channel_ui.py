@@ -284,6 +284,29 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             self.assertEqual(app.query_one("#new-channel-name").value, "Society")
             self.assertEqual(radio.sent_texts, [])
 
+    async def test_editor_is_dedicated_blank_view_hiding_transcript_and_composer(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            switcher = app.query_one("#chat-channel-content")
+            self.assertEqual(switcher.current, "new-channel-editor")
+            # The conversation view (transcript/composer/marker) is hidden.
+            self.assertFalse(app.query_one("#chat-conversation").display)
+
+    async def test_cancel_restores_normal_chat_view(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            await pilot.press("escape")
+            await pilot.pause()
+            switcher = app.query_one("#chat-channel-content")
+            self.assertEqual(switcher.current, "chat-conversation")
+            self.assertTrue(app.query_one("#chat-conversation").display)
+
 
 class ConfiguredPskMetadataTests(PrivateChannelUiBase):
     def _radio_with_channels(self, psk: bytes) -> "object":
