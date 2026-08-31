@@ -1,4 +1,4 @@
-"""Meshtastic private-channel PSK semantics and stable channel identity.
+"""Meshtastic private-channel PSK semantics.
 
 Pure logic only: no SDK, no radio, no I/O. Encodes the actual Meshtastic
 PSK model this app must follow (see meshtastic.util.fromPSK/genPSK256 and
@@ -11,17 +11,21 @@ radio_service.psk_matches_request):
   PSK") are NOT private-channel keys -- they are how Meshtastic marks the
   public/default PSKs, so they are rejected here for a private channel
   rather than silently treated as a real secret.
-- A private channel's STABLE identity (history isolation, never keyed by
-  display name alone) is its cryptographic key: two peers using the same
-  PSK share the same logical private channel regardless of the differing
-  local display names Meshtastic protocol semantics permit. Keying by
-  sha256(psk) keeps that true while staying opaque and length-stable.
+
+CHANNEL IDENTITY IS DELIBERATELY NOT DEFINED HERE. MeshtasticPass's channel
+identity (for CHAT history isolation) is radio_service.RadioService.
+_channel_stable_key, which follows the actual Meshtastic protocol hierarchy:
+Channel.settings.id (globally-unique ID) -> generate_channel_hash(name, psk)
+(the on-air channel number the radio actually uses) -> resolved name. A
+sha256(psk) key is a persistence convenience at best and is NOT the protocol
+identity; deriving it here would conflict with that existing semantics, so
+it is intentionally absent. wire the editor/model against the radio_service
+identity, never a PSK-only hash.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import os
 
 
@@ -56,19 +60,3 @@ def normalize_private_psk(value: str) -> tuple[str, bytes] | None:
         return None
     canonical = base64.b64encode(raw).decode("ascii")
     return canonical, raw
-
-
-def channel_stable_key(raw_psk: bytes, display_name: str) -> str:
-    """A stable private-channel identity independent of slot index and name.
-
-    Derived from the cryptographic PSK itself (sha256), so two peers using
-    the same key join the same logical channel even with different local
-    display names -- the ordering Meshtastic protocol semantics permit.
-    Only if no key bytes are available (should not happen for a genuinely
-    private channel) does it fall back to a name-derived key, which is
-    strictly a display-name identity and not a cryptographic guarantee.
-    """
-    if raw_psk:
-        return "psk:" + hashlib.sha256(raw_psk).hexdigest()
-    normalized_name = (display_name or "").strip().lower()
-    return "name:" + normalized_name

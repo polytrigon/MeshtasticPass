@@ -8,11 +8,9 @@ identity the private-channel feature relies on.
 from __future__ import annotations
 
 import base64
-import hashlib
 import unittest
 
 from channel_psk import (
-    channel_stable_key,
     generate_private_psk,
     normalize_private_psk,
 )
@@ -76,31 +74,6 @@ class NormalizePrivatePskTests(unittest.TestCase):
         self.assertIsNotNone(normalize_private_psk(_b64(raw)))
         # A double-padded / malformed form must fail.
         self.assertIsNone(normalize_private_psk(_b64(raw) + "=="))
-
-
-class ChannelStableKeyTests(unittest.TestCase):
-    def test_same_psk_same_key_regardless_of_display_name(self) -> None:
-        raw = bytes(range(16))
-        self.assertEqual(
-            channel_stable_key(raw, "Secret Society"),
-            channel_stable_key(raw, "Totally Different Name"),
-        )
-
-    def test_different_psk_different_key(self) -> None:
-        self.assertNotEqual(
-            channel_stable_key(bytes(range(16)), "A"),
-            channel_stable_key(bytes(range(16, 32)), "A"),
-        )
-
-    def test_key_is_the_psk_hash(self) -> None:
-        raw = bytes(range(16))
-        self.assertEqual(
-            channel_stable_key(raw, "x"),
-            "psk:" + hashlib.sha256(raw).hexdigest(),
-        )
-
-    def test_empty_psk_falls_back_to_normalized_name(self) -> None:
-        self.assertEqual(channel_stable_key(b"", "  ABC "), "name:abc")
 
 
 if __name__ == "__main__":
