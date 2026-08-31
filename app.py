@@ -4217,8 +4217,8 @@ class MeshtasticPassApp(App[None]):
         with ContentSwitcher(initial="connection", id="content"):
             with ConnectionPage(id="connection", classes="tab-page"):
                 yield Static("CONNECTION", id="connection-title", classes="page-title")
-                yield Static(id="connection-status")
                 yield DeviceSelector(self.settings.device_path, devices)
+                yield Static(id="connection-status")
                 yield Static(id="connection-details")
                 yield Static(id="connection-error")
                 yield LongNameControl()
