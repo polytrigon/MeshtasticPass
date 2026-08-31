@@ -3303,11 +3303,16 @@ class MeshtasticPassApp(App[None]):
         overflow-x: hidden;
     }
 
-    /* Every section heading after the first (CONNECTION -> NETWORK ->
-       RADIO -> STYLE) gets exactly ONE blank line of separation above
-       it -- no section receives special extra spacing. */
-    #radio-title, #style-title, #advanced-radio-title {
+    /* CONNECTION -> NETWORK keeps exactly one blank line of separation
+       above it; RADIO and STYLE follow directly with no extra blank line
+       (the NETWORK/RADIO and RADIO/STYLE boundaries read as tighter,
+       related groups). Focus order is unaffected. */
+    #advanced-radio-title {
         margin-top: 1;
+    }
+
+    #radio-title, #style-title {
+        margin-top: 0;
     }
 
     .identity-name-control {
@@ -8641,13 +8646,19 @@ class MeshtasticPassApp(App[None]):
         current_dm_node_id) -- never in NEW DM mode or the DM list. Deletes
         the persisted history for that one conversation (keyed by canonical
         node ID, never display name), drops its session-local state/unread,
-        and returns to the DM list. Zero RF; nothing is deleted from the
-        radio/NodeDB; channel history is untouched; a future message with
-        that node naturally recreates the conversation.
+        then opens the NEXT remaining DM in the selector's order (wrapping)
+        so the user is never stranded; if none remain it returns to CHAT's
+        default DM state (the conversation list). Never opens NEW DM. Zero
+        RF; nothing is deleted from the radio/NodeDB; channel history is
+        untouched; a future message with that node naturally recreates the
+        conversation.
         """
         node_id = self.current_dm_node_id
         if node_id is None:
             return
+        # Capture the selector order BEFORE deletion so "next" is relative
+        # to the deleted conversation's own position in that ordering.
+        prior_order = list(self._dm_conversation_order)
         if self.chat_store is not None:
             try:
                 self.chat_store.delete_dm_conversation(node_id)
@@ -8655,8 +8666,52 @@ class MeshtasticPassApp(App[None]):
                 self._show_dm_send_error(str(error))
                 return
         self._dm_states.pop(node_id, None)
-        self._close_dm_conversation()
+        self.current_dm_node_id = None
+        self._exit_new_dm_mode()
         self._recount_dm_unread()
+
+        remaining = (
+            [
+                conversation_id
+                for conversation_id, _time in self.chat_store.list_dm_conversations()
+            ]
+            if self.chat_store is not None
+            else []
+        )
+        if remaining:
+            next_id = self._next_dm_after(prior_order, node_id, remaining)
+            long_name, short_name = self._dm_identity(next_id)
+            self._open_dm_conversation(
+                next_id, long_name=long_name, short_name=short_name
+            )
+        else:
+            # No DMs left: CHAT's default DM state (the conversation list).
+            self.query_one("#dm-content", ContentSwitcher).current = "dm-list"
+            self._refresh_dm_list()
+            self.query_one("#dm-list", VerticalScroll).focus()
+        self._update_tab_bar()
+
+    @staticmethod
+    def _next_dm_after(
+        prior_order: list[str], deleted_id: str, remaining: list[str]
+    ) -> str:
+        """Pick the DM immediately after `deleted_id` in the selector order.
+
+        Walks the PRE-delete order (most-recent-activity first) starting one
+        position past the deleted conversation and wrapping, choosing the
+        first ID still present in `remaining`. Falls back to the first
+        remaining conversation when `prior_order` is stale or no longer
+        references the deleted ID.
+        """
+        if not prior_order or deleted_id not in prior_order:
+            return remaining[0]
+        index = prior_order.index(deleted_id)
+        count = len(prior_order)
+        for offset in range(1, count + 1):
+            candidate = prior_order[(index + offset) % count]
+            if candidate in remaining:
+                return candidate
+        return remaining[0]
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         targets: list[Static | ChatEntryWidget] = []
@@ -9289,14 +9344,14 @@ class MeshtasticPassApp(App[None]):
         that method's own docstring for why it -- not the App's
         on_key -- has to be the one to do this).
         """
-        chat_input = self.query_one("#chat-input", Input)
+        composer = self._active_chat_input()
         picker = EmojiPicker()
         self._emoji_picker = picker
         self.screen.mount(picker)
         palette = THEME_PALETTES[self._current_theme]
         picker.set_palette(palette.base, palette.accent)
         placement = calculate_popup_placement(
-            chat_input.region,
+            composer.region,
             self.screen.region,
             emoji_picker_total_width(),
             EMOJI_PICKER_HEIGHT,
@@ -9317,14 +9372,28 @@ class MeshtasticPassApp(App[None]):
         Relies on Textual's own Input.cursor_position/value indexing
         rather than reimplementing cursor math (see item 25).
         """
-        chat_input = self.query_one("#chat-input", Input)
-        draft = chat_input.value
-        cursor = chat_input.cursor_position
+        composer = self._active_chat_input()
+        draft = composer.value
+        cursor = composer.cursor_position
         new_value = draft[:cursor] + emoji + draft[cursor:]
         new_cursor = cursor + len(emoji)
-        chat_input.value = new_value
-        chat_input.focus()
-        chat_input.cursor_position = new_cursor
+        composer.value = new_value
+        composer.focus()
+        composer.cursor_position = new_cursor
+
+    def _active_chat_input(self) -> Input:
+        """The Input widget currently acting as the chat/DM composer.
+
+        CHANNEL CHAT uses #chat-input; a DM conversation (or the transient
+        NEW DM entry surface, which also types into #dm-input) uses
+        #dm-input. Choosing the WRONG one is exactly the bug that made the
+        emoji menu opened from a DM position at / edit the channel CHAT
+        composer instead -- the active conversation's identity is derived
+        here from the current _chat_mode, never hardcoded.
+        """
+        if self._chat_mode == "dms":
+            return self.query_one("#dm-input", Input)
+        return self.query_one("#chat-input", Input)
 
     def _clear_indicator_if_at_bottom(self) -> None:
         if self._is_near_chat_bottom() and self.transcript_new_count:
@@ -9763,7 +9832,7 @@ class MeshtasticPassApp(App[None]):
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
             text = "↑↓ select    ENTER open    C channel    1-3 tabs    F4 quit"
         elif self.current_tab == "chat":
-            text = "↑↓ navigate    C channel    ENTER action    ESC back    F4 quit"
+            text = "↑↓ navigate    C channel    ENTER action    CTRL+D delete    ESC back    F4 quit"
         else:
             text = (
                 "↑↓←→ select    1-3 tabs    F4 quit"

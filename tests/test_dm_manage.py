@@ -346,17 +346,15 @@ class DeleteDmTests(DmManageAppTestsBase):
 
 
 class ConnectionSectionSpacingTests(DmManageAppTestsBase):
-    async def test_every_section_has_exactly_one_blank_line_above_it(self) -> None:
+    async def test_section_spacing(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(100, 40)) as pilot:
             await pilot.pause()
-            for title_id in ("advanced-radio-title", "radio-title", "style-title"):
-                title = app.query_one(f"#{title_id}")
-                self.assertEqual(
-                    title.styles.margin.top,
-                    1,
-                    f"{title_id} must have exactly one blank line of separation",
-                )
+            # NETWORK keeps exactly one blank line above it; RADIO and
+            # STYLE follow directly with no extra blank line.
+            self.assertEqual(app.query_one("#advanced-radio-title").styles.margin.top, 1)
+            self.assertEqual(app.query_one("#radio-title").styles.margin.top, 0)
+            self.assertEqual(app.query_one("#style-title").styles.margin.top, 0)
 
 
 class MeshHighlightLabelTests(DmManageAppTestsBase):
@@ -384,6 +382,173 @@ class MeshHighlightLabelTests(DmManageAppTestsBase):
                 label.render().spans[0].style.foreground,
                 Color.parse(THEME_PALETTES[app._current_theme].accent2),
             )
+
+
+class DmFooterTests(DmManageAppTestsBase):
+    async def test_dm_conversation_footer_offers_ctrl_d_delete(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app.open_dm("!a11ce001", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            # Focus the transcript (not the composer) so the DM-conversation
+            # footer (not the composer footer) is the one being rendered.
+            app.query_one("#dm-log").focus()
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertIn("CTRL+D delete", footer)
+
+    async def test_channel_footer_never_offers_ctrl_d_delete(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertNotIn("CTRL+D delete", footer)
+
+
+class DeleteDmNextTest(DmManageAppTestsBase):
+    def _seed(self, node_id: str, text: str, received_at: float) -> None:
+        self.store.add_incoming(
+            packet_id=hash(node_id) & 0xFFFF,
+            node_id=node_id,
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text=text,
+            radio_rx_at=received_at,
+            received_at=received_at,
+            dm_node_id=node_id,
+        )
+
+    async def test_delete_selects_next_dm_in_selector_order(self) -> None:
+        # Most recent activity first: !33333333, then !22222222, then !11111111.
+        self._seed("!11111111", "oldest", 100.0)
+        self._seed("!22222222", "middle", 200.0)
+        self._seed("!33333333", "newest", 300.0)
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app.open_dm("!33333333", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            self.assertEqual(app.current_dm_node_id, "!33333333")
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            # Deleted the most-recent; next remaining in selector order.
+            self.assertEqual(app.current_dm_node_id, "!22222222")
+            self.assertEqual(
+                [nid for nid, _t in self.store.list_dm_conversations()],
+                ["!22222222", "!11111111"],
+            )
+
+    async def test_delete_wraps_to_first_when_deleting_last_in_order(self) -> None:
+        self._seed("!11111111", "oldest", 100.0)
+        self._seed("!22222222", "middle", 200.0)
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            # Open the LEAST-recent (last in selector order).
+            app.open_dm("!11111111", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            self.assertEqual(app.current_dm_node_id, "!11111111")
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            # Wraps to the next remaining DM (the only other one).
+            self.assertEqual(app.current_dm_node_id, "!22222222")
+
+    async def test_delete_final_dm_returns_to_default_dm_state_and_never_new_dm(
+        self,
+    ) -> None:
+        self._seed("!a11ce001", "solo", 100.0)
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app.open_dm("!a11ce001", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            self.assertIsNone(app.current_dm_node_id)
+            self.assertFalse(app._new_dm_mode)
+            self.assertEqual(self.store.list_dm_conversations(), [])
+            # Conversation list is shown (default DM state).
+            self.assertEqual(
+                app.query_one("#dm-content").current, "dm-list"
+            )
+
+
+class EmojiMenuContextTests(DmManageAppTestsBase):
+    async def test_emoji_from_dm_edits_dm_not_channel(self) -> None:
+        self.store.add_incoming(
+            packet_id=1,
+            node_id="!a11ce001",
+            sender_name="Alice",
+            sender_short_name="ALC",
+            channel_index=0,
+            text="hi",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            dm_node_id="!a11ce001",
+        )
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app.open_dm("!a11ce001", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            dm_input = app.query_one("#dm-input")
+            dm_input.focus()
+            await pilot.pause()
+            dm_input.value = "hi ;)"
+            await pilot.pause()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertIsNotNone(app._emoji_picker)
+            # Selecting the highlighted emoji inserts into the DM composer.
+            await pilot.press("enter")
+            await pilot.pause()
+            # Selecting the highlighted emoji inserts into the DM composer at
+            # the cursor (end): "hi ;)" + the first emoji choice, "😀".
+            self.assertEqual(dm_input.value, "hi ;)😀")
+            # The channel composer must NOT have been edited.
+            self.assertEqual(app.query_one("#chat-input").value, "")
+
+    async def test_channel_emoji_still_targets_channel(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            chat_input = app.query_one("#chat-input")
+            chat_input.focus()
+            await pilot.pause()
+            chat_input.value = "hello"
+            await pilot.pause()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertIsNotNone(app._emoji_picker)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertNotEqual(chat_input.value, "hello")
+            dm_input = app.query_one("#dm-input")
+            self.assertEqual(dm_input.value, "")
 
 
 if __name__ == "__main__":
