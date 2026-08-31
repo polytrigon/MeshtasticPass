@@ -324,5 +324,187 @@ class ConfiguredPskMetadataTests(PrivateChannelUiBase):
             self.assertEqual(app._channel_psk_metadata_text(), "")
 
 
+class PrivateChannelApplyTests(unittest.TestCase):
+    """Fake-SDK boundary tests for RadioService.apply_private_channel.
+
+    Proves find-slot → write only the intended channel → readback → verify,
+    and that failures never promote. No live hardware.
+    """
+
+    def _fake_radio(self, *, roles, name="", psk=b""):
+        from types import SimpleNamespace
+
+        from meshtastic.protobuf import channel_pb2
+        from radio_service import RadioService
+
+        channels = []
+        for i, role in enumerate(roles):
+            ch = channel_pb2.Channel()
+            ch.index = i
+            ch.role = role
+            if role != channel_pb2.Channel.Role.DISABLED:
+                ch.settings.name = name
+                ch.settings.psk = psk
+            channels.append(ch)
+        written = {}
+
+        class Ack:
+            receivedNak = False
+
+        class LocalNode:
+            def __init__(self):
+                self.channels = channels
+                self._ack = Ack()
+
+            def onAckNak(self, _packet):
+                pass
+
+            def _sendAdmin(self, message, onResponse=None):
+                if message.HasField("set_channel"):
+                    written["channel"] = message.set_channel
+                    onResponse({"decoded": {}})
+                elif message.get_channel_request:
+                    slot = message.get_channel_request - 1
+                    ch = channel_pb2.Channel()
+                    ch.index = slot
+                    ch.settings.name = written["channel"].settings.name
+                    ch.settings.psk = written["channel"].settings.psk
+                    holder = SimpleNamespace(
+                        HasField=lambda _f: True,
+                        get_channel_response=ch,
+                    )
+                    onResponse(
+                        {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": holder}}}
+                    )
+
+        service = RadioService()
+        service._interface = SimpleNamespace(
+            localNode=LocalNode(),
+            _acknowledgment=Ack(),
+        )
+        # connection_lost Event must not be set.
+        service._connection_lost = __import__("threading").Event()
+        return service, written
+
+    def test_not_connected(self) -> None:
+        from radio_service import RadioService
+
+        service = RadioService()
+        result = service.apply_private_channel(name="Secret", psk=b"\x01" * 16)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "not_connected")
+
+    def test_no_available_slot_is_non_destructive(self) -> None:
+        from meshtastic.protobuf import channel_pb2
+
+        service, written = self._fake_radio(
+            roles=[channel_pb2.Channel.Role.PRIMARY] * 8
+        )
+        result = service.apply_private_channel(name="Secret", psk=b"\x01" * 16)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "no_channel_slot")
+        self.assertEqual(written, {})
+
+    def test_writes_first_disabled_slot_then_verifies_and_promotes(self) -> None:
+        from meshtastic.protobuf import channel_pb2
+
+        service, written = self._fake_radio(
+            roles=[
+                channel_pb2.Channel.Role.PRIMARY,
+                channel_pb2.Channel.Role.DISABLED,
+            ]
+        )
+        psk = bytes(range(16))
+        result = service.apply_private_channel(name="Secret Society", psk=psk)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.slot, 1)
+        # Only the intended channel was written (slot 1), name/psk exact.
+        wrote = written["channel"]
+        self.assertEqual(wrote.index, 1)
+        self.assertEqual(wrote.settings.name, "Secret Society")
+        self.assertEqual(bytes(wrote.settings.psk), psk)
+
+    def test_mismatch_does_not_promote(self) -> None:
+        from meshtastic.protobuf import channel_pb2
+
+        service, _ = self._fake_radio(
+            roles=[channel_pb2.Channel.Role.PRIMARY, channel_pb2.Channel.Role.DISABLED]
+        )
+        service._interface.localNode._sendAdmin = lambda message, onResponse=None: None
+        result = service.apply_private_channel(
+            name="Secret Society", psk=bytes(range(16)), timeout=0.01
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "timeout")
+
+
+class ApplyPendingChannelTests(PrivateChannelUiBase):
+    def _seed_pending(self, app) -> "PendingChannelConfig":
+        app._start_new_channel()
+        return app._save_new_channel("Secret Society", "")
+
+    async def test_apply_success_promotes_to_real_channel(self) -> None:
+        from radio_service import ChannelInfo, PrivateChannelApplyResult
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            pending = self._seed_pending(app)
+            self.assertIsNotNone(pending)
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                True, 2, ""
+            )
+            app.radio.get_config_channels = lambda: (
+                ChannelInfo(0, "LongFast"),
+                ChannelInfo(2, "Secret Society"),
+            )
+            app._activate_new_channel_apply()
+            for _ in range(20):
+                await pilot.pause()
+                if app._pending_channel is None:
+                    break
+            # Pending cleared; promoted real channel in the selector; CHAT on it.
+            self.assertIsNone(app._pending_channel)
+            self.assertIn("Secret Society", [c.name for c in app._channels])
+            self.assertEqual(app.current_channel_index, 2)
+
+    async def test_apply_failure_preserves_pending_and_shows_error(self) -> None:
+        from radio_service import PrivateChannelApplyResult
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            pending = self._seed_pending(app)
+            self.assertIsNotNone(pending)
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                False, 1, "timeout"
+            )
+            app._activate_new_channel_apply()
+            for _ in range(20):
+                await pilot.pause()
+                if not app._pending_apply_active:
+                    break
+            # Pending preserved; no promotion; compact error shown.
+            self.assertIsNotNone(app._pending_channel)
+            self.assertEqual(app._new_channel_error, "timeout")
+            self.assertNotIn("Secret Society", [c.name for c in app._channels])
+
+    async def test_apply_offline_is_zero_write(self) -> None:
+        from radio_service import RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self._seed_pending(app)
+            app._radio_state = RadioState.OFFLINE
+            app.radio.apply_private_channel = lambda name, psk: (_ for _ in ()).throw(
+                AssertionError("radio apply must not run while offline")
+            )
+            app._activate_new_channel_apply()
+            await pilot.pause()
+            self.assertEqual(app._new_channel_error, "RADIO NOT ONLINE")
+            self.assertIsNotNone(app._pending_channel)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,7 @@ from radio_service import (
     ChannelInfo,
     ClockSyncResult,
     ConfigWriteResult,
+    PrivateChannelApplyResult,
     DeliveryState,
     DISPLAY_UNITS_IMPERIAL,
     DISPLAY_UNITS_METRIC,
@@ -898,6 +899,36 @@ class NewNetworkControl(Static):
             event.stop()
 
 
+class NewChannelApply(Static):
+    """[ APPLY ] -- write the validated pending private channel to the radio.
+
+    Asynchronous, radio-touching (see MeshtasticPassApp._apply_pending_channel):
+    writes exactly one logical channel slot, then readbacks/verifies before any
+    promotion. Never claims success before a matching readback.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ APPLY ]",
+            id="new-channel-apply",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._cancel_new_channel()
+            event.stop()
+
+
 class NewChannelSave(Static):
     """[ SAVE ] -- validate the CHAT NEW CHANNEL editor (see
     MeshtasticPassApp._save_new_channel). Production of a pending draft only,
@@ -1408,6 +1439,22 @@ class SendSubmitted(Message):
         self.entry = entry
         self.sent = sent
         self.generation = generation
+
+
+class PrivateChannelApplyResultMessage(Message):
+    """A verified (or failed) private-channel apply, posted from the worker."""
+
+    def __init__(self, result: object, pending: object) -> None:
+        super().__init__()
+        self.result = result
+        self.pending = pending
+
+
+class PrivateChannelApplyFailed(Message):
+    def __init__(self, detail: str, pending: object) -> None:
+        super().__init__()
+        self.detail = detail
+        self.pending = pending
 
 
 class SendFailed(Message):
@@ -4214,6 +4261,8 @@ class MeshtasticPassApp(App[None]):
         self._pending_channel: PendingChannelConfig | None = None
         self._new_channel_error = ""
         self._new_channel_editor_open = False
+        # Guards against duplicate APPLY writes while an async apply is live.
+        self._pending_apply_active = False
         # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
         # tab -- it is a MODE inside CHAT, alongside "channel" (the
         # default). current_tab stays "chat" for both; only this and
@@ -4508,6 +4557,7 @@ class MeshtasticPassApp(App[None]):
                             ):
                                 yield NewChannelCancel()
                                 yield NewChannelSave()
+                                yield NewChannelApply()
                         yield ChatMessageInput(
                             placeholder="> message",
                             id="chat-input",
@@ -9063,6 +9113,96 @@ class MeshtasticPassApp(App[None]):
         name = name_inputs[0].value if name_inputs else ""
         key = key_inputs[0].value if key_inputs else ""
         return self._save_new_channel(name, key) is not None
+
+    def _activate_new_channel_apply(self) -> None:
+        """APPLY the pending private channel to the radio (async worker).
+
+        Guarded: offline before APPLY, or an apply already active, is a no-op
+        (zero writes). On a verified success the pending state is dropped, the
+        channel list is refreshed from radio-authoritative state, CHAT switches
+        to the promoted channel, and its PSK metadata displays normally. On any
+        failure the pending config is preserved for retry/correction and a
+        compact error is shown -- nothing is promoted before a matching
+        readback, and a stale completion from an obsolete radio can never
+        mutate current state (apply_private_channel already guards the session).
+        """
+        pending = self._pending_channel
+        if pending is None or self._pending_apply_active:
+            return
+        if self._radio_state is not RadioState.ONLINE:
+            self._new_channel_error = "RADIO NOT ONLINE"
+            self._refresh_new_channel_editor()
+            return
+        self._pending_apply_active = True
+        self._new_channel_error = ""
+        self._refresh_new_channel_editor()
+
+        def worker() -> None:
+            result = None
+            try:
+                result = self.radio.apply_private_channel(
+                    name=pending.name, psk=pending.raw_psk
+                )
+            except Exception as error:
+                self.post_message(
+                    PrivateChannelApplyFailed(str(error), pending)
+                )
+                return
+            self.post_message(PrivateChannelApplyResultMessage(result, pending))
+
+        self.run_worker(worker, thread=True)
+
+    @on(NewChannelApply.Activated)
+    def new_channel_apply(self, _event: NewChannelApply.Activated) -> None:
+        self._activate_new_channel_apply()
+
+    @on(PrivateChannelApplyResultMessage)
+    def private_channel_apply_result(
+        self, event: "PrivateChannelApplyResultMessage"
+    ) -> None:
+        self._pending_apply_active = False
+        result = event.result
+        if result is None or not getattr(result, "ok", False):
+            self._new_channel_error = (
+                getattr(result, "error", "APPLY FAILED") or "APPLY FAILED"
+            )
+            self._new_channel_editor_open = True
+            self._refresh_new_channel_editor()
+            return
+        # Verified success: promote ONLY from radio-authoritative state.
+        slot = getattr(result, "slot", None)
+        channels = ()
+        getter = getattr(self.radio, "get_config_channels", None)
+        if callable(getter):
+            try:
+                channels = getter()
+            except Exception:
+                channels = ()
+        promoted = next(
+            (c for c in channels if c.index == slot), None
+        )
+        if promoted is None:
+            self._new_channel_error = "CHANNEL NOT FOUND AFTER APPLY"
+            self._new_channel_editor_open = True
+            self._refresh_new_channel_editor()
+            return
+        self._channels = channels
+        self._pending_channel = None
+        self._new_channel_error = ""
+        self._new_channel_editor_open = False
+        self._clear_new_channel_inputs()
+        self._refresh_new_channel_editor()
+        # Switch CHAT to the new configured channel (local, zero-write/RF).
+        self._switch_chat_mode("channel")
+        self.run_worker(self._switch_channel(promoted.index), name="switch-to-private-channel")
+        self._update_tab_bar()
+
+    @on(PrivateChannelApplyFailed)
+    def private_channel_apply_failed(self, event: "PrivateChannelApplyFailed") -> None:
+        self._pending_apply_active = False
+        self._new_channel_error = event.detail
+        self._new_channel_editor_open = True
+        self._refresh_new_channel_editor()
 
     def _focus_new_channel_field(self, field: str) -> None:
         """Focus one editor field/control: name | key | save | cancel."""
