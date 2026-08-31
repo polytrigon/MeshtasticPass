@@ -899,40 +899,11 @@ class NewNetworkControl(Static):
             event.stop()
 
 
-class NewChannelApply(Static):
-    """[ APPLY ] -- write the validated pending private channel to the radio.
-
-    Asynchronous, radio-touching (see MeshtasticPassApp._apply_pending_channel):
-    writes exactly one logical channel slot, then readbacks/verifies before any
-    promotion. Never claims success before a matching readback.
-    """
-
-    can_focus = True
-
-    class Activated(Message):
-        pass
-
-    def __init__(self) -> None:
-        super().__init__(
-            "[ APPLY ]",
-            id="new-channel-apply",
-            classes="connection-action-row",
-            markup=False,
-        )
-
-    def on_key(self, event: Key) -> None:
-        if event.key == "enter":
-            self.post_message(self.Activated())
-            event.stop()
-        elif event.key == "escape":
-            self.app._cancel_new_channel()
-            event.stop()
-
-
 class NewChannelSave(Static):
     """[ SAVE ] -- validate the CHAT NEW CHANNEL editor (see
-    MeshtasticPassApp._save_new_channel). Production of a pending draft only,
-    zero radio writes; never claims the radio was configured.
+    MeshtasticPassApp._save_new_channel). When ONLINE a valid draft is
+    auto-applied to the radio (writes + readbacks + verifies, then promotes);
+    never claims the radio was configured before a verified readback.
     """
 
     can_focus = True
@@ -4581,9 +4552,8 @@ class MeshtasticPassApp(App[None]):
                                     classes="editor-actions",
                                     markup=False,
                                 ):
-                                    yield NewChannelCancel()
                                     yield NewChannelSave()
-                                    yield NewChannelApply()
+                                    yield NewChannelCancel()
                                 yield Static(
                                     "LEAVING KEY BLANK WILL CREATE A NEW CHANNEL",
                                     classes="editor-hint",
@@ -9167,14 +9137,30 @@ class MeshtasticPassApp(App[None]):
 
         self.run_worker(worker, thread=True)
 
-    @on(NewChannelApply.Activated)
-    def new_channel_apply(self, _event: NewChannelApply.Activated) -> None:
+    @on(NewChannelSave.Activated)
+    def new_channel_save(self, _event: NewChannelSave.Activated) -> None:
+        if not self._new_channel_editor_open:
+            return
+        if self._radio_state is not RadioState.ONLINE:
+            # SAVE auto-applies to the radio, so it requires an ONLINE radio.
+            # Nothing is written and no pending draft is created offline.
+            self._new_channel_error = "RADIO NOT ONLINE"
+            self._refresh_new_channel_editor()
+            self._focus_new_channel_field("name")
+            return
+        saved = self._activate_new_channel_save()
+        if not saved:
+            # Invalid (bad name/key): stay in the editor, values preserved.
+            self._refresh_new_channel_editor()
+            self._focus_new_channel_field("key" if self._new_channel_error else "name")
+            return
+        # SAVE validated and we are online: auto-apply the private channel
+        # (writes + readbacks + verifies, then promotes on success).
         self._activate_new_channel_apply()
+        self.query_one("#chat-log", ChatTranscript).focus()
 
     @on(PrivateChannelApplyResultMessage)
-    def private_channel_apply_result(
-        self, event: "PrivateChannelApplyResultMessage"
-    ) -> None:
+    def private_channel_apply_result(self, event: "PrivateChannelApplyResultMessage"):
         self._pending_apply_active = False
         result = event.result
         if result is None or not getattr(result, "ok", False):
@@ -9267,17 +9253,6 @@ class MeshtasticPassApp(App[None]):
     def new_channel_key_submitted(self, _event: Input.Submitted) -> None:
         if self._new_channel_editor_open:
             self._focus_new_channel_field("key" if self._new_channel_error else "save")
-
-    @on(NewChannelSave.Activated)
-    def new_channel_save(self, _event: NewChannelSave.Activated) -> None:
-        if not self._new_channel_editor_open:
-            return
-        self._activate_new_channel_save()
-        if self._new_channel_editor_open:
-            self._refresh_new_channel_editor()
-            self._focus_new_channel_field("key" if self._new_channel_error else "name")
-        else:
-            self.query_one("#chat-log", ChatTranscript).focus()
 
     @on(NewChannelCancel.Activated)
     def new_channel_cancel(self, _event: NewChannelCancel.Activated) -> None:

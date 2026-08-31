@@ -344,6 +344,11 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             self.assertTrue(app.query_one("#new-channel-save").display)
             self.assertTrue(app.query_one("#new-channel-cancel").display)
             self.assertTrue(app.query_one("#new-channel-actions").has_class("editor-actions"))
+            # No APPLY control remains in the editor actions row.
+            self.assertEqual(
+                [c.id for c in app.query_one("#new-channel-actions").children],
+                ["new-channel-save", "new-channel-cancel"],
+            )
             # New PRESET uses the SAME sharing primitives and stays intact.
             app.show_tab("connection")
             await pilot.pause()
@@ -529,6 +534,50 @@ class ApplyPendingChannelTests(PrivateChannelUiBase):
     def _seed_pending(self, app) -> "PendingChannelConfig":
         app._start_new_channel()
         return app._save_new_channel("Secret Society", "")
+
+    async def test_save_online_auto_applies_and_promotes(self) -> None:
+        from radio_service import ChannelInfo, PrivateChannelApplyResult, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.ONLINE
+            app._start_new_channel()
+            await pilot.pause()
+            app.query_one("#new-channel-name").value = "Secret Society"
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                True, 2, ""
+            )
+            app.radio.get_config_channels = lambda: (
+                ChannelInfo(0, "LongFast"),
+                ChannelInfo(2, "Secret Society"),
+            )
+            # Trigger SAVE via the handler (auto-applies when ONLINE).
+            app.new_channel_save(None)
+            for _ in range(20):
+                await pilot.pause()
+                if app._pending_channel is None:
+                    break
+            self.assertIsNone(app._pending_channel)
+            self.assertIn("Secret Society", [c.name for c in app._channels])
+
+    async def test_save_offline_is_zero_write_and_keeps_editor(self) -> None:
+        from radio_service import RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.OFFLINE
+            app._start_new_channel()
+            await pilot.pause()
+            app.query_one("#new-channel-name").value = "Secret Society"
+            app.radio.apply_private_channel = lambda name, psk: (_ for _ in ()).throw(
+                AssertionError("must not write while offline")
+            )
+            app.new_channel_save(None)
+            await pilot.pause()
+            self.assertEqual(app._new_channel_error, "RADIO NOT ONLINE")
+            self.assertIsNone(app._pending_channel)
 
     async def test_apply_success_promotes_to_real_channel(self) -> None:
         from radio_service import ChannelInfo, PrivateChannelApplyResult
