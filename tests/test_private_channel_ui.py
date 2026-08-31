@@ -1099,6 +1099,42 @@ class SaveCancelSpacingTests(PrivateChannelUiBase):
                 cancel.region.x - (save.region.x + save.region.width), 1
             )
 
+    async def test_focused_action_control_uses_accent_and_geometry_unchanged(
+        self,
+    ) -> None:
+        from theme_palette import THEME_PALETTES
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._start_new_channel()
+            await pilot.pause()
+            save = app.query_one("#new-channel-save")
+            save.focus()
+            await pilot.pause()
+            accent = THEME_PALETTES[app._current_theme].accent.upper()
+            self.assertEqual(
+                str(app.query_one("#new-channel-save").styles.color.hex.upper()),
+                accent,
+            )
+            # Geometry unchanged: still one cell between SAVE and CANCEL.
+            cancel = app.query_one("#new-channel-cancel")
+            self.assertEqual(cancel.region.x - (save.region.x + save.region.width), 1)
+            # NEW PRESET uses the same shared primitive.
+            app.show_tab("connection")
+            await pilot.pause()
+            app._set_network_editor_open(True)
+            await pilot.pause()
+            psave = app.query_one("#advanced-radio-save")
+            psave.focus()
+            await pilot.pause()
+            self.assertEqual(
+                str(app.query_one("#advanced-radio-save").styles.color.hex.upper()),
+                accent,
+            )
+
 
 class PskCopyConfirmationTests(PrivateChannelUiBase):
     def _private(self, app):

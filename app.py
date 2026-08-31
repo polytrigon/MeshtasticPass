@@ -3618,6 +3618,19 @@ class MeshtasticPassApp(App[None]):
         color: $amber_accent;
     }
 
+    /* Focused editor action controls (SAVE/CANCEL) highlight with the shared
+       ACCENT semantic color -- the same convention .keyboard-dropdown:focus
+       already uses -- rather than relying on the subtle $selection_background
+       alone. Applies through the shared .editor-actions primitive, so both the
+       NEW PRESET and NEW CHANNEL action rows get it; geometry is unchanged. */
+    .editor-actions .connection-action-row:focus {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber .editor-actions .connection-action-row:focus {
+        color: $amber_accent;
+    }
+
     #connection .connection-action-row,
     .editor-form .connection-action-row {
         height: 1;
