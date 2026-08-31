@@ -3225,9 +3225,15 @@ class MeshtasticPassApp(App[None]):
     }
 
     /* Every section heading after the first (CONNECTION -> NETWORK ->
-       RADIO -> STYLE) gets one blank line of separation above it. */
-    #advanced-radio-title, #radio-title, #style-title {
+       RADIO -> STYLE) gets one blank line of separation above it;
+       NETWORK gets an extra one so the section break after the
+       CONNECTION identity rows reads clearly. */
+    #radio-title, #style-title {
         margin-top: 1;
+    }
+
+    #advanced-radio-title {
+        margin-top: 2;
     }
 
     .identity-name-control {
