@@ -1082,6 +1082,23 @@ class SaveCancelSpacingTests(PrivateChannelUiBase):
                 cancel.region.x - (save.region.x + save.region.width), 1
             )
 
+    async def test_new_preset_action_row_shrink_wraps_and_is_adjacent(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("connection")
+            await pilot.pause()
+            app._set_network_editor_open(True)
+            await pilot.pause()
+            save = app.query_one("#advanced-radio-save")
+            cancel = app.query_one("#advanced-radio-cancel")
+            # Shrink-wrapped (not 1fr-full-width), adjacent with one-cell gap.
+            self.assertEqual(save.region.width, len("[ SAVE ]"))
+            self.assertEqual(cancel.region.width, len("[ CANCEL ]"))
+            self.assertEqual(
+                cancel.region.x - (save.region.x + save.region.width), 1
+            )
+
 
 class PskCopyConfirmationTests(PrivateChannelUiBase):
     def _private(self, app):

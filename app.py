@@ -3712,6 +3712,15 @@ class MeshtasticPassApp(App[None]):
         padding-left: 14;
     }
 
+    /* SAVE/CANCEL controls inside the shared editor action row shrink-wrap
+       (width:auto), so [ SAVE ] [ CANCEL ] sit adjacent with a one-cell gap
+       instead of each consuming 1fr and spreading across the whole row. The
+       container ids give this rule equal specificity to
+       #connection .connection-action-row's own width:1fr AND it is declared
+       later in source, so it wins for the NEW PRESET row too (NEW CHANNEL's
+       editor is not inside #connection, but shares the same primitive). */
+    #advanced-radio-actions .connection-action-row,
+    #new-channel-actions .connection-action-row,
     .editor-actions .connection-action-row {
         width: auto;
         margin-left: 1;
