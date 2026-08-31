@@ -381,6 +381,37 @@ class ChatStore:
             )
             connection.execute("DELETE FROM messages WHERE id = ?", (message_id,))
 
+    def delete_dm_conversation(self, dm_node_id: str) -> int:
+        """Permanently remove one WHOLE DM conversation and its history.
+
+        Local delete only (see app.py's CTRL+D action) -- never sends or
+        implies anything to the mesh, and never touches channel history
+        (every matching row has dm_node_id set, so the WHERE clause below
+        can never match an ordinary channel/broadcast row whose dm_node_id
+        is NULL). Keyed by the remote party's canonical node ID -- never a
+        display name -- exactly like every other DM query in this store.
+        Deletes every message in BOTH directions of that one conversation,
+        plus their send-attempt rows, in one transaction. A no-op (returns
+        0) if no such conversation exists.
+
+        Returns the number of `messages` rows removed (for the caller's
+        selector/unread bookkeeping and for tests).
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM send_attempts
+                WHERE message_id IN (
+                    SELECT id FROM messages WHERE dm_node_id = ?
+                )
+                """,
+                (dm_node_id,),
+            )
+            cursor = connection.execute(
+                "DELETE FROM messages WHERE dm_node_id = ?", (dm_node_id,)
+            )
+            return cursor.rowcount
+
     def load_recent(
         self,
         channel_index: int = 0,
