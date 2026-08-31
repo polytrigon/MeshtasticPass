@@ -406,14 +406,14 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
     # ---- Collapsed default -------------------------------------------------
 
-    async def test_heading_is_exactly_advanced_radio(self) -> None:
+    async def test_heading_is_exactly_network(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
             app.show_tab("connection")
             await pilot.pause()
             title = str(app.query_one("#advanced-radio-title", Static).render())
-            self.assertEqual(title, "ADVANCED RADIO")
+            self.assertEqual(title, "NETWORK")
 
     async def test_default_view_is_collapsed_with_longfast_network(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
@@ -1091,14 +1091,17 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
         self.settings.save_radio_config_preset(
             RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
         )
-        # channel_num reads stale (0) on attempt 1, correct (48) from 2.
-        self._readback_converges_on(radio, 2, field="channel_num", stale=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
             app.show_tab("connection")
             await pilot.pause()
 
+            # Installed only now -- AFTER startup detection has already
+            # done its own read-only candidate reads -- so the stale
+            # window counts exactly the apply's own verify readbacks:
+            # channel_num reads stale (0) on attempt 1, correct from 2.
+            self._readback_converges_on(radio, 2, field="channel_num", stale=0)
             app._on_network_selected("NYC MS48")
             await self._wait_apply_settled(pilot, app)
 
@@ -1115,12 +1118,13 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
         self.settings.save_radio_config_preset(
             RadioConfigPreset(name="NYC MS48", modem_preset="MEDIUM_SLOW", frequency_slot=48)
         )
-        self._readback_converges_on(radio, 2, field="channel_num", stale=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
             app.show_tab("connection")
             await pilot.pause()
+            # Installed after startup detection (see the test above).
+            self._readback_converges_on(radio, 2, field="channel_num", stale=0)
             app._on_network_selected("NYC MS48")
             await self._wait_apply_settled(pilot, app)
             # Converged on attempt 2 -> a small, bounded number of
@@ -1258,7 +1262,7 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
 
     # ---- UI polish -----------------------------------------------------
 
-    async def test_new_network_aligns_with_the_network_control(self) -> None:
+    async def test_new_preset_aligns_with_the_preset_control(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._wait_online(pilot, app)
@@ -1266,7 +1270,8 @@ class AdvancedRadioUITests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             rendered = str(app.query_one(NewNetworkControl).render())
             self.assertTrue(rendered.startswith(CONNECTION_VALUE_COLUMN_INDENT))
-            self.assertIn("[ NEW NETWORK ]", rendered)
+            self.assertIn("[ NEW PRESET ]", rendered)
+            self.assertNotIn("[ NEW NETWORK ]", rendered)
 
     async def test_save_and_cancel_share_one_row(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)

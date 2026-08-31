@@ -189,6 +189,12 @@ ADVANCED_RADIO_CONFIRM_SECONDS = 6.0
 # operation is force-resolved to an honest ERROR -- there is never a
 # permanent "SAVING & APPLYING..." state (see _network_apply_timed_out).
 NETWORK_APPLY_TIMEOUT_SECONDS = 90.0
+# NETWORK: how long a terminal "<name> APPLIED" success line stays on
+# #advanced-radio-status before clearing itself. Success only -- a
+# genuine error line never auto-dismisses, and any NEWER status write
+# (via _set_advanced_radio_status, the single funnel) disarms a pending
+# dismiss first, so a stale timer can never clear a newer message.
+NETWORK_STATUS_SUCCESS_DISMISS_SECONDS = 10.0
 # U+2713 CHECK MARK -- a plain, Narrow-width Unicode symbol (never an
 # emoji-presentation glyph, so it never unexpectedly renders double-
 # width). SENT/checkmark meaning: the strongest truthful evidence of a
@@ -741,6 +747,16 @@ class AutoSyncSelector(KeyboardDropdown):
 # or SAVE ever writes RF/config (see _apply_network_from_thread).
 BUILTIN_LONGFAST_NETWORK = "LongFast"
 _LONGFAST_DEFAULT_PSK_BASE64 = "AQ=="
+# NETWORK: what the PRESET selector shows when a successful radio sync
+# does not semantically match ANY saved PRESET (built-in LongFast
+# included) -- an honest "the radio is on a configuration this app has
+# no PRESET for" placeholder. Display-only: it is NEVER added to the
+# dropdown's options (KeyboardDropdown.selected_label falls back to
+# str(value) for a value with no option), never persisted, and never
+# creates a PRESET. Resolving it requires an explicit user selection;
+# detection itself performs zero writes (see
+# _detect_active_network_from_radio).
+UNMATCHED_NETWORK_LABEL = "CURRENT RADIO"
 
 
 def builtin_longfast_preset() -> "RadioConfigPreset":
@@ -754,20 +770,20 @@ def builtin_longfast_preset() -> "RadioConfigPreset":
 
 
 class NetworkSelector(KeyboardDropdown):
-    """ADVANCED RADIO's "NETWORK [ ... ]" dropdown -- the mechanism for
+    """The NETWORK section's "PRESET [ ... ]" dropdown -- the mechanism
 
-    switching between complete saved Meshtastic network configurations
-    (RadioConfigPreset.name) plus the built-in BUILTIN_LONGFAST_NETWORK
-    entry. Merely focusing it, opening it, or navigating its choices is
-    zero RF/config; only re-selecting a different NETWORK to confirm it
-    ever applies anything (see MeshtasticPassApp.dropdown_selected's
-    "network" branch).
+    for switching between complete saved Meshtastic network
+    configurations (RadioConfigPreset.name) plus the built-in
+    BUILTIN_LONGFAST_NETWORK entry. Merely focusing it, opening it, or
+    navigating its choices is zero RF/config; only re-selecting a
+    different PRESET to confirm it ever applies anything (see
+    MeshtasticPassApp.dropdown_selected's "network" branch).
     """
 
     def __init__(self, options: Iterable[DropdownOption]) -> None:
         super().__init__(
             "network",
-            "NETWORK",
+            "PRESET",
             options,
             BUILTIN_LONGFAST_NETWORK,
             widget_id="advanced-radio-network-selector",
@@ -797,7 +813,7 @@ class RadioModeSelector(KeyboardDropdown):
 
 
 class NewNetworkControl(Static):
-    """[ NEW NETWORK ] -- reveals the transient NEW NETWORK editor.
+    """[ NEW PRESET ] -- reveals the transient NEW PRESET editor.
 
     Zero RF, zero persistence by itself: it only shows the editor rows
     (see MeshtasticPassApp._set_network_editor_open). The user must
@@ -810,12 +826,12 @@ class NewNetworkControl(Static):
         pass
 
     def __init__(self) -> None:
-        # Indented to the same control/value column the NETWORK selector's
+        # Indented to the same control/value column the PRESET selector's
         # "[ LongFast ▾ ]" starts at (CONNECTION_VALUE_COLUMN_INDENT),
         # derived from CONNECTION_LABEL_WIDTH so it tracks UI scale rather
         # than a hardcoded gap.
         super().__init__(
-            f"{CONNECTION_VALUE_COLUMN_INDENT}[ NEW NETWORK ]",
+            f"{CONNECTION_VALUE_COLUMN_INDENT}[ NEW PRESET ]",
             id="advanced-radio-new-network",
             classes="connection-action-row",
             markup=False,
@@ -3186,7 +3202,7 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    /* CONNECTION/STYLE/RADIO's own section headers use DIM (the
+    /* CONNECTION/NETWORK/RADIO/STYLE's own section headers use DIM (the
        theme's 50%-BASE-over-background token), never ACCENT/ACCENT2 --
        ID-scoped so "PROFILE" and #mesh-connection-status (which
        reuse .page-title for its own layout/weight, not this coloring)
@@ -3208,7 +3224,9 @@ class MeshtasticPassApp(App[None]):
         overflow-x: hidden;
     }
 
-    #style-title, #radio-title {
+    /* Every section heading after the first (CONNECTION -> NETWORK ->
+       RADIO -> STYLE) gets one blank line of separation above it. */
+    #advanced-radio-title, #radio-title, #style-title {
         margin-top: 1;
     }
 
@@ -3993,12 +4011,23 @@ class MeshtasticPassApp(App[None]):
         # without depending on Textual's own worker exclusivity (which
         # cannot actually interrupt a blocking thread either way).
         self._radio_workers: dict[str, Thread] = {}
-        # ADVANCED RADIO: the currently selected NETWORK name (app-side
-        # notion of "which NETWORK this app would apply / last applied",
-        # never a live radio readback -- see _refresh_network_options).
-        # Starts on the built-in LongFast; changes ONLY on a confirmed
-        # NETWORK switch or a confirmed SAVE, never on connect/reconnect.
+        # NETWORK: the currently selected PRESET name. Starts on the
+        # built-in LongFast -- a LOCAL UI DEFAULT ONLY (zero writes)
+        # until a radio has actually been read. Once a successful radio
+        # sync completes, the RADIO is authoritative: _detect_active_
+        # network_from_radio derives the active PRESET from the actual
+        # radio configuration (read-only) on every genuine connect/
+        # reconnect. Also changes on a confirmed PRESET switch or a
+        # confirmed SAVE. Never auto-applied.
         self._selected_network: str = BUILTIN_LONGFAST_NETWORK
+        # NETWORK: True when the last successful radio sync did not
+        # semantically match ANY saved PRESET -- the selector then shows
+        # the honest UNMATCHED_NETWORK_LABEL placeholder instead of
+        # falsely claiming some PRESET (e.g. LongFast) is active. While
+        # True there IS no active PRESET, so any explicit selection is a
+        # genuine switch (no "already selected" no-op). Cleared by a
+        # detection match, a verified apply, or a SAVE.
+        self._network_unmatched = False
         # Whether the transient NEW NETWORK editor is currently revealed
         # (see _set_network_editor_open). Purely local UI state -- never
         # persisted, discarded on leaving CONNECTION (see show_tab).
@@ -4020,6 +4049,13 @@ class MeshtasticPassApp(App[None]):
         self._network_apply: NetworkApply | None = None
         self._network_apply_seq = 0
         self._network_apply_timer: Timer | None = None
+        # NETWORK: the one-shot auto-dismiss for a terminal "<name>
+        # APPLIED" success line (NETWORK_STATUS_SUCCESS_DISMISS_SECONDS).
+        # Correlation-safe by construction: EVERY status write goes
+        # through _set_advanced_radio_status, which stops any pending
+        # dismiss first, so a stale timer can never clear a newer
+        # status/error; only the success path ever re-arms it.
+        self._network_status_dismiss_timer: Timer | None = None
         self._status_dot_count = 1
         self._connection_animation_timer: Timer | None = None
         self._chat_timestamp_timer: Timer | None = None
@@ -4098,37 +4134,20 @@ class MeshtasticPassApp(App[None]):
                 yield ShortNameControl()
                 yield Static(id="short-name-status", markup=False)
                 yield Static(id="identity-values", markup=False)
-                yield Static("STYLE", id="style-title", classes="page-title")
-                yield FontSizeSelector(self.settings.font_size)
-                yield Static(id="font-size-status", markup=False)
-                yield ColorSelector(self.settings.color)
-                yield Static(id="color-status", markup=False)
-                yield Static("RADIO", id="radio-title", classes="page-title")
-                yield Static(id="radio-info", markup=False)
-                yield RoleSelector(0)
-                yield Static(id="role-status", markup=False)
-                yield BluetoothSelector(True)
-                yield TimezoneSelector("")
-                yield Static(id="timezone-status", markup=False)
-                yield ScreenTimeoutSelector(300)
-                yield UnitsSelector(DISPLAY_UNITS_METRIC)
-                yield CompassSelector(True)
-                yield FlipScreenSelector(False)
-                yield Clock24HSelector(True)
-                yield HopLimitSelector(3)
-                yield AutoSyncSelector(self.settings.clock_auto_sync)
-                yield Static(id="radio-status")
-                # ADVANCED RADIO: a compact sub-section for switching
-                # between complete saved Meshtastic NETWORK configs --
-                # HOP LIMIT above stays completely independent (never
-                # folded into a saved NETWORK; see RadioConfigPreset's
-                # own docstring). Collapsed by default: only the NETWORK
-                # selector and [ NEW NETWORK ] are visible; the
-                # .advanced-radio-editor rows below are hidden until
-                # NEW NETWORK is activated and discarded on leaving the
-                # view (see _set_network_editor_open / show_tab).
+                # Conceptual section order: CONNECTION -> NETWORK ->
+                # RADIO -> STYLE. NETWORK is the saved-PRESET section
+                # (PRESET selector + NEW PRESET editor); RADIO holds the
+                # device/radio controls that are NOT part of a saved
+                # PRESET (HOP LIMIT included -- never folded into a
+                # PRESET; see RadioConfigPreset's own docstring); STYLE
+                # is appearance only. NETWORK is collapsed by default:
+                # only the PRESET selector and [ NEW PRESET ] are
+                # visible; the .advanced-radio-editor rows below are
+                # hidden until NEW PRESET is activated and discarded on
+                # leaving the view (see _set_network_editor_open /
+                # show_tab).
                 yield Static(
-                    "ADVANCED RADIO",
+                    "NETWORK",
                     id="advanced-radio-title",
                     classes="page-title",
                 )
@@ -4171,6 +4190,26 @@ class MeshtasticPassApp(App[None]):
                     yield SaveNetworkControl()
                     yield CancelNetworkControl()
                 yield Static(id="advanced-radio-status", markup=False)
+                yield Static("RADIO", id="radio-title", classes="page-title")
+                yield Static(id="radio-info", markup=False)
+                yield RoleSelector(0)
+                yield Static(id="role-status", markup=False)
+                yield BluetoothSelector(True)
+                yield TimezoneSelector("")
+                yield Static(id="timezone-status", markup=False)
+                yield ScreenTimeoutSelector(300)
+                yield UnitsSelector(DISPLAY_UNITS_METRIC)
+                yield CompassSelector(True)
+                yield FlipScreenSelector(False)
+                yield Clock24HSelector(True)
+                yield HopLimitSelector(3)
+                yield AutoSyncSelector(self.settings.clock_auto_sync)
+                yield Static(id="radio-status")
+                yield Static("STYLE", id="style-title", classes="page-title")
+                yield FontSizeSelector(self.settings.font_size)
+                yield Static(id="font-size-status", markup=False)
+                yield ColorSelector(self.settings.color)
+                yield Static(id="color-status", markup=False)
             with Vertical(id="chat", classes="tab-page"):
                 # Peer selectors (CHAT/DM/MENTION UX Part B): LEFT is the
                 # configured Meshtastic channel selector (unchanged
@@ -4266,7 +4305,10 @@ class MeshtasticPassApp(App[None]):
         self._load_chat_history()
         if self._history_error:
             self._show_send_error(self._history_error)
-        self.query_one(FontSizeSelector).focus()
+        # Land on the first focus stop of the reordered CONNECTION ->
+        # NETWORK -> RADIO -> STYLE page (STYLE now sits at the bottom,
+        # so focusing it here would scroll the view away from the top).
+        self.query_one(DeviceSelector).focus()
         self._monitor.start()
 
     def on_unmount(self) -> None:
@@ -4282,6 +4324,8 @@ class MeshtasticPassApp(App[None]):
             self._network_apply_timer.stop()
         if self._advanced_radio_confirm_timer is not None:
             self._advanced_radio_confirm_timer.stop()
+        if self._network_status_dismiss_timer is not None:
+            self._network_status_dismiss_timer.stop()
         self.restore_terminal_cursor()
         self._monitor.stop()
         self._reconcile_interrupted_sends_before_shutdown()
@@ -4998,7 +5042,7 @@ class MeshtasticPassApp(App[None]):
                         self.query_one("#dm-log", ChatTranscript).focus()
         elif tab_id == "connection":
             self._refresh_device_options()
-            self.query_one(FontSizeSelector).focus()
+            self.query_one(DeviceSelector).focus()
         elif tab_id == "mesh":
             self._refresh_mesh()
             # MESH's own arrow-key navigation is handled by the App's
@@ -5171,21 +5215,34 @@ class MeshtasticPassApp(App[None]):
         up/down for) -- one definition, never two independently
         maintained copies of this order.
 
-        Only ONE of the ADVANCED RADIO tails is ever included: the
-        collapsed [ NEW NETWORK ] row, or -- when the transient editor
-        is open -- NETWORK NAME/RADIO MODE/FREQ. SLOT/KEY then SAVE. The
-        hidden side is left out entirely so a `display: none` row never
-        becomes an unreachable focus stop. CANCEL is deliberately NOT a
-        vertical stop -- [ SAVE ] [ CANCEL ] share one row and CANCEL is
-        reached from SAVE with RIGHT (see on_key); vertical nav from
-        CANCEL is delegated to its SAVE sibling.
+        Focus order follows the visual section order (CONNECTION ->
+        NETWORK -> RADIO -> STYLE). Only ONE of the NETWORK-section
+        tails is ever included: the collapsed [ NEW PRESET ] row, or --
+        when the transient editor is open -- NETWORK NAME/RADIO MODE/
+        FREQ. SLOT/KEY then SAVE. The hidden side is left out entirely
+        so a `display: none` row never becomes an unreachable focus
+        stop. CANCEL is deliberately NOT a vertical stop -- [ SAVE ]
+        [ CANCEL ] share one row and CANCEL is reached from SAVE with
+        RIGHT (see on_key); vertical nav from CANCEL is delegated to
+        its SAVE sibling.
         """
-        base: tuple[Widget, ...] = (
+        head: tuple[Widget, ...] = (
             self.query_one(DeviceSelector),
             self.query_one(LongNameControl),
             self.query_one(ShortNameControl),
-            self.query_one(FontSizeSelector),
-            self.query_one(ColorSelector),
+            self.query_one(NetworkSelector),
+        )
+        if self._network_editor_open:
+            network_tail: tuple[Widget, ...] = (
+                self.query_one("#network-name-input", Input),
+                self.query_one(RadioModeSelector),
+                self.query_one("#freq-slot-input", Input),
+                self.query_one("#key-input", Input),
+                self.query_one(SaveNetworkControl),
+            )
+        else:
+            network_tail = (self.query_one(NewNetworkControl),)
+        rest: tuple[Widget, ...] = (
             self.query_one(RoleSelector),
             self.query_one(BluetoothSelector),
             self.query_one(TimezoneSelector),
@@ -5196,21 +5253,12 @@ class MeshtasticPassApp(App[None]):
             self.query_one(Clock24HSelector),
             self.query_one(HopLimitSelector),
             self.query_one(AutoSyncSelector),
-            self.query_one(NetworkSelector),
+            self.query_one(FontSizeSelector),
+            self.query_one(ColorSelector),
         )
-        if self._network_editor_open:
-            tail: tuple[Widget, ...] = (
-                self.query_one("#network-name-input", Input),
-                self.query_one(RadioModeSelector),
-                self.query_one("#freq-slot-input", Input),
-                self.query_one("#key-input", Input),
-                self.query_one(SaveNetworkControl),
-            )
-        else:
-            tail = (self.query_one(NewNetworkControl),)
         return [
             control
-            for control in (*base, *tail)
+            for control in (*head, *network_tail, *rest)
             if not getattr(control, "disabled", False)
         ]
 
@@ -5418,21 +5466,89 @@ class MeshtasticPassApp(App[None]):
         return options
 
     def _refresh_network_options(self) -> None:
-        """Rebuild the NETWORK dropdown from the built-in LongFast plus
+        """Rebuild the PRESET dropdown from the built-in LongFast plus
 
-        the saved NETWORK list, and re-assert the app's own selected
-        NETWORK (_selected_network) as the shown value -- never a live
-        radio readback, and never auto-applied. Called on mount, on
-        every connection-state change (see _render_radio_settings), and
-        after a SAVE/switch, so it is never left stale relative to the
-        saved list or a pending-then-abandoned selector choice.
+        the saved PRESET list, and re-assert the current selection as
+        the shown value -- never auto-applied. When the last successful
+        radio sync matched no saved PRESET (_network_unmatched), the
+        shown value is the honest UNMATCHED_NETWORK_LABEL placeholder
+        instead: display-only, never added to the options, so the open
+        menu still lists only real PRESETs. Called on mount, on every
+        connection-state change (see _render_radio_settings), and after
+        a SAVE/switch, so it is never left stale relative to the saved
+        list or a pending-then-abandoned selector choice.
         """
         selector = self.query_one(NetworkSelector)
         options = self._network_options()
         valid = {option.value for option in options}
         if self._selected_network not in valid:
             self._selected_network = BUILTIN_LONGFAST_NETWORK
-        selector.set_options(options, value=self._selected_network)
+        shown = (
+            UNMATCHED_NETWORK_LABEL
+            if self._network_unmatched
+            else self._selected_network
+        )
+        selector.set_options(options, value=shown)
+
+    def _detect_active_network_from_radio(self) -> None:
+        """Derive the ACTIVE PRESET from the actual radio configuration
+
+        after a successful config sync -- the radio is authoritative,
+        never the app's previous assumption (fresh install, restart,
+        the built-in LongFast default, or whatever was selected before
+        the radio was changed externally). Called from _show_connection
+        on every genuine non-ONLINE -> ONLINE transition, once the
+        SDK's full config sync has already completed inside connect(),
+        and skipped while a NETWORK apply is in flight (its own
+        verification owns the outcome there).
+
+        STRICTLY READ-ONLY: each candidate comparison reuses
+        verify_radio_config_preset -- the SAME semantic rules the apply
+        verification uses (modem preset, frequency slot with LongFast
+        channel_num=0 semantics, PSK default-key equivalence) -- which
+        only reads the SDK's already-synced cache. Zero RF, zero config
+        writes, and NEVER an automatic "correction" of the radio toward
+        whichever PRESET the app previously believed was active.
+
+        Exactly one match -> that PRESET is selected/displayed. More
+        than one semantically identical match -> the current selection
+        wins if it is among them, else the first in the selector's own
+        order (built-in LongFast first, then saved order). No match ->
+        the honest UNMATCHED_NETWORK_LABEL placeholder (see
+        _refresh_network_options); no PRESET is created or persisted.
+        """
+        matches: list[str] = []
+        for option in self._network_options():
+            name = str(option.value)
+            preset = self._network_preset(name)
+            if preset is None:
+                continue
+            try:
+                verification = verify_radio_config_preset(self.radio, preset)
+            except Exception as error:
+                self._log_netcfg(
+                    f"detect: verify {name!r} ERROR {error.__class__.__name__}"
+                )
+                continue
+            if verification.ok:
+                matches.append(name)
+        if matches:
+            if not self._network_unmatched and self._selected_network in matches:
+                chosen = self._selected_network
+            else:
+                chosen = matches[0]
+            self._log_netcfg(
+                f"detect: radio matches {matches!r} -> active PRESET {chosen!r}"
+            )
+            self._selected_network = chosen
+            self._network_unmatched = False
+        else:
+            self._log_netcfg(
+                "detect: radio config matches no saved PRESET -> "
+                f"{UNMATCHED_NETWORK_LABEL!r} (read-only, nothing written)"
+            )
+            self._network_unmatched = True
+        self._refresh_network_options()
 
     def _network_editor_fields(
         self,
@@ -5502,7 +5618,16 @@ class MeshtasticPassApp(App[None]):
         jump to the top) so the user can always see the result of the
         NETWORK action they just triggered -- SWITCHING..., WAITING FOR
         RECONNECT..., APPLIED, NOT APPLIED... (spec item 6).
+
+        Every status write disarms any pending success auto-dismiss
+        FIRST -- the single-funnel guarantee that a stale 10s timer can
+        never clear a newer message (only _finish_network_apply's
+        success branch ever re-arms it, for exactly the line it just
+        wrote).
         """
+        if self._network_status_dismiss_timer is not None:
+            self._network_status_dismiss_timer.stop()
+            self._network_status_dismiss_timer = None
         status = self.query_one("#advanced-radio-status", Static)
         status.remove_class("setting-error")
         status.remove_class("setting-success")
@@ -5518,6 +5643,14 @@ class MeshtasticPassApp(App[None]):
             self.query_one("#advanced-radio-status").scroll_visible(animate=False)
         except Exception:
             pass
+
+    def _dismiss_network_apply_success(self) -> None:
+        # The 10s success auto-dismiss fired with no newer status having
+        # been written in the meantime (any newer write would have
+        # stopped this timer via _set_advanced_radio_status) -- clear
+        # the "<name> APPLIED" line.
+        self._network_status_dismiss_timer = None
+        self._set_advanced_radio_status("", None)
 
     def _arm_advanced_radio_confirm(self, action: str) -> None:
         self._advanced_radio_confirm = action
@@ -5636,13 +5769,13 @@ class MeshtasticPassApp(App[None]):
 
     @staticmethod
     def _log_netcfg(line: str) -> None:
-        """One concise ADVANCED RADIO apply diagnostic line -- rare (only
+        """One concise NETWORK diagnostic line -- rare (a deliberate,
 
-        a deliberate, confirmed SAVE/switch triggers any), never a
-        continuous stream, and never secret key material (see
-        _begin_network_apply's PSK line: length only). Plain print,
-        matching rx_debug_log's own "lightweight terminal trace, not
-        logging.*" precedent.
+        confirmed SAVE/switch, or one read-only detection pass per
+        genuine (re)connect), never a continuous stream, and never
+        secret key material (see _begin_network_apply's PSK line:
+        length only). Plain print, matching rx_debug_log's own
+        "lightweight terminal trace, not logging.*" precedent.
         """
         print(f"[NETCFG] {line}", flush=True)
 
@@ -5683,6 +5816,7 @@ class MeshtasticPassApp(App[None]):
         # (spec I steps 6-8) -- the RF result is reported honestly in
         # the status line, never by falsely claiming it was applied.
         self._selected_network = preset.name
+        self._network_unmatched = False
         self._refresh_network_options()
         self._collapse_network_editor()
         if self._radio_state is not RadioState.ONLINE:
@@ -5703,7 +5837,11 @@ class MeshtasticPassApp(App[None]):
         NETWORK is not treated as active until post-reconnect readback
         verification succeeds (see _resolve_network_apply_after_reconnect).
         """
-        if value == self._selected_network:
+        if value == self._selected_network and not self._network_unmatched:
+            # Re-selecting the active PRESET is a zero-write no-op.
+            # While the radio is on an UNMATCHED configuration there is
+            # no active PRESET, so every explicit selection -- the
+            # previously believed name included -- is a genuine switch.
             if self._network_apply is None:
                 self._set_advanced_radio_status("", None)
             return
@@ -6059,12 +6197,23 @@ class MeshtasticPassApp(App[None]):
         )
         if success:
             self._selected_network = apply.name
+            self._network_unmatched = False
             self._refresh_network_options()
             prefix = "SAVED & " if apply.saved else ""
             # Spec D/J: normal success uses ACCENT here, not the
             # confirm-green .setting-success other CONNECTION rows use.
             self._set_advanced_radio_status(
                 f"{apply.name} {prefix}APPLIED", "setting-accent"
+            )
+            # Success only: leave "<name> APPLIED" visible for a fixed
+            # window, then clear it. _set_advanced_radio_status (just
+            # called) stopped any previously pending dismiss, so this
+            # timer is always correlated with exactly the line above;
+            # any NEWER status/error written during the window disarms
+            # it again before it can fire.
+            self._network_status_dismiss_timer = self.set_timer(
+                NETWORK_STATUS_SUCCESS_DISMISS_SECONDS,
+                self._dismiss_network_apply_success,
             )
             return
         # Failure. A SAVE stays saved+selected locally (honest: "SAVED
@@ -6177,12 +6326,22 @@ class MeshtasticPassApp(App[None]):
         if host.tzdef is None:
             print(f"[CLOCK SYNC] host timezone not synced: {host.detail}", flush=True)
             return
-        if self.radio.read_synced_config_field("device", "tzdef") is None:
+        current_tzdef = self.radio.read_synced_config_field("device", "tzdef")
+        if current_tzdef is None:
             print(
                 "[CLOCK SYNC] host timezone not synced: "
                 "device.tzdef unsupported by this schema",
                 flush=True,
             )
+            return
+        if current_tzdef == host.tzdef:
+            # Already correct on the radio (the common steady state on
+            # every reconnect) -- write NOTHING. A device set_config
+            # admin write is a real config transaction the firmware
+            # persists; repeating it once per connection lifecycle when
+            # it changes nothing is exactly the kind of redundant
+            # reconnect-time write the unexpected-reboot audit exists
+            # to rule out.
             return
         try:
             result = self.radio.write_verified_config_field("device", "tzdef", host.tzdef)
@@ -9472,6 +9631,20 @@ class MeshtasticPassApp(App[None]):
         self._render_identity(force_value=True)
         self._render_radio_settings()
         self._on_connection_state_for_network_apply(state, was_online)
+        # RADIO-AUTHORITATIVE PRESET DETECTION: after every genuine
+        # (re)connect whose full config sync just completed, derive the
+        # active PRESET from the actual radio state (read-only, zero
+        # writes) -- including right after a NETWORK apply resolved on
+        # this very reconnect (the call above may have finished it), so
+        # the selector always reflects the radio, not an assumption.
+        # Skipped while an apply is STILL in flight: its own
+        # verification lifecycle owns the selector then.
+        if (
+            state is RadioState.ONLINE
+            and not was_online
+            and self._network_apply is None
+        ):
+            self._detect_active_network_from_radio()
         self._refresh_mesh()
         self.query_one("#connection-error", Static).update("")
         self._update_chat_connection_state()
