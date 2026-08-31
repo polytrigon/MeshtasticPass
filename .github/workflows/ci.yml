@@ -1,0 +1,75 @@
+# PR gate: codifies CONTRIBUTING.md's own pre-PR checklist
+# (python -m unittest discover -v, python -m compileall -q ., git diff
+# --check) plus the repo's headless --simulate smoke, so every pull
+# request runs the exact workflow contributors are already asked to run
+# locally. Simulation only: no serial devices, no live radio
+# configuration writes, no LoRa traffic (CONTRIBUTING requirement).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the whitespace check can diff against the
+          # PR base branch.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned dependencies (+ pytest, CI-only test dep)
+        # requirements.txt stays app-only and pinned (its own policy);
+        # pytest is needed solely because tests/test_radio_write_
+        # readback_probe.py is pytest-style -- without it, unittest
+        # discover fails at import time.
+        run: pip install -r requirements.txt pytest
+
+      - name: Byte-compile every module
+        run: python -m compileall -q .
+
+      - name: Whitespace check against the PR base
+        if: github.event_name == 'pull_request'
+        run: git diff --check "origin/${GITHUB_BASE_REF}...HEAD"
+
+      - name: Focused fast tests (radio/NETWORK core)
+        # Fails fast on the config/preset logic before the ~20 minute
+        # full suite. Only modules that exist on main are listed here;
+        # branch-specific test modules are still covered by the full
+        # discover run below.
+        run: >
+          python -m unittest -v
+          tests.test_advanced_radio_config
+          tests.test_app_settings
+          tests.test_radio_service
+          tests.test_radio_capabilities
+          tests.test_radio_config_snapshot
+          tests.test_radio_config_write
+
+      - name: Pytest-style probe tests
+        # These 20 function-style tests are invisible to unittest
+        # discover (the module imports, but nothing is collected), so
+        # they get their own explicit pytest run.
+        run: python -m pytest tests/test_radio_write_readback_probe.py -q
+
+      - name: Full test suite
+        run: python -m unittest discover -v
+
+      - name: Headless simulate smoke (clean shutdown)
+        run: python tests/_exit_probe.py
+
+      - name: Headless simulate smoke (stalled SDK call must not hang exit)
+        run: python tests/_exit_probe.py --stuck-auto-sync

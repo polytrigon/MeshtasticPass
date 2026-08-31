@@ -526,7 +526,13 @@ class ChatStoreTests(unittest.TestCase):
             """
         ).fetchall()
         detail = " ".join(str(row["detail"]) for row in plan)
-        self.assertIn("USING INDEX incoming_node_message_time", detail)
+        # Newer SQLite reports the same plan as "USING COVERING INDEX";
+        # either phrasing proves the named index is used -- the actual
+        # requirement -- so accept both rather than pinning one
+        # SQLite version's wording.
+        self.assertRegex(
+            detail, r"USING (?:COVERING )?INDEX incoming_node_message_time"
+        )
         self.assertNotIn("SCAN messages", detail)
 
 
