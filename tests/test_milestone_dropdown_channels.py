@@ -56,6 +56,10 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
             # A fresh install's default is LARGE (first-run default
             # text size), not MEDIUM -- see AppSettings.DEFAULT_FONT_SIZE.
             self.assertIn("[ LARGE ▾ ]", str(font.render()))
+            # The app now lands on USB DEVICE (STYLE moved to the
+            # bottom of the reordered page); focus UI SCALE explicitly.
+            font.focus()
+            await pilot.pause()
             await pilot.press("enter", "down", "escape")
             self.assertFalse(font.is_open)
             self.assertEqual(font.font_size, 16)
