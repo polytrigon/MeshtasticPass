@@ -305,6 +305,41 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             self.assertEqual(int(app.query_one("#new-channel-name-row .connection-label").styles.width.value), 13)
             self.assertEqual(int(app.query_one("#network-name-row .connection-label").styles.width.value), 13)
 
+    async def test_new_channel_row_order_and_shared_form_primitives(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            editor = app.query_one("#new-channel-editor")
+            self.assertTrue(editor.has_class("editor-form"))
+            children = list(editor.children)
+            idx_name = next(
+                i for i, w in enumerate(children) if w.id == "new-channel-name-row"
+            )
+            idx_key = next(
+                i for i, w in enumerate(children) if w.id == "new-channel-key-row"
+            )
+            idx_hint = next(
+                i for i, w in enumerate(children) if w.has_class("editor-hint")
+            )
+            idx_actions = next(
+                i for i, w in enumerate(children) if w.id == "new-channel-actions"
+            )
+            # Correct order, no hidden spacer between NAME and KEY.
+            self.assertLess(idx_name, idx_key)
+            self.assertEqual(idx_key, idx_name + 1)
+            self.assertLess(idx_key, idx_hint)
+            self.assertLess(idx_hint, idx_actions)
+            # SAVE / CANCEL visible; actions share NEW PRESET's editor-actions.
+            self.assertTrue(app.query_one("#new-channel-save").display)
+            self.assertTrue(app.query_one("#new-channel-cancel").display)
+            self.assertTrue(app.query_one("#new-channel-actions").has_class("editor-actions"))
+            # New PRESET uses the SAME sharing primitives and stays intact.
+            app.show_tab("connection")
+            await pilot.pause()
+            self.assertTrue(app.query_one("#advanced-radio-actions").has_class("editor-actions"))
+            self.assertTrue(app.query_one("#network-name-row").has_class("connection-action-row"))
+
     async def test_editor_is_dedicated_blank_view_hiding_transcript_and_composer(
         self,
     ) -> None:
@@ -314,7 +349,6 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             await self._open_editor(pilot, app)
             switcher = app.query_one("#chat-channel-content")
             self.assertEqual(switcher.current, "new-channel-editor")
-            # The conversation view (transcript/composer/marker) is hidden.
             self.assertFalse(app.query_one("#chat-conversation").display)
 
     async def test_cancel_restores_normal_chat_view(self) -> None:
@@ -324,8 +358,7 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             await self._open_editor(pilot, app)
             await pilot.press("escape")
             await pilot.pause()
-            switcher = app.query_one("#chat-channel-content")
-            self.assertEqual(switcher.current, "chat-conversation")
+            self.assertEqual(app.query_one("#chat-channel-content").current, "chat-conversation")
             self.assertTrue(app.query_one("#chat-conversation").display)
 
 

@@ -3647,7 +3647,8 @@ class MeshtasticPassApp(App[None]):
         color: $amber_accent;
     }
 
-    #connection .connection-action-row {
+    #connection .connection-action-row,
+    .editor-form .connection-action-row {
         height: 1;
         min-height: 1;
         width: 1fr;
@@ -3656,6 +3657,7 @@ class MeshtasticPassApp(App[None]):
 
     .chat-entry:focus,
     #connection .connection-action-row:focus,
+    .editor-form .connection-action-row:focus,
     #connection .identity-name-control.editing {
         background: $selection_background;
     }
@@ -3728,18 +3730,27 @@ class MeshtasticPassApp(App[None]):
         min-height: 0;
     }
 
-    #advanced-radio-actions {
+    .editor-actions {
         height: 1;
         /* CONNECTION_VALUE_COLUMN_INDENT (2 row-prefix + 12 label + 1)
            minus each button's own margin-left:2 -- so [ SAVE ] lands in
            the same column the form controls' "[ ... ]" start at, and
-           [ CANCEL ] follows on the SAME row after a 2-cell gap. */
+           [ CANCEL ] follows on the SAME row after a 2-cell gap. Shared
+           by NEW PRESET and NEW CHANNEL so both action rows align
+           identically. */
         padding-left: 13;
     }
 
-    #advanced-radio-actions .connection-action-row {
+    .editor-actions .connection-action-row {
         width: auto;
         margin-left: 2;
+    }
+
+    .editor-hint {
+        height: 1;
+        min-height: 1;
+        /* Aligned to the form's value column: gutter(2) + label(13). */
+        padding-left: 13;
     }
 
     /* Spec D/J: pending ("SAVING & APPLYING...") and normal success
@@ -4485,7 +4496,8 @@ class MeshtasticPassApp(App[None]):
                     input_id="key-input",
                 )
                 with Horizontal(
-                    id="advanced-radio-actions", classes="advanced-radio-editor"
+                    id="advanced-radio-actions",
+                    classes="advanced-radio-editor editor-actions",
                 ):
                     yield SaveNetworkControl()
                     yield CancelNetworkControl()
@@ -4544,7 +4556,8 @@ class MeshtasticPassApp(App[None]):
                                     select_on_focus=False,
                                 )
                             with Vertical(
-                                id="new-channel-editor", classes="new-channel-editor"
+                                id="new-channel-editor",
+                                classes="new-channel-editor editor-form",
                             ):
                                 yield Static(
                                     "NEW CHANNEL",
@@ -4565,13 +4578,13 @@ class MeshtasticPassApp(App[None]):
                                 )
                                 yield Static(
                                     "LEAVE BLANK TO CREATE CHANNEL",
-                                    classes="new-channel-hint",
+                                    classes="editor-hint",
                                     markup=False,
                                 )
                                 yield Static(id="new-channel-error", markup=False)
                                 with Horizontal(
                                     id="new-channel-actions",
-                                    classes="connection-action-row",
+                                    classes="editor-actions",
                                 ):
                                     yield NewChannelCancel()
                                     yield NewChannelSave()
