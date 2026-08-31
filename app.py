@@ -9224,7 +9224,16 @@ class MeshtasticPassApp(App[None]):
             self._new_channel_editor_open = True
             self._refresh_new_channel_editor()
             return
-        self._channels = channels
+        # Explicitly re-creating/applying this private channel clears any
+        # prior local CTRL+D suppression for its canonical identity, so it
+        # becomes visible again (see _delete_current_channel).
+        if promoted.stable_key and promoted.stable_key in self.settings.hidden_channel_ids:
+            self.settings.hidden_channel_ids.discard(promoted.stable_key)
+            try:
+                self.settings.save()
+            except OSError:
+                pass
+        self._channels = self._filter_hidden_channels(channels)
         # Rebuild the channel selector from the authoritative (post-APPLY)
         # channel list so the new private channel appears as a real,
         # user-facing entry (never a raw slot/index) and stays selectable.
@@ -9369,35 +9378,68 @@ class MeshtasticPassApp(App[None]):
             send_error_widgets[0].update("PSK COPIED")
         return True
 
+    def _filter_hidden_channels(
+        self, channels: tuple[ChannelInfo, ...]
+    ) -> tuple[ChannelInfo, ...]:
+        """Exclude locally CTRL+D-deleted channels from the app-visible list.
+
+        Filters by the persisted canonical ChannelInfo identity
+        (settings.hidden_channel_ids, keyed by RadioService._channel_stable_key
+        -- never slot/name/PSK alone). The radio-authoritative snapshot passed
+        in is never mutated. A channel whose identity is unknown ("" stable_key)
+        is never hidden by this mechanism.
+        """
+        hidden = self.settings.hidden_channel_ids
+        if not hidden:
+            return tuple(channels)
+        return tuple(
+            channel for channel in channels if channel.stable_key not in hidden
+        )
+
     def _delete_current_channel(self) -> None:
         """CTRL+D: remove a configured private/configured channel locally.
 
-        Locally removes the current (non-PRIMARY) channel from the app's
-        channel list/state and selects the next remaining channel. This is a
-        MeshtasticPass-list-only deletion: it does NOT write/disable/reconfigure
-        the channel on the Meshtastic radio (zero RF, zero config writes), does
-        NOT touch PRIMARY, and NEVER targets the NEW CHANNEL sentinel.
+        Locally deletes/hides the current (non-PRIMARY) configured channel from
+        MeshtasticPass's CHAT channel list/state and selects the next remaining
+        channel. This is a MeshtasticPass-list-only operation: it does NOT
+        write/disable/reconfigure the channel on the Meshtastic radio (zero RF,
+        zero config writes), does NOT touch PRIMARY, and NEVER targets the NEW
+        CHANNEL sentinel.
 
-        IMPORTANT honest caveat: because the app's channel list is
-        radio-authoritative (re-derived from the radio on connect/refresh), a
-        locally removed channel will be rediscovered from the radio on a later
-        reconnect/refresh and reappear. A truly persistent removal requires a
-        radio-side delete protocol (out of scope here) or a persisted hidden
-        filter.
+        The deleted channel's canonical ChannelInfo identity
+        (RadioService._channel_stable_key -- never a slot index, display name,
+        or PSK hash alone) is persisted in settings.hidden_channel_ids and
+        excluded whenever the authoritative configured-channel list becomes the
+        app-visible CHAT list (see _filter_hidden_channels). A genuinely
+        different channel later occupying the same slot has a different
+        identity and is NOT hidden. Explicitly re-creating/applying the same
+        private channel clears its suppression (see the APPLY success path).
         """
         index = self.current_channel_index
         if index == 0 or self._new_channel_editor_open:
             return
-        remaining = tuple(channel for channel in self._channels if channel.index != index)
+        channel = next(
+            (c for c in self._channels if c.index == index),
+            None,
+        )
+        if channel is None:
+            return
+        if channel.stable_key:
+            self.settings.hidden_channel_ids.add(channel.stable_key)
+            try:
+                self.settings.save()
+            except OSError:
+                pass
+        remaining = tuple(ch for ch in self._channels if ch.index != index)
         if len(remaining) == len(self._channels):
             return
-        prior_order = [channel.index for channel in self._channels]
+        prior_order = [ch.index for ch in self._channels]
         position = prior_order.index(index) if index in prior_order else -1
-        remaining_indexes = [channel.index for channel in remaining]
+        remaining_indexes = [ch.index for ch in remaining]
         if not remaining_indexes:
             return
         next_index = remaining_indexes[0]
-        if position >= 0:
+        if position >= 0 and len(prior_order):
             for offset in range(1, len(prior_order) + 1):
                 candidate = prior_order[(position + offset) % len(prior_order)]
                 if candidate in remaining_indexes:
@@ -10618,7 +10660,10 @@ class MeshtasticPassApp(App[None]):
             self._reset_clock_sync_state()
         if state is RadioState.ONLINE and info is not None and info.channels:
             self._invalidate_reassigned_channel_caches(info.channels)
-            self._channels = info.channels
+            # Locally-hid (CTRL+D) configured channels are excluded at this
+            # boundary -- the radio-authoritative snapshot is never mutated,
+            # only the app-visible CHAT channel list is filtered.
+            self._channels = self._filter_hidden_channels(info.channels)
             selector = self.query_one(ChannelSelector)
             available_indexes = {channel.index for channel in self._channels}
             selected_index = self.current_channel_index

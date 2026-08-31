@@ -905,6 +905,88 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
             self.assertEqual(app.current_channel_index, 0)
 
+    async def test_ctrl_d_persists_hidden_identity_across_reload(self) -> None:
+        from radio_service import ChannelInfo, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._radio_state = RadioState.ONLINE
+            app._channels = (
+                ChannelInfo(0, "MEDIUMSLOW"),
+                ChannelInfo(1, "SECRET", stable_key="hash:SECRET:7"),
+            )
+            app.current_channel_index = 1
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            await pilot.press("ctrl+d")
+            for _ in range(15):
+                await pilot.pause()
+                if app.current_channel_index == 0:
+                    break
+            self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
+            self.assertIn("hash:SECRET:7", self.settings.hidden_channel_ids)
+        # New app/settings reload still hides SECRET at the filter boundary.
+        reloaded = self._make_app()
+        reloaded.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        reloaded._channels = (
+            ChannelInfo(0, "MEDIUMSLOW"),
+            ChannelInfo(1, "SECRET", stable_key="hash:SECRET:7"),
+        )
+        self.assertEqual(
+            [c.name for c in reloaded._filter_hidden_channels(reloaded._channels)],
+            ["MEDIUMSLOW"],
+        )
+
+    async def test_hidden_channel_identity_not_keyed_by_slot(self) -> None:
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.settings.hidden_channel_ids = {"hash:SECRET:7"}
+            # A different channel later occupies the same slot (index 1) but has
+            # a DIFFERENT canonical identity -> must remain visible.
+            channels = (
+                ChannelInfo(0, "MEDIUMSLOW"),
+                ChannelInfo(1, "NEWONE", stable_key="hash:NEWONE:9"),
+            )
+            self.assertEqual(
+                [c.name for c in app._filter_hidden_channels(channels)],
+                ["MEDIUMSLOW", "NEWONE"],
+            )
+
+    async def test_reapply_clears_suppression(self) -> None:
+        from radio_service import ChannelInfo, PrivateChannelApplyResult, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.ONLINE
+            app.settings.hidden_channel_ids = {"hash:SECRET:7"}
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW", stable_key="hash:MEDIUM:0"),)
+            app._start_new_channel()
+            await pilot.pause()
+            app.query_one("#new-channel-name").value = "SECRET"
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                True, 1, ""
+            )
+            app.radio.get_config_channels = lambda: (
+                ChannelInfo(0, "MEDIUMSLOW", stable_key="hash:MEDIUM:0"),
+                ChannelInfo(1, "SECRET", stable_key="hash:SECRET:7"),
+            )
+            app.new_channel_save(None)
+            for _ in range(20):
+                await pilot.pause()
+                if app._pending_channel is None:
+                    break
+            self.assertNotIn("hash:SECRET:7", self.settings.hidden_channel_ids)
+            self.assertIn("SECRET", [c.name for c in app._channels])
+
 
 if __name__ == "__main__":
     unittest.main()
