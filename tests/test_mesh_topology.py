@@ -15,6 +15,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from rich.cells import cell_len
 from textual.color import Color
@@ -7230,15 +7231,20 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
             # The fixture must genuinely exercise a clipped relay stage
             # -- otherwise this test would pass vacuously.
             self.assertTrue(clipped_relay_ids, "fixture must clip at least one relay stage")
+            # ORPHAN TOPOLOGY CIRCLE AUDIT: a chain containing a clipped
+            # stage takes the direct-route connector fallback, so NONE
+            # of its stages -- the clipped one (which must never stand
+            # in as an extra continuation indication) OR its on-screen
+            # siblings (whose connector no longer visits them) -- may
+            # render. Previously the siblings stayed visible as exactly
+            # the unexplained standalone circles seen on hardware.
             for node_id, widget in relay_widgets.items():
-                if node_id in clipped_relay_ids:
-                    self.assertFalse(
-                        widget.display,
-                        f"{node_id} clipped to the boundary must render hidden, "
-                        "never as an extra continuation indication",
-                    )
-                else:
-                    self.assertTrue(widget.display)
+                self.assertFalse(
+                    widget.display,
+                    f"{node_id} belongs to a clipped, direct-routed chain and "
+                    "must render hidden, never as a standalone circle or an "
+                    "extra continuation indication",
+                )
 
     async def test_selection_round_trip_restores_the_same_indicator_set(self) -> None:
         """Case E: toggling selection away and back must restore the
@@ -7540,6 +7546,343 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             palette = THEME_PALETTES[app._current_theme]
             colors = {color for _x, _y, _glyph, color in connectors}
             self.assertIn(palette.accent, colors)
+
+
+class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
+    """ORPHAN TOPOLOGY CIRCLE AUDIT: every visible synthetic hollow-
+
+    circle relay marker must participate in a currently drawn connector
+    chain. Hardware showed isolated `CIRCLE_STROKED_LARGE` dots with no
+    line through them: the relay widgets were shown during glyph
+    placement, then the connector loop's direct-route fallbacks (an
+    edge-clipped stage, or a duplicate-cell chain route) quietly stopped
+    visiting them. The fix decides relay `display` AFTER routing, from
+    exactly the set of stages the drawn connectors visit -- real nodes,
+    their labels/edge indicators, and traceroute `*` are untouched.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    @staticmethod
+    def _clipped_chain_fixture(you_id: str, short_name: str = "FMH3"):
+        """The verified MeshSelectedRelayChainSpuriousConnectorTests
+
+        geometry: a 3-hop remote that, once the board recenters on it,
+        independently edge-clips exactly one intermediate relay stage
+        at a (60, 14) terminal -- forcing the direct-route fallback.
+        """
+        working_set = (
+            MeshNodeState(
+                node=NodeMetadata(you_id, "You", "YOU", is_local=True),
+                is_client=False,
+                is_relay=False,
+                last_interaction_at=None,
+            ),
+            MeshNodeState(
+                node=NodeMetadata(
+                    "!faroff03",
+                    "Far Multi Hop",
+                    short_name,
+                    3,
+                    last_heard=1_700_000_000.0,
+                ),
+                is_client=False,
+                is_relay=False,
+                last_interaction_at=None,
+            ),
+        )
+        base_positions = {you_id: (7, 2), "!faroff03": (8, 5)}
+        return working_set, base_positions
+
+    @staticmethod
+    def _connected_chain_fixture(you_id: str):
+        """A 3-hop remote whose whole chain stays on-screen with YOU
+
+        selected (the default) -- the chain routes normally, so every
+        stage is genuinely connected.
+        """
+        working_set = (
+            MeshNodeState(
+                node=NodeMetadata(you_id, "You", "YOU", is_local=True),
+                is_client=False,
+                is_relay=False,
+                last_interaction_at=None,
+            ),
+            MeshNodeState(
+                node=NodeMetadata(
+                    "!near0003",
+                    "Near Multi Hop",
+                    "NMH3",
+                    3,
+                    last_heard=1_700_000_000.0,
+                ),
+                is_client=False,
+                is_relay=False,
+                last_interaction_at=None,
+            ),
+        )
+        base_positions = {you_id: (4, 9), "!near0003": (4, 13)}
+        return working_set, base_positions
+
+    async def test_clipping_fallback_cannot_leave_an_orphan_marker(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._clipped_chain_fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            view.select_node("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+            self.assertEqual(len(relay_ids), 3)
+            self.assertTrue(
+                relay_ids & view._edge_node_ids,
+                "fixture must genuinely edge-clip a relay stage, or this "
+                "test proves nothing",
+            )
+            # The chain fell back to the direct route, so EVERY stage of
+            # it -- clipped or on-screen sibling -- must be hidden.
+            for widget in app.query(MeshRelayWidget):
+                self.assertFalse(
+                    widget.display,
+                    f"{widget.node_id} has no connector through it and must "
+                    "not render as a standalone circle",
+                )
+
+    async def test_collision_routing_fallback_cannot_leave_an_orphan_marker(
+        self,
+    ) -> None:
+        """The duplicate-cell (self-overlapping chain route) fallback is
+
+        geometry-dependent, so it is forced deterministically here: the
+        multi-point chain call is made to return a route with one
+        repeated cell, while the 2-point direct call passes through
+        untouched -- exercising exactly app.py's belt-and-suspenders
+        branch.
+        """
+        real_route_chain_avoiding = route_chain_avoiding
+
+        def duplicating(points, obstacles):
+            cells = real_route_chain_avoiding(points, obstacles)
+            if len(points) > 2 and cells:
+                return cells + (cells[0],)
+            return cells
+
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._connected_chain_fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            with mock.patch("app.route_chain_avoiding", side_effect=duplicating):
+                view.set_nodes(
+                    working_set,
+                    base_positions,
+                    theme=app._current_theme,
+                    now=1_700_000_000.0,
+                )
+            await pilot.pause()
+
+            self.assertEqual(len(view.relay_stages), 3)
+            for widget in app.query(MeshRelayWidget):
+                self.assertFalse(
+                    widget.display,
+                    "a chain whose route degraded to the direct line must "
+                    "hide all of its intermediate markers",
+                )
+            # The connector itself still rendered (the direct line).
+            canvas = view.board.query_one(MeshCanvas)
+            _w, _h, connectors, _theme = canvas._signature
+            self.assertGreater(len(connectors), 0)
+
+    async def test_connected_intermediate_markers_remain_visible(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._connected_chain_fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+            self.assertEqual(len(relay_ids), 3)
+            self.assertFalse(relay_ids & view._edge_node_ids)
+            shown = [w for w in app.query(MeshRelayWidget) if w.display]
+            self.assertEqual({w.node_id for w in shown}, relay_ids)
+            canvas = view.board.query_one(MeshCanvas)
+            _w, _h, connectors, _theme = canvas._signature
+            self.assertGreater(len(connectors), 0)
+
+    async def test_refresh_relayout_removes_obsolete_markers(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            hopped = NodeMetadata(
+                "!hopper01", "Hopper", "HOP", 3, last_heard=now - 5,
+                position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, hopped): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 3)
+
+            # The radio now reports a direct (0-hop) route: a re-layout
+            # must leave no marker from the previous topology behind.
+            rerouted = NodeMetadata(
+                "!hopper01", "Hopper", "HOP", 0, last_heard=now - 4,
+                position=north_of_local(3),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, rerouted): nodes
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
+
+    async def test_real_nodes_are_never_removed_by_orphan_cleanup(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            now = 1_700_000_000.0
+            you_id = app.radio.info.node_id
+            local = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
+            # A real off-screen 5-hop node: its chain clips, so its
+            # synthetic markers all hide -- but the real node itself
+            # must keep its boundary-continuation glyph, and a real
+            # STALE node must keep its own hollow circle.
+            far = NodeMetadata(
+                "!far00001", "Far", "FAR1", 5, last_heard=now - 5,
+                position=north_of_local(50),
+            )
+            stale = NodeMetadata(
+                "!stale001", "Stale", "STL", 1,
+                last_heard=now - ACTIVE_WINDOW_SECONDS - 100,
+                position=south_of_local(2),
+            )
+            app.radio.get_known_nodes = lambda nodes=(local, far, stale): nodes
+            await self._open_mesh(pilot)
+            app._refresh_mesh(wall_now=now)
+            await pilot.pause()
+
+            view = app.query_one(MeshTopologyView)
+            self.assertEqual(view.edge_node_ids, frozenset({"!far00001"}))
+            for widget in app.query(MeshRelayWidget):
+                self.assertFalse(widget.display)
+            node_widgets = {w.node_id: w for w in app.query(MeshNodeWidget)}
+            self.assertEqual(
+                set(node_widgets), {you_id, "!far00001", "!stale001"}
+            )
+            for widget in node_widgets.values():
+                self.assertTrue(
+                    widget.display,
+                    f"real node {widget.node_id} must never be hidden by "
+                    "orphan-marker cleanup",
+                )
+            self.assertEqual(
+                str(node_widgets["!stale001"].render()).strip(),
+                CIRCLE_STROKED_LARGE,
+                "a real STALE node keeps its legitimate hollow circle",
+            )
+
+    async def test_unicode_emoji_labels_remain_unchanged(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._clipped_chain_fixture(
+                you_id, short_name="⛰️"
+            )
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            label = next(
+                w
+                for w in app.query(MeshNodeLabelWidget)
+                if w.node_id == "!faroff03"
+            )
+            self.assertTrue(label.display)
+            self.assertIn("⛰", str(label.render()))
+
+    async def test_selected_route_rendering_remains_correct(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._connected_chain_fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            view.select_node("!near0003")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            canvas = view.board.query_one(MeshCanvas)
+            _w, _h, connectors, _theme = canvas._signature
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertIn(
+                palette.accent, {color for _x, _y, _glyph, color in connectors}
+            )
+            # The selected chain still routes through its stages, so its
+            # markers stay visible.
+            self.assertTrue(
+                all(w.display for w in app.query(MeshRelayWidget))
+            )
+
+    async def test_traceroute_star_rendering_remains_correct(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set, base_positions = self._clipped_chain_fixture(you_id)
+            view = app.query_one(MeshTopologyView)
+            view.mark_traced("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            view.select_node("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+            traced = next(
+                w for w in app.query(MeshNodeWidget) if w.node_id == "!faroff03"
+            )
+            self.assertIn("*", str(traced.render()))
+            for widget in app.query(MeshRelayWidget):
+                self.assertFalse(widget.display)
 
 
 class ProjectToViewportTests(unittest.TestCase):

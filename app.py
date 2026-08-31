@@ -2551,23 +2551,13 @@ class MeshTopologyView(Container):
             widget.styles.offset = (grid_x, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
             widget.refresh_visual(theme=theme)
-            # MESH BOUNDARY CONTINUATION INDICATORS item 30-32: a real
-            # node's own clipped glyph at the viewport edge IS the
-            # existing "more topology exists here" signal (see the
-            # comment above viewport_positions/project_to_viewport --
-            # it renders unlabeled at the boundary). A relay stage is
-            # never a real NodeDB entry -- just interpolated route
-            # geometry between YOU and a real client (see RelayStage) --
-            # so if IT is what got clipped here (its own interpolated
-            # cell fell outside the viewport, independent of whether
-            # the real endpoint did), it must never visually stand in
-            # for that same signal: hidden entirely rather than
-            # rendered at the boundary, where an anonymous dim dot
-            # would be indistinguishable from a genuinely off-screen
-            # node. This is display-only -- edge_ids itself (used
-            # above for the spurious-connector chain-ordering check)
-            # is untouched, so that fix's own correctness is unaffected.
-            widget.display = widget.node_id not in edge_ids
+            # Visibility is decided LATER, after the connector loop has
+            # actually routed each chain (see the loop over
+            # relay_widgets below render-time routing): a relay stage
+            # is only ever shown when the drawn connector genuinely
+            # visits it. Positioning/refresh here stays unconditional
+            # so a stage that IS shown lands on exactly the same anchor
+            # formula as before.
 
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
@@ -2629,6 +2619,15 @@ class MeshTopologyView(Container):
         # working_set already filters them out of `working_set` itself.
         connector_cells: list[tuple[int, int, str, str]] = []
         selected_connector_cells: list[tuple[int, int, str, str]] = []
+        # ORPHAN TOPOLOGY CIRCLE AUDIT: the synthetic relay stages whose
+        # chain the connector loop below ACTUALLY routed through. Only
+        # these stages are displayed (see the visibility loop after this
+        # one) -- every fallback to a direct YOU-to-endpoint line, and
+        # every skipped/undrawn chain, leaves its stages out, so an
+        # anonymous hollow circle can never stand on the board without
+        # its connector chain. Starts empty so "no connectors at all"
+        # (YOU missing from centers) also shows zero relay markers.
+        connected_relay_ids: set[str] = set()
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
@@ -2682,11 +2681,13 @@ class MeshTopologyView(Container):
                 # the lower topology, rise to the top, then run
                 # horizontally across it" -- entirely through CELLS
                 # that never individually repeat). Falling back to a
-                # direct YOU-to-endpoint line for the connector's PATH
-                # only -- the relay dots themselves stay rendered at
-                # their own clipped positions (see the glyph-placement
-                # loop above), never fabricated or hidden, only the
-                # connecting LINE no longer visits them.
+                # direct YOU-to-endpoint line replaces the connector's
+                # PATH -- and, since the line then visits no stage, the
+                # chain's relay dots are withheld from
+                # connected_relay_ids so they are hidden along with it
+                # (orphan-circle audit): an intermediate marker whose
+                # connector no longer visits it would otherwise stand
+                # on the board as an unexplained standalone circle.
                 relay_stage_ids_in_chain = {
                     stage.node_id for stage in chain_stages if stage.node_id in centers
                 }
@@ -2705,6 +2706,11 @@ class MeshTopologyView(Container):
                         route_cells = route_chain_avoiding(
                             (centers[you_id], centers[remote_id]), obstacles
                         )
+                    else:
+                        # The drawn connector genuinely visits every
+                        # stage of this chain -- these markers have a
+                        # visible line through them and may render.
+                        connected_relay_ids |= relay_stage_ids_in_chain
                 if is_selected:
                     color = palette.accent
                 elif is_stale:
@@ -2716,6 +2722,24 @@ class MeshTopologyView(Container):
                     color = palette.dim_base
                 target = selected_connector_cells if is_selected else connector_cells
                 target.extend((x, y, glyph, color) for x, y, glyph in route_cells)
+        # ORPHAN TOPOLOGY CIRCLE AUDIT invariant: every visible
+        # synthetic hollow-circle relay marker participates in a
+        # currently drawn connector chain. Decided HERE -- after the
+        # routing above settled which chains are actually drawn through
+        # their stages -- never before, which is exactly the ordering
+        # bug that produced unexplained standalone circles (the marker
+        # was shown in the placement loop, then the route fell back to
+        # a direct line that no longer visits it). This also subsumes
+        # the earlier edge-clip rule (MESH BOUNDARY CONTINUATION items
+        # 30-32: an anonymous dim dot clipped to the viewport edge must
+        # never impersonate a real off-screen node's boundary
+        # indicator): a chain containing an edge-clipped stage always
+        # takes the direct-route fallback, so none of its stages are
+        # connected, and none render. Display-only for SYNTHETIC
+        # markers -- real MeshNodeWidget nodes (their glyphs, labels,
+        # edge indicators, traceroute '*') are never touched here.
+        for widget in relay_widgets:
+            widget.display = widget.node_id in connected_relay_ids
         # Selected route drawn LAST: MeshCanvas's own overlay dict keys
         # on (x, y), so whichever connector's cells are appended last
         # wins any shared cell -- painting the focused node's full
