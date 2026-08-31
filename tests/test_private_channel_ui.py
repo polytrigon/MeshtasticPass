@@ -319,17 +319,27 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             idx_key = next(
                 i for i, w in enumerate(children) if w.id == "new-channel-key-row"
             )
-            idx_hint = next(
-                i for i, w in enumerate(children) if w.has_class("editor-hint")
-            )
             idx_actions = next(
                 i for i, w in enumerate(children) if w.id == "new-channel-actions"
             )
-            # Correct order, no hidden spacer between NAME and KEY.
+            idx_hint = next(
+                i for i, w in enumerate(children) if w.has_class("editor-hint")
+            )
+            # Correct order: NAME, then KEY (adjacent, no hidden spacer), then
+            # SAVE/CANCEL, then the hint below.
             self.assertLess(idx_name, idx_key)
             self.assertEqual(idx_key, idx_name + 1)
-            self.assertLess(idx_key, idx_hint)
-            self.assertLess(idx_hint, idx_actions)
+            self.assertLess(idx_key, idx_actions)
+            self.assertLess(idx_actions, idx_hint)
+            # Exact labels / hint text per the layout spec.
+            self.assertEqual(
+                str(app.query_one("#new-channel-key-row .connection-label").render()),
+                "CHANNEL KEY",
+            )
+            self.assertEqual(
+                str(app.query_one(".editor-hint").render()),
+                "LEAVING KEY BLANK WILL CREATE A NEW CHANNEL",
+            )
             # SAVE / CANCEL visible; actions share NEW PRESET's editor-actions.
             self.assertTrue(app.query_one("#new-channel-save").display)
             self.assertTrue(app.query_one("#new-channel-cancel").display)

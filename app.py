@@ -4571,24 +4571,25 @@ class MeshtasticPassApp(App[None]):
                                     collapsible=False,
                                 )
                                 yield NetworkFieldInput(
-                                    label="KEY",
+                                    label="CHANNEL KEY",
                                     widget_id="new-channel-key-row",
                                     input_id="new-channel-key",
                                     collapsible=False,
                                 )
-                                yield Static(
-                                    "LEAVE BLANK TO CREATE CHANNEL",
-                                    classes="editor-hint",
-                                    markup=False,
-                                )
-                                yield Static(id="new-channel-error", markup=False)
                                 with Horizontal(
                                     id="new-channel-actions",
                                     classes="editor-actions",
+                                    markup=False,
                                 ):
                                     yield NewChannelCancel()
                                     yield NewChannelSave()
                                     yield NewChannelApply()
+                                yield Static(
+                                    "LEAVING KEY BLANK WILL CREATE A NEW CHANNEL",
+                                    classes="editor-hint",
+                                    markup=False,
+                                )
+                                yield Static(id="new-channel-error", markup=False)
                     with Vertical(id="chat-dms"):
                         yield Static(
                             id="dm-connection-status",
