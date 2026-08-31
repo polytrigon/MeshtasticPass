@@ -720,5 +720,55 @@ class ApplyPendingChannelTests(PrivateChannelUiBase):
             self.assertIsNotNone(app._pending_channel)
 
 
+class PskHeaderTests(PrivateChannelUiBase):
+    async def test_public_channel_omits_psk_and_no_strip(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            self.assertEqual(str(app.query_one("#chat-channel-psk").render()), "")
+            # No separate PSK strip is rendered for a configured public channel.
+            self.assertFalse(app.query_one("#new-channel-pending").display)
+
+    async def test_configured_private_channel_shows_inline_psk_in_header(self) -> None:
+        import base64 as _b64
+
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            raw = bytes(range(16))
+            app._channels = (ChannelInfo(0, "SECRET"),)
+            app.current_channel_index = 0
+            # Fake radio exposing a matching configured PSK for channel 0.
+            from types import SimpleNamespace
+
+            app.radio.channel_psk_text = lambda index: _b64.b64encode(raw).decode("ascii")
+            app._refresh_channel_psk_header()
+            await pilot.pause()
+            text = str(app.query_one("#chat-channel-psk").render())
+            self.assertIn("PSK", text)
+            self.assertIn(_b64.b64encode(raw).decode("ascii"), text)
+            # The pending strip is separate and hidden for a configured channel.
+            self.assertFalse(app.query_one("#new-channel-pending").display)
+
+    async def test_pending_psk_presentation_is_separate_from_header(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._start_new_channel()
+            await pilot.pause()
+            app._save_new_channel("SECRET", "")
+            await pilot.pause()
+            # Pending strip still shows the NOT YET APPLIED + PSK; header is
+            # empty (the pending config is NOT a configured channel).
+            self.assertTrue(app.query_one("#new-channel-pending").display)
+            self.assertEqual(str(app.query_one("#chat-channel-psk").render()), "")
+
+
 if __name__ == "__main__":
     unittest.main()
