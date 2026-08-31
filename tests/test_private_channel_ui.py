@@ -222,10 +222,13 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             await pilot.press("enter")  # name -> key
             await pilot.pause()
             self.assertEqual(app.focused.id, "new-channel-key")
-            await pilot.press("down")  # key -> cancel
+            await pilot.press("down")  # key -> SAVE (not CANCEL)
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "new-channel-save")
+            await pilot.press("right")  # SAVE -> CANCEL
             await pilot.pause()
             self.assertEqual(app.focused.id, "new-channel-cancel")
-            await pilot.press("down")  # cancel -> save
+            await pilot.press("left")  # CANCEL -> SAVE
             await pilot.pause()
             self.assertEqual(app.focused.id, "new-channel-save")
             await pilot.press("enter")  # save (blank key -> generated)
@@ -542,24 +545,99 @@ class ApplyPendingChannelTests(PrivateChannelUiBase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             app._radio_state = RadioState.ONLINE
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW"),)
             app._start_new_channel()
             await pilot.pause()
-            app.query_one("#new-channel-name").value = "Secret Society"
+            app.query_one("#new-channel-name").value = "SECRET"
             app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
-                True, 2, ""
+                True, 1, ""
             )
             app.radio.get_config_channels = lambda: (
-                ChannelInfo(0, "LongFast"),
-                ChannelInfo(2, "Secret Society"),
+                ChannelInfo(0, "MEDIUMSLOW"),
+                ChannelInfo(1, "SECRET"),
             )
-            # Trigger SAVE via the handler (auto-applies when ONLINE).
             app.new_channel_save(None)
             for _ in range(20):
                 await pilot.pause()
                 if app._pending_channel is None:
                     break
             self.assertIsNone(app._pending_channel)
-            self.assertIn("Secret Society", [c.name for c in app._channels])
+            self.assertIn("SECRET", [c.name for c in app._channels])
+
+    async def test_apply_refreshes_selector_with_real_secret_name(self) -> None:
+        from radio_service import ChannelInfo, PrivateChannelApplyResult, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.ONLINE
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW"),)
+            app._start_new_channel()
+            await pilot.pause()
+            app.query_one("#new-channel-name").value = "SECRET"
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                True, 1, ""
+            )
+            app.radio.get_config_channels = lambda: (
+                ChannelInfo(0, "MEDIUMSLOW"),
+                ChannelInfo(1, "SECRET"),
+            )
+            app.new_channel_save(None)
+            for _ in range(20):
+                await pilot.pause()
+                if app._pending_channel is None:
+                    break
+            await pilot.pause()
+            selector = app.query_one(ChannelSelector)
+            # Selector options are the authoritative channels, never a raw index.
+            self.assertEqual([o.value for o in selector.options], [0, 1])
+            self.assertEqual([o.label for o in selector.options], ["MEDIUMSLOW", "SECRET"])
+            # Heading shows the real channel name, never "1".
+            self.assertEqual(selector.selected_label, "SECRET")
+            self.assertEqual(app.current_channel_index, 1)
+            # Opening the dropdown appends NEW CHANNEL after the real channels.
+            selector.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            labels = [o.label for o in selector.options]
+            self.assertEqual(labels, ["MEDIUMSLOW", "SECRET", "NEW CHANNEL"])
+            await pilot.press("escape")
+            await pilot.pause()
+
+    async def test_switch_secret_mediumslow_secret_works_zero_writes(self) -> None:
+        from radio_service import ChannelInfo, PrivateChannelApplyResult, RadioState
+
+        radio = ControllableSendRadioService()
+        app = self._make_app(radio)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.ONLINE
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW"),)
+            app._start_new_channel()
+            await pilot.pause()
+            app.query_one("#new-channel-name").value = "SECRET"
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                True, 1, ""
+            )
+            app.radio.get_config_channels = lambda: (
+                ChannelInfo(0, "MEDIUMSLOW"),
+                ChannelInfo(1, "SECRET"),
+            )
+            app.new_channel_save(None)
+            for _ in range(20):
+                await pilot.pause()
+                if app._pending_channel is None:
+                    break
+            self.assertEqual(app.current_channel_index, 1)
+            # SECRET -> MEDIUMSLOW -> SECRET, all local, zero writes/RF.
+            await app._switch_channel(0)
+            await pilot.pause()
+            self.assertEqual(app.current_channel_index, 0)
+            self.assertIn("SECRET", [c.name for c in app._channels])
+            await app._switch_channel(1)
+            await pilot.pause()
+            self.assertEqual(app.current_channel_index, 1)
+            self.assertEqual(radio.sent_texts, [])
 
     async def test_save_offline_is_zero_write_and_keeps_editor(self) -> None:
         from radio_service import RadioState

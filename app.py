@@ -4783,6 +4783,17 @@ class MeshtasticPassApp(App[None]):
                 self._move_new_channel_focus(-1 if event.key == "up" else 1)
                 event.stop()
                 return
+            # [ SAVE ] [ CANCEL ] share one row -- RIGHT/LEFT moves within the
+            # pair, the same convention NEW PRESET uses for its SAVE/CANCEL.
+            focused_field = self._new_channel_focused_field()
+            if event.key == "right" and focused_field == "save":
+                self._focus_new_channel_field("cancel")
+                event.stop()
+                return
+            if event.key == "left" and focused_field == "cancel":
+                self._focus_new_channel_field("save")
+                event.stop()
+                return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
         if isinstance(self.focused, Input):
@@ -9188,6 +9199,14 @@ class MeshtasticPassApp(App[None]):
             self._refresh_new_channel_editor()
             return
         self._channels = channels
+        # Rebuild the channel selector from the authoritative (post-APPLY)
+        # channel list so the new private channel appears as a real,
+        # user-facing entry (never a raw slot/index) and stays selectable.
+        selector = self.query_one(ChannelSelector)
+        selector.set_options(
+            (DropdownOption(channel.name, channel.index) for channel in self._channels),
+            value=promoted.index,
+        )
         self._pending_channel = None
         self._new_channel_error = ""
         self._new_channel_editor_open = False
@@ -9219,7 +9238,10 @@ class MeshtasticPassApp(App[None]):
             if isinstance(widgets[0], Input):
                 widgets[0].cursor_position = len(widgets[0].value)
 
-    _NEW_CHANNEL_FIELD_ORDER = ("name", "key", "cancel", "save")
+    # Vertical stops: CHANNEL NAME, CHANNEL KEY, SAVE. CANCEL is NOT a
+    # vertical stop -- it is a horizontal sibling of SAVE (reached with RIGHT
+    # from SAVE / LEFT from CANCEL), exactly like NEW PRESET's SAVE/CANCEL pair.
+    _NEW_CHANNEL_FIELD_ORDER = ("name", "key", "save")
 
     def _new_channel_focused_field(self) -> str:
         focused = self.focused
@@ -9237,11 +9259,17 @@ class MeshtasticPassApp(App[None]):
     def _move_new_channel_focus(self, direction: int) -> None:
         order = self._NEW_CHANNEL_FIELD_ORDER
         current = self._new_channel_focused_field()
+        if current == "cancel":
+            # CANCEL shares SAVE's vertical position (see NEW PRESET: vertical
+            # nav from CANCEL behaves exactly as from its SAVE sibling).
+            current = "save"
         try:
             index = order.index(current)
         except ValueError:
             index = 0
-        target = order[(index + direction) % len(order)]
+        # Clamp at the ends (SAVE is the last vertical stop -- DOWN from it
+        # stays put), never wrap to a hidden/other control.
+        target = order[max(0, min(len(order) - 1, index + direction))]
         self._focus_new_channel_field(target)
 
     @on(Input.Submitted, "#new-channel-name")
