@@ -7230,15 +7230,20 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
             # The fixture must genuinely exercise a clipped relay stage
             # -- otherwise this test would pass vacuously.
             self.assertTrue(clipped_relay_ids, "fixture must clip at least one relay stage")
+            # Once any stage in a chain independently clips, the whole
+            # chain's connector falls back to a direct YOU<->endpoint line
+            # (see MeshTopologyView.set_nodes), so NO stage in that chain
+            # participates in a visible connector anymore -- every one of
+            # its relay dots must render hidden, never a clipped dot as a
+            # second boundary continuation OR an on-screen dot as an
+            # orphan hollow circle.
             for node_id, widget in relay_widgets.items():
-                if node_id in clipped_relay_ids:
-                    self.assertFalse(
-                        widget.display,
-                        f"{node_id} clipped to the boundary must render hidden, "
-                        "never as an extra continuation indication",
-                    )
-                else:
-                    self.assertTrue(widget.display)
+                self.assertFalse(
+                    widget.display,
+                    f"{node_id} must render hidden: its chain's connector "
+                    "fell back to a direct line (a sibling stage clipped), "
+                    "so no stage participates in a visible connector chain",
+                )
 
     async def test_selection_round_trip_restores_the_same_indicator_set(self) -> None:
         """Case E: toggling selection away and back must restore the
@@ -7540,6 +7545,137 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             palette = THEME_PALETTES[app._current_theme]
             colors = {color for _x, _y, _glyph, color in connectors}
             self.assertIn(palette.accent, colors)
+
+
+class MeshRelayOrphanCircleTests(unittest.IsolatedAsyncioTestCase):
+    """Orphan hollow-circle regression: a synthetic relay stage renders
+    only while it is a waypoint on a connector route actually drawn for
+    its chain. When a chain's connector falls back to a direct
+    YOU<->endpoint line (an intermediate stage independently clipped to
+    the viewport edge), every relay dot in that chain must be hidden --
+    never left as an unexplained standalone hollow circle with no visible
+    connector entering or leaving it (the hardware-observed symptom).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+
+    def _make_app(self) -> MeshtasticPassApp:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        return MeshtasticPassApp(radio, self.settings)
+
+    async def _open_mesh(self, pilot) -> None:
+        await pilot.pause()
+        await pilot.press("3")
+        await pilot.pause()
+        await pilot.pause()
+
+    @staticmethod
+    def _state(
+        node_id: str,
+        name: str,
+        *,
+        hops: int | None = None,
+        is_local: bool = False,
+    ) -> MeshNodeState:
+        node = NodeMetadata(
+            node_id,
+            name,
+            name[:4].upper(),
+            hops,
+            is_local=is_local,
+            last_heard=1_700_000_000.0,
+        )
+        return MeshNodeState(
+            node=node, is_client=False, is_relay=False, last_interaction_at=None
+        )
+
+    async def test_edge_clipped_chain_hides_every_relay_dot_and_keeps_real_node(
+        self,
+    ) -> None:
+        """A chain whose connector falls back to a direct line (because
+        one intermediate stage edge-clipped) must hide ALL of its relay
+        dots -- the clipped one AND the still-on-screen ones, which would
+        otherwise render as orphan hollow circles with no connector.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set = (
+                self._state(you_id, "You", is_local=True),
+                self._state("!faroff03", "Far Multi Hop", hops=3),
+            )
+            base_positions = {you_id: (7, 2), "!faroff03": (8, 5)}
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            view.select_node("!faroff03")
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+
+            self.assertEqual(len(view.relay_stages), 3)
+            relay_ids = {stage.node_id for stage in view.relay_stages}
+            self.assertTrue(
+                relay_ids & view._edge_node_ids,
+                "fixture must genuinely edge-clip a relay stage, or this "
+                "test proves nothing",
+            )
+            widgets = {w.node_id: w for w in app.query(MeshRelayWidget)}
+            self.assertEqual(set(widgets), relay_ids)
+            for node_id, widget in widgets.items():
+                self.assertFalse(
+                    widget.display,
+                    f"{node_id} must not render as an orphan hollow circle",
+                )
+            # Real nodes are never hidden by orphan cleanup.
+            self.assertTrue(
+                any(w.node_id == "!faroff03" for w in app.query(MeshNodeWidget))
+            )
+
+    async def test_fully_on_screen_chain_keeps_relay_dot_visible(self) -> None:
+        """A relay stage whose chain is entirely on-screen (no clip, no
+        fallback) must still render -- the fix removes orphans only,
+        never a legitimately-connected intermediate relay circle.
+        """
+        app = self._make_app()
+        async with app.run_test(size=(60, 14)) as pilot:
+            await self._open_mesh(pilot)
+            you_id = app.radio.info.node_id
+            working_set = (
+                self._state(you_id, "You", is_local=True),
+                self._state("!near0001", "Near", hops=1),
+            )
+            base_positions = {
+                you_id: (MESH_LOGICAL_GRID_CENTER_ROW, MESH_LOGICAL_GRID_CENTER_COLUMN),
+                "!near0001": (
+                    MESH_LOGICAL_GRID_CENTER_ROW,
+                    MESH_LOGICAL_GRID_CENTER_COLUMN + 2,
+                ),
+            }
+            view = app.query_one(MeshTopologyView)
+            view.set_nodes(
+                working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
+            )
+            await pilot.pause()
+
+            self.assertEqual(len(view.relay_stages), 1)
+            self.assertFalse(view._edge_node_ids)
+            widgets = list(app.query(MeshRelayWidget))
+            self.assertEqual(len(widgets), 1)
+            self.assertTrue(widgets[0].display)
+            self.assertEqual(str(widgets[0].render()), CIRCLE_STROKED_LARGE)
 
 
 class ProjectToViewportTests(unittest.TestCase):

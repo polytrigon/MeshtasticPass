@@ -2564,10 +2564,11 @@ class MeshTopologyView(Container):
             # for that same signal: hidden entirely rather than
             # rendered at the boundary, where an anonymous dim dot
             # would be indistinguishable from a genuinely off-screen
-            # node. This is display-only -- edge_ids itself (used
-            # above for the spurious-connector chain-ordering check)
-            # is untouched, so that fix's own correctness is unaffected.
-            widget.display = widget.node_id not in edge_ids
+            # node. Its final display value is decided AFTER connector
+            # routing below (see visible_relay_ids), where a stage is
+            # also hidden whenever its chain's connector fell back to a
+            # direct YOU-to-endpoint line and no longer traverses it --
+            # never decided here from the edge set alone.
 
         # The label is a separate, independently positioned overlay: its
         # own box is exactly cell_len(label) wide (never wider), centered
@@ -2629,6 +2630,15 @@ class MeshTopologyView(Container):
         # working_set already filters them out of `working_set` itself.
         connector_cells: list[tuple[int, int, str, str]] = []
         selected_connector_cells: list[tuple[int, int, str, str]] = []
+        # A relay stage renders only while it is genuinely a waypoint on
+        # the connector route actually drawn this cycle. Chains whose
+        # connector fell back to a direct YOU-to-endpoint line (an
+        # edge-clipped stage, or a self-overlapping detour) no longer
+        # traverse their stages, so those stages must be hidden rather
+        # than left as unexplained standalone hollow circles -- relay
+        # markers and their connector geometry must be derived from the
+        # SAME route state, never two different filters.
+        visible_relay_ids: set[str] = set()
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
@@ -2690,6 +2700,7 @@ class MeshTopologyView(Container):
                 relay_stage_ids_in_chain = {
                     stage.node_id for stage in chain_stages if stage.node_id in centers
                 }
+                routed_through_stages = False
                 if relay_stage_ids_in_chain & self._edge_node_ids:
                     route_cells = route_chain_avoiding(
                         (centers[you_id], centers[remote_id]), obstacles
@@ -2705,6 +2716,10 @@ class MeshTopologyView(Container):
                         route_cells = route_chain_avoiding(
                             (centers[you_id], centers[remote_id]), obstacles
                         )
+                    else:
+                        routed_through_stages = True
+                if routed_through_stages:
+                    visible_relay_ids |= relay_stage_ids_in_chain
                 if is_selected:
                     color = palette.accent
                 elif is_stale:
@@ -2716,6 +2731,16 @@ class MeshTopologyView(Container):
                     color = palette.dim_base
                 target = selected_connector_cells if is_selected else connector_cells
                 target.extend((x, y, glyph, color) for x, y, glyph in route_cells)
+        # A relay stage is visible only while it remained a waypoint on a
+        # connector route actually drawn this cycle (see visible_relay_ids
+        # above). Every stage in a chain that fell back to a direct
+        # YOU-to-endpoint line is hidden here -- this is the orphan
+        # hollow-circle fix: a synthetic relay dot can never render as an
+        # unexplained standalone circle whose adjacent connector geometry
+        # was clipped or suppressed. Real nodes are untouched: this only
+        # ever toggles MeshRelayWidget.display, never a node glyph/label.
+        for widget in relay_widgets:
+            widget.display = widget.node_id in visible_relay_ids
         # Selected route drawn LAST: MeshCanvas's own overlay dict keys
         # on (x, y), so whichever connector's cells are appended last
         # wins any shared cell -- painting the focused node's full
