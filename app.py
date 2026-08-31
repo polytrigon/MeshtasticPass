@@ -3669,7 +3669,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #chat-header-bullet {
-        width: 3;
+        width: 1;
         height: auto;
         min-height: 2;
         content-align: center middle;
@@ -3677,20 +3677,6 @@ class MeshtasticPassApp(App[None]):
     }
 
     Screen.theme-amber #chat-header-bullet {
-        color: $amber_dim;
-    }
-
-    #chat-channel-psk {
-        width: auto;
-        max-width: 40%;
-        height: auto;
-        min-height: 2;
-        text-style: bold;
-        text-overflow: ellipsis;
-        color: $snow_dim;
-    }
-
-    Screen.theme-amber #chat-channel-psk {
         color: $amber_dim;
     }
 
@@ -4525,7 +4511,6 @@ class MeshtasticPassApp(App[None]):
                         markup=False,
                     )
                     yield DMModeSelector(0)
-                    yield Static("", id="chat-channel-psk", classes="chat-channel-psk", markup=False)
                 with ContentSwitcher(initial="chat-channel", id="chat-content"):
                     with Vertical(id="chat-channel"):
                         with ContentSwitcher(
@@ -7487,7 +7472,6 @@ class MeshtasticPassApp(App[None]):
         self.call_after_refresh(self._jump_to_newest)
 
         self._render_chat_status()
-        self._refresh_channel_psk_header()
 
     async def _reconcile_current_channel_identity(self) -> None:
         """Refresh the CURRENTLY-displayed channel if its live identity
@@ -9240,7 +9224,6 @@ class MeshtasticPassApp(App[None]):
         self._switch_chat_mode("channel")
         self.run_worker(self._switch_channel(promoted.index), name="switch-to-private-channel")
         self._update_tab_bar()
-        self._refresh_channel_psk_header()
 
     @on(PrivateChannelApplyFailed)
     def private_channel_apply_failed(self, event: "PrivateChannelApplyFailed") -> None:
@@ -9347,23 +9330,6 @@ class MeshtasticPassApp(App[None]):
                 return ""
             return psk
         return ""
-
-    def _refresh_channel_psk_header(self) -> None:
-        """Render the current configured channel's PSK inline in the CHAT header.
-
-        Reuses the header's existing styling (see #chat-channel-psk CSS); sets
-        the text to " - PSK <base64>" for a configured private channel and "" for
-        the public/default channel (no PSK clutter). UI metadata only -- never a
-        ChatStore message, never logged; zero RF. Called whenever the current
-        channel or the authoritative channel list changes.
-        """
-        widgets = list(self.query("#chat-channel-psk"))
-        if not widgets:
-            return
-        psk = self._channel_psk_metadata_text()
-        # Inline, on the SAME header physical line, after the DM selector --
-        # the bare Base64 value is the final header value, no "PSK" prefix.
-        widgets[0].update(f" - {psk}" if psk else "")
 
     def _copy_current_psk(self) -> bool:
         """Copy the current configured channel's normalized Base64 PSK.
@@ -10782,7 +10748,6 @@ class MeshtasticPassApp(App[None]):
                 widget.display = True
         elif dm_status_widgets:
             dm_status_widgets[0].display = False
-        self._refresh_channel_psk_header()
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:

@@ -727,11 +727,14 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.pause()
             app.show_tab("chat")
             await pilot.pause()
-            self.assertEqual(str(app.query_one("#chat-channel-psk").render()), "")
-            # No separate PSK strip is rendered for a configured public channel.
+            self.assertEqual(app._channel_psk_metadata_text(), "")
+            # No standalone PSK strip is rendered for a public channel.
             self.assertFalse(app.query_one("#new-channel-pending").display)
+            # The PSK is not placed in the top CHAT header/nav.
+            header = str(app.query_one("#chat-header").render())
+            self.assertNotIn("PSK", header)
 
-    async def test_configured_private_channel_shows_inline_psk_in_header(self) -> None:
+    async def test_configured_private_channel_psk_not_in_header_but_copyable(self) -> None:
         import base64 as _b64
 
         from radio_service import ChannelInfo
@@ -741,22 +744,20 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.pause()
             app.show_tab("chat")
             raw = bytes(range(16))
+            b64 = _b64.b64encode(raw).decode("ascii")
             app._channels = (ChannelInfo(0, "SECRET"),)
             app.current_channel_index = 0
-            # Fake radio exposing a matching configured PSK for channel 0.
-            from types import SimpleNamespace
-
-            app.radio.channel_psk_text = lambda index: _b64.b64encode(raw).decode("ascii")
-            app._refresh_channel_psk_header()
+            app.radio.channel_psk_text = lambda index: b64
             await pilot.pause()
-            text = str(app.query_one("#chat-channel-psk").render())
-            # Same header line, bare Base64, NO literal "PSK" prefix.
-            self.assertEqual(text, f" - {_b64.b64encode(raw).decode('ascii')}")
-            self.assertNotIn("PSK", text)
-            # The pending strip is separate and hidden for a configured channel.
+            # PSK is NOT rendered in the top nav/header.
+            header = str(app.query_one("#chat-header").render())
+            self.assertNotIn(b64, header)
+            self.assertNotIn("PSK", header)
+            # It remains available as metadata for the copy action.
+            self.assertEqual(app._channel_psk_metadata_text(), b64)
             self.assertFalse(app.query_one("#new-channel-pending").display)
 
-    async def test_pending_psk_presentation_is_separate_from_header(self) -> None:
+    async def test_pending_psk_presentation_is_separate_and_header_empty(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
@@ -765,10 +766,12 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.pause()
             app._save_new_channel("SECRET", "")
             await pilot.pause()
-            # Pending strip still shows the NOT YET APPLIED + PSK; header is
-            # empty (the pending config is NOT a configured channel).
+            # Pending strip shows the NOT YET APPLIED + PSK; the header has no
+            # PSK (the pending config is NOT a configured channel).
             self.assertTrue(app.query_one("#new-channel-pending").display)
-            self.assertEqual(str(app.query_one("#chat-channel-psk").render()), "")
+            self.assertEqual(app._channel_psk_metadata_text(), "")
+            header = str(app.query_one("#chat-header").render())
+            self.assertNotIn("PSK", header)
 
     async def test_p_copies_psk_only_when_composer_not_focused(self) -> None:
         from radio_service import ChannelInfo
@@ -784,7 +787,6 @@ class PskHeaderTests(PrivateChannelUiBase):
             app._channels = (ChannelInfo(0, "SECRET"),)
             app.current_channel_index = 0
             app.radio.channel_psk_text = lambda index: b64
-            app._refresh_channel_psk_header()
             await pilot.pause()
             app.query_one("#chat-log").focus()
             await pilot.pause()
@@ -806,7 +808,6 @@ class PskHeaderTests(PrivateChannelUiBase):
             app._channels = (ChannelInfo(0, "SECRET"),)
             app.current_channel_index = 0
             app.radio.channel_psk_text = lambda index: _b64.b64encode(bytes(range(16))).decode("ascii")
-            app._refresh_channel_psk_header()
             await pilot.pause()
             ch = app.query_one("#chat-input")
             ch.focus()
@@ -841,7 +842,6 @@ class PskHeaderTests(PrivateChannelUiBase):
             app._channels = (ChannelInfo(0, "SECRET"),)
             app.current_channel_index = 0
             app.radio.channel_psk_text = lambda index: _b64.b64encode(bytes(range(16))).decode("ascii")
-            app._refresh_channel_psk_header()
             app._update_footer()
             await pilot.pause()
             app.query_one("#chat-log").focus()
