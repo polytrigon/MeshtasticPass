@@ -23,6 +23,7 @@ from channel_psk import generate_private_psk, normalize_private_psk
 from chat_store import ChatStore
 from simulated_radio_service import SimulatedRadioService
 from tests.test_app import ControllableSendRadioService
+from textual.widgets import Input
 
 
 def _simulated_radio(**kwargs) -> SimulatedRadioService:
@@ -986,6 +987,54 @@ class PskHeaderTests(PrivateChannelUiBase):
                     break
             self.assertNotIn("hash:SECRET:7", self.settings.hidden_channel_ids)
             self.assertIn("SECRET", [c.name for c in app._channels])
+
+    async def test_private_footer_visible_immediately_after_apply_with_no_focus(
+        self,
+    ) -> None:
+        from radio_service import ChannelInfo, PrivateChannelApplyResult, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._radio_state = RadioState.ONLINE
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW", stable_key="hash:MEDIUM:0"),)
+            app._start_new_channel()
+            await pilot.pause()
+            app.query_one("#new-channel-name").value = "SECRET"
+            app.radio.apply_private_channel = lambda name, psk: PrivateChannelApplyResult(
+                True, 1, ""
+            )
+            app.radio.get_config_channels = lambda: (
+                ChannelInfo(0, "MEDIUMSLOW", stable_key="hash:MEDIUM:0"),
+                ChannelInfo(1, "SECRET", stable_key="hash:SECRET:7"),
+            )
+            app.radio.channel_psk_text = lambda index: (
+                "q8Z1" if index == 1 else None
+            )
+            app.new_channel_save(None)
+            for _ in range(20):
+                await pilot.pause()
+                if app._pending_channel is None:
+                    break
+            await pilot.pause()
+            # Transitioned to SECRET; NOTHING focused.
+            self.assertEqual(app.current_channel_index, 1)
+            self.assertNotIsInstance(app.focused, Input)
+            footer = str(app.query_one("#footer").render())
+            self.assertIn("CTRL+D delete", footer)
+            self.assertIn("P copy psk", footer)
+            # Focus the composer -> composer footer.
+            app.query_one("#chat-input").focus()
+            await pilot.pause()
+            composer_footer = str(app.query_one("#footer").render())
+            self.assertIn("CTRL+E emojis", composer_footer)
+            self.assertNotIn("CTRL+D delete", composer_footer)
+            # ESC from composer -> private actions return.
+            await pilot.press("escape")
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertIn("CTRL+D delete", footer)
+            self.assertIn("P copy psk", footer)
 
 
 if __name__ == "__main__":

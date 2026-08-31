@@ -7490,6 +7490,11 @@ class MeshtasticPassApp(App[None]):
         self.call_after_refresh(self._jump_to_newest)
 
         self._render_chat_status()
+        # The footer must reflect the channel just selected (its context, e.g.
+        # private-channel CTRL+D delete / P copy psk). _switch_chat_mode's own
+        # earlier _update_footer() ran before the channel index changed here,
+        # so without this the footer is stale until the next focus event.
+        self._update_footer()
 
     async def _reconcile_current_channel_identity(self) -> None:
         """Refresh the CURRENTLY-displayed channel if its live identity
