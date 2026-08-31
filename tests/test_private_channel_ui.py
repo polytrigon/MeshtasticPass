@@ -284,6 +284,27 @@ class NewChannelEditorInteractionTests(PrivateChannelUiBase):
             self.assertEqual(app.query_one("#new-channel-name").value, "Society")
             self.assertEqual(radio.sent_texts, [])
 
+    async def test_new_channel_shares_new_preset_form_geometry(self) -> None:
+        from app import NetworkFieldInput
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            # NEW CHANNEL NAME/KEY are the SAME NetworkFieldInput rows NEW PRESET
+            # uses, with the same 16-column field geometry.
+            self.assertIsInstance(app.query_one("#new-channel-name-row"), NetworkFieldInput)
+            self.assertIsInstance(app.query_one("#new-channel-key-row"), NetworkFieldInput)
+            self.assertEqual(int(app.query_one("#new-channel-name").styles.width.value), 16)
+            self.assertEqual(int(app.query_one("#new-channel-key").styles.width.value), 16)
+            # NEW PRESET form uses the same component + geometry.
+            self.assertIsInstance(app.query_one("#network-name-row"), NetworkFieldInput)
+            self.assertEqual(int(app.query_one("#network-name-input").styles.width.value), 16)
+            self.assertEqual(int(app.query_one("#key-input").styles.width.value), 16)
+            # Label column shares the same 13-cell width.
+            self.assertEqual(int(app.query_one("#new-channel-name-row .connection-label").styles.width.value), 13)
+            self.assertEqual(int(app.query_one("#network-name-row .connection-label").styles.width.value), 13)
+
     async def test_editor_is_dedicated_blank_view_hiding_transcript_and_composer(
         self,
     ) -> None:

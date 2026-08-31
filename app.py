@@ -1053,10 +1053,16 @@ class NetworkFieldInput(Horizontal):
         widget_id: str,
         input_id: str,
         max_length: int | None = None,
+        collapsible: bool = True,
     ) -> None:
-        super().__init__(
-            id=widget_id, classes="connection-action-row advanced-radio-editor"
-        )
+        # `collapsible` is False for the CHAT NEW CHANNEL form, which shares
+        # this same layout primitives but has no collapse toggle (it is always
+        # shown while the CHAT editor view is active). NEW PRESET keeps it True
+        # (its editor rows collapse until [ NEW PRESET ] is pressed).
+        classes = "connection-action-row"
+        if collapsible:
+            classes += " advanced-radio-editor"
+        super().__init__(id=widget_id, classes=classes)
         self._label = label
         self._input_id = input_id
         self._max_length = max_length
@@ -3538,7 +3544,8 @@ class MeshtasticPassApp(App[None]):
     }
 
     #long-name-input, #short-name-input,
-    #network-name-input, #freq-slot-input, #key-input {
+    #network-name-input, #freq-slot-input, #key-input,
+    #new-channel-name, #new-channel-key {
         width: 16;
         height: 1;
         border: none;
@@ -4544,46 +4551,18 @@ class MeshtasticPassApp(App[None]):
                                     classes="page-title",
                                     markup=False,
                                 )
-                                with Horizontal(
-                                    classes="connection-action-row"
-                                ):
-                                    yield Static(
-                                        " ",
-                                        classes="connection-selection-gutter",
-                                        markup=False,
-                                    )
-                                    yield Static(
-                                        "CHANNEL NAME",
-                                        classes="connection-label",
-                                        markup=False,
-                                    )
-                                    yield Static(
-                                        "[ ", classes="identity-bracket", markup=False
-                                    )
-                                    yield Input(id="new-channel-name")
-                                    yield Static(
-                                        " ]", classes="identity-bracket", markup=False
-                                    )
-                                with Horizontal(
-                                    classes="connection-action-row"
-                                ):
-                                    yield Static(
-                                        " ",
-                                        classes="connection-selection-gutter",
-                                        markup=False,
-                                    )
-                                    yield Static(
-                                        "KEY",
-                                        classes="connection-label",
-                                        markup=False,
-                                    )
-                                    yield Static(
-                                        "[ ", classes="identity-bracket", markup=False
-                                    )
-                                    yield Input(id="new-channel-key")
-                                    yield Static(
-                                        " ]", classes="identity-bracket", markup=False
-                                    )
+                                yield NetworkFieldInput(
+                                    label="CHANNEL NAME",
+                                    widget_id="new-channel-name-row",
+                                    input_id="new-channel-name",
+                                    collapsible=False,
+                                )
+                                yield NetworkFieldInput(
+                                    label="KEY",
+                                    widget_id="new-channel-key-row",
+                                    input_id="new-channel-key",
+                                    collapsible=False,
+                                )
                                 yield Static(
                                     "LEAVE BLANK TO CREATE CHANNEL",
                                     classes="new-channel-hint",
