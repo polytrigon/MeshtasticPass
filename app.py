@@ -4908,6 +4908,14 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
+            if event.key == "p" and self._channel_psk_metadata_text():
+                # Only when the current channel is a configured private one and
+                # the composer is NOT focused (the Input branch above already
+                # returned for a focused composer, so 'p'/'P' would otherwise
+                # type normally). Copies the normalized Base64 PSK; zero RF.
+                self._copy_current_psk()
+                event.stop()
+                return
             if event.key == "left":
                 self._focus_oldest_new_message()
                 event.stop()
@@ -9317,12 +9325,13 @@ class MeshtasticPassApp(App[None]):
         return self._pending_channel.psk_base64
 
     def _channel_psk_metadata_text(self) -> str:
-        """PSK metadata line for the CURRENT configured channel, or "".
+        """Normalized Base64 PSK for the CURRENT configured channel, or "".
 
-        UI metadata only -- never a ChatStore message, never logged. Returns
-        "" for the public/default channel (no PSK clutter), so a private
-        channel's normalized Base64 key is the only thing shown, read from
-        the radio-authoritative channel settings (zero RF).
+        Bare Base64 only (no "PSK" prefix -- the header renders it as the
+        final value after DM). UI metadata only -- never a ChatStore message,
+        never logged. Returns "" for the public/default channel (no PSK
+        clutter), so a private channel's key is the only thing shown, read
+        from the radio-authoritative channel settings (zero RF).
         """
         for channel in self._channels:
             if channel.index != self.current_channel_index:
@@ -9336,7 +9345,7 @@ class MeshtasticPassApp(App[None]):
                 return ""
             if not psk:
                 return ""
-            return f"PSK {psk}"
+            return psk
         return ""
 
     def _refresh_channel_psk_header(self) -> None:
@@ -9352,7 +9361,29 @@ class MeshtasticPassApp(App[None]):
         if not widgets:
             return
         psk = self._channel_psk_metadata_text()
+        # Inline, on the SAME header physical line, after the DM selector --
+        # the bare Base64 value is the final header value, no "PSK" prefix.
         widgets[0].update(f" - {psk}" if psk else "")
+
+    def _copy_current_psk(self) -> bool:
+        """Copy the current configured channel's normalized Base64 PSK.
+
+        Reuses Textual's built-in clipboard mechanism (App.copy_to_clipboard,
+        OSC 52) -- no new dependency. Returns True when a private-channel PSK
+        was available and copied; the PSK is never printed/logged. A compact
+        confirmation uses the existing CHAT status row (#send-error).
+        """
+        psk = self._channel_psk_metadata_text()
+        if not psk:
+            return False
+        try:
+            self.copy_to_clipboard(psk)
+        except Exception:
+            return False
+        send_error_widgets = list(self.query("#send-error"))
+        if send_error_widgets:
+            send_error_widgets[0].update("PSK COPIED")
+        return True
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         targets: list[Static | ChatEntryWidget] = []
@@ -10470,6 +10501,14 @@ class MeshtasticPassApp(App[None]):
             text = "CTRL+E emojis    ESC cancel    ENTER send"
         elif self.current_tab == "chat" and self._chat_mode == "channel":
             text = "↑↓ navigate    C channel    D dms    ENTER action    F4 quit"
+            if self._channel_psk_metadata_text():
+                # Configured private channel: offer copy-PSK (public/default
+                # channel omits it). CTRL+D channel delete is NOT offered --
+                # see the report (radio-authoritative discovery conflict).
+                text = (
+                    "↑↓ navigate    C channel    D dms    ENTER action    "
+                    "P copy psk    F4 quit"
+                )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
             text = "↑↓ select    ENTER open    C channel    1-3 tabs    F4 quit"
         elif self.current_tab == "chat":

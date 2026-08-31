@@ -750,8 +750,9 @@ class PskHeaderTests(PrivateChannelUiBase):
             app._refresh_channel_psk_header()
             await pilot.pause()
             text = str(app.query_one("#chat-channel-psk").render())
-            self.assertIn("PSK", text)
-            self.assertIn(_b64.b64encode(raw).decode("ascii"), text)
+            # Same header line, bare Base64, NO literal "PSK" prefix.
+            self.assertEqual(text, f" - {_b64.b64encode(raw).decode('ascii')}")
+            self.assertNotIn("PSK", text)
             # The pending strip is separate and hidden for a configured channel.
             self.assertFalse(app.query_one("#new-channel-pending").display)
 
@@ -768,6 +769,87 @@ class PskHeaderTests(PrivateChannelUiBase):
             # empty (the pending config is NOT a configured channel).
             self.assertTrue(app.query_one("#new-channel-pending").display)
             self.assertEqual(str(app.query_one("#chat-channel-psk").render()), "")
+
+    async def test_p_copies_psk_only_when_composer_not_focused(self) -> None:
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            raw = bytes(range(16))
+            import base64 as _b64
+
+            b64 = _b64.b64encode(raw).decode("ascii")
+            app._channels = (ChannelInfo(0, "SECRET"),)
+            app.current_channel_index = 0
+            app.radio.channel_psk_text = lambda index: b64
+            app._refresh_channel_psk_header()
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            copied = []
+            app.copy_to_clipboard = lambda text: copied.append(text)
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(copied, [b64])
+
+    async def test_p_while_composer_focused_types_and_does_not_copy(self) -> None:
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            import base64 as _b64
+
+            app._channels = (ChannelInfo(0, "SECRET"),)
+            app.current_channel_index = 0
+            app.radio.channel_psk_text = lambda index: _b64.b64encode(bytes(range(16))).decode("ascii")
+            app._refresh_channel_psk_header()
+            await pilot.pause()
+            ch = app.query_one("#chat-input")
+            ch.focus()
+            await pilot.pause()
+            copied = []
+            app.copy_to_clipboard = lambda text: copied.append(text)
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(copied, [])
+            self.assertIn("p", ch.value)
+
+    async def test_public_channel_footer_omits_copy_and_ctrl_d(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertNotIn("P copy psk", footer)
+            self.assertNotIn("CTRL+D delete", footer)
+
+    async def test_private_channel_footer_offers_copy_no_channel_delete(self) -> None:
+        from radio_service import ChannelInfo
+        import base64 as _b64
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._channels = (ChannelInfo(0, "SECRET"),)
+            app.current_channel_index = 0
+            app.radio.channel_psk_text = lambda index: _b64.b64encode(bytes(range(16))).decode("ascii")
+            app._refresh_channel_psk_header()
+            app._update_footer()
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertIn("P copy psk", footer)
+            # CTRL+D channel delete is NOT offered (radio-authoritative conflict).
+            self.assertNotIn("CTRL+D delete", footer)
 
 
 if __name__ == "__main__":
