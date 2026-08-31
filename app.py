@@ -3669,7 +3669,7 @@ class MeshtasticPassApp(App[None]):
     }
 
     #chat-header-bullet {
-        width: 1;
+        width: 3;
         height: auto;
         min-height: 2;
         content-align: center middle;
@@ -4769,6 +4769,24 @@ class MeshtasticPassApp(App[None]):
             self._delete_current_dm()
             event.stop()
             return
+        if (
+            event.key == "ctrl+d"
+            and self.current_tab == "chat"
+            and self._chat_mode == "channel"
+            and not self._new_channel_editor_open
+            and self.current_channel_index > 0
+            and any(
+                channel.index == self.current_channel_index
+                for channel in self._channels
+            )
+        ):
+            # CTRL+D deletes a configured private/configured (non-PRIMARY)
+            # channel from the app-visible list/state, locally only. Zero
+            # radio writes/RF. PRIMARY (index 0) and the NEW CHANNEL editor
+            # are never targets.
+            self._delete_current_channel()
+            event.stop()
+            return
         if self._new_channel_editor_open and self.current_tab == "chat":
             # NEW CHANNEL editor is active: UP/DOWN navigate the editor
             # fields, ESC cancels. Printable characters and ENTER are left
@@ -4893,7 +4911,7 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
-            if event.key == "p" and self._channel_psk_metadata_text():
+            if event.key == "p" and self.current_channel_index > 0 and self._channel_psk_metadata_text():
                 # Only when the current channel is a configured private one and
                 # the composer is NOT focused (the Input branch above already
                 # returned for a focused composer, so 'p'/'P' would otherwise
@@ -9351,6 +9369,57 @@ class MeshtasticPassApp(App[None]):
             send_error_widgets[0].update("PSK COPIED")
         return True
 
+    def _delete_current_channel(self) -> None:
+        """CTRL+D: remove a configured private/configured channel locally.
+
+        Locally removes the current (non-PRIMARY) channel from the app's
+        channel list/state and selects the next remaining channel. This is a
+        MeshtasticPass-list-only deletion: it does NOT write/disable/reconfigure
+        the channel on the Meshtastic radio (zero RF, zero config writes), does
+        NOT touch PRIMARY, and NEVER targets the NEW CHANNEL sentinel.
+
+        IMPORTANT honest caveat: because the app's channel list is
+        radio-authoritative (re-derived from the radio on connect/refresh), a
+        locally removed channel will be rediscovered from the radio on a later
+        reconnect/refresh and reappear. A truly persistent removal requires a
+        radio-side delete protocol (out of scope here) or a persisted hidden
+        filter.
+        """
+        index = self.current_channel_index
+        if index == 0 or self._new_channel_editor_open:
+            return
+        remaining = tuple(channel for channel in self._channels if channel.index != index)
+        if len(remaining) == len(self._channels):
+            return
+        prior_order = [channel.index for channel in self._channels]
+        position = prior_order.index(index) if index in prior_order else -1
+        remaining_indexes = [channel.index for channel in remaining]
+        if not remaining_indexes:
+            return
+        next_index = remaining_indexes[0]
+        if position >= 0:
+            for offset in range(1, len(prior_order) + 1):
+                candidate = prior_order[(position + offset) % len(prior_order)]
+                if candidate in remaining_indexes:
+                    next_index = candidate
+                    break
+        self._channels = remaining
+        self._channel_states.pop(index, None)
+        selector = self.query_one(ChannelSelector)
+        selector.set_options(
+            (
+                DropdownOption(channel.name, channel.index)
+                for channel in self._channels
+            ),
+            value=next_index,
+        )
+        self._switch_chat_mode("channel")
+        self.run_worker(
+            self._switch_channel(next_index), name="switch-after-channel-delete"
+        )
+        self._update_tab_bar()
+        self._update_footer()
+
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         targets: list[Static | ChatEntryWidget] = []
         transcript = self.query_one("#dm-log", ChatTranscript)
@@ -10467,13 +10536,18 @@ class MeshtasticPassApp(App[None]):
             text = "CTRL+E emojis    ESC cancel    ENTER send"
         elif self.current_tab == "chat" and self._chat_mode == "channel":
             text = "↑↓ navigate    C channel    D dms    ENTER action    F4 quit"
-            if self._channel_psk_metadata_text():
-                # Configured private channel: offer copy-PSK (public/default
-                # channel omits it). CTRL+D channel delete is NOT offered --
-                # see the report (radio-authoritative discovery conflict).
+            # A configured private/configured (non-PRIMARY) channel offers
+            # copy-PSK and CTRL+D (local list deletion). The public/default
+            # PRIMARY channel offers neither.
+            if self.current_channel_index > 0 and self._channel_psk_metadata_text():
                 text = (
                     "↑↓ navigate    C channel    D dms    ENTER action    "
-                    "P copy psk    F4 quit"
+                    "CTRL+D delete    P copy psk    F4 quit"
+                )
+            elif self.current_channel_index > 0:
+                text = (
+                    "↑↓ navigate    C channel    D dms    ENTER action    "
+                    "CTRL+D delete    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
             text = "↑↓ select    ENTER open    C channel    1-3 tabs    F4 quit"

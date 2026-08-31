@@ -721,6 +721,20 @@ class ApplyPendingChannelTests(PrivateChannelUiBase):
 
 
 class PskHeaderTests(PrivateChannelUiBase):
+    async def test_chat_header_channel_dm_separator_renders_space_bullet_space(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            # The CHANNEL -> DM separator is a 3-cell box centered on the
+            # bullet: `space + bullet + space` (i.e. `[ CHANNEL ] • [ DM()]`).
+            bullet = app.query_one("#chat-header-bullet")
+            self.assertEqual(int(bullet.styles.width.value), 3)
+            self.assertEqual(str(bullet.render()), "\u2022")
+
     async def test_public_channel_omits_psk_and_no_strip(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(100, 30)) as pilot:
@@ -745,8 +759,8 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.show_tab("chat")
             raw = bytes(range(16))
             b64 = _b64.b64encode(raw).decode("ascii")
-            app._channels = (ChannelInfo(0, "SECRET"),)
-            app.current_channel_index = 0
+            app._channels = (ChannelInfo(1, "SECRET"),)
+            app.current_channel_index = 1
             app.radio.channel_psk_text = lambda index: b64
             await pilot.pause()
             # PSK is NOT rendered in the top nav/header.
@@ -784,8 +798,8 @@ class PskHeaderTests(PrivateChannelUiBase):
             import base64 as _b64
 
             b64 = _b64.b64encode(raw).decode("ascii")
-            app._channels = (ChannelInfo(0, "SECRET"),)
-            app.current_channel_index = 0
+            app._channels = (ChannelInfo(1, "SECRET"),)
+            app.current_channel_index = 1
             app.radio.channel_psk_text = lambda index: b64
             await pilot.pause()
             app.query_one("#chat-log").focus()
@@ -805,8 +819,8 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.show_tab("chat")
             import base64 as _b64
 
-            app._channels = (ChannelInfo(0, "SECRET"),)
-            app.current_channel_index = 0
+            app._channels = (ChannelInfo(1, "SECRET"),)
+            app.current_channel_index = 1
             app.radio.channel_psk_text = lambda index: _b64.b64encode(bytes(range(16))).decode("ascii")
             await pilot.pause()
             ch = app.query_one("#chat-input")
@@ -839,8 +853,8 @@ class PskHeaderTests(PrivateChannelUiBase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             app.show_tab("chat")
-            app._channels = (ChannelInfo(0, "SECRET"),)
-            app.current_channel_index = 0
+            app._channels = (ChannelInfo(1, "SECRET"),)
+            app.current_channel_index = 1
             app.radio.channel_psk_text = lambda index: _b64.b64encode(bytes(range(16))).decode("ascii")
             app._update_footer()
             await pilot.pause()
@@ -848,8 +862,48 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.pause()
             footer = str(app.query_one("#footer").render())
             self.assertIn("P copy psk", footer)
-            # CTRL+D channel delete is NOT offered (radio-authoritative conflict).
-            self.assertNotIn("CTRL+D delete", footer)
+            self.assertIn("CTRL+D delete", footer)
+
+    async def test_ctrl_d_deletes_private_channel_locally_and_not_primary(self) -> None:
+        from radio_service import ChannelInfo, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._radio_state = RadioState.ONLINE
+            app._channels = (
+                ChannelInfo(0, "MEDIUMSLOW"),
+                ChannelInfo(1, "SECRET"),
+            )
+            app.current_channel_index = 1
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            await pilot.press("ctrl+d")
+            for _ in range(15):
+                await pilot.pause()
+                if app.current_channel_index == 0:
+                    break
+            # SECRET removed locally; PRIMARY (MEDIUMSLOW) selected and kept.
+            self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
+            self.assertEqual(app.current_channel_index, 0)
+
+    async def test_ctrl_d_does_not_delete_primary(self) -> None:
+        from radio_service import ChannelInfo, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._radio_state = RadioState.ONLINE
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW"),)
+            app.current_channel_index = 0
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
+            self.assertEqual(app.current_channel_index, 0)
 
 
 if __name__ == "__main__":
