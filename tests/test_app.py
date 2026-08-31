@@ -799,6 +799,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 str(app.query_one("#tab-bar", Static).render()),
             )
 
+            # Startup focus lands on USB DEVICE now (STYLE moved to the
+            # bottom of the reordered page) -- focus UI SCALE first.
+            selector.focus()
+            await pilot.pause()
             await pilot.press("enter", "down", "enter")
             await pilot.pause()
 
@@ -2826,15 +2830,26 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             device.focus()
             await pilot.pause()
             assert_selected(device)
+            # CONNECTION's own rows are adjacent; the NETWORK/RADIO
+            # sections now sit between SHORT NAME and STYLE (CONNECTION
+            # -> NETWORK -> RADIO -> STYLE), so STYLE adjacency is
+            # exercised separately below.
             for key, expected in (
                 ("down", long_name),
                 ("down", short_name),
-                ("down", font),
-                ("down", color),
-                ("up", font),
-                ("up", short_name),
                 ("up", long_name),
                 ("up", device),
+            ):
+                await pilot.press(key)
+                await pilot.pause()
+                assert_selected(expected)
+
+            font.focus()
+            await pilot.pause()
+            assert_selected(font)
+            for key, expected in (
+                ("down", color),
+                ("up", font),
             ):
                 await pilot.press(key)
                 await pilot.pause()
