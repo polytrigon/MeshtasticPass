@@ -189,5 +189,140 @@ class PskHelperTests(unittest.TestCase):
         self.assertIsNone(normalize_private_psk("!!!"))
 
 
+class NewChannelEditorInteractionTests(PrivateChannelUiBase):
+    async def _open_editor(self, pilot, app) -> None:
+        app.show_tab("chat")
+        await pilot.pause()
+        selector = app.query_one(ChannelSelector)
+        selector.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        selector._activate_popup_item(len(selector.options) - 1, None)
+        await pilot.pause()
+
+    async def test_new_channel_editor_is_rendered_and_focuses_name(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            editor = app.query_one("#new-channel-editor")
+            self.assertTrue(editor.display)
+            self.assertEqual(app.focused.id, "new-channel-name")
+
+    async def test_type_name_key_navigate_save_creates_pending_only(self) -> None:
+        radio = ControllableSendRadioService()
+        app = self._make_app(radio)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            name_input = app.query_one("#new-channel-name")
+            name_input.focus()
+            name_input.value = "Secret Society"
+            await pilot.pause()
+            await pilot.press("enter")  # name -> key
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "new-channel-key")
+            await pilot.press("down")  # key -> cancel
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "new-channel-cancel")
+            await pilot.press("down")  # cancel -> save
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "new-channel-save")
+            await pilot.press("enter")  # save (blank key -> generated)
+            await pilot.pause()
+            self.assertIsNotNone(app._pending_channel)
+            self.assertNotIn("Secret Society", [c.name for c in app._channels])
+            # Zero RF/config.
+            self.assertEqual(radio.sent_texts, [])
+
+    async def test_escape_from_anywhere_cancels_editor(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            app.query_one("#new-channel-name").value = "Some"
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app._new_channel_editor_open)
+            self.assertIsNone(app._pending_channel)
+            self.assertFalse(app.query_one("#new-channel-editor").display)
+
+    async def test_reopen_editor_starts_clean(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            app.query_one("#new-channel-name").value = "Secret"
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            await pilot.pause()
+            name_input = app.query_one("#new-channel-name")
+            self.assertEqual(name_input.value, "")
+
+    async def test_invalid_save_preserves_values_and_keeps_editor(self) -> None:
+        radio = ControllableSendRadioService()
+        app = self._make_app(radio)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await self._open_editor(pilot, app)
+            app.query_one("#new-channel-name").value = "Society"
+            await pilot.pause()
+            await pilot.press("enter")  # name -> key
+            await pilot.pause()
+            app.query_one("#new-channel-key").value = "!badkey"
+            await pilot.pause()
+            await pilot.press("down", "down")  # -> save
+            await pilot.pause()
+            await pilot.press("enter")  # save with invalid key
+            await pilot.pause()
+            self.assertTrue(app._new_channel_editor_open)
+            self.assertEqual(app._new_channel_error, "INVALID KEY")
+            self.assertIsNone(app._pending_channel)
+            self.assertEqual(app.query_one("#new-channel-name").value, "Society")
+            self.assertEqual(radio.sent_texts, [])
+
+
+class ConfiguredPskMetadataTests(PrivateChannelUiBase):
+    def _radio_with_channels(self, psk: bytes) -> "object":
+        from types import SimpleNamespace
+        from radio_service import RadioService
+
+        service = RadioService()
+        channel = SimpleNamespace(index=0, settings=SimpleNamespace(psk=psk))
+        service._interface = SimpleNamespace(
+            localNode=SimpleNamespace(channels=[channel])
+        )
+        return service
+
+    def test_public_sentinel_psk_is_not_metadata(self) -> None:
+        # 0x01 = default public channel PSK -> no private metadata.
+        service = self._radio_with_channels(b"\x01")
+        self.assertIsNone(service.channel_psk_text(0))
+
+    def test_no_encryption_sentinel_is_not_metadata(self) -> None:
+        service = self._radio_with_channels(b"\x00")
+        self.assertIsNone(service.channel_psk_text(0))
+
+    def test_real_16_byte_psk_metadata_is_normalized_base64(self) -> None:
+        import base64 as _b64
+
+        raw = bytes(range(16))
+        service = self._radio_with_channels(raw)
+        self.assertEqual(service.channel_psk_text(0), _b64.b64encode(raw).decode("ascii"))
+
+    async def test_private_psk_metadata_is_ui_only_and_default_channel_uncluttered(
+        self,
+    ) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            # The simulated radio offers only public channels (no private PSK),
+            # so the metadata helper must return "" for the default channel.
+            self.assertEqual(app._channel_psk_metadata_text(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

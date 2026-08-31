@@ -898,6 +898,59 @@ class NewNetworkControl(Static):
             event.stop()
 
 
+class NewChannelSave(Static):
+    """[ SAVE ] -- validate the CHAT NEW CHANNEL editor (see
+    MeshtasticPassApp._save_new_channel). Production of a pending draft only,
+    zero radio writes; never claims the radio was configured.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ SAVE ]",
+            id="new-channel-save",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._cancel_new_channel()
+            event.stop()
+
+
+class NewChannelCancel(Static):
+    """[ CANCEL ] -- discard the CHAT NEW CHANNEL editor. Zero writes/RF."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ CANCEL ]",
+            id="new-channel-cancel",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._cancel_new_channel()
+            event.stop()
+
+
 class SaveNetworkControl(Static):
     """[ SAVE ] -- validate the NEW NETWORK editor, then (after a
 
@@ -4424,8 +4477,37 @@ class MeshtasticPassApp(App[None]):
                         yield ChatTranscript(id="chat-log")
                         yield Static(id="chat-new-below")
                         yield Static(id="send-error")
-                        yield Static(id="new-channel-editor", markup=False)
-                        yield Static(id="new-channel-error", markup=False)
+                        with Vertical(id="new-channel-editor", classes="new-channel-editor"):
+                            yield Static("NEW CHANNEL", classes="new-channel-title", markup=False)
+                            yield Static("CHANNEL NAME", classes="new-channel-label", markup=False)
+                            yield Input(
+                                id="new-channel-name",
+                                placeholder="channel name",
+                                select_on_focus=False,
+                            )
+                            yield Static("KEY", classes="new-channel-label", markup=False)
+                            yield Input(
+                                id="new-channel-key",
+                                placeholder="key",
+                                select_on_focus=False,
+                            )
+                            yield Static(
+                                "LEAVE BLANK TO CREATE CHANNEL",
+                                classes="new-channel-hint",
+                                markup=False,
+                            )
+                            yield Static(
+                                "NOT YET APPLIED TO RADIO",
+                                id="new-channel-pending",
+                                classes="new-channel-hint",
+                                markup=False,
+                            )
+                            yield Static(id="new-channel-error", markup=False)
+                            with Horizontal(
+                                id="new-channel-actions", classes="new-channel-actions"
+                            ):
+                                yield NewChannelCancel()
+                                yield NewChannelSave()
                         yield ChatMessageInput(
                             placeholder="> message",
                             id="chat-input",
@@ -4640,6 +4722,20 @@ class MeshtasticPassApp(App[None]):
             self._delete_current_dm()
             event.stop()
             return
+        if self._new_channel_editor_open and self.current_tab == "chat":
+            # NEW CHANNEL editor is active: UP/DOWN navigate the editor
+            # fields, ESC cancels. Printable characters and ENTER are left
+            # to the focused editor field/control so typing works like a
+            # normal input; nothing here leaks into hidden CHANNEL/DM widgets.
+            if event.key == "escape":
+                self._cancel_new_channel()
+                self.query_one("#chat-log", ChatTranscript).focus()
+                event.stop()
+                return
+            if event.key in ("up", "down"):
+                self._move_new_channel_focus(-1 if event.key == "up" else 1)
+                event.stop()
+                return
         if isinstance(self.focused, KeyboardDropdown) and self.focused.is_open:
             return
         if isinstance(self.focused, Input):
@@ -8844,16 +8940,25 @@ class MeshtasticPassApp(App[None]):
         self._pending_channel = None
         self._new_channel_error = ""
         self._new_channel_editor_open = True
+        self._clear_new_channel_inputs()
         self._refresh_new_channel_editor()
+        self._focus_new_channel_field("name")
         self._update_footer()
 
     def _cancel_new_channel(self) -> None:
-        """Discard the pending draft. Zero writes/RF; no channel created."""
+        """Discard the pending draft and editor inputs. Zero writes/RF."""
         self._pending_channel = None
         self._new_channel_error = ""
         self._new_channel_editor_open = False
+        self._clear_new_channel_inputs()
         self._refresh_new_channel_editor()
         self._update_footer()
+
+    def _clear_new_channel_inputs(self) -> None:
+        for selector in ("#new-channel-name", "#new-channel-key"):
+            widgets = list(self.query(selector))
+            if widgets:
+                widgets[0].value = ""
 
     def _save_new_channel(self, name: str, key: str) -> PendingChannelConfig | None:
         """Validate and build the pending private-channel config.
@@ -8897,23 +9002,134 @@ class MeshtasticPassApp(App[None]):
         return self._pending_channel
 
     def _refresh_new_channel_editor(self) -> None:
-        """Render the CHAT-local NEW CHANNEL editor state (if any).
+        """Render / hide the CHAT-local NEW CHANNEL editor.
 
-        The panel only ever reflects `_new_channel_editor_open` +
-        `_pending_channel` + `_new_channel_error`; it produces no radio
-        traffic and no ChatStore writes. A pending config's key is shown so
-        the user can retain/share it, but it never claims the channel is
-        radio-configured.
+        Reflects `_new_channel_editor_open` + `_pending_channel` +
+        `_new_channel_error`. Produces no radio traffic and no ChatStore
+        writes. NAME/KEY Input values are only ever set here on open/cancel
+        (never cleared on validation error, so the user's entries survive).
+
+        When a pending config exists (SAVE succeeded), the editor collapses
+        to a compact "NOT YET APPLIED TO RADIO + PSK" strip -- clearly not a
+        radio-configured channel, never added to the configured-channel
+        selector, never given CHAT history.
         """
-        widgets = list(self.query("#new-channel-editor"))
-        if not widgets:
+        editor_widgets = list(self.query("#new-channel-editor"))
+        if not editor_widgets:
             return
-        editor = widgets[0]
+        editor = editor_widgets[0]
         editor.display = self._new_channel_editor_open
+
+        name_inputs = list(self.query("#new-channel-name"))
+        key_inputs = list(self.query("#new-channel-key"))
+        pending = self._pending_channel
+        if pending is not None:
+            # Successful local SAVE: show the pending strip, not the fields.
+            if name_inputs:
+                name_inputs[0].display = False
+            if key_inputs:
+                key_inputs[0].display = False
+            pending_widgets = list(self.query("#new-channel-pending"))
+            if pending_widgets:
+                pending_widgets[0].update(
+                    "NOT YET APPLIED TO RADIO\n"
+                    f"PSK  {pending.psk_base64}"
+                )
+                pending_widgets[0].display = True
+        else:
+            if name_inputs:
+                name_inputs[0].display = True
+            if key_inputs:
+                key_inputs[0].display = True
+            pending_widgets = list(self.query("#new-channel-pending"))
+            if pending_widgets:
+                pending_widgets[0].display = False
+
         error_widgets = list(self.query("#new-channel-error"))
         if error_widgets:
             error_widgets[0].display = bool(self._new_channel_error)
             error_widgets[0].update(self._new_channel_error)
+
+    def _activate_new_channel_save(self) -> bool:
+        """Validate the current editor fields; returns True on success.
+
+        Reads #new-channel-name / #new-channel-key and delegates to
+        _save_new_channel. On success leaves the compact pending strip
+        visible and focuses the CHAT transcript; on failure keeps the editor
+        fields (values preserved) focused.
+        """
+        name_inputs = list(self.query("#new-channel-name"))
+        key_inputs = list(self.query("#new-channel-key"))
+        name = name_inputs[0].value if name_inputs else ""
+        key = key_inputs[0].value if key_inputs else ""
+        return self._save_new_channel(name, key) is not None
+
+    def _focus_new_channel_field(self, field: str) -> None:
+        """Focus one editor field/control: name | key | save | cancel."""
+        widget_ids = {
+            "name": "#new-channel-name",
+            "key": "#new-channel-key",
+            "save": "#new-channel-save",
+            "cancel": "#new-channel-cancel",
+        }
+        widgets = list(self.query(widget_ids[field]))
+        if widgets:
+            widgets[0].focus()
+            if isinstance(widgets[0], Input):
+                widgets[0].cursor_position = len(widgets[0].value)
+
+    _NEW_CHANNEL_FIELD_ORDER = ("name", "key", "cancel", "save")
+
+    def _new_channel_focused_field(self) -> str:
+        focused = self.focused
+        focused_id = getattr(focused, "id", None)
+        for field, selector in (
+            ("name", "#new-channel-name"),
+            ("key", "#new-channel-key"),
+            ("save", "#new-channel-save"),
+            ("cancel", "#new-channel-cancel"),
+        ):
+            if focused_id == selector.lstrip("#"):
+                return field
+        return "name"
+
+    def _move_new_channel_focus(self, direction: int) -> None:
+        order = self._NEW_CHANNEL_FIELD_ORDER
+        current = self._new_channel_focused_field()
+        try:
+            index = order.index(current)
+        except ValueError:
+            index = 0
+        target = order[(index + direction) % len(order)]
+        self._focus_new_channel_field(target)
+
+    @on(Input.Submitted, "#new-channel-name")
+    def new_channel_name_submitted(self, _event: Input.Submitted) -> None:
+        if self._new_channel_editor_open:
+            self._focus_new_channel_field("key")
+
+    @on(Input.Submitted, "#new-channel-key")
+    def new_channel_key_submitted(self, _event: Input.Submitted) -> None:
+        if self._new_channel_editor_open:
+            self._focus_new_channel_field("key" if self._new_channel_error else "save")
+
+    @on(NewChannelSave.Activated)
+    def new_channel_save(self, _event: NewChannelSave.Activated) -> None:
+        if not self._new_channel_editor_open:
+            return
+        self._activate_new_channel_save()
+        if self._new_channel_editor_open:
+            self._refresh_new_channel_editor()
+            self._focus_new_channel_field("key" if self._new_channel_error else "name")
+        else:
+            self.query_one("#chat-log", ChatTranscript).focus()
+
+    @on(NewChannelCancel.Activated)
+    def new_channel_cancel(self, _event: NewChannelCancel.Activated) -> None:
+        if not self._new_channel_editor_open:
+            return
+        self._cancel_new_channel()
+        self.query_one("#chat-log", ChatTranscript).focus()
 
     def _pending_channel_psk_summary(self) -> str:
         """The generated/normalized key text for the pending editor, or "".
@@ -8924,6 +9140,29 @@ class MeshtasticPassApp(App[None]):
         if self._pending_channel is None:
             return ""
         return self._pending_channel.psk_base64
+
+    def _channel_psk_metadata_text(self) -> str:
+        """PSK metadata line for the CURRENT configured channel, or "".
+
+        UI metadata only -- never a ChatStore message, never logged. Returns
+        "" for the public/default channel (no PSK clutter), so a private
+        channel's normalized Base64 key is the only thing shown, read from
+        the radio-authoritative channel settings (zero RF).
+        """
+        for channel in self._channels:
+            if channel.index != self.current_channel_index:
+                continue
+            getter = getattr(self.radio, "channel_psk_text", None)
+            if not callable(getter):
+                return ""
+            try:
+                psk = getter(channel.index)
+            except Exception:
+                return ""
+            if not psk:
+                return ""
+            return f"PSK  {psk}"
+        return ""
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         targets: list[Static | ChatEntryWidget] = []

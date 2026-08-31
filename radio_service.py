@@ -2465,6 +2465,41 @@ class RadioService:
             channels=self._read_channel_info(local_node),
         )
 
+    def channel_psk_text(self, channel_index: int) -> str | None:
+        """Normalized Base64 PSK for one enabled channel, or None.
+
+        Read-only, zero-RF: reads the ALREADY-synced local channel settings
+        (exactly where _read_channel_info reads ChannelInfo identity), never
+        requests anything from the radio. Returns None for the public/default
+        sentinel PSKs (0x00 no-encryption, 0x01 default), for an unavailable/
+        disabled channel, and for a malformed length -- so a private channel's
+        key is the ONLY non-None result. The returned text is UI metadata
+        only and is never logged by callers.
+        """
+        if self._interface is None:
+            return None
+        local_node = getattr(self._interface, "localNode", None)
+        channels = getattr(local_node, "channels", None)
+        if not channels:
+            return None
+        for channel in channels:
+            if RadioService._optional_int(getattr(channel, "index", None)) != channel_index:
+                continue
+            settings = getattr(channel, "settings", None)
+            psk = getattr(settings, "psk", None)
+            if not isinstance(psk, (bytes, bytearray)):
+                return None
+            raw = bytes(psk)
+            if raw in (b"", b"\x00", b"\x01"):
+                # Public/no-encryption sentinels -- never a private key.
+                return None
+            if len(raw) not in (16, 32):
+                return None
+            import base64 as _base64
+
+            return _base64.b64encode(raw).decode("ascii")
+        return None
+
     @staticmethod
     def _read_channel_info(local_node: Any) -> tuple[ChannelInfo, ...]:
         """Convert enabled SDK channel protobufs into stable app values."""
