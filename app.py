@@ -1008,7 +1008,7 @@ class EditChannelCancel(Static):
 
 
 class EditChannelDelete(Static):
-    """[ DELETE CHANNEL ] -- enter the in-place YES/NO confirmation for the
+    """[ DEL CHANNEL ] -- enter the in-place YES/NO confirmation for the
     currently-edited private channel. Selectable, but does NOT delete."""
 
     can_focus = True
@@ -1018,7 +1018,7 @@ class EditChannelDelete(Static):
 
     def __init__(self) -> None:
         super().__init__(
-            "[ DELETE CHANNEL ]",
+            "[ DEL CHANNEL ]",
             id="edit-channel-delete",
             classes="connection-action-row",
             markup=False,
@@ -1031,6 +1031,62 @@ class EditChannelDelete(Static):
         elif event.key == "escape":
             self.app._close_edit_channel()
             event.stop()
+
+
+class CopyChannelKey(Static):
+    """[ COPY KEY ] -- copy the current channel's actual key to the clipboard.
+
+    Selectable/focusable. Uses Textual's built-in App.copy_to_clipboard (OSC 52,
+    the same mechanism the removed PSK-copy used); zero RF, no channel
+    mutation, the overlay stays open. The real key is never displayed, only
+    kept internally and copied on activation.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ COPY KEY ]",
+            id="edit-channel-copy-key",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
+class ChannelEditActionRow(Horizontal):
+    """A labeled row in the EDIT CHANNEL overlay that holds a focusable action
+    (e.g. `[ COPY KEY ]` or `[ DEL CHANNEL ]`) instead of a text Input.
+
+    Reuses the EXACT layout primitives of NetworkFieldInput -- a 2-cell
+    selection gutter, a 13-cell connection-label, then the action control --
+    so the action's leading `[` lines up with the `[` of a CHANNEL NAME input
+    row and with every other labeled row in the established forms. An empty
+    label renders the action left-aligned to the SAME column (used for
+    `[ DEL CHANNEL ]` so it lines up under `[ COPY KEY ]`).
+    """
+
+    can_focus = False
+
+    def __init__(self, *, label: str, widget_id: str, control: Static) -> None:
+        super().__init__(id=widget_id, classes="connection-action-row")
+        self._label = label
+        self._control = control
+
+    def compose(self) -> ComposeResult:
+        yield Static(" ", classes="connection-selection-gutter", markup=False)
+        yield Static(self._label, classes="connection-label", markup=False)
+        yield self._control
 
 
 class EditChannelDeleteYes(Static):
@@ -1111,17 +1167,16 @@ class EditChannelOverlay(Vertical):
         self._error = ""
 
     def on_mount(self) -> None:
-        # Populate the form inputs and show the COMPLETE form immediately, then
-        # focus CHANNEL NAME -- all AFTER composition (screen.mount is async,
-        # so these child widgets do not exist until on_mount runs). The title
-        # ("EDIT CHANNEL") is a heading only and never receives focus.
+        # Populate the CHANNEL NAME input and show the COMPLETE form
+        # immediately, then focus CHANNEL NAME -- all AFTER composition
+        # (screen.mount is async). The CHANNEL KEY row is a [ COPY KEY ]
+        # action (not an editable input), so the real key is kept internally
+        # (self._psk) and copied on activation, never displayed. The title is a
+        # heading only and never receives focus.
         self.set_mode("form")
         name_inputs = list(self.query("#edit-channel-name"))
         if name_inputs:
             name_inputs[0].value = self._name
-        key_inputs = list(self.query("#edit-channel-key"))
-        if key_inputs:
-            key_inputs[0].value = self._psk
         error_widgets = list(self.query("#edit-channel-error"))
         if error_widgets:
             error_widgets[0].display = bool(self._error)
@@ -1134,9 +1189,6 @@ class EditChannelOverlay(Vertical):
         name_inputs = list(self.query("#edit-channel-name"))
         if name_inputs:
             name_inputs[0].value = name
-        key_inputs = list(self.query("#edit-channel-key"))
-        if key_inputs:
-            key_inputs[0].value = psk
 
     def set_error(self, error: str) -> None:
         self._error = error
@@ -1154,13 +1206,20 @@ class EditChannelOverlay(Vertical):
                 input_id="edit-channel-name",
                 collapsible=False,
             )
-            yield NetworkFieldInput(
+            # CHANNEL KEY is a COPY KEY action, not an editable/display key.
+            # The [ COPY KEY ] row and the [ DEL CHANNEL ] row both reuse the
+            # ChannelEditActionRow layout (gutter + connection-label + action),
+            # so their leading `[` line up with the CHANNEL NAME input's `[`.
+            yield ChannelEditActionRow(
                 label="CHANNEL KEY",
                 widget_id="edit-channel-key-row",
-                input_id="edit-channel-key",
-                collapsible=False,
+                control=CopyChannelKey(),
             )
-            yield EditChannelDelete()
+            yield ChannelEditActionRow(
+                label="",
+                widget_id="edit-channel-delete-row",
+                control=EditChannelDelete(),
+            )
             with Horizontal(
                 id="edit-channel-actions",
                 classes="editor-actions",
@@ -3799,7 +3858,7 @@ class MeshtasticPassApp(App[None]):
 
     #long-name-input, #short-name-input,
     #network-name-input, #freq-slot-input, #key-input,
-    #new-channel-name, #new-channel-key {
+    #new-channel-name, #new-channel-key, #edit-channel-name {
         width: 16;
         height: 1;
         border: none;
@@ -3816,7 +3875,10 @@ class MeshtasticPassApp(App[None]):
     Screen.theme-amber #short-name-input,
     Screen.theme-amber #network-name-input,
     Screen.theme-amber #freq-slot-input,
-    Screen.theme-amber #key-input {
+    Screen.theme-amber #key-input,
+    Screen.theme-amber #new-channel-name,
+    Screen.theme-amber #new-channel-key,
+    Screen.theme-amber #edit-channel-name {
         color: $amber_base;
     }
 
@@ -4011,7 +4073,7 @@ class MeshtasticPassApp(App[None]):
         position: absolute;
         background: #101010;
         border: solid $snow_dim;
-        padding: 0 1;
+        padding: 1;
         height: auto;
         scrollbar-size: 1 1;
         scrollbar-color: $snow_base;
@@ -9881,12 +9943,42 @@ class MeshtasticPassApp(App[None]):
     @on(Input.Submitted, "#edit-channel-name")
     def edit_channel_name_submitted(self, _event: Input.Submitted) -> None:
         if self._edit_channel_editor_open:
-            self._focus_edit_channel_field("key")
+            self._focus_edit_channel_field("copy_key")
 
-    @on(Input.Submitted, "#edit-channel-key")
-    def edit_channel_key_submitted(self, _event: Input.Submitted) -> None:
-        if self._edit_channel_editor_open:
-            self._focus_edit_channel_field("delete")
+    @on(CopyChannelKey.Activated)
+    def edit_channel_copy_key(self, _event: CopyChannelKey.Activated) -> None:
+        if not self._edit_channel_editor_open:
+            return
+        # Copy the REAL current channel key (kept internally, never displayed)
+        # via Textual's built-in clipboard -- zero RF, no channel mutation, the
+        # overlay stays open.
+        key = self._channel_psk_metadata_text()
+        if not key:
+            self._show_send_error("PSK COPY FAILED")
+            return
+        try:
+            self.copy_to_clipboard(key)
+        except Exception:
+            self._show_send_error("PSK COPY FAILED")
+            return
+        self._show_psk_copy_status("PSK COPIED")
+
+    def _show_psk_copy_status(self, message: str) -> None:
+        """Compact ACCENT copy confirmation on the CHAT status row (#send-error),
+        reusing the established timed-dismiss convention (_send_error_dismiss_timer
+        + _auto_dismiss_send_error). The copied key is never part of the message.
+        """
+        if self._send_error_dismiss_timer is not None:
+            self._send_error_dismiss_timer.stop()
+            self._send_error_dismiss_timer = None
+        self._send_error_message = message
+        widgets = list(self.query("#send-error"))
+        if widgets:
+            widgets[0].add_class("setting-accent")
+        self._send_error_dismiss_timer = self.set_timer(
+            SEND_ERROR_AUTO_DISMISS_SECONDS, self._auto_dismiss_send_error
+        )
+        self._render_chat_status()
 
     @on(NewChannelCancel.Activated)
     def new_channel_cancel(self, _event: NewChannelCancel.Activated) -> None:
@@ -10142,13 +10234,13 @@ class MeshtasticPassApp(App[None]):
 
     # Vertical stops: CHANNEL NAME, CHANNEL KEY, DELETE CHANNEL, SAVE. CANCEL
     # is a horizontal sibling of SAVE (Right from SAVE / Left from CANCEL).
-    _EDIT_CHANNEL_FIELD_ORDER = ("name", "key", "delete", "save")
+    _EDIT_CHANNEL_FIELD_ORDER = ("name", "copy_key", "delete", "save")
 
     def _edit_channel_focused_field(self) -> str:
         focused_id = getattr(self.focused, "id", None)
         for field, selector in (
             ("name", "edit-channel-name"),
-            ("key", "edit-channel-key"),
+            ("copy_key", "edit-channel-copy-key"),
             ("delete", "edit-channel-delete"),
             ("save", "edit-channel-save"),
             ("cancel", "edit-channel-cancel"),
@@ -10162,7 +10254,7 @@ class MeshtasticPassApp(App[None]):
     def _focus_edit_channel_field(self, field: str) -> None:
         widget_ids = {
             "name": "#edit-channel-name",
-            "key": "#edit-channel-key",
+            "copy_key": "#edit-channel-copy-key",
             "delete": "#edit-channel-delete",
             "save": "#edit-channel-save",
             "cancel": "#edit-channel-cancel",
@@ -10187,13 +10279,9 @@ class MeshtasticPassApp(App[None]):
         target = order[max(0, min(len(order) - 1, index + direction))]
         self._focus_edit_channel_field(target)
 
-    def _edit_channel_values(self) -> tuple[str, str]:
+    def _edit_channel_name_value(self) -> str:
         name_inputs = list(self.query("#edit-channel-name"))
-        key_inputs = list(self.query("#edit-channel-key"))
-        return (
-            name_inputs[0].value if name_inputs else "",
-            key_inputs[0].value if key_inputs else "",
-        )
+        return name_inputs[0].value if name_inputs else ""
 
     def _save_edit_channel(self) -> bool:
         """Apply the edited CHANNEL NAME (and key) to the current channel.
@@ -10207,8 +10295,7 @@ class MeshtasticPassApp(App[None]):
         channel = self._current_private_channel()
         if channel is None:
             return False
-        name, _key = self._edit_channel_values()
-        name = name.strip()
+        name = self._edit_channel_name_value().strip()
         if not name:
             self._edit_channel_error = "CHANNEL NAME REQUIRED"
             self._edit_channel_editor_open = True

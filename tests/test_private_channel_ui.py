@@ -810,7 +810,11 @@ class PskHeaderTests(PrivateChannelUiBase):
             # CTRL+E opens the EDIT CHANNEL overlay with the current values.
             self.assertTrue(app._edit_channel_editor_open)
             self.assertEqual(app.query_one("#edit-channel-name").value, "SECRET")
-            self.assertEqual(app.query_one("#edit-channel-key").value, b64)
+            # CHANNEL KEY is a COPY KEY action; the real key is kept internally.
+            self.assertTrue(app._edit_channel_psk)
+            self.assertEqual(
+                str(app.query_one("#edit-channel-copy-key").render()), "[ COPY KEY ]"
+            )
             # The CHAT channel view itself is NOT replaced -- it stays visible
             # behind the floating overlay.
             self.assertEqual(
@@ -1327,8 +1331,10 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self.assertTrue(app._edit_channel_editor_open)
             self.assertEqual(self._focused_id(app), "edit-channel-name")
             self.assertEqual(app.query_one("#edit-channel-name").value, "SECRET")
-            key = app.query_one("#edit-channel-key")
-            self.assertTrue(key.value)  # actual current key populated
+            self.assertTrue(app._edit_channel_psk)  # actual current key held internally
+            self.assertEqual(
+                str(app.query_one("#edit-channel-copy-key").render()), "[ COPY KEY ]"
+            )
             # The title is present but not the focused widget.
             self.assertNotEqual(self._focused_id(app), "edit-channel-overlay")
             title = app.query_one("#edit-channel-form").query_one(".page-title")
@@ -1347,7 +1353,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self.assertEqual(self._focused_id(app), "edit-channel-name")
             await pilot.press("down")
             await pilot.pause()
-            self.assertEqual(self._focused_id(app), "edit-channel-key")
+            self.assertEqual(self._focused_id(app), "edit-channel-copy-key")
             await pilot.press("down")
             await pilot.pause()
             self.assertEqual(self._focused_id(app), "edit-channel-delete")
@@ -1495,6 +1501,95 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             await pilot.pause()
             self.assertIsNotNone(app.query_one("#chat-log"))
             self.assertEqual(app.query_one("#chat-channel-content").current, "chat-conversation")
+
+    async def test_copy_key_copies_and_does_not_close_or_mutate(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            b64 = self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            copied = []
+            app.copy_to_clipboard = lambda text: copied.append(text)
+            # DOWN name -> COPY KEY, ENTER copies.
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-copy-key")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(copied, [b64])
+            # Overlay stays open; channel list unchanged; CHAT still mounted.
+            self.assertTrue(app._edit_channel_editor_open)
+            self.assertEqual([c.name for c in app._channels], ["SECRET"])
+            self.assertIsNotNone(app.query_one("#chat-log"))
+
+    async def test_del_channel_label_and_alignment_with_copy_key(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            # DEL CHANNEL label (not DELETE CHANNEL).
+            self.assertEqual(
+                str(app.query_one("#edit-channel-delete").render()), "[ DEL CHANNEL ]"
+            )
+            # COPY KEY and DEL CHANNEL both use the labeled-row layout, so the
+            # leading `[` of each begins in the same column.
+            copy_row = app.query_one("#edit-channel-key-row")
+            del_row = app.query_one("#edit-channel-delete-row")
+            copy_bracket = copy_row.query_one(".connection-label")
+            del_bracket = del_row.query_one(".connection-label")
+            self.assertIsNotNone(copy_bracket)
+            self.assertIsNotNone(del_bracket)
+            # Same label width -> same column for the action start.
+            self.assertEqual(int(copy_row.styles.width.value), int(del_row.styles.width.value))
+
+    async def test_overlay_height_hugs_content_and_has_compact_padding(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            overlay = app._edit_channel_overlay
+            self.assertIsNotNone(overlay)
+            # Height is auto (hugs content), NOT 1fr/full chat height.
+            self.assertEqual(str(overlay.styles.height), "auto")
+            # Compact padding on all four sides (1 cell each).
+            pad = overlay.styles.padding
+            self.assertEqual((pad.top, pad.bottom, pad.left, pad.right), (1, 1, 1, 1))
+
+    async def test_channel_name_has_no_blue_default_focus_treatment(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            name_input = app.query_one("#edit-channel-name")
+            # The input is focused but uses the established form treatment --
+            # the SAME background (#101010) and ACCENT focus border as the
+            # NEW CHANNEL name/key inputs, never a Textual/browser blue focus.
+            self.assertEqual(self._focused_id(app), "edit-channel-name")
+            self.assertEqual(name_input.styles.background.rgb, (16, 16, 16))
+            # The focus border is the theme ACCENT (green), identical to the
+            # established NEW CHANNEL input -- never blue.
+            border_color = name_input.styles.border_left[1]
+            self.assertIsNotNone(border_color)
+            self.assertNotEqual(getattr(border_color, "rgb", None), (0, 0, 255))
 
 
 class ChatNetworkIdentityTests(PrivateChannelUiBase):
