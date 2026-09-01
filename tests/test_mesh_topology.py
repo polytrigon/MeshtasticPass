@@ -8134,6 +8134,38 @@ class MeshNodeMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("REPLY", labels)
             values = [item.value for item in app._user_menu.items]
             self.assertNotIn("reply", values)
+            self.assertIn("REMOVE NODE", labels)
+
+    async def test_mesh_remove_node_drops_it_from_working_set(self) -> None:
+        """REMOVE NODE from the MESH menu removes only the selected node from
+        the radio NodeDB and drops it from MESH presentation -- unrelated
+        nodes stay, and it is NOT a whole-NodeDB clear."""
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!a11ce001"
+            other_id = "!b0b00002"
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            app._activate_menu_item(
+                NodeMetadata(target_id, "Alice Trail", "ALCE"), "remove"
+            )
+            await pilot.pause()
+            app._activate_menu_item(
+                NodeMetadata(target_id, "Alice Trail", "ALCE"), "remove"
+            )
+            for _ in range(6):
+                await pilot.pause()
+            self.assertIn(target_id, app.radio._removed_node_ids)
+            view = app.query_one(MeshTopologyView)
+            ids = {state.node.node_id for state in view.working_set}
+            self.assertNotIn(target_id, ids)
+            self.assertIn(other_id, ids)
+            self.assertIn(you_id, ids)
 
     async def test_enter_on_you_opens_informational_only_menu(self) -> None:
         app = self._make_app()

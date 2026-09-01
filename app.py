@@ -113,6 +113,7 @@ from radio_service import (
     TracerouteResult,
     TracerouteState,
     TracerouteStatus,
+    NodeRemoveResult,
     rx_debug_enabled,
     rx_debug_log,
     validate_long_name,
@@ -1472,6 +1473,24 @@ class TracerouteStatusReceived(Message):
         super().__init__()
         self.request_token = request_token
         self.status = status
+
+
+class NodeRemoveOutcome(Message):
+    """A confirmed REMOVE NODE radio call finished (success or failure).
+
+    `node_id` is the canonical node ID that was targeted; `result` is the
+    RadioService NodeRemoveResult (None if the radio call raised an
+    unexpected exception). Used to refresh MESH/CHAT presentation on
+    success and to report a compact ERROR on failure -- never a
+    fabricated local success.
+    """
+
+    def __init__(
+        self, node_id: str, result: NodeRemoveResult | None
+    ) -> None:
+        super().__init__()
+        self.node_id = node_id
+        self.result = result
 
 
 class TracerouteRequestFailed(Message):
@@ -4423,6 +4442,13 @@ class MeshtasticPassApp(App[None]):
         self._user_menu_scroll_target: ScrollableContainer | None = None
         self._user_menu_scroll_x: float | None = None
         self._user_menu_scroll_y: float | None = None
+        # REMOVE NODE (radio-side NodeDB removal) is a destructive action
+        # gated by a two-step "press again to confirm" within the shared
+        # node context menu (CHAT and MESH both open it). This is the node
+        # id (canonical) currently awaiting confirmation, and its auto-
+        # disarm timer -- mirroring the advanced-radio confirm convention.
+        self._node_remove_confirm: str | None = None
+        self._node_remove_confirm_timer: Timer | None = None
         self._emoji_picker: EmojiPicker | None = None
         # MESH LAYOUT STABILITY: sticky logical positions (node_id ->
         # (x, y, region), assign_grid_slots' own PositionedNode shape)
@@ -10149,6 +10175,13 @@ class MeshtasticPassApp(App[None]):
             highlighted = len(items) - 1
             if allow_traceroute and self._active_traceroute is None:
                 items.append(PopupItem("TRACEROUTE", "traceroute", actionable=True))
+            # REMOVE NODE: an explicit, guided radio-side NodeDB removal.
+            # Offered for a remote node only (never the local/self node,
+            # which _open_node_menu renders in the is_local branch above),
+            # since removing the connected radio's own entry is impossible
+            # and would be a footgun. Uses the SAME canonical node ID as
+            # every other action here -- never a display label.
+            items.append(PopupItem("REMOVE NODE", "remove", actionable=True))
         menu = ViewportMenu(
             items,
             highlighted_index=highlighted,
@@ -10191,6 +10224,9 @@ class MeshtasticPassApp(App[None]):
                 long_name=metadata.long_name,
                 short_name=metadata.short_name,
             )
+            return
+        if action == "remove":
+            self._request_node_remove(metadata)
             return
         self._activate_node_action(metadata.node_id, action)
 
@@ -10237,6 +10273,88 @@ class MeshtasticPassApp(App[None]):
                 widget.set_favorite(self.settings.is_favorite(node_id))
         self._refresh_mesh()
         self._close_user_menu()
+
+    def _request_node_remove(self, metadata: NodeMetadata) -> None:
+        """Two-step confirmation for the REMOVE NODE radio action.
+
+        First activation arms a "press again to confirm" state for that
+        exact canonical node id; a second activation of the same node
+        performs the removal. Any other menu action / disarm / timeout
+        cancels it. Never a confirmation for a different node, and never
+        a remote node that is actually the local/self radio (guarded
+        again at the radio boundary too).
+        """
+        self._close_user_menu(restore_focus=False)
+        node_id = metadata.node_id
+        if self._node_remove_confirm == node_id:
+            self._disarm_node_remove_confirm()
+            if self._radio_state is not RadioState.ONLINE:
+                self.notify("REMOVE NODE · radio not connected", severity="error")
+                return
+            self._perform_node_remove(node_id)
+            return
+        self._arm_node_remove_confirm(node_id)
+        self.notify("REMOVE NODE · press again to confirm", severity="warning")
+
+    def _arm_node_remove_confirm(self, node_id: str) -> None:
+        self._node_remove_confirm = node_id
+        if self._node_remove_confirm_timer is not None:
+            self._node_remove_confirm_timer.stop()
+        self._node_remove_confirm_timer = self.set_timer(
+            ADVANCED_RADIO_CONFIRM_SECONDS, self._node_remove_confirm_expired
+        )
+
+    def _disarm_node_remove_confirm(self) -> None:
+        self._node_remove_confirm = None
+        if self._node_remove_confirm_timer is not None:
+            self._node_remove_confirm_timer.stop()
+            self._node_remove_confirm_timer = None
+
+    def _node_remove_confirm_expired(self) -> None:
+        self._node_remove_confirm_timer = None
+        if self._node_remove_confirm is not None:
+            self._node_remove_confirm = None
+
+    def _perform_node_remove(self, node_id: str) -> None:
+        """Dispatch the confirmed radio-side NodeDB removal, then refresh.
+
+        Runs the SDK admin call on a worker thread (it may block on the
+        serial/ack path), reports success (the node is dropped from the
+        working set and CHAT name presentation refreshed) or a compact
+        ERROR without ever fabricating a local success. Stored CHAT/DM/
+        channel history is untouched -- only radio NodeDB metadata is
+        removed, so a rediscovered node repopulates with fresh identity.
+        """
+        remove = getattr(self.radio, "remove_node", None)
+        if not callable(remove):
+            self.notify("REMOVE NODE · not supported by this radio", severity="error")
+            return
+
+        def from_thread() -> None:
+            try:
+                result = remove(node_id)
+            except Exception:
+                result = None
+            self.post_message(NodeRemoveOutcome(node_id, result))
+
+        self.run_worker(from_thread, thread=True)
+
+    @on(NodeRemoveOutcome)
+    def node_remove_outcome(self, event: NodeRemoveOutcome) -> None:
+        if event.result is not None and event.result.removed:
+            self.notify(f"REMOVE NODE · {event.node_id}", severity="information")
+            # Refresh radio-authoritative known-node + CHAT presentation.
+            # The removed node drops out of the MESH working set (see
+            # _mesh_working_set/get_known_nodes) and CHAT name presentation
+            # refreshes; stored history is preserved. No NodeInfo probe is
+            # sent -- rediscovery only via normal mesh traffic.
+            self._refresh_mesh()
+            self._refresh_chat_mentions()
+        elif event.result is not None:
+            reason = event.result.reason or "unsupported"
+            self.notify(f"REMOVE NODE failed · {reason}", severity="error")
+        else:
+            self.notify("REMOVE NODE failed · radio error", severity="error")
 
     def _activate_user_action(
         self,

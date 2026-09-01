@@ -237,6 +237,47 @@ class RadioServiceTests(unittest.TestCase):
         self.assertEqual(open_interface.call_count, 2)
         self.assertGreaterEqual(interface.close.call_count, 2)
 
+    def _service_with_interface(self, local_node_id: str = "!12345678"):
+        """A RadioService wired to a fake interface for remove_node tests."""
+        service = RadioService()
+        interface = make_interface()
+        remove_node_mock = Mock(return_value=None)
+        interface.localNode = SimpleNamespace(removeNode=remove_node_mock)
+        service._interface = interface
+        service._activity_local_node_id = local_node_id
+        return service, interface, remove_node_mock
+
+    def test_remove_node_dispatches_only_the_target_node(self) -> None:
+        service, _interface, remove_node_mock = self._service_with_interface()
+        result = service.remove_node("!a11ce001")
+        self.assertTrue(result.removed)
+        self.assertEqual(result.node_id, "!a11ce001")
+        self.assertEqual(remove_node_mock.call_args[0][0], "!a11ce001")
+
+    def test_remove_node_never_targets_the_local_node(self) -> None:
+        service, _interface, remove_node_mock = self._service_with_interface(
+            local_node_id="!12345678"
+        )
+        result = service.remove_node("!12345678")
+        self.assertFalse(result.removed)
+        self.assertEqual(result.reason, "local")
+        remove_node_mock.assert_not_called()
+
+    def test_remove_node_reports_not_connected_without_interface(self) -> None:
+        service = RadioService()
+        service._interface = None
+        result = service.remove_node("!a11ce001")
+        self.assertFalse(result.removed)
+        self.assertEqual(result.reason, "not_connected")
+
+    def test_remove_node_does_not_clear_the_whole_nodedb(self) -> None:
+        service, _interface, remove_node_mock = self._service_with_interface()
+        service.remove_node("!a11ce001")
+        # The SDK admin method is remove_by_nodenum for ONE node; the app
+        # never sends nodedb_reset. Assert the dispatch did not reset.
+        called_names = [call.args for call in remove_node_mock.call_args_list]
+        self.assertEqual(called_names, [("!a11ce001",)])
+
     def test_receive_callback_delivers_messages_across_a_reconnect(self) -> None:
         """_subscribe_to_events() only subscribes once per RadioService
 

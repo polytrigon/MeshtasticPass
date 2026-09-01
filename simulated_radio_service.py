@@ -31,6 +31,7 @@ from radio_service import (
     TracerouteResult,
     TracerouteState,
     TracerouteStatus,
+    NodeRemoveResult,
     validate_send_request,
     validate_long_name,
     validate_short_name,
@@ -250,6 +251,12 @@ class SimulatedRadioService:
         self._online = False
         self._closed = False
         self._sent_messages: list[SentMessage] = []
+        # NodeDB entries removed via remove_node -- a deterministic stand-in
+        # for the radio's own NodeDB deletion. The local node is never added
+        # here (self-protection) and a removed node only reappears if the
+        # mesh is heard from again (see _hear_node), mirroring real
+        # discovery. Lowercased canonical node IDs.
+        self._removed_node_ids: set[str] = set()
         self._send_count = 0
         self._activity_reference_time: float | None = None
         self._direct_observations: dict[str, float] = {}
@@ -449,8 +456,32 @@ class SimulatedRadioService:
                 position=node.position,
             )
             for node in SIMULATED_NODES
+            if node.node_id.strip().lower() not in self._removed_node_ids
         )
         return (local, *remotes)
+
+    def remove_node(self, node_id: str, *, timeout: float = 15.0) -> NodeRemoveResult:
+        """Deterministically remove a remote node from the simulated NodeDB.
+
+        Mirrors RadioService.remove_node: protects the local node (never
+        removable), only ever removes the ONE named node, never clears the
+        whole NodeDB, and never sends a probe to force rediscovery. A node
+        is not re-added until the mesh is heard from again (see
+        _hear_node). Offline -> failure ("not_connected"); removing the
+        local node -> "local".
+        """
+        normalized = node_id.strip().lower()
+        if not self._online or self._stop_event.is_set():
+            return NodeRemoveResult(False, node_id, "not_connected")
+        if normalized == self.info.node_id.lower():
+            return NodeRemoveResult(False, node_id, "local")
+        self._removed_node_ids.add(normalized)
+        return NodeRemoveResult(True, node_id, "")
+
+    def _hear_node(self, node_id: str) -> None:
+        """Normal mesh traffic (no probe) lets a previously-removed node
+        reappear with fresh identity, mirroring real rediscovery."""
+        self._removed_node_ids.discard(node_id.strip().lower())
 
     def _node_last_heard(self, node: SimulatedNode) -> float | None:
         reference = self._activity_reference_time

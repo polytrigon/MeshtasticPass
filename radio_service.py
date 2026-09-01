@@ -437,6 +437,25 @@ class ConfigWriteResult:
 
 
 @dataclass(frozen=True)
+class NodeRemoveResult:
+    """Outcome of one RadioService.remove_node() call.
+
+    `removed` is True ONLY when the radio-owned NodeDB removal was
+    actually dispatched to the connected radio and accepted (a NAK was
+    NOT seen); it mirrors ConfigWriteResult's honesty rules -- never
+    merely because the local SDK cache/record was mutated. `reason` is
+    "" when removed is True, otherwise one of: "not_connected",
+    "disconnected" (the connection/interface changed mid-operation),
+    "nak" (the radio rejected the admin request), or "local" (the
+    target is the connected radio's own node and is never removable).
+    """
+
+    removed: bool
+    node_id: str | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class RadioApplyResult:
     """Outcome of apply_radio_config_preset() -- one controlled,
 
@@ -1871,6 +1890,77 @@ class RadioService:
     # PROTOBUF-SOURCE-VERIFIED (mesh_pb2.pyi RouteDiscovery.snr_towards/
     # snr_back): "SNR of the received packet, 1 = 0.25dB, -128 = invalid".
     _TRACEROUTE_UNKNOWN_SNR = -128
+
+    def remove_node(self, node_id: str, *, timeout: float = 15.0) -> NodeRemoveResult:
+        """Remove ONE remote node from the connected radio's NodeDB.
+
+        This is a real radio-side operation: it sends the admin message
+        ``AdminMessage.remove_by_nodenum`` (the SDK's own
+        ``LocalNode.removeNode`` on the connected radio -- PROTOBUF-
+        SOURCE-VERIFIED: ``remove_by_nodenum`` is a fixed64 node number),
+        which removes that node's stored NodeDB entry locally on the
+        device. It is NOT a local-only hide and it NEVER clears the whole
+        NodeDB (no ``nodedb_reset``) and never touches other nodes.
+
+        Safety: the connected radio's OWN canonical node ID can never be
+        removed (report reason "local"); a removed node is regenerated
+        with fresh identity metadata only if the mesh later hears it
+        again via normal Meshtastic traffic (no NodeInfo probe is sent
+        here -- zero extra RF to rediscover it).
+
+        This is explicit user action only; without a NAK it is reported
+        as removed. On any local/connection problem it returns honest
+        failure (never a fabricated local success) -- see
+        NodeRemoveResult. The SDK admin call is best-effort fire-and-
+        forget for the LOCAL node (like Node.writeConfig's own local
+        path), bounded by `timeout`; we do NOT wait for a routing ACK
+        because for a local-node admin write the SDK never delivers that
+        to a callback that is not literally named ``onAckNak`` (see
+        write_verified_config_field's own note). Connection loss or an
+        interface swap mid-operation is reported as "disconnected".
+        """
+        interface = self._interface
+        if interface is None:
+            return NodeRemoveResult(False, node_id, "not_connected")
+        target_interface = interface
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            return NodeRemoveResult(False, node_id, "not_connected")
+
+        # Self-node protection: never remove the connected radio itself.
+        candidate_number = _node_number_from_id(node_id)
+        if self._is_local_node(node_id, candidate_number):
+            return NodeRemoveResult(False, node_id, "local")
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return NodeRemoveResult(False, node_id, "disconnected")
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            # Mirror the established local admin-write convention: feed a
+            # real ACK/NAK through the SDK's own handler (so it records
+            # any NAK) the same way write_verified_config_field does.
+            local_node.onAckNak(packet)
+            acknowledgment = getattr(interface, "_acknowledgment", None)
+            if acknowledgment is not None and acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            # Use the SDK's own LocalNode.removeNode (admin remove_by_
+            # nodenum), which normalizes a "!xxxxxxxx" string to a node
+            # number and wires onResponse for the acknowledgment.
+            local_node.removeNode(node_id)
+        except Exception:
+            # The SDK admin call itself failed to dispatch (offline,
+            # unsupported, malformed) -- never claim the node was removed.
+            return NodeRemoveResult(False, node_id, "nak")
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return NodeRemoveResult(False, node_id, "disconnected")
+        if nak_seen["nak"]:
+            return NodeRemoveResult(False, node_id, "nak")
+        return NodeRemoveResult(True, node_id, "")
 
     def send_traceroute(
         self,
