@@ -477,5 +477,119 @@ class PerRadioNamespaceAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([e.text for e in poly2.chat_history], ["POLY history"])
 
 
+class PrimaryChannelIdentityTests(unittest.IsolatedAsyncioTestCase):
+    """MEDIUMSLOW -> PRIMARY display change must NOT change identity.
+
+    The unnamed PRIMARY logical channel's ON-SCREEN label ("PRIMARY") is
+    presentation only. It must never feed CHAT's stable channel identity
+    or the ChatStore conversation key, so a mere display-label change (or
+    the previous bug where the modem preset "MediumSlow" was shown) can
+    never re-key existing history or cause an async refresh to switch to
+    a different conversation. A truly unnamed primary with no assigned
+    settings.id and no PSK has genuinely no stable identity of its own
+    (key "" = "unknown"), NOT a fabricated key from its label.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        self.chat_db_path = self.root / "chat.db"
+
+    @staticmethod
+    def _radio(node_id: str = SIMULATED_LOCAL_NODE_ID) -> SimulatedRadioService:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.info = replace(radio.info, node_id=node_id)
+        return radio
+
+    @staticmethod
+    async def _wait_online(pilot, app) -> None:
+        for _ in range(15):
+            await pilot.pause()
+            if app._radio_state is RadioState.ONLINE:
+                break
+        assert app._radio_state is RadioState.ONLINE
+        for _ in range(5):
+            await pilot.pause()
+
+    def test_display_label_does_not_enter_stable_identity(self) -> None:
+        from types import SimpleNamespace
+        from radio_service import RadioService
+
+        # The stable key is derived from the channel's REAL configured name
+        # plus psk/settings.id (the `configured_name` argument). The DISPLAY
+        # label is never what the caller passes for identity. Prove the
+        # labelled caller contract: an unnamed primary (configured_name "")
+        # keys only by its psk hash, insensitive to any shown label.
+        with_psk = SimpleNamespace(name="", psk=bytes([1, 2, 3]))
+        bare_key = RadioService._channel_stable_key(with_psk, "")
+        self.assertEqual(bare_key, "hash::0")
+        # Simulate the OLD buggy caller passing the shown label as identity:
+        # that WOULD differ -- which is exactly why _read_channel_info never
+        # does it, instead always passing the real configured name.
+        label_key = RadioService._channel_stable_key(with_psk, "PRIMARY")
+        self.assertNotEqual(bare_key, label_key)
+
+        # Truly unnamed primary, no id/psk: no identity of its own.
+        unnamed = SimpleNamespace(name="", id=0)
+        self.assertEqual(RadioService._channel_stable_key(unnamed, ""), "")
+
+        # A genuinely named channel with no id/psk keys by its real name.
+        named = SimpleNamespace(name="LongFast")
+        self.assertEqual(RadioService._channel_stable_key(named, "LongFast"), "LongFast")
+
+    def test_read_channel_info_keeps_primary_label_out_of_identity(self) -> None:
+        from types import SimpleNamespace
+        from radio_service import ChannelInfo, RadioService
+
+        channels = [
+            SimpleNamespace(index=0, role=1, settings=SimpleNamespace(name="")),
+        ]
+        local_node = SimpleNamespace(
+            channels=channels,
+            localConfig=SimpleNamespace(lora=SimpleNamespace(use_preset=True, modem_preset=0)),
+        )
+        result = RadioService._read_channel_info(local_node)
+        # Presentation label is "PRIMARY", but stable identity is "" (the
+        # real configured name for an unnamed primary with no id/psk) --
+        # never "PRIMARY" and never the modem preset "MediumSlow".
+        self.assertEqual(result, (ChannelInfo(0, "PRIMARY", stable_key=""),))
+
+    async def test_primary_label_change_keeps_history_mounted(self) -> None:
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        # Seeded under an unnamed PRIMARY channel: no settings.id, no psk, so
+        # its stable identity is "" (unknown).
+        store.add_incoming(
+            packet_id=1, node_id="!a11ce001", sender_name="Alice Trail",
+            sender_short_name="ALCE", channel_index=0, text="primary history",
+            radio_rx_at=100.0, received_at=100.0, channel_key="",
+        )
+        # The connected radio presents this exact unnamed primary: display
+        # label "PRIMARY", stable identity "" (no settings.id, no psk).
+        radio = self._radio()
+        radio.info = replace(
+            radio.info,
+            channels=(ChannelInfo(0, "PRIMARY", stable_key=""),),
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["primary history"])
+
+            # Label and identity are unchanged across an async refresh, so the
+            # mounted conversation stays put (PROBLEM 3 invariant).
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["primary history"])
+
+
 if __name__ == "__main__":
     unittest.main()
