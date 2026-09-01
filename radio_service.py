@@ -393,6 +393,25 @@ def psk_matches_request(requested: bytes, actual: bytes) -> bool:
 
 
 @dataclass(frozen=True)
+class PrivateChannelApplyResult:
+    """Outcome of one RadioService.apply_private_channel() call.
+
+    `ok` is True ONLY after a fresh radio-originated get_channel_response for
+    the written slot returned the same name AND a PSK matching the requested
+    key (via psk_matches_request) -- never merely because the local Python
+    channels object was mutated. `slot` is the logical channel index a
+    secondary channel was written to (None when there was no free DISABLED
+    slot or the radio was unavailable). `error` is a compact machine/
+    UI-safe reason ("not_connected", "no_channel_slot", "nak", "timeout",
+    "mismatch", "disconnected") or "" on success.
+    """
+
+    ok: bool
+    slot: int | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class ConfigWriteResult:
     """Outcome of one RadioService.write_verified_config_field() call.
 
@@ -1268,6 +1287,115 @@ class RadioService:
             time.sleep(0.05)
 
         return ConfigWriteResult(False, (name, psk), None, "timeout")
+
+    def apply_private_channel(
+        self,
+        *,
+        name: str,
+        psk: bytes,
+        timeout: float = 15.0,
+    ) -> PrivateChannelApplyResult:
+        """Write ONE secondary (private) logical channel and verify it.
+
+        Mirrors write_verified_primary_channel's write-then-readback MODEL for
+        a SECONDARY channel, on the first DISABLED logical channel slot
+        (Meshtastic slots 0-7 via localNode.channels). Only that one channel's
+        name/psk/role are changed (never role/settings of other slots, never
+        PRESET/LoRa/modem-frequency/hop). No reboot behavior is added; the SDK's
+        local-node admin write is fire-and-forget (onResponse=None style), so
+        the write is bounded by this method's readback loop, not a 300s stall.
+
+        On success the config snapshot is rebuilt and the slot returned; the
+        CALLER must promote the UI to radio-authoritative ChannelInfo only after
+        (and from) a subsequent _read_channel_info -- never fabricate state.
+        """
+        interface = self._interface
+        if interface is None:
+            return PrivateChannelApplyResult(False, None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if local_node is None or not channels:
+            return PrivateChannelApplyResult(False, None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2, channel_pb2
+
+        disabled_role = channel_pb2.Channel.Role.DISABLED
+        slot = next(
+            (
+                RadioService._optional_int(getattr(channel, "index", None))
+                for channel in channels
+                if getattr(channel, "role", None) == disabled_role
+            ),
+            None,
+        )
+        if slot is None:
+            return PrivateChannelApplyResult(False, None, "no_channel_slot")
+
+        target_interface = interface
+        target = channels[slot]
+        target.role = channel_pb2.Channel.Role.SECONDARY
+        target.settings.name = name
+        target.settings.psk = psk
+
+        write_message = admin_pb2.AdminMessage()
+        write_message.set_channel.CopyFrom(target)
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+        except Exception:
+            pass
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return PrivateChannelApplyResult(False, slot, "disconnected")
+        if nak_seen["nak"]:
+            return PrivateChannelApplyResult(False, slot, "nak")
+
+        read_request = admin_pb2.AdminMessage()
+        # get_channel_request is 1-INDEXED on the wire (see
+        # write_verified_primary_channel's own comment about channel 0 == 1).
+        read_request.get_channel_request = slot + 1
+        found: dict[str, Any] = {}
+
+        def on_response(packet: Any) -> None:
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            if not isinstance(admin, dict):
+                return
+            raw = admin.get("raw")
+            if raw is None or not raw.HasField("get_channel_response"):
+                return
+            response = raw.get_channel_response
+            if getattr(response, "index", None) != slot:
+                return
+            found["name"] = response.settings.name
+            found["psk"] = bytes(response.settings.psk)
+
+        try:
+            local_node._sendAdmin(read_request, onResponse=on_response)
+        except Exception:
+            return PrivateChannelApplyResult(False, slot, "timeout")
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                return PrivateChannelApplyResult(False, slot, "disconnected")
+            if nak_seen["nak"]:
+                return PrivateChannelApplyResult(False, slot, "nak")
+            if "name" in found:
+                if found["name"] == name and psk_matches_request(psk, found["psk"]):
+                    self._rebuild_config_snapshot()
+                    return PrivateChannelApplyResult(True, slot, "")
+                return PrivateChannelApplyResult(False, slot, "mismatch")
+            time.sleep(0.05)
+
+        return PrivateChannelApplyResult(False, slot, "timeout")
 
     def begin_settings_transaction(self) -> bool:
         """Open a Meshtastic settings-edit transaction
@@ -2465,6 +2593,56 @@ class RadioService:
             channels=self._read_channel_info(local_node),
         )
 
+    def get_config_channels(self) -> tuple[ChannelInfo, ...]:
+        """Refresh the configured-channel list from the CURRENT interface.
+
+        Zero-RF: re-reads the already-synced localNode.channels (the same
+        source _read_radio_info snapshots). Used after a private-channel
+        apply so the UI can promote the channel actually written/verified.
+        """
+        interface = self._interface
+        if interface is None:
+            return ()
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            return ()
+        return self._read_channel_info(local_node)
+
+    def channel_psk_text(self, channel_index: int) -> str | None:
+        """Normalized Base64 PSK for one enabled channel, or None.
+
+        Read-only, zero-RF: reads the ALREADY-synced local channel settings
+        (exactly where _read_channel_info reads ChannelInfo identity), never
+        requests anything from the radio. Returns None for the public/default
+        sentinel PSKs (0x00 no-encryption, 0x01 default), for an unavailable/
+        disabled channel, and for a malformed length -- so a private channel's
+        key is the ONLY non-None result. The returned text is UI metadata
+        only and is never logged by callers.
+        """
+        if self._interface is None:
+            return None
+        local_node = getattr(self._interface, "localNode", None)
+        channels = getattr(local_node, "channels", None)
+        if not channels:
+            return None
+        for channel in channels:
+            if RadioService._optional_int(getattr(channel, "index", None)) != channel_index:
+                continue
+            settings = getattr(channel, "settings", None)
+            psk = getattr(settings, "psk", None)
+            if not isinstance(psk, (bytes, bytearray)):
+                return None
+            raw = bytes(psk)
+            if raw in (b"", b"\x00", b"\x01"):
+                # Public/no-encryption sentinels -- never a private key.
+                return None
+            if len(raw) not in (16, 32):
+                return None
+            import base64 as _base64
+
+            return _base64.b64encode(raw).decode("ascii")
+        return None
+
     @staticmethod
     def _read_channel_info(local_node: Any) -> tuple[ChannelInfo, ...]:
         """Convert enabled SDK channel protobufs into stable app values."""
@@ -2556,19 +2734,18 @@ class RadioService:
 
     @staticmethod
     def _primary_channel_default_name(local_node: Any) -> str:
-        """Derive the unnamed primary channel label from the radio preset."""
-        try:
-            from meshtastic.protobuf import config_pb2
+        """UI fallback label for an UNNAMED primary (index 0) logical channel.
 
-            lora = local_node.localConfig.lora
-            if not lora.use_preset:
-                return ""
-            enum_name = config_pb2.Config.LoRaConfig.ModemPreset.Name(
-                lora.modem_preset
-            )
-        except (ImportError, AttributeError, KeyError, TypeError, ValueError):
-            return ""
-        return "".join(part.title() for part in enum_name.split("_"))
+        Returns "PRIMARY" -- the display-only fallback for a primary logical
+        channel with no meaningful configured name. It is NEVER the modem/radio
+        preset (e.g. "MediumSlow"): MEDIUM SLOW is the RF modem preset, not the
+        Meshtastic logical-channel identity, so it must not be presented as the
+        channel name. "PRIMARY" never reaches the radio (presentation only); the
+        channel's authoritative identity (settings.id / channel hash) is
+        unchanged. A genuinely named primary channel uses its real name instead
+        (see _read_channel_info).
+        """
+        return "PRIMARY"
 
 
 # Compact UI wording for the write STAGE a NETWORK apply failed at
