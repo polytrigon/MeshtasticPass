@@ -1,8 +1,13 @@
 # CLAUDE.md
 
 Claude Code reads this file to learn how to work in this repository. The
-canonical, tool-agnostic engineering rules now live in `AGENTS.md`; read that
-first and treat it as the source of truth for all MeshtasticPass engineering
+canonical, tool-agnostic engineering rules live in `AGENTS.md`, imported here
+so Claude Code loads them directly rather than being merely asked to go read
+them:
+
+@AGENTS.md
+
+Treat `AGENTS.md` as the source of truth for all MeshtasticPass engineering
 doctrine (architecture, identity rules, persistence, delivery-state
 monotonicity, RF/config safety, simulation, async/correlation safety, reconnect
 lifecycle, MESH truthfulness, theme/style conventions, test strategy, CI
