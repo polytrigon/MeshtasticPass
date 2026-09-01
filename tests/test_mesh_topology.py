@@ -99,6 +99,8 @@ from radio_service import (
     TracerouteState,
 )
 from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
     SIMULATED_NODES,
@@ -2094,6 +2096,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         old_timestamp = now - 10 * 24 * 60 * 60
 
         first_process_store = ChatStore.open(db_path)
+        first_process_store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         first_process_store.add_incoming(
             packet_id=1,
             node_id="!a11ce001",
@@ -2107,6 +2110,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         first_process_store.close()
 
         second_process_store = ChatStore.open(db_path)
+        second_process_store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(second_process_store.close)
         app = self._make_app(chat_store=second_process_store)
         async with app.run_test(size=(90, 28)) as pilot:
@@ -2140,6 +2144,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         old_timestamp = now - 30 * 24 * 60 * 60
 
         store = ChatStore.open(db_path)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         store.add_incoming(
             packet_id=1,
             node_id="!a11ce001",
@@ -2164,6 +2169,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         store.close()
 
         store = ChatStore.open(db_path)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(store.close)
         app = self._make_app(chat_store=store)
         async with app.run_test(size=(90, 28)) as pilot:
@@ -8162,6 +8168,38 @@ class MeshNodeMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("REPLY", labels)
             values = [item.value for item in app._user_menu.items]
             self.assertNotIn("reply", values)
+            self.assertIn("REMOVE NODE", labels)
+
+    async def test_mesh_remove_node_drops_it_from_working_set(self) -> None:
+        """REMOVE NODE from the MESH menu removes only the selected node from
+        the radio NodeDB and drops it from MESH presentation -- unrelated
+        nodes stay, and it is NOT a whole-NodeDB clear."""
+        app = self._make_app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            you_id = app.radio.info.node_id
+            target_id = "!a11ce001"
+            other_id = "!b0b00002"
+            await self._open_mesh(pilot)
+            _mesh_select_node(app, target_id)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            app._activate_menu_item(
+                NodeMetadata(target_id, "Alice Trail", "ALCE"), "remove"
+            )
+            await pilot.pause()
+            app._activate_menu_item(
+                NodeMetadata(target_id, "Alice Trail", "ALCE"), "remove"
+            )
+            for _ in range(6):
+                await pilot.pause()
+            self.assertIn(target_id, app.radio._removed_node_ids)
+            view = app.query_one(MeshTopologyView)
+            ids = {state.node.node_id for state in view.working_set}
+            self.assertNotIn(target_id, ids)
+            self.assertIn(other_id, ids)
+            self.assertIn(you_id, ids)
 
     async def test_enter_on_you_opens_informational_only_menu(self) -> None:
         app = self._make_app()

@@ -43,3 +43,6 @@ config.json
 .claude/
 .DS_Store
 *~
+
+# repo-local scratch (ephemeral test/temp output)
+.tmp/

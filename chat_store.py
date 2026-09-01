@@ -7,11 +7,21 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import RLock
+from time import time
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
+
+# Separator that joins the canonical local node ID and the canonical SHORT
+# NAME into a single durable profile key. The node-id half is always the
+# canonical "!xxxxxxxx" form (never contains ":"), so splitting on the FIRST
+# ":" unambiguously recovers the node id; the short-name half is canonicalized
+# (stripped, uppercased) and may be empty (a node-only lineage). The profile
+# key is the ONE place this composite is built/parsed -- never scattered as
+# display strings through the app.
+_PROFILE_KEY_SEPARATOR = ":"
 
 
 class ChatStoreError(Exception):
@@ -58,6 +68,33 @@ class StoredMessage:
     # history. See CHAT channel-history isolation (FINAL MESHTASTIC
     # POLISH pass) and this field's own precedent, dm_node_id.
     channel_key: str | None = None
+    # This row's OWNING physical/local radio's canonical node ID. A
+    # row belongs to exactly one local radio conversation namespace --
+    # CHAT state lives under (canonical local node ID -> conversation
+    # identity). Two different radios (POLY vs SOHO) running identical
+    # network/channel/PSK/DM settings must never share history, so this
+    # is always part of every read filter and every write stamp.
+    # NULL means "written before per-radio namespacing existed" or
+    # "local identity was not yet resolved when the row was written".
+    # The preserve-but-hide migration policy guarantees such a NULL
+    # row is NEVER returned by any read (every query filters
+    # local_node_id = <resolved id>, and a NULL equality never matches),
+    # so pre-namespacing history is kept on disk but never presented as
+    # belonging to any radio. Writes that occur before the radio's local
+    # node ID is resolved are likewise never surfaced.
+    local_node_id: str | None = None
+    # This row's owning LOCAL CHAT HISTORY PROFILE key -- the durable
+    # composite (canonical canonical local node ID + canonical SHORT NAME)
+    # that scopes ALL local CHAT state for one physical/local radio pairing.
+    # A profile is the privacy boundary at the LOCAL device: local device
+    # access, not a cryptographic radio fingerprint. Two profiles with the
+    # SAME node id but DIFFERENT short names (POLY vs SOHO vs 1234) are
+    # distinct namespaces that are never merged. NULL means "written before
+    # per-profile namespacing existed" (or "local identity not yet resolved
+    # when the row was written"); the preserve-but-hide policy guarantees
+    # such a row is never returned by any read, so pre-profile history is
+    # preserved on disk but never presented as belonging to a profile.
+    profile_key: str | None = None
 
     @property
     def message_time(self) -> float | None:
@@ -104,6 +141,102 @@ def default_chat_db_path() -> Path:
     return root / "meshtasticpass" / "chat.db"
 
 
+def canonical_short_name(short_name: str | None) -> str:
+    """Canonicalize a local SHORT NAME for history-profile identity.
+
+    SHORT NAME (not LONG NAME) is part of the local CHAT history profile:
+    !1234 + POLY, !1234 + SOHO and !1234 + 1234 are distinct profiles even
+    for the same node id. Canonicalization is strip + UPPERCASE, so
+    "poly"/"POLY" are the SAME profile (short names are case-insensitive
+    labels; a user renaming only the case must never splinter history).
+    LONG NAME is never part of the profile -- it is presentation only
+    (see canonical_profile_key).
+
+    Returns "" ONLY for a genuinely unusable value (None, or blank/
+    whitespace after trimming). A blank/whitespace SHORT NAME is UNRESOLVED
+    identity -- it must NOT contribute a node-only profile, so it yields ""
+    and canonical_profile_key returns None (never a "!12345678:" key).
+    """
+    if not isinstance(short_name, str):
+        return ""
+    normalized = short_name.strip().upper()
+    return normalized
+
+
+def canonical_profile_key(node_id: str | None, short_name: str | None) -> str | None:
+    """Build the durable local CHAT history profile key for a radio pairing.
+
+    The profile is (canonical local node ID + canonical SHORT NAME). This is
+    the ONE place the composite is built -- never concatenated as display
+    strings through the app. Returns None unless BOTH components are usable:
+
+    - the node id normalizes to a canonical "!xxxxxxxx" hex id, AND
+    - the SHORT NAME canonicalizes to a NON-EMPTY value.
+
+    A missing/blank/whitespace-only SHORT NAME is unresolved identity, so
+    None is returned (a node-only "!12345678:" key is NEVER created). A real
+    factory/default short name such as "1234" is valid and yields
+    "!12345678:1234".
+    """
+    normalized = normalize_profile_node_id(node_id)
+    if normalized is None:
+        return None
+    short = canonical_short_name(short_name)
+    if not short:
+        return None
+    return f"{normalized}{_PROFILE_KEY_SEPARATOR}{short}"
+
+
+def normalize_profile_node_id(node_id: str | None) -> str | None:
+    """Canonical "!"-prefixed 8-hex-digit local node id, or None.
+
+    The LOCAL profile identity uses the actual Meshtastic node-ID wire
+    representation, normalized consistently to canonical "!xxxxxxxx" (lowercase
+    hex). Only the canonical hex form is accepted -- an optional "!" prefix and
+    surrounding whitespace are tolerated, but a bare digit-only string is NOT
+    interpreted via competing decimal/hex readings. The connected radio's own
+    `RadioInfo.node_id` is already canonical, so this is a defensive guard for
+    hand-constructed/tests values, never a source of ambiguity.
+
+    Returns None when the id is not usable (blank, non-hex, not a 32-bit
+    node id) -- the preserve-but-hide fallback.
+    """
+    if not isinstance(node_id, str):
+        return None
+    candidate = node_id.strip()
+    had_prefix = candidate.startswith("!")
+    if had_prefix:
+        candidate = candidate[1:]
+    # Canonical hex node-id representation. A "!"-prefixed value is
+    # unambiguously a node id (parsed as hex). A BARE digit-only string (no
+    # "!" and no a-f letter) is ambiguous under decimal vs hex and is
+    # rejected -- one representation, never two competing readings.
+    if not candidate or len(candidate) > 8:
+        return None
+    if not had_prefix and not any(ch in "abcdefABCDEF" for ch in candidate):
+        return None
+    try:
+        value = int(candidate, 16)
+    except ValueError:
+        return None
+    return f"!{value & 0xFFFFFFFF:08x}"
+
+
+def split_profile_key(profile_key: str | None) -> tuple[str | None, str]:
+    """Split a profile key into its (canonical node id, canonical short name).
+
+    Inverse of canonical_profile_key. Malformed/unknown keys yield
+    (None, ""). Used only where a profile must be decomposed (e.g. to know
+    a rename target's node id); the app never builds profile identity from
+    raw display strings.
+    """
+    if not profile_key:
+        return (None, "")
+    node_part, _, short_part = profile_key.partition(_PROFILE_KEY_SEPARATOR)
+    node_normalized = normalize_profile_node_id(node_part)
+    return (node_normalized, short_part)
+
+
 class ChatStore:
     """Own one SQLite connection and all CHAT persistence SQL."""
 
@@ -112,6 +245,192 @@ class ChatStore:
         self.path = path
         self._lock = RLock()
         self._closed = False
+        # The active LOCAL CHAT HISTORY PROFILE (canonical local node ID +
+        # canonical SHORT NAME). Every write is stamped with this and every
+        # read is filtered by it, so CHAT state is isolated per (node ID +
+        # short name) pairing -- !1234+POLY, !1234+SOHO and !1234+1234 are
+        # never merged. None means "local profile not yet resolved": reads
+        # surface no history and writes are stored but later hidden (the
+        # preserve-but-hide policy -- never present a row as belonging to a
+        # profile we cannot prove owned it).
+        self._active_profile_key: str | None = None
+        # Whether the profile was EVER explicitly bound. A raw ChatStore
+        # that never calls set_active_profile (older Store tests, hand-run
+        # tools) is left profile-unfiltered so its write-then-read round
+        # trips still work exactly as before; once the app resolves a local
+        # profile it always binds, turning the profile filter on
+        # permanently for the life of this store.
+        self._profile_bound: bool = False
+
+    def set_active_profile(self, profile_key: str | None) -> None:
+        """Bind this store to one local CHAT history profile.
+
+        `profile_key` is the durable composite built by
+        canonical_profile_key(node_id, short_name). Call it once the local
+        (node ID + SHORT NAME) profile is resolved (or resolve it to None
+        while unknown). The store does not read or write any conversation
+        state outside this profile. Switching profiles (a live rename of
+        the SHORT NAME, or attaching a different radio) requires nothing
+        more than calling this again with the new key -- every subsequent
+        read/write is then scoped to the new profile; no other profile's
+        rows match, and the two are never merged.
+        """
+        self._active_profile_key = profile_key
+        self._profile_bound = True
+
+    def set_local_profile(self, node_id: str | None, short_name: str | None = None) -> str | None:
+        """Convenience: bind the store to the canonical (node ID + SHORT NAME)
+        profile -- builds the durable profile key and activates it. Returns
+        the profile key (None when the node id is not usable).
+
+        Equivalent to set_active_profile(canonical_profile_key(...)); the app
+        and tests use this to bind by identity rather than by an opaque key.
+        """
+        key = canonical_profile_key(node_id, short_name)
+        self.set_active_profile(key)
+        return key
+
+    def is_namespace_bound(self) -> bool:
+        """Whether this store's per-profile namespace has been set at all.
+
+        A store the app never bound (raw unit tests / hand tools) keeps its
+        pre-namespacing behavior (reads unfiltered, writes profile-less);
+        once the app resolves a local profile it always binds, turning the
+        profile filter on permanently for this store's lifetime.
+        """
+        return self._profile_bound
+
+    def ensure_profile(self, node_id: str | None, short_name: str | None) -> str | None:
+        """Record a known local (node ID + SHORT NAME) profile; return its key.
+
+        Idempotent (INSERT OR IGNORE). Creates a durable
+        local_profiles record so a pairing stays independently recoverable
+        across restart/rename even before any message row is written under
+        it. Returns canonical_profile_key, or None when the node id is not
+        usable (no authority to create a profile).
+        """
+        key = canonical_profile_key(node_id, short_name)
+        if key is None:
+            return None
+        normalized = normalize_profile_node_id(node_id)
+        now = time()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO local_profiles
+                    (profile_key, node_id, short_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, normalized, canonical_short_name(short_name), now, now),
+            )
+        return key
+
+    def profile_exists(self, profile_key: str | None) -> bool:
+        """Whether a durable profile exists for this exact pairing."""
+        if not profile_key:
+            return False
+        try:
+            with self._lock:
+                self._ensure_open()
+                row = self._connection.execute(
+                    "SELECT 1 FROM local_profiles WHERE profile_key = ? LIMIT 1",
+                    (profile_key,),
+                ).fetchone()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(f"Could not look up local profile: {error}") from error
+        return row is not None
+
+    def list_profile_keys(self) -> tuple[str, ...]:
+        """All known (node ID + SHORT NAME) profile keys, in creation order."""
+        try:
+            with self._lock:
+                self._ensure_open()
+                rows = self._connection.execute(
+                    "SELECT profile_key FROM local_profiles ORDER BY created_at ASC"
+                ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ChatStoreError(f"Could not list local profiles: {error}") from error
+        return tuple(str(row["profile_key"]) for row in rows)
+
+    def _rekey_active_profile_rows(
+        self, old_profile_key: str | None, new_profile_key: str
+    ) -> None:
+        """Move every row currently under `old_profile_key` to `new_profile_key`.
+
+        A LIVE RENAME (target pairing does not exist yet): history follows
+        the rename. Atomic and restart-safe (one UPDATE; if the process dies
+        the old key simply has no rows). No merge, no duplicate, no delete.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE messages SET profile_key = ? WHERE profile_key = ?",
+                (new_profile_key, old_profile_key),
+            )
+            connection.execute(
+                "UPDATE local_profiles SET profile_key = ?, updated_at = ? WHERE profile_key = ?",
+                (new_profile_key, time(), old_profile_key),
+            )
+
+    def migrate_profile_association(
+        self, old_profile_key: str | None, new_profile_key: str
+    ) -> None:
+        """CASE 1 live rename: rekey the active profile's rows+record to a new key.
+
+        Reused by the app when a live SHORT NAME change targets a pairing that
+        does NOT yet exist: the current profile becomes the new pairing, so
+        its history follows the rename (never duplicated or merged).
+        """
+        if old_profile_key == new_profile_key:
+            return
+        self._rekey_active_profile_rows(old_profile_key, new_profile_key)
+
+    def switch_profile(self, profile_key: str | None) -> None:
+        """CASE 2 live rename: switch to an ALREADY-EXISTING pairing.
+
+        No data is migrated or merged -- the current profile's rows stay
+        under their own key; the store now reads/writes the existing target
+        profile. (Also the ordinary cross-radio / fresh-profile switch.)
+        """
+        self.set_active_profile(profile_key)
+
+    @property
+    def _ns_filter(self) -> str:
+        """SQL fragment narrowing a read to the bound local profile.
+
+        Empty (no filter) when the profile was never explicitly bound (a
+        raw Store used directly without the app -- its write-then-read
+        round trips must behave exactly as before namespacing). Once
+        bound, every read is narrowed to profile_key = <active key>; a
+        None key matches nothing, so an unresolved profile surfaces no
+        state (preserve-but-hide).
+        """
+        return " AND profile_key = ?" if self._profile_bound else ""
+
+    def _ns_params(self) -> tuple:
+        """Parameter values paired with _ns_filter (emptied when unbound)."""
+        return (self._active_profile_key,) if self._profile_bound else ()
+
+    def _ns_value(self) -> str | None:
+        """The profile key stamped on a newly-written row.
+
+        The active local profile once bound; None otherwise (a raw Store
+        never bound by the app writes profile-less rows that a later
+        bound store treats as unowned and hides -- the preserve-but-hide
+        compatibility policy).
+        """
+        return self._active_profile_key if self._profile_bound else None
+
+    def _ns_node_id(self) -> str | None:
+        """The canonical node-id half of the active profile, for tracing.
+
+        Kept purely for backward-compatibility/audit of the legacy
+        local_node_id column; the authoritative scoping key is profile_key
+        (_ns_value). Returns None when unbound.
+        """
+        if not self._profile_bound or not self._active_profile_key:
+            return None
+        node_part, _short = split_profile_key(self._active_profile_key)
+        return node_part
 
     @classmethod
     def open(cls, path: Path | str | None = None) -> "ChatStore":
@@ -226,8 +545,8 @@ class ChatStore:
             INSERT OR IGNORE INTO messages (
                 direction, packet_id, node_id, sender_name, sender_short_name,
                 channel_index, text, origin_sent_at, radio_rx_at, received_at, local_sent_at,
-                delivery_state, created_at, dm_node_id, channel_key
-            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                delivery_state, created_at, dm_node_id, channel_key, local_node_id, profile_key
+            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
         """
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -245,17 +564,19 @@ class ChatStore:
                     created_at,
                     dm_node_id,
                     channel_key,
+                    self._ns_node_id(),
+                    self._ns_value(),
                 ),
             )
             if cursor.rowcount:
                 return InsertResult(int(cursor.lastrowid), True)
             row = connection.execute(
-                """
+                f"""
                 SELECT id FROM messages
                 WHERE direction = 'incoming' AND node_id = ?
-                    AND packet_id = ? AND channel_index = ? AND dm_node_id IS ?
+                    AND packet_id = ? AND channel_index = ? AND dm_node_id IS ?{self._ns_filter}
                 """,
-                (node_id, packet_id, channel_index, dm_node_id),
+                (node_id, packet_id, channel_index, dm_node_id, *self._ns_params()),
             ).fetchone()
             if row is None:
                 raise ChatStoreError("Incoming message was not stored.")
@@ -278,8 +599,8 @@ class ChatStore:
                     direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
                     received_at, local_sent_at, delivery_state, created_at, dm_node_id,
-                    channel_key
-                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                    channel_key, local_node_id, profile_key
+                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel_index,
@@ -290,6 +611,8 @@ class ChatStore:
                     local_sent_at,
                     dm_node_id,
                     channel_key,
+                    self._ns_node_id(),
+                    self._ns_value(),
                 ),
             )
             return int(cursor.lastrowid)
@@ -399,16 +722,17 @@ class ChatStore:
         """
         with self._transaction() as connection:
             connection.execute(
-                """
+                f"""
                 DELETE FROM send_attempts
                 WHERE message_id IN (
-                    SELECT id FROM messages WHERE dm_node_id = ?
+                    SELECT id FROM messages WHERE dm_node_id = ?{self._ns_filter}
                 )
                 """,
-                (dm_node_id,),
+                (dm_node_id, *self._ns_params()),
             )
             cursor = connection.execute(
-                "DELETE FROM messages WHERE dm_node_id = ?", (dm_node_id,)
+                f"DELETE FROM messages WHERE dm_node_id = ?{self._ns_filter}",
+                (dm_node_id, *self._ns_params()),
             )
             return cursor.rowcount
 
@@ -445,14 +769,14 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT id, direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
                     received_at, local_sent_at, delivery_state, created_at, dm_node_id,
-                    channel_key
+                    channel_key, local_node_id, profile_key
                     FROM (
                         SELECT * FROM messages
-                        WHERE channel_index = ? AND dm_node_id IS NULL
+                        WHERE channel_index = ? AND dm_node_id IS NULL{self._ns_filter}
                             AND (? IS NULL OR channel_key = ? OR channel_key IS NULL)
                         ORDER BY
                             COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
@@ -465,7 +789,7 @@ class ChatStore:
                         received_at ASC,
                         id ASC
                     """,
-                    (channel_index, channel_key, channel_key, limit + 1),
+                    (channel_index, *self._ns_params(), channel_key, channel_key, limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load CHAT history: {error}") from error
@@ -494,17 +818,18 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT
                         LOWER(node_id) AS node_id,
                         MAX(COALESCE(origin_sent_at, radio_rx_at)) AS message_time
                     FROM messages
                     WHERE direction = 'incoming'
                         AND node_id IS NOT NULL
-                        AND dm_node_id IS NULL
+                        AND dm_node_id IS NULL{self._ns_filter}
                         AND COALESCE(origin_sent_at, radio_rx_at) IS NOT NULL
                     GROUP BY LOWER(node_id)
-                    """
+                    """,
+                    self._ns_params(),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(
@@ -539,7 +864,7 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     WITH cursor AS (
                         SELECT
                             COALESCE(
@@ -553,9 +878,9 @@ class ChatStore:
                     SELECT messages.id, direction, packet_id, node_id, sender_name,
                         sender_short_name, messages.channel_index, text, origin_sent_at,
                         radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
-                        dm_node_id, channel_key
+                        dm_node_id, channel_key, local_node_id, profile_key
                     FROM messages CROSS JOIN cursor
-                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL
+                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL{self._ns_filter}
                         AND (? IS NULL OR messages.channel_key = ? OR messages.channel_key IS NULL)
                         AND (
                         COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
@@ -582,6 +907,7 @@ class ChatStore:
                         before_message_id,
                         channel_index,
                         channel_index,
+                        *self._ns_params(),
                         channel_key,
                         channel_key,
                         limit + 1,
@@ -613,13 +939,14 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT id, direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
-                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id,
+                    local_node_id, profile_key
                     FROM (
                         SELECT * FROM messages
-                        WHERE dm_node_id = ?
+                        WHERE dm_node_id = ?{self._ns_filter}
                         ORDER BY
                             COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
                             received_at DESC,
@@ -631,7 +958,7 @@ class ChatStore:
                         received_at ASC,
                         id ASC
                     """,
-                    (dm_node_id, limit + 1),
+                    (dm_node_id, *self._ns_params(), limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load DM history: {error}") from error
@@ -664,7 +991,7 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     WITH cursor AS (
                         SELECT
                             COALESCE(
@@ -678,9 +1005,9 @@ class ChatStore:
                     SELECT messages.id, direction, packet_id, node_id, sender_name,
                         sender_short_name, messages.channel_index, text, origin_sent_at,
                         radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
-                        dm_node_id
+                        dm_node_id, local_node_id, profile_key
                     FROM messages CROSS JOIN cursor
-                    WHERE messages.dm_node_id = ? AND (
+                    WHERE messages.dm_node_id = ?{self._ns_filter} AND (
                         COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
                             < cursor.order_time
                         OR (
@@ -705,6 +1032,7 @@ class ChatStore:
                         before_message_id,
                         dm_node_id,
                         dm_node_id,
+                        *self._ns_params(),
                         limit + 1,
                     ),
                 ).fetchall()
@@ -732,7 +1060,7 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT
                         dm_node_id,
                         MAX(
@@ -744,10 +1072,11 @@ class ChatStore:
                             END
                         ) AS latest_message_time
                     FROM messages
-                    WHERE dm_node_id IS NOT NULL
+                    WHERE dm_node_id IS NOT NULL{self._ns_filter}
                     GROUP BY dm_node_id
                     ORDER BY latest_message_time DESC
-                    """
+                    """,
+                    self._ns_params(),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not list DM conversations: {error}") from error
@@ -788,10 +1117,10 @@ class ChatStore:
                         SELECT id, direction, packet_id, node_id, sender_name,
                             sender_short_name, channel_index, text, origin_sent_at,
                             radio_rx_at, received_at, local_sent_at, delivery_state,
-                            created_at
+                            created_at, dm_node_id, channel_key, local_node_id, profile_key
                         FROM messages
                         WHERE channel_index = ?
-                            AND direction = 'incoming'
+                            AND direction = 'incoming'{self._ns_filter}
                             AND id IN ({placeholders})
                         ORDER BY
                             COALESCE(
@@ -801,7 +1130,7 @@ class ChatStore:
                             id ASC
                         LIMIT 1
                         """,
-                        (channel_index, *chunk),
+                        (channel_index, *self._ns_params(), *chunk),
                     ).fetchone()
                     if row is not None:
                         candidate = StoredMessage(**dict(row))
@@ -866,7 +1195,17 @@ class ChatStore:
                         delivery_state TEXT,
                         created_at REAL NOT NULL,
                         dm_node_id TEXT,
-                        channel_key TEXT
+                        channel_key TEXT,
+                        local_node_id TEXT,
+                        profile_key TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS local_profiles (
+                        profile_key TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL,
+                        short_name TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
                     );
 
                     CREATE TABLE IF NOT EXISTS send_attempts (
@@ -893,7 +1232,19 @@ class ChatStore:
                     )
                 else:
                     current_version = int(row["version"])
-                    if current_version not in (1, 2, 3, SCHEMA_VERSION):
+                    # Any version from 1 up to (and including) the current
+                    # SCHEMA_VERSION is a supported database that must be
+                    # migrated in place (each historical bump below adds its
+                    # own column); only a database claiming a FUTURE version
+                    # is genuinely unsupported. A literal tuple like
+                    # "(1, 2, 3, SCHEMA_VERSION)" silently breaks the moment
+                    # a bump is applied without updating it -- e.g. the v4 ->
+                    # v5 per-radio bump left "4" out, so an existing valid
+                    # v4 database raised "Unsupported CHAT schema version 4"
+                    # instead of migrating. Ranging over every prior version
+                    # makes the migration path correct and restart-safe no
+                    # matter how many times the version is advanced.
+                    if not (1 <= current_version <= SCHEMA_VERSION):
                         raise ChatStoreError(
                             f"Unsupported CHAT schema version {current_version}."
                         )
@@ -929,6 +1280,34 @@ class ChatStore:
                         connection.execute(
                             "ALTER TABLE messages ADD COLUMN channel_key TEXT"
                         )
+                    if current_version <= 4 and "local_node_id" not in columns:
+                        # v4 -> v5: add per-physical/local-radio CHAT
+                        # namespace (CHAT state-integrity). Unlike
+                        # channel_key, a NULL local_node_id is NEVER
+                        # grandfathered into queries -- the preserve-
+                        # but-hide migration policy keeps pre-namespacing
+                        # rows on disk but never returns them, so a
+                        # radio can never surface history it did not
+                        # actually own. Rows are only ever stamped with
+                        # a resolved local node ID going forward.
+                        connection.execute(
+                            "ALTER TABLE messages ADD COLUMN local_node_id TEXT"
+                        )
+                    if current_version <= 5 and "profile_key" not in columns:
+                        # v5 -> v6: add the LOCAL CHAT HISTORY PROFILE key
+                        # (canonical local node ID + canonical SHORT NAME).
+                        # Existing rows get profile_key = NULL -- they predate
+                        # profile keying and cannot be tied to a trustworthy
+                        # profile (no short name was recorded), so the
+                        # preserve-but-hide policy keeps them on disk but
+                        # never returns them, exactly like the v4 -> v5
+                        # local_node_id NULL rows. They are never arbitrarily
+                        # assigned to whichever profile connects first, and
+                        # never merged. local_node_id (node half) is retained
+                        # for audit; profile_key is the authoritative scope.
+                        connection.execute(
+                            "ALTER TABLE messages ADD COLUMN profile_key TEXT"
+                        )
                     if current_version != SCHEMA_VERSION:
                         connection.execute(
                             "UPDATE schema_version SET version = ?",
@@ -953,11 +1332,26 @@ class ChatStore:
                 # itself stays genuinely NULL for a channel row -- every
                 # `dm_node_id IS NULL` filter elsewhere is unaffected --
                 # only this index's own notion of "equal" is coerced.
+                #
+                # profile_key is included so the SAME remote packet arriving
+                # under two different local profiles (same node id, different
+                # SHORT NAME) is treated as two distinct observations -- a
+                # profile never deduplicates a packet it has not itself seen.
+                # COALESCE(profile_key, '') mirrors the dm_node_id reasoning:
+                # a pre-profile NULL row must not collide with every other
+                # NULL row.
                 connection.execute("DROP INDEX IF EXISTS incoming_packet_identity")
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX incoming_packet_identity
-                    ON messages(node_id, packet_id, channel_index, COALESCE(dm_node_id, ''))
+                    ON messages(
+                        node_id,
+                        packet_id,
+                        channel_index,
+                        COALESCE(dm_node_id, ''),
+                        COALESCE(local_node_id, ''),
+                        COALESCE(profile_key, '')
+                    )
                     WHERE direction = 'incoming' AND packet_id IS NOT NULL
                     """
                 )

@@ -393,6 +393,25 @@ def psk_matches_request(requested: bytes, actual: bytes) -> bool:
 
 
 @dataclass(frozen=True)
+class PrivateChannelApplyResult:
+    """Outcome of one RadioService.apply_private_channel() call.
+
+    `ok` is True ONLY after a fresh radio-originated get_channel_response for
+    the written slot returned the same name AND a PSK matching the requested
+    key (via psk_matches_request) -- never merely because the local Python
+    channels object was mutated. `slot` is the logical channel index a
+    secondary channel was written to (None when there was no free DISABLED
+    slot or the radio was unavailable). `error` is a compact machine/
+    UI-safe reason ("not_connected", "no_channel_slot", "nak", "timeout",
+    "mismatch", "disconnected") or "" on success.
+    """
+
+    ok: bool
+    slot: int | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class ConfigWriteResult:
     """Outcome of one RadioService.write_verified_config_field() call.
 
@@ -414,6 +433,25 @@ class ConfigWriteResult:
     applied: bool
     requested_value: Any
     readback_value: Any | None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class NodeRemoveResult:
+    """Outcome of one RadioService.remove_node() call.
+
+    `removed` is True ONLY when the radio-owned NodeDB removal was
+    actually dispatched to the connected radio and accepted (a NAK was
+    NOT seen); it mirrors ConfigWriteResult's honesty rules -- never
+    merely because the local SDK cache/record was mutated. `reason` is
+    "" when removed is True, otherwise one of: "not_connected",
+    "disconnected" (the connection/interface changed mid-operation),
+    "nak" (the radio rejected the admin request), or "local" (the
+    target is the connected radio's own node and is never removable).
+    """
+
+    removed: bool
+    node_id: str | None = None
     reason: str = ""
 
 
@@ -1269,6 +1307,115 @@ class RadioService:
 
         return ConfigWriteResult(False, (name, psk), None, "timeout")
 
+    def apply_private_channel(
+        self,
+        *,
+        name: str,
+        psk: bytes,
+        timeout: float = 15.0,
+    ) -> PrivateChannelApplyResult:
+        """Write ONE secondary (private) logical channel and verify it.
+
+        Mirrors write_verified_primary_channel's write-then-readback MODEL for
+        a SECONDARY channel, on the first DISABLED logical channel slot
+        (Meshtastic slots 0-7 via localNode.channels). Only that one channel's
+        name/psk/role are changed (never role/settings of other slots, never
+        PRESET/LoRa/modem-frequency/hop). No reboot behavior is added; the SDK's
+        local-node admin write is fire-and-forget (onResponse=None style), so
+        the write is bounded by this method's readback loop, not a 300s stall.
+
+        On success the config snapshot is rebuilt and the slot returned; the
+        CALLER must promote the UI to radio-authoritative ChannelInfo only after
+        (and from) a subsequent _read_channel_info -- never fabricate state.
+        """
+        interface = self._interface
+        if interface is None:
+            return PrivateChannelApplyResult(False, None, "not_connected")
+        local_node = getattr(interface, "localNode", None)
+        channels = getattr(local_node, "channels", None) if local_node else None
+        if local_node is None or not channels:
+            return PrivateChannelApplyResult(False, None, "not_connected")
+
+        from meshtastic.protobuf import admin_pb2, channel_pb2
+
+        disabled_role = channel_pb2.Channel.Role.DISABLED
+        slot = next(
+            (
+                RadioService._optional_int(getattr(channel, "index", None))
+                for channel in channels
+                if getattr(channel, "role", None) == disabled_role
+            ),
+            None,
+        )
+        if slot is None:
+            return PrivateChannelApplyResult(False, None, "no_channel_slot")
+
+        target_interface = interface
+        target = channels[slot]
+        target.role = channel_pb2.Channel.Role.SECONDARY
+        target.settings.name = name
+        target.settings.psk = psk
+
+        write_message = admin_pb2.AdminMessage()
+        write_message.set_channel.CopyFrom(target)
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            local_node.onAckNak(packet)
+            if interface._acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            local_node._sendAdmin(write_message, onResponse=on_ack)
+        except Exception:
+            pass
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return PrivateChannelApplyResult(False, slot, "disconnected")
+        if nak_seen["nak"]:
+            return PrivateChannelApplyResult(False, slot, "nak")
+
+        read_request = admin_pb2.AdminMessage()
+        # get_channel_request is 1-INDEXED on the wire (see
+        # write_verified_primary_channel's own comment about channel 0 == 1).
+        read_request.get_channel_request = slot + 1
+        found: dict[str, Any] = {}
+
+        def on_response(packet: Any) -> None:
+            decoded = packet.get("decoded") if isinstance(packet, dict) else None
+            admin = decoded.get("admin") if isinstance(decoded, dict) else None
+            if not isinstance(admin, dict):
+                return
+            raw = admin.get("raw")
+            if raw is None or not raw.HasField("get_channel_response"):
+                return
+            response = raw.get_channel_response
+            if getattr(response, "index", None) != slot:
+                return
+            found["name"] = response.settings.name
+            found["psk"] = bytes(response.settings.psk)
+
+        try:
+            local_node._sendAdmin(read_request, onResponse=on_response)
+        except Exception:
+            return PrivateChannelApplyResult(False, slot, "timeout")
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if self._interface is not target_interface or self._connection_lost.is_set():
+                return PrivateChannelApplyResult(False, slot, "disconnected")
+            if nak_seen["nak"]:
+                return PrivateChannelApplyResult(False, slot, "nak")
+            if "name" in found:
+                if found["name"] == name and psk_matches_request(psk, found["psk"]):
+                    self._rebuild_config_snapshot()
+                    return PrivateChannelApplyResult(True, slot, "")
+                return PrivateChannelApplyResult(False, slot, "mismatch")
+            time.sleep(0.05)
+
+        return PrivateChannelApplyResult(False, slot, "timeout")
+
     def begin_settings_transaction(self) -> bool:
         """Open a Meshtastic settings-edit transaction
 
@@ -1743,6 +1890,77 @@ class RadioService:
     # PROTOBUF-SOURCE-VERIFIED (mesh_pb2.pyi RouteDiscovery.snr_towards/
     # snr_back): "SNR of the received packet, 1 = 0.25dB, -128 = invalid".
     _TRACEROUTE_UNKNOWN_SNR = -128
+
+    def remove_node(self, node_id: str, *, timeout: float = 15.0) -> NodeRemoveResult:
+        """Remove ONE remote node from the connected radio's NodeDB.
+
+        This is a real radio-side operation: it sends the admin message
+        ``AdminMessage.remove_by_nodenum`` (the SDK's own
+        ``LocalNode.removeNode`` on the connected radio -- PROTOBUF-
+        SOURCE-VERIFIED: ``remove_by_nodenum`` is a fixed64 node number),
+        which removes that node's stored NodeDB entry locally on the
+        device. It is NOT a local-only hide and it NEVER clears the whole
+        NodeDB (no ``nodedb_reset``) and never touches other nodes.
+
+        Safety: the connected radio's OWN canonical node ID can never be
+        removed (report reason "local"); a removed node is regenerated
+        with fresh identity metadata only if the mesh later hears it
+        again via normal Meshtastic traffic (no NodeInfo probe is sent
+        here -- zero extra RF to rediscover it).
+
+        This is explicit user action only; without a NAK it is reported
+        as removed. On any local/connection problem it returns honest
+        failure (never a fabricated local success) -- see
+        NodeRemoveResult. The SDK admin call is best-effort fire-and-
+        forget for the LOCAL node (like Node.writeConfig's own local
+        path), bounded by `timeout`; we do NOT wait for a routing ACK
+        because for a local-node admin write the SDK never delivers that
+        to a callback that is not literally named ``onAckNak`` (see
+        write_verified_config_field's own note). Connection loss or an
+        interface swap mid-operation is reported as "disconnected".
+        """
+        interface = self._interface
+        if interface is None:
+            return NodeRemoveResult(False, node_id, "not_connected")
+        target_interface = interface
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            return NodeRemoveResult(False, node_id, "not_connected")
+
+        # Self-node protection: never remove the connected radio itself.
+        candidate_number = _node_number_from_id(node_id)
+        if self._is_local_node(node_id, candidate_number):
+            return NodeRemoveResult(False, node_id, "local")
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return NodeRemoveResult(False, node_id, "disconnected")
+
+        nak_seen = {"nak": False}
+
+        def on_ack(packet: Any) -> None:
+            # Mirror the established local admin-write convention: feed a
+            # real ACK/NAK through the SDK's own handler (so it records
+            # any NAK) the same way write_verified_config_field does.
+            local_node.onAckNak(packet)
+            acknowledgment = getattr(interface, "_acknowledgment", None)
+            if acknowledgment is not None and acknowledgment.receivedNak:
+                nak_seen["nak"] = True
+
+        try:
+            # Use the SDK's own LocalNode.removeNode (admin remove_by_
+            # nodenum), which normalizes a "!xxxxxxxx" string to a node
+            # number and wires onResponse for the acknowledgment.
+            local_node.removeNode(node_id)
+        except Exception:
+            # The SDK admin call itself failed to dispatch (offline,
+            # unsupported, malformed) -- never claim the node was removed.
+            return NodeRemoveResult(False, node_id, "nak")
+
+        if self._interface is not target_interface or self._connection_lost.is_set():
+            return NodeRemoveResult(False, node_id, "disconnected")
+        if nak_seen["nak"]:
+            return NodeRemoveResult(False, node_id, "nak")
+        return NodeRemoveResult(True, node_id, "")
 
     def send_traceroute(
         self,
@@ -2465,6 +2683,56 @@ class RadioService:
             channels=self._read_channel_info(local_node),
         )
 
+    def get_config_channels(self) -> tuple[ChannelInfo, ...]:
+        """Refresh the configured-channel list from the CURRENT interface.
+
+        Zero-RF: re-reads the already-synced localNode.channels (the same
+        source _read_radio_info snapshots). Used after a private-channel
+        apply so the UI can promote the channel actually written/verified.
+        """
+        interface = self._interface
+        if interface is None:
+            return ()
+        local_node = getattr(interface, "localNode", None)
+        if local_node is None:
+            return ()
+        return self._read_channel_info(local_node)
+
+    def channel_psk_text(self, channel_index: int) -> str | None:
+        """Normalized Base64 PSK for one enabled channel, or None.
+
+        Read-only, zero-RF: reads the ALREADY-synced local channel settings
+        (exactly where _read_channel_info reads ChannelInfo identity), never
+        requests anything from the radio. Returns None for the public/default
+        sentinel PSKs (0x00 no-encryption, 0x01 default), for an unavailable/
+        disabled channel, and for a malformed length -- so a private channel's
+        key is the ONLY non-None result. The returned text is UI metadata
+        only and is never logged by callers.
+        """
+        if self._interface is None:
+            return None
+        local_node = getattr(self._interface, "localNode", None)
+        channels = getattr(local_node, "channels", None)
+        if not channels:
+            return None
+        for channel in channels:
+            if RadioService._optional_int(getattr(channel, "index", None)) != channel_index:
+                continue
+            settings = getattr(channel, "settings", None)
+            psk = getattr(settings, "psk", None)
+            if not isinstance(psk, (bytes, bytearray)):
+                return None
+            raw = bytes(psk)
+            if raw in (b"", b"\x00", b"\x01"):
+                # Public/no-encryption sentinels -- never a private key.
+                return None
+            if len(raw) not in (16, 32):
+                return None
+            import base64 as _base64
+
+            return _base64.b64encode(raw).decode("ascii")
+        return None
+
     @staticmethod
     def _read_channel_info(local_node: Any) -> tuple[ChannelInfo, ...]:
         """Convert enabled SDK channel protobufs into stable app values."""
@@ -2491,6 +2759,13 @@ class RadioService:
             settings = getattr(channel, "settings", None)
             raw_name = getattr(settings, "name", "")
             name = raw_name.strip() if isinstance(raw_name, str) else ""
+            # The authoritative configured channel NAME (raw_text, possibly
+            # empty for an unnamed primary) -- NEVER the display-resolved
+            # "PRIMARY"/"MediumSlow" fallback, which is presentation only.
+            # channel identity (see _channel_stable_key) must come from the
+            # real configured name + psk/settings.id, so changing the
+            # fallback label cannot change a conversation's stable key.
+            configured_name = name
             if not name and index == 0:
                 name = RadioService._primary_channel_default_name(local_node)
             resolved_name = name or f"Channel {index + 1}"
@@ -2498,20 +2773,27 @@ class RadioService:
                 ChannelInfo(
                     index,
                     resolved_name,
-                    stable_key=RadioService._channel_stable_key(settings, resolved_name),
+                    stable_key=RadioService._channel_stable_key(
+                        settings, configured_name
+                    ),
                 )
             )
             seen_indexes.add(index)
         return tuple(sorted(result, key=lambda channel: channel.index))
 
     @staticmethod
-    def _channel_stable_key(settings: Any, resolved_name: str) -> str:
+    def _channel_stable_key(settings: Any, configured_name: str) -> str:
         """This channel's own cryptographic/assigned identity (CHAT
 
         channel-history isolation) -- NEVER the radio-assigned slot
         index, which a user can freely reassign to a completely
         different channel (e.g. reconfiguring slot 0 from "LongFast" to
-        "MediumSlow") while keeping the SAME index. Preference order:
+        "MediumSlow") while keeping the SAME index, and NEVER the
+        DISPLAY-only fallback label (e.g. "PRIMARY", or the modem-preset
+        name "MediumSlow") -- presentation must never become identity.
+        `configured_name` is the channel's real configured `settings.name`
+        (empty for an unnamed primary), not a resolved display label.
+        Preference order:
 
         1. Channel.settings.id -- PROTOBUF-SOURCE-VERIFIED (channel_pb2.pyi):
            "Used to construct a globally unique channel ID... Any time
@@ -2523,19 +2805,23 @@ class RadioService:
         2. meshtastic.util.generate_channel_hash(name, psk) -- the SAME
            8-bit "channel number" hash Meshtastic's own official tooling
            (meshtastic.node) already computes for channel disambiguation,
-           paired with the resolved display name here specifically to
+           paired with the REAL configured name here specifically to
            close the "two different names happen to hash the same" case
            (the hash alone has a real, if small, 1-in-256 collision
            floor for two independently-chosen PSKs -- not eliminated by
            this pairing, just not made worse by name-only guessing).
-        3. The resolved display name alone, if `settings`/`psk` are
-           unavailable for some reason -- strictly better than the bare
-           index (a rename is at least a DELIBERATE, visible user
-           action, unlike a same-index slot reassignment), even though
-           it cannot detect a same-name-different-PSK reassignment.
+        3. The real configured name alone, if `settings` is present but
+           carries no `id`/`psk` -- strictly better than the bare index
+           (a rename is at least a DELIBERATE, visible user action,
+           unlike a same-index slot reassignment), even though it cannot
+           detect a same-name-different-PSK reassignment. An empty
+           configured name (an unnamed primary with no assigned id and
+           no PSK) has genuinely no identity of its own, so this returns
+           "" (honestly "unknown") rather than the display label.
 
-        Returns "" (never a fabricated key) only if `settings` itself
-        is entirely unavailable -- callers treat "" as "unknown," the
+        Returns "" (never a fabricated key) when `settings` itself is
+        unavailable, or when a neither-named-nor-cryptographically-tagged
+        channel has no identity -- callers treat "" as "unknown," the
         same honest default a pre-connection placeholder channel uses.
         """
         if settings is None:
@@ -2548,27 +2834,26 @@ class RadioService:
             try:
                 from meshtastic.util import generate_channel_hash
 
-                channel_hash = generate_channel_hash(resolved_name, bytes(psk))
+                channel_hash = generate_channel_hash(configured_name, bytes(psk))
             except Exception:
-                return resolved_name
-            return f"hash:{resolved_name}:{channel_hash}"
-        return resolved_name
+                return configured_name
+            return f"hash:{configured_name}:{channel_hash}"
+        return configured_name
 
     @staticmethod
     def _primary_channel_default_name(local_node: Any) -> str:
-        """Derive the unnamed primary channel label from the radio preset."""
-        try:
-            from meshtastic.protobuf import config_pb2
+        """UI fallback label for an UNNAMED primary (index 0) logical channel.
 
-            lora = local_node.localConfig.lora
-            if not lora.use_preset:
-                return ""
-            enum_name = config_pb2.Config.LoRaConfig.ModemPreset.Name(
-                lora.modem_preset
-            )
-        except (ImportError, AttributeError, KeyError, TypeError, ValueError):
-            return ""
-        return "".join(part.title() for part in enum_name.split("_"))
+        Returns "PRIMARY" -- the display-only fallback for a primary logical
+        channel with no meaningful configured name. It is NEVER the modem/radio
+        preset (e.g. "MediumSlow"): MEDIUM SLOW is the RF modem preset, not the
+        Meshtastic logical-channel identity, so it must not be presented as the
+        channel name. "PRIMARY" never reaches the radio (presentation only); the
+        channel's authoritative identity (settings.id / channel hash) is
+        unchanged. A genuinely named primary channel uses its real name instead
+        (see _read_channel_info).
+        """
+        return "PRIMARY"
 
 
 # Compact UI wording for the write STAGE a NETWORK apply failed at

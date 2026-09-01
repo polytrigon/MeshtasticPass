@@ -27,7 +27,11 @@ from app_settings import AppSettings
 from chat_store import ChatStore
 from mesh_state import MeshNodeState
 from radio_service import NodeMetadata, ReceivedMessage
-from simulated_radio_service import SimulatedRadioService
+from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
+    SimulatedRadioService,
+)
 from tests.test_app import ControllableSendRadioService
 from theme_palette import THEME_PALETTES
 
@@ -65,6 +69,7 @@ class DmManageAppTestsBase(unittest.IsolatedAsyncioTestCase):
         # the test always observes the SAME database the app writes to
         # (the app otherwise opens the XDG-honored user path).
         self.store = ChatStore.open(self.chat_db_path)
+        self.store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(self.store.close)
 
     def _make_app(self, radio=None):
@@ -549,6 +554,82 @@ class EmojiMenuContextTests(DmManageAppTestsBase):
             self.assertNotEqual(chat_input.value, "hello")
             dm_input = app.query_one("#dm-input")
             self.assertEqual(dm_input.value, "")
+
+
+class DmContextOwnershipTests(DmManageAppTestsBase):
+    """Problem 2 (DM hidden-CHANNEL context): the VISIBLE conversation owns
+    transcript selection, UP/DOWN, ENTER, and message-context actions.
+
+    With a DM open, a hidden CHANNEL transcript (even one owning a FAILED
+    outgoing message with a RESEND control) must never receive those
+    actions -- its controls are not navigable and are never actionable.
+    """
+
+    async def test_dm_navigation_targets_only_the_visible_dm_transcript(self) -> None:
+        from app import MessageActionControl
+        from app_controller import outgoing_chat_entry
+        from radio_service import DeliveryState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+
+            # Build a CHANNEL transcript holding a FAILED outgoing message,
+            # so its RESEND control is present -- the thing a hidden
+            # CHANNEL could wrongly select while a DM is visible.
+            channel_entry = outgoing_chat_entry(
+                "channel failed", delivery_state=DeliveryState.FAILED
+            )
+            channel_entry.send_generation = 1
+            channel_state = app._state_for(0)
+            channel_state.entries.append(channel_entry)
+            app.chat_history = channel_state.entries
+            channel_widget = app._chat_entry_widget(channel_entry)
+            app.query_one("#chat-log").mount(channel_widget)
+            await pilot.pause()
+            self.assertGreaterEqual(
+                len(list(app.query_one("#chat-log").query(MessageActionControl))),
+                1,
+            )
+
+            # Open a DM and give it its own outgoing message.
+            app.open_dm("!a11ce001", long_name="Alice", short_name="ALC")
+            dm_entry = app._start_dm_outgoing("!a11ce001", "dm message")
+            dm_entry.delivery_state = DeliveryState.SENT
+            await pilot.pause()
+
+            # All navigable stops while the DM is open come from the DM
+            # transcript -- never one whose ancestor is the hidden CHANNEL.
+            targets = app._chat_navigation_targets()
+            self.assertTrue(targets)
+            for target in targets:
+                is_channel = False
+                node = target
+                while node is not None:
+                    if node.id == "chat-log":
+                        is_channel = True
+                        break
+                    node = node.parent
+                self.assertFalse(
+                    is_channel,
+                    "a CHANNEL transcript stop became navigable while a DM is open",
+                )
+
+            # UP from the DM transcript focuses a DM stop (ancestor #dm-log),
+            # never a hidden CHANNEL control.
+            app.query_one("#dm-log").focus()
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertIsNotNone(app.focused)
+            is_dm = False
+            node = app.focused
+            while node is not None:
+                if node.id == "dm-log":
+                    is_dm = True
+                    break
+                node = node.parent
+            self.assertTrue(is_dm, "focus left the active DM conversation")
 
 
 if __name__ == "__main__":

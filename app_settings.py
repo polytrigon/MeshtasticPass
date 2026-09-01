@@ -140,6 +140,12 @@ class AppSettings:
     color: str = DEFAULT_COLOR
     device_path: str = DEFAULT_DEVICE_PATH
     favorite_node_ids: set[str] = field(default_factory=set)
+    # Canonical ChannelInfo stable identities (see RadioService
+    # _channel_stable_key) of configured channels the user has locally
+    # deleted/hidden from the CHAT list via CTRL+D. NEVER a slot index,
+    # display name, or PSK hash alone -- only the collapsed, contiguous
+    # list of stored identities with a leading "_" like "cafeface".
+    hidden_channel_ids: set[str] = field(default_factory=set)
     # A MeshtasticPass-local behavior preference, never a radio config
     # field (see RadioService.sync_clock/SyncClockControl) -- OFF until
     # the user explicitly turns it on; never silently enabled by a
@@ -194,6 +200,7 @@ class AppSettings:
                 "favorite_node_ids",
                 "clock_auto_sync",
                 "radio_config_presets",
+                "hidden_channel_ids",
             )
         }
         candidate = raw.get("font_size")
@@ -214,6 +221,13 @@ class AppSettings:
             settings.favorite_node_ids = {
                 value.strip().lower()
                 for value in favorites
+                if isinstance(value, str) and value.strip()
+            }
+        hidden = raw.get("hidden_channel_ids")
+        if isinstance(hidden, list):
+            settings.hidden_channel_ids = {
+                value.strip()
+                for value in hidden
                 if isinstance(value, str) and value.strip()
             }
         auto_sync_candidate = raw.get("clock_auto_sync")
@@ -320,6 +334,7 @@ class AppSettings:
         data["device_path"] = self.device_path
         data["favorite_node_ids"] = sorted(self.favorite_node_ids)
         data["clock_auto_sync"] = self.clock_auto_sync
+        data["hidden_channel_ids"] = sorted(self.hidden_channel_ids)
         data["radio_config_presets"] = [
             {
                 "name": preset.name,

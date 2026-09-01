@@ -21,6 +21,7 @@ from app import (
     MeshtasticPassApp,
 )
 from app_settings import AppSettings
+from chat_store import ChatStore
 from radio_service import NodeMetadata, RadioService, RadioState
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
 from theme_palette import THEME_PALETTES
@@ -149,11 +150,11 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             labels = [item.label for item in menu.items]
             self.assertEqual(
                 labels,
-                ["Alice Trail", "ALCE", "1 HOP AWAY", "REPLY", "DIRECT MSG", "HIGHLIGHT"],
+                ["Alice Trail", "ALCE", "1 HOP AWAY", "REPLY", "DIRECT MSG", "HIGHLIGHT", "REMOVE NODE"],
             )
             self.assertEqual(
                 [item.actionable for item in menu.items],
-                [False, False, False, True, True, True],
+                [False, False, False, True, True, True, True],
             )
             await pilot.press("up", "down")
             self.assertEqual(menu.highlighted_index, 5)
@@ -293,7 +294,13 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             menu = app.query_one("#node-context-menu", ViewportMenu)
-            self.assertEqual(menu.items[-1].label, "UNHIGHLIGHT")
+            highlight_item = next(
+                item for item in menu.items if item.value in ("favorite", "unfavorite")
+            )
+            self.assertEqual(
+                highlight_item.label,
+                "UNHIGHLIGHT",
+            )
             await pilot.press("enter")
             await pilot.pause()
             self.assertFalse(self.settings.is_favorite("!a11ce001"))
@@ -319,7 +326,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             labels = [item.label for item in app._user_menu.items]
-            self.assertEqual(labels, ["NOLN", "2 HOPS AWAY", "REPLY", "DIRECT MSG", "HIGHLIGHT"])
+            self.assertEqual(labels, ["NOLN", "2 HOPS AWAY", "REPLY", "DIRECT MSG", "HIGHLIGHT", "REMOVE NODE"])
             await pilot.press("escape")
 
             missing_short_unknown_hops = replace(
@@ -335,7 +342,7 @@ class ViewportContextFavoriteTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             labels = [item.label for item in app._user_menu.items]
-            self.assertEqual(labels, ["No Short Name", "REPLY", "DIRECT MSG", "HIGHLIGHT"])
+            self.assertEqual(labels, ["No Short Name", "REPLY", "DIRECT MSG", "HIGHLIGHT", "REMOVE NODE"])
 
     async def test_right_and_end_jump_newest_without_footer_hint(self) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
@@ -421,6 +428,149 @@ class NodeMetadataTests(unittest.TestCase):
         )
         interface.nodesByNum[0xA11CE001].pop("hopsAway")
         self.assertIsNone(service.get_node_metadata("!a11ce001").hops_away)
+
+
+class NodeRemoveTests(unittest.IsolatedAsyncioTestCase):
+    """REMOVE NODE: real radio-side NodeDB removal via the shared node menu.
+
+    CHAT and MESH both surface it from the SAME _open_node_menu, keyed only
+    by the canonical node ID. Two-step confirm, self-node protection, no
+    whole-NodeDB clear, and stored CHAT/DM/channel history preserved.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.settings = AppSettings.load(
+            config_path=root / "config.json",
+            profile_path=root / "terminal.conf",
+        )
+
+    def _make_app(self, radio=None, chat_store=None):
+        return MeshtasticPassApp(radio or self._radio(), self.settings, chat_store=chat_store)
+
+    @staticmethod
+    def _radio() -> SimulatedRadioService:
+        return SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+
+    async def test_chat_menu_includes_remove_node(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(58, 16)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            widget = list(app.query(ChatEntryWidget))[-1]
+            widget.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            labels = [item.label for item in app._user_menu.items]
+            self.assertIn("REMOVE NODE", labels)
+            index = labels.index("REMOVE NODE")
+            self.assertTrue(app._user_menu.items[index].actionable)
+            self.assertEqual(app._user_menu.items[index].value, "remove")
+
+    async def test_remove_node_is_two_step_and_calls_radio_with_canonical_id(
+        self,
+    ) -> None:
+        radio = self._radio()
+        radio.remove_node = Mock(wraps=radio.remove_node)
+        app = self._make_app(radio)
+        async with app.run_test(size=(58, 16)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._accept_received_message(SIMULATED_MESSAGES[0])
+            node_id = SIMULATED_MESSAGES[0].sender_node_id
+            widget = list(app.query(ChatEntryWidget))[-1]
+            widget.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            # First activation only arms confirmation -- no radio call yet.
+            app._activate_menu_item(
+                NodeMetadata(node_id, "Alice", "ALCE"), "remove"
+            )
+            await pilot.pause()
+            radio.remove_node.assert_not_called()
+            # Second activation performs the removal.
+            app._activate_menu_item(
+                NodeMetadata(node_id, "Alice", "ALCE"), "remove"
+            )
+            await pilot.pause()
+            radio.remove_node.assert_called_once()
+            self.assertEqual(radio.remove_node.call_args[0][0], node_id)
+
+    async def test_self_node_cannot_be_removed(self) -> None:
+        radio = self._radio()
+        radio.remove_node = Mock(wraps=radio.remove_node)
+        app = self._make_app(radio)
+        async with app.run_test(size=(58, 16)) as pilot:
+            await pilot.pause()
+            # Confirm the radio boundary refuses the local node's own id.
+            result = radio.remove_node(radio.info.node_id)
+            self.assertFalse(result.removed)
+            self.assertEqual(result.reason, "local")
+
+    async def test_removal_preserves_channel_history(self) -> None:
+        from chat_store import ChatStore
+
+        store = ChatStore.open(Path(self.directory.name) / "chat.db")
+        radio = self._radio()
+        store.add_incoming(
+            packet_id=1, node_id="!a11ce001", sender_name="Alice Trail",
+            sender_short_name="ALCE", channel_index=0, text="keep me",
+            radio_rx_at=100.0, received_at=100.0,
+        )
+        app = self._make_app(radio, chat_store=store)
+        async with app.run_test(size=(58, 16)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self.assertIn("keep me", [e.text for e in app.chat_history])
+            # Removing the node's NodeDB entry must NOT delete history.
+            app._request_node_remove(NodeMetadata("!a11ce001", "Alice", "ALCE"))
+            await pilot.pause()
+            app._request_node_remove(NodeMetadata("!a11ce001", "Alice", "ALCE"))
+            for _ in range(5):
+                await pilot.pause()
+            self.assertIn("keep me", [e.text for e in app.chat_history])
+
+    async def test_unsupported_radio_reports_error_without_fake_success(self) -> None:
+        radio = self._radio()
+        radio.remove_node = None  # no supported admin boundary
+        app = self._make_app(radio)
+        async with app.run_test(size=(58, 16)) as pilot:
+            await pilot.pause()
+            notifications = []
+            app.notify = lambda message, **kwargs: notifications.append(message)
+            app._request_node_remove(NodeMetadata("!a11ce001", "Alice", "ALCE"))
+            await pilot.pause()
+            app._request_node_remove(NodeMetadata("!a11ce001", "Alice", "ALCE"))
+            await pilot.pause()
+            self.assertIn("not supported", " ".join(notifications))
+            # No radio state was cleared/faked: the node is still present.
+            self.assertNotIn(
+                "!a11ce001", getattr(app.radio, "_removed_node_ids", set())
+            )
+
+    async def test_removed_node_reappears_on_normal_discovery(self) -> None:
+        radio = self._radio()
+        app = self._make_app(radio)
+        async with app.run_test(size=(58, 16)) as pilot:
+            await pilot.pause()
+            # Remove a remote node via the radio boundary.
+            radio.remove_node("!a11ce001")
+            self.assertIn("!a11ce001", radio._removed_node_ids)
+            self.assertNotIn(
+                "!a11ce001",
+                {m.node_id for m in radio.get_known_nodes()},
+            )
+            # Normal mesh traffic (no probe) lets it reappear fresh.
+            radio._hear_node("!a11ce001")
+            self.assertNotIn("!a11ce001", radio._removed_node_ids)
+            self.assertIn(
+                "!a11ce001", {m.node_id for m in radio.get_known_nodes()}
+            )
 
 
 if __name__ == "__main__":
