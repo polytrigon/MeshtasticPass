@@ -7466,6 +7466,22 @@ class MeshtasticPassApp(App[None]):
                 return channel.name
         return f"Channel {channel_index + 1}"
 
+    def _refresh_channel_start_marker(self, channel_index: int) -> None:
+        """Re-render an empty channel's START marker with the current label.
+
+        The marker is mounted as soon as a channel is touched, which can be
+        during the pre-identity CONNECTING window (when 'Channel N' is the
+        fallback name). Once the live channel name is known this updates the
+        marker text in place -- a targeted Static update, never a full
+        transcript remount, so it cannot duplicate or race mounted widgets.
+        """
+        label = self._channel_label(channel_index)
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        for marker in transcript.query(StartOfChannelHistoryMarker):
+            text = f"This is the start of {label} channel history"
+            if str(marker.render()) != text:
+                marker.update(text)
+
     def _capture_current_channel_state(self) -> None:
         state = self._state_for(self.current_channel_index)
         state.entries = self.chat_history
@@ -7673,6 +7689,13 @@ class MeshtasticPassApp(App[None]):
         # live identity changes again.
         state.loaded_key = key
         if fresh_ids == current_ids:
+            # Content did not change, but the mounted START-of-history marker
+            # may still carry the pre-identity placeholder label (e.g. it was
+            # mounted during CONNECTING with the fallback "Channel N" name):
+            # refresh its label to the now-known real channel name. This is a
+            # targeted marker re-render, never a full transcript remount, so
+            # it cannot race or duplicate any mounted message widgets.
+            self._refresh_channel_start_marker(channel_index)
             return
         # A GENUINE difference: `state.entries`/self.chat_history are only
         # ever replaced with fresh objects in THIS branch, never on the
@@ -10815,14 +10838,21 @@ class MeshtasticPassApp(App[None]):
         required).
         """
         if local_node_id is None:
-            # Identity unresolved (e.g. the transient CONNECTING event
-            # before the radio reports its node ID). Do NOT rebind the
-            # store to a NULL namespace: for a store the caller already
-            # bound to a radio (tests, or a value inherited from the
-            # constructor path) that would silently switch filtering to
-            # "matches nothing" and hide real history. Keep whatever
-            # namespace is active; the resolved ONLINE identity below is
-            # what actually (re)activates it.
+            # Identity unresolved (e.g. the CONNECTING event before the
+            # radio reports its node ID). Bind the store to the "no radio"
+            # namespace so both reads and writes agree on hiding everything
+            # (preserve-but-hide): the pre-namespacing/unattributable rows
+            # (NULL) must not leak into view yet, and a message that arrives
+            # before the identity resolves is stored with no radio attribut
+            # but intentionally kept hidden -- consistent, never leaked.
+            # CHAT history isolation must NOT surface another radio's (or a
+            # legacy NULL row's) content while the identity is unresolved.
+            # This is a NO-OP when the store is already bound to a resolved
+            # radio (a transient CONNECTING in the middle of an ordinary
+            # reconnect of the SAME radio): the resolved ONLINE identity
+            # below is what re-activates that namespace.
+            if self.chat_store is not None and not self.chat_store.is_namespace_bound():
+                self.chat_store.set_local_node_id(None)
             return
         if local_node_id == self._local_radio_node_id:
             if self.chat_store is not None:

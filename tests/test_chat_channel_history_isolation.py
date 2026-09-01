@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -22,7 +23,7 @@ from app import (
 )
 from app_settings import AppSettings
 from chat_store import ChatStore
-from radio_service import ChannelInfo, RadioState
+from radio_service import ChannelInfo, RadioState, ReceivedMessage
 from simulated_radio_service import (
     SIMULATED_LOCAL_NODE_ID,
     SIMULATED_MESSAGES,
@@ -873,6 +874,197 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
             await self._wait_online(pilot, app)
             self.assertEqual(app._local_radio_node_id, "!b1b2b3b4")
             self.assertEqual([e.text for e in app.chat_history], [])
+
+
+class MigrationLiveIngestTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end v4 -> v5 migration + live per-radio ingestion.
+
+    Mirrors the hardware regression: an existing valid schema-v4 database
+    must open (NOT "unsupported chat schema version 4"), migrate
+    deterministically to v5 (local_node_id column, preserve-but-hide), then
+    continue admitting NEW messages under the currently connected radio's
+    canonical namespace -- and never leak legacy rows, never collide a new
+    packet with a legacy NULL row, and isolate a different radio.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        self.chat_db_path = self.root / "chat.db"
+
+    @staticmethod
+    def _mk_v4_db(path: Path) -> None:
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (4);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                packet_id INTEGER,
+                node_id TEXT,
+                sender_name TEXT,
+                sender_short_name TEXT,
+                channel_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                origin_sent_at REAL,
+                radio_rx_at REAL,
+                received_at REAL NOT NULL,
+                local_sent_at REAL,
+                delivery_state TEXT,
+                created_at REAL NOT NULL,
+                dm_node_id TEXT,
+                channel_key TEXT
+            );
+            CREATE TABLE send_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES messages(id),
+                packet_id INTEGER,
+                state TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                completed_at REAL,
+                error TEXT
+            );
+            INSERT INTO messages VALUES (
+                1,'incoming',789,'!b0b00002','Old Radio','OLD',0,
+                'OLD channel',100,101,101,NULL,NULL,101,NULL,NULL
+            );
+            INSERT INTO messages VALUES (
+                2,'incoming',789,'!b0b00002','Old Radio','OLD',0,
+                'OLD dm',102,103,103,NULL,NULL,103,'!b0b00002',NULL
+            );
+            INSERT INTO send_attempts VALUES (
+                1, 1, NULL, 'SENT', 101, NULL, NULL
+            );
+            """
+        )
+        connection.commit()
+        connection.close()
+
+    @staticmethod
+    def _radio(node_id: str) -> SimulatedRadioService:
+        radio = SimulatedRadioService(
+            connect_delay=0.5, message_interval=0, scripted_messages=()
+        )
+        radio.info = replace(radio.info, node_id=node_id)
+        return radio
+
+    @staticmethod
+    async def _settle(pilot, app) -> None:
+        for _ in range(30):
+            await pilot.pause()
+            if app._radio_state is RadioState.ONLINE:
+                break
+        assert app._radio_state is RadioState.ONLINE
+        for _ in range(5):
+            await pilot.pause()
+
+    async def test_migration_then_per_radio_live_ingest_and_switch(self) -> None:
+        from radio_service import ChannelInfo as CI
+
+        self._mk_v4_db(self.chat_db_path)
+        store = ChatStore.open(self.chat_db_path)
+        self.assertEqual(
+            store._connection.execute("SELECT version FROM schema_version").fetchone()[0],
+            5,
+        )
+        # legacy rows preserved but hidden after binding a real radio.
+        store.set_local_node_id("!aaaaaaaa")
+        page = store.load_recent_page(channel_index=0, channel_key=None)
+        self.assertEqual([m.text for m in page.messages], [])
+        rows = store._connection.execute(
+            "SELECT text, local_node_id FROM messages ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(r["text"], r["local_node_id"]) for r in rows],
+            [("OLD channel", None), ("OLD dm", None)],
+        )
+        store.close()
+
+        # Bind radio !aaaaaaaa: legacy hidden; a NEW channel packet (same
+        # packet_id + node_id as the legacy row) must be inserted and become
+        # visible; a NEW DM too -- no dedup collision against legacy NULL.
+        reopened = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(self._radio("!aaaaaaaa"), self.settings, chat_store=reopened)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._settle(pilot, app)
+            self.assertEqual(app._local_radio_node_id, "!aaaaaaaa")
+            self.assertEqual([e.text for e in app.chat_history], [])
+            app._accept_received_message(
+                replace(
+                    SIMULATED_MESSAGES[0],
+                    packet_id=789,
+                    sender_node_id="!b0b00002",
+                    text="A new packet",
+                    channel_index=0,
+                )
+            )
+            await pilot.pause()
+            for _ in range(8):
+                await pilot.pause()
+            self.assertIn("A new packet", [e.text for e in app.chat_history])
+            self.assertNotIn("OLD channel", [e.text for e in app.chat_history])
+            all_rows = reopened._connection.execute(
+                "SELECT text, local_node_id FROM messages"
+            ).fetchall()
+            self.assertIn(("A new packet", "!aaaaaaaa"), [(r["text"], r["local_node_id"]) for r in all_rows])
+
+            # A new DM for the same radio, namespaced and visible.
+            app._accept_received_dm(
+                ReceivedMessage(
+                    sender_node_id="!b0b00002",
+                    sender_long_name="Old Radio",
+                    sender_short_name="OLD",
+                    channel_index=0,
+                    text="A new DM",
+                    rssi=None,
+                    snr=None,
+                    packet_id=790,
+                    radio_rx_at=200.0,
+                    is_direct=True,
+                )
+            )
+            await pilot.pause()
+            for _ in range(8):
+                await pilot.pause()
+            dm_rows = reopened._connection.execute(
+                "SELECT text, local_node_id, dm_node_id FROM messages WHERE dm_node_id = ?",
+                ("!b0b00002",),
+            ).fetchall()
+            self.assertIn(
+                ("A new DM", "!aaaaaaaa", "!b0b00002"),
+                [(r["text"], r["local_node_id"], r["dm_node_id"]) for r in dm_rows],
+            )
+
+            # Switch to a DIFFERENT radio: !aaaaaaaa history must vanish.
+            app._activate_local_radio_namespace("!bbbbbbbb")
+            app._channels = (CI(0, "LongFast", stable_key="id:primary"),)
+            self.assertEqual([e.text for e in app.chat_history], [])
+
+        # Reopened under !bbbbbbbb: only its own (empty) history is visible.
+        reopened_b = ChatStore.open(self.chat_db_path)
+        reopened_b.set_local_node_id("!bbbbbbbb")
+        self.assertEqual(
+            [m.text for m in reopened_b.load_recent_page(channel_index=0, channel_key=None).messages],
+            [],
+        )
+        reopened_b.close()
+
+        # Switching back to !aaaaaaaa restores its namespaced new history.
+        reopened_a = ChatStore.open(self.chat_db_path)
+        reopened_a.set_local_node_id("!aaaaaaaa")
+        visible = [
+            m.text
+            for m in reopened_a.load_recent_page(channel_index=0, channel_key=None).messages
+        ]
+        self.assertIn("A new packet", visible)
+        reopened_a.close()
 
 
 if __name__ == "__main__":

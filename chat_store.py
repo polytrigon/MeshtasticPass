@@ -157,6 +157,16 @@ class ChatStore:
         self._local_node_id = node_id
         self._namespace_bound = True
 
+    def is_namespace_bound(self) -> bool:
+        """Whether this store's per-radio namespace has been set at all.
+
+        A store the app never bound (raw unit tests / hand tools) keeps its
+        pre-namespacing behavior (reads unfiltered, writes namespace-less);
+        once the app resolves a radio identity it always binds, turning the
+        namespace filter on permanently for this store's lifetime.
+        """
+        return self._namespace_bound
+
     @property
     def _ns_filter(self) -> str:
         """SQL fragment narrowing a read to the bound radio namespace.
@@ -972,7 +982,19 @@ class ChatStore:
                     )
                 else:
                     current_version = int(row["version"])
-                    if current_version not in (1, 2, 3, SCHEMA_VERSION):
+                    # Any version from 1 up to (and including) the current
+                    # SCHEMA_VERSION is a supported database that must be
+                    # migrated in place (each historical bump below adds its
+                    # own column); only a database claiming a FUTURE version
+                    # is genuinely unsupported. A literal tuple like
+                    # "(1, 2, 3, SCHEMA_VERSION)" silently breaks the moment
+                    # a bump is applied without updating it -- e.g. the v4 ->
+                    # v5 per-radio bump left "4" out, so an existing valid
+                    # v4 database raised "Unsupported CHAT schema version 4"
+                    # instead of migrating. Ranging over every prior version
+                    # makes the migration path correct and restart-safe no
+                    # matter how many times the version is advanced.
+                    if not (1 <= current_version <= SCHEMA_VERSION):
                         raise ChatStoreError(
                             f"Unsupported CHAT schema version {current_version}."
                         )
