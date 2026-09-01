@@ -78,6 +78,7 @@ from radio_service import (
 )
 from simulated_radio_service import (
     SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
     SIMULATED_MESSAGES,
     SimulatedRadioService,
     SimulatedSendOutcome,
@@ -4954,7 +4955,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         restart, and that reopening never causes a retransmission.
         """
         seeding_store = ChatStore.open(self.chat_db_path)
-        seeding_store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        seeding_store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         legacy_message_id = seeding_store.add_outgoing(
             text="abandoned before this app version existed",
             channel_index=0,
@@ -5146,7 +5147,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         risk a real duplicate transmission).
         """
         seeding_store = ChatStore.open(self.chat_db_path)
-        seeding_store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        seeding_store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         message_id = seeding_store.add_outgoing(
             text="so and intermediaey received, stored, then resent it at a later time",
             channel_index=0,
@@ -6780,7 +6781,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_history_pagination_is_bounded_and_preserves_ui_state(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         for index in range(225):
             store.add_incoming(
                 packet_id=50_000 + index,
@@ -6885,7 +6886,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_new_message_keeps_default_window_at_100(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         for index in range(100):
             store.add_incoming(
                 packet_id=90_000 + index,
@@ -6930,7 +6931,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forty_new_messages_replace_oldest_mounted_history(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         for index in range(150):
             store.add_incoming(
                 packet_id=92_000 + index,
@@ -7000,7 +7001,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_passive_history_marker_is_dim_and_empty_chat_omits_it(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         store.add_incoming(
             packet_id=94_000,
             node_id="!a11ce001",
@@ -7375,7 +7376,7 @@ class ReconnectDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         sent_id = store.add_outgoing(
             text="reload sent", channel_index=0, local_sent_at=100.0,
             delivery_state="SENT",
@@ -7437,7 +7438,7 @@ class ReconnectDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cross_restart_reload_preserves_dm_terminal_states(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         sent_id = store.add_outgoing(
             text="dm reload sent",
             channel_index=0,
@@ -7478,7 +7479,7 @@ class ReconnectDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
         be connected now.
         """
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id("!bbbbbbbb")
+        store.set_local_profile("!bbbbbbbb", "SIM")
         message_id = store.add_outgoing(
             text="survives a radio swap",
             channel_index=0,
@@ -7513,7 +7514,7 @@ class ReconnectDeliveryStateTests(unittest.IsolatedAsyncioTestCase):
         above).
         """
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         message_id = store.add_outgoing(
             text="still in flight at shutdown",
             channel_index=0,

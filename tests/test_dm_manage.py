@@ -27,7 +27,11 @@ from app_settings import AppSettings
 from chat_store import ChatStore
 from mesh_state import MeshNodeState
 from radio_service import NodeMetadata, ReceivedMessage
-from simulated_radio_service import SIMULATED_LOCAL_NODE_ID, SimulatedRadioService
+from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
+    SimulatedRadioService,
+)
 from tests.test_app import ControllableSendRadioService
 from theme_palette import THEME_PALETTES
 
@@ -65,7 +69,7 @@ class DmManageAppTestsBase(unittest.IsolatedAsyncioTestCase):
         # the test always observes the SAME database the app writes to
         # (the app otherwise opens the XDG-honored user path).
         self.store = ChatStore.open(self.chat_db_path)
-        self.store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self.store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(self.store.close)
 
     def _make_app(self, radio=None):
