@@ -152,10 +152,10 @@ def canonical_short_name(short_name: str | None) -> str:
     LONG NAME is never part of the profile -- it is presentation only
     (see canonical_profile_key).
 
-    Returns "" (never a fabricated key) when there is no usable short
-    name; the profile then keys by the bare node id (a node-only lineage,
-    e.g. a factory-reset radio that shows a placeholder that is the node
-    id itself still gets its own node-id-only profile).
+    Returns "" ONLY for a genuinely unusable value (None, or blank/
+    whitespace after trimming). A blank/whitespace SHORT NAME is UNRESOLVED
+    identity -- it must NOT contribute a node-only profile, so it yields ""
+    and canonical_profile_key returns None (never a "!12345678:" key).
     """
     if not isinstance(short_name, str):
         return ""
@@ -166,47 +166,59 @@ def canonical_short_name(short_name: str | None) -> str:
 def canonical_profile_key(node_id: str | None, short_name: str | None) -> str | None:
     """Build the durable local CHAT history profile key for a radio pairing.
 
-    The profile is (canonical local node ID + canonical SHORT NAME). The
-    node-id half is the canonical "!xxxxxxxx" form; the short-name half is
-    canonical_short_name. This is the ONE place the composite is built --
-    never concatenated as display strings through the app. Keep `node_id`
-    canonical (lowercased, "!"-prefixed) before calling:
-    normalize_mesh_node_id is the SSOT, but this helper also accepts an
-    already-canonical id and a bare decimal/hex string defensively.
+    The profile is (canonical local node ID + canonical SHORT NAME). This is
+    the ONE place the composite is built -- never concatenated as display
+    strings through the app. Returns None unless BOTH components are usable:
 
-    Returns None when there is no usable canonical node id at all (no
-    authoritative local identity yet) -- the preserve-but-hide fallback.
+    - the node id normalizes to a canonical "!xxxxxxxx" hex id, AND
+    - the SHORT NAME canonicalizes to a NON-EMPTY value.
+
+    A missing/blank/whitespace-only SHORT NAME is unresolved identity, so
+    None is returned (a node-only "!12345678:" key is NEVER created). A real
+    factory/default short name such as "1234" is valid and yields
+    "!12345678:1234".
     """
     normalized = normalize_profile_node_id(node_id)
     if normalized is None:
         return None
     short = canonical_short_name(short_name)
+    if not short:
+        return None
     return f"{normalized}{_PROFILE_KEY_SEPARATOR}{short}"
 
 
 def normalize_profile_node_id(node_id: str | None) -> str | None:
     """Canonical "!"-prefixed 8-hex-digit local node id, or None.
 
-    Accepts an already-canonical id, a bare lowercased/uppercased id, or a
-    bare decimal/hex node number. Mirrors mesh_state.normalize_mesh_node_id
-    without importing it (this module is a leaf dependency). Only ever used
-    to build profile keys for the LOCAL radio identity.
+    The LOCAL profile identity uses the actual Meshtastic node-ID wire
+    representation, normalized consistently to canonical "!xxxxxxxx" (lowercase
+    hex). Only the canonical hex form is accepted -- an optional "!" prefix and
+    surrounding whitespace are tolerated, but a bare digit-only string is NOT
+    interpreted via competing decimal/hex readings. The connected radio's own
+    `RadioInfo.node_id` is already canonical, so this is a defensive guard for
+    hand-constructed/tests values, never a source of ambiguity.
+
+    Returns None when the id is not usable (blank, non-hex, not a 32-bit
+    node id) -- the preserve-but-hide fallback.
     """
     if not isinstance(node_id, str):
         return None
     candidate = node_id.strip()
-    if candidate.startswith("!"):
+    had_prefix = candidate.startswith("!")
+    if had_prefix:
         candidate = candidate[1:]
-    if not candidate:
+    # Canonical hex node-id representation. A "!"-prefixed value is
+    # unambiguously a node id (parsed as hex). A BARE digit-only string (no
+    # "!" and no a-f letter) is ambiguous under decimal vs hex and is
+    # rejected -- one representation, never two competing readings.
+    if not candidate or len(candidate) > 8:
+        return None
+    if not had_prefix and not any(ch in "abcdefABCDEF" for ch in candidate):
         return None
     try:
         value = int(candidate, 16)
     except ValueError:
-        # Not hexadecimal. Try decimal node number.
-        try:
-            value = int(candidate, 10)
-        except ValueError:
-            return None
+        return None
     return f"!{value & 0xFFFFFFFF:08x}"
 
 

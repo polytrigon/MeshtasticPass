@@ -1521,7 +1521,8 @@ class LocalProfileTests(unittest.TestCase):
         from chat_store import canonical_profile_key, canonical_short_name, split_profile_key
         # node id canonicalized; short name stripped + uppercased.
         self.assertEqual(canonical_profile_key("!12345678", "  poly "), "!12345678:POLY")
-        self.assertEqual(canonical_profile_key("12345678", "poly"), "!12345678:POLY")
+        # A hex string that contains an a-f letter is unambiguously hex.
+        self.assertEqual(canonical_profile_key("a11ce001", "poly"), "!a11ce001:POLY")
         self.assertEqual(canonical_short_name("poly"), "POLY")
         self.assertEqual(canonical_short_name(None), "")
         # no usable node id -> None (no authority).
@@ -1530,6 +1531,30 @@ class LocalProfileTests(unittest.TestCase):
         node, short = split_profile_key("!12345678:POLY")
         self.assertEqual(node, "!12345678")
         self.assertEqual(short, "POLY")
+
+    def test_blank_or_missing_short_name_never_yields_a_node_only_profile(self) -> None:
+        from chat_store import canonical_profile_key
+        # blank / whitespace-only / None SHORT NAME is unresolved identity
+        # and must NOT build a node-only "!12345678:" profile.
+        self.assertIsNone(canonical_profile_key("!12345678", ""))
+        self.assertIsNone(canonical_profile_key("!12345678", "   "))
+        self.assertIsNone(canonical_profile_key("!12345678", None))
+        # A real factory/default short name ("1234") is valid and distinct.
+        self.assertEqual(canonical_profile_key("!12345678", "1234"), "!12345678:1234")
+
+    def test_node_id_normalization_has_no_decimal_hex_ambiguity(self) -> None:
+        from chat_store import canonical_profile_key, normalize_profile_node_id
+        # Canonical "!xxxxxxxx" hex form is accepted (even if all digits, the
+        # "!" prefix makes it unambiguously a node id).
+        self.assertEqual(normalize_profile_node_id("!a11ce001"), "!a11ce001")
+        self.assertEqual(normalize_profile_node_id("!12345678"), "!12345678")
+        # A BARE digit-only string is ambiguous -> rejected (no two readings).
+        self.assertIsNone(normalize_profile_node_id("12345678"))
+        # A hex string with an a-f letter (no prefix) is unambiguously hex.
+        self.assertEqual(normalize_profile_node_id("a11ce001"), "!a11ce001")
+        # non-hex garbage rejected.
+        self.assertIsNone(normalize_profile_node_id("ZZZZZZZZ"))
+        self.assertIsNone(canonical_profile_key("not-a-node", "POLY"))
 
     def test_profiles_are_isolated_by_short_name_not_node_id_alone(self) -> None:
         # !aaaa + POLY vs !aaaa + SOHO vs !aaaa + 1234 -> three namespaces.

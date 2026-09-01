@@ -4335,6 +4335,16 @@ class MeshtasticPassApp(App[None]):
         # The most recently observed local SHORT NAME, used to build the
         # profile key and to detect a live rename. Always the canonical form.
         self._last_local_short_name: str | None = None
+        # True while identity is unresolved (a transient CONNECTING, or a
+        # blank/missing SHORT NAME): the store is bound to the no-profile
+        # namespace, so reads expose nothing and writes are owned by nobody.
+        # Set True on entering the unresolved state and cleared on any
+        # successful resolve, where it suppresses the LIVE-RENAME migration:
+        # an unresolved -> resolved-to-a-DIFFERENT-profile activation must be
+        # a fresh switch, never a rekey of the previously active profile's
+        # rows (those belong to the old pairing until the pairing is really
+        # renamed while continuously connected).
+        self._profile_pending_resolution: bool = False
         # Local wall-clock moment AUTO SYNC last completed a clock-set
         # successfully in THIS session -- never the radio's own time
         # (see RadioService.sync_clock: AdminMessage has no get-time
@@ -10856,24 +10866,51 @@ class MeshtasticPassApp(App[None]):
         unread markers, DM list/histories) is discarded so nothing can leak;
         the display then rebuilds from the NEW profile.
         """
+        if self.chat_store is None:
+            # No persisted CHAT history: there is no profile namespace to bind
+            # or isolate, so this is a no-op. The app is purely live-in-memory
+            # (e.g. tests/hand tools), and must not reset conversation state.
+            return
         if node_id is None:
             # Identity unresolved (e.g. the CONNECTING event before the
-            # radio reports its node ID): bind the store to the "no profile"
-            # namespace so reads and writes agree on hiding everything.
-            # NO-OP when already bound to a resolved profile (an ordinary
-            # reconnect of the SAME profile must not be mistaken for one).
-            if self.chat_store is not None and not self.chat_store.is_namespace_bound():
-                self.chat_store.set_active_profile(None)
+            # radio reports its node ID). If a profile was PREVIOUSLY bound,
+            # bind the store back to the "no profile" namespace so BOTH reads
+            # and writes are owned by NO profile -- a transient CONNECTING must
+            # not let an incoming packet during the unresolved window
+            # contaminate the previously active profile. On the FIRST connect
+            # there is no previously-active profile, so leave the store as-is
+            # (messages arrive and are attributed once identity resolves); the
+            # strict unresolved-ownership guarantee only bites after a profile
+            # has actually been active.
+            if self._active_profile_key is not None:
+                self._profile_pending_resolution = True
+                if self.chat_store is not None:
+                    self.chat_store.set_active_profile(None)
             return
 
         self._last_local_short_name = short_name
         profile_key = canonical_profile_key(node_id, short_name)
         if profile_key is None:
+            # node ID is usable but the SHORT NAME is blank/whitespace --
+            # still unresolved identity (never a node-only profile). Same
+            # treatment as above: only a previously-active profile is dropped.
+            if self._active_profile_key is not None:
+                self._profile_pending_resolution = True
+                if self.chat_store is not None:
+                    self.chat_store.set_active_profile(None)
             return
+        was_pending_resolution = self._profile_pending_resolution
+        self._profile_pending_resolution = False
         if profile_key == self._active_profile_key:
-            # Same profile (may be a reconnect); keep it bound.
+            # Same profile (may be a reconnect). Keep it bound. If we JUST
+            # came out of an unresolved window, the in-memory transcript may
+            # be polluted by unowned packets (written to no profile) that were
+            # mounted during the unresolved window -- reload it so only THIS
+            # profile's own rows are shown again.
             if self.chat_store is not None:
                 self.chat_store.set_active_profile(profile_key)
+            if was_pending_resolution:
+                self._reload_active_profile_view(preserve_dm=True)
             return
 
         previous_key = self._active_profile_key
@@ -10883,12 +10920,16 @@ class MeshtasticPassApp(App[None]):
             # LIVE-RENAME decision, made BEFORE ensure_profile (which would
             # otherwise create the target pairing and conceal the fact that
             # it was genuinely NEW): only migrate when the previous profile
-            # shares THIS node id (a rename of the same physical radio) and
-            # only when the target pairing is genuinely NEW.
+            # shares THIS node id (a rename of the same physical radio),
+            # only when the target pairing is genuinely NEW, and NOT when we
+            # are resolving out of an unresolved state (where the previous
+            # resolved profile's rows belong to that old pairing and must not
+            # be rekeyed into the newly-resolved one).
             previous_node, _previous_short = split_profile_key(previous_key)
             target_preexisting = self.chat_store.profile_exists(profile_key)
             if (
                 previous_key is not None
+                and not was_pending_resolution
                 and previous_node == normalize_profile_node_id(node_id)
                 and not target_preexisting
                 and previous_key != profile_key
@@ -10908,22 +10949,42 @@ class MeshtasticPassApp(App[None]):
             # creating it only if it did not already exist.
             self.chat_store.ensure_profile(node_id, short_name)
 
+        # A different (node ID + SHORT NAME) profile is now active, or we just
+        # came out of an unresolved window: no conversation state owned by the
+        # previous/unresolved profile may remain live, and any unowned packets
+        # mounted during the unresolved window are discarded.
         if previous_key is None:
-            # First resolved profile for this app run -- nothing from a
-            # PREVIOUS profile needs discarding.
+            # First resolved profile of this app run: nothing from a PREVIOUS
+            # profile needs discarding. (A seeded store keeps whatever the
+            # mount-time _load_chat_history already loaded.)
             return
+        self._reload_active_profile_view()
 
-        # A different (node ID + SHORT NAME) profile is now active: no
-        # conversation state owned by the previous profile may remain live.
+    def _reload_active_profile_view(self, *, preserve_dm: bool = False) -> None:
+        """Drop per-conversation in-memory state and reload the active profile.
+
+        Used when the active profile changes (a different pairing, or a
+        resolve out of an unresolved window) so no conversation state owned by
+        the previous/unresolved profile stays live, and so any unowned packets
+        mounted during an unresolved window are discarded. The reset makes the
+        channel state unlatched, so _restore_channel_state reloads fresh from
+        the CURRENTLY-bound profile.
+
+        `preserve_dm=True` keeps DM conversation state (used by a SAME-profile
+        reconnect that merely passed through a transient unresolved CONNECTING
+        window: the DM belongs to the SAME profile and must survive, while any
+        channel transcript pollution is rehydrated from the profile's rows).
+        """
         self._channel_states = {
             0: ChannelChatState()
         }
         self.chat_history = self._channel_states[0].entries
         self.current_channel_index = 0
-        self._dm_states = {}
-        self.current_dm_node_id = None
-        self._dm_conversation_order = []
-        self._dm_list_highlighted_index = 0
+        if not preserve_dm:
+            self._dm_states = {}
+            self.current_dm_node_id = None
+            self._dm_conversation_order = []
+            self._dm_list_highlighted_index = 0
         self.unread_count = 0
         self.dm_unread_count = 0
         self.transcript_new_count = 0

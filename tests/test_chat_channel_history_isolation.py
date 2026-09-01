@@ -1226,6 +1226,105 @@ class LocalProfileAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([e.text for e in app2.chat_history], ["A history"])
         store2.close()
 
+    async def test_unresolved_identity_hides_and_owns_nothing(self) -> None:
+        """A previously-active profile must not be read/owned while identity
+        is unresolved, and incoming packets must not contaminate it."""
+        app, store = self._open("!12345678", "POLY")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual(app._active_profile_key, "!12345678:POLY")
+            app._accept_received_message(
+                replace(SIMULATED_MESSAGES[0], packet_id=31, text="POLY history", channel_index=0)
+            )
+            await pilot.pause()
+            for _ in range(5):
+                await pilot.pause()
+            self.assertEqual([e.text for e in app.chat_history], ["POLY history"])
+
+            # Resolve identity to UNRESOLVED (no node id). Persistence ownership
+            # must become no-profile: POLY history is hidden from reads and a
+            # new incoming packet must NOT be written into POLY. In-memory
+            # cache is preserved (a same-profile reconnect restores it) but is
+            # not rendered/resolved while identity is unresolved.
+            app._activate_local_profile(None, None)
+            await pilot.pause()
+            self.assertIsNone(store._active_profile_key)
+            self.assertTrue(app._profile_pending_resolution)
+            # The store's profile-scoped read exposes no POLY history.
+            self.assertEqual(
+                [m.text for m in store.load_recent_page(channel_index=0, channel_key="sim-longfast").messages],
+                [],
+            )
+            app._accept_received_message(
+                replace(SIMULATED_MESSAGES[0], packet_id=32, text="unresolved packet", channel_index=0)
+            )
+            await pilot.pause()
+            for _ in range(5):
+                await pilot.pause()
+            # The unresolved packet is not attributed to POLY.
+            self.assertNotIn(
+                "unresolved packet",
+                [m.text for m in store.load_recent_page(channel_index=0, channel_key="sim-longfast").messages],
+            )
+
+            # Resolve back to POLY: restores POLY, and the unresolved packet
+            # (which was written with no profile) is NOT imported.
+            app._activate_local_profile("!12345678", "POLY")
+            await pilot.pause()
+            self.assertEqual([e.text for e in app.chat_history], ["POLY history"])
+        store.close()
+
+        # A blank/whitespace-only SHORT NAME is unresolved identity too.
+        app2, store2 = self._open("!12345678", "POLY")
+        async with app2.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app2)
+            app2._activate_local_profile("!12345678", "   ")
+            await pilot.pause()
+            self.assertIsNone(store2._active_profile_key)
+            self.assertEqual(app2._active_profile_key, "!12345678:POLY")
+        store2.close()
+
+    async def test_resolution_to_different_short_name_exposes_only_that_profile(self) -> None:
+        # Seed SOHO with its OWN history (a distinct, pre-existing pairing).
+        for short, text, pid in (("POLY", "POLY history", 41), ("SOHO", "SOHO history", 42)):
+            app, store = self._open("!12345678", short)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_online(pilot, app)
+                app._accept_received_message(
+                    replace(SIMULATED_MESSAGES[0], packet_id=pid, text=text, channel_index=0)
+                )
+                await pilot.pause()
+            store.close()
+        # Resolve to SOHO (a different pairing) -> ONLY SOHO is exposed;
+        # POLY history is not imported/migrated.
+        app, store = self._open("!12345678", "POLY")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["POLY history"])
+            # Force an unresolved window, then resolve to SOHO: a fresh
+            # activation of the existing SOHO pairing, never a rekey of POLY.
+            app._activate_local_profile(None, None)
+            await pilot.pause()
+            app._activate_local_profile("!12345678", "SOHO")
+            await pilot.pause()
+            self.assertEqual(app._active_profile_key, "!12345678:SOHO")
+            self.assertEqual([e.text for e in app.chat_history], ["SOHO history"])
+        store.close()
+
+    async def test_no_node_only_profile_record_is_ever_created(self) -> None:
+        """Resolving with a blank SHORT NAME must not create a node-only
+        profile record (e.g. "!12345678:")."""
+        app, store = self._open("!12345678", "POLY")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            app._activate_local_profile("!12345678", "")
+            await pilot.pause()
+        store.close()
+        check = ChatStore.open(self.chat_db_path)
+        self.assertNotIn("!12345678:", list(check.list_profile_keys()))
+        self.assertNotIn("!12345678", list(check.list_profile_keys()))
+        check.close()
+
 
 if __name__ == "__main__":
     unittest.main()
