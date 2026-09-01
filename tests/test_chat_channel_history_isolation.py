@@ -23,7 +23,11 @@ from app import (
 from app_settings import AppSettings
 from chat_store import ChatStore
 from radio_service import ChannelInfo, RadioState
-from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
+from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_MESSAGES,
+    SimulatedRadioService,
+)
 
 
 class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
@@ -64,6 +68,7 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
         MediumSlow before this (new) session ever opens.
         """
         store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         store.add_incoming(
             packet_id=1,
             node_id="!longfast1",
@@ -147,6 +152,7 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         store.add_incoming(
             packet_id=1,
             node_id="!longfast1",
@@ -271,6 +277,7 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_display_names_isolated_by_stable_key(self) -> None:
         store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         store.add_incoming(
             packet_id=1,
             node_id="!alice",
@@ -393,6 +400,81 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(radio.sent_messages), sent_before)
             self.assertEqual(radio._traceroute_count, traceroutes_before)
+
+
+class PerRadioNamespaceAppTests(unittest.IsolatedAsyncioTestCase):
+    """CHAT state-integrity: conversation state belongs to a physical radio.
+
+    Two different radios (POLY vs SOHO) running the SAME logical network/
+    channel/PSK/DM must never share CHAT state. Switching radios must not
+    leak the other radio's transcript, and switching back must restore it.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        self.chat_db_path = self.root / "chat.db"
+
+    @staticmethod
+    def _radio(node_id: str) -> SimulatedRadioService:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.info = replace(radio.info, node_id=node_id)
+        return radio
+
+    @staticmethod
+    async def _wait_online(pilot, app) -> None:
+        for _ in range(15):
+            await pilot.pause()
+            if app._radio_state is RadioState.ONLINE:
+                break
+        assert app._radio_state is RadioState.ONLINE
+        for _ in range(5):
+            await pilot.pause()
+
+    async def test_radio_switch_isolates_and_restores_channel_history(self) -> None:
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id("!a1a2a3a4")
+        store.add_incoming(
+            packet_id=1, node_id="!a11ce001", sender_name="Alice Trail",
+            sender_short_name="ALCE", channel_index=0, text="POLY history",
+            radio_rx_at=100.0, received_at=100.0, channel_key="sim-longfast",
+        )
+        poly_app = MeshtasticPassApp(
+            self._radio("!a1a2a3a4"), self.settings, chat_store=store
+        )
+        async with poly_app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, poly_app)
+            self.assertEqual([e.text for e in poly_app.chat_history], ["POLY history"])
+            self.assertEqual(poly_app._local_radio_node_id, "!a1a2a3a4")
+
+        # SOHO: a DIFFERENT physical radio, same logical channel config.
+        # It must see NO POLY history -- CHAT opens empty.
+        soho_store = ChatStore.open(self.chat_db_path)
+        soho_store.set_local_node_id("!b1b2b3b4")
+        soho_app = MeshtasticPassApp(
+            self._radio("!b1b2b3b4"), self.settings, chat_store=soho_store
+        )
+        async with soho_app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, soho_app)
+            self.assertEqual(soho_app._local_radio_node_id, "!b1b2b3b4")
+            self.assertEqual([e.text for e in soho_app.chat_history], [])
+
+        # Back to POLY: its persisted history is restored, SOHO's is absent.
+        poly_again = ChatStore.open(self.chat_db_path)
+        poly_again.set_local_node_id("!a1a2a3a4")
+        poly2 = MeshtasticPassApp(
+            self._radio("!a1a2a3a4"), self.settings, chat_store=poly_again
+        )
+        async with poly2.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, poly2)
+            self.assertEqual([e.text for e in poly2.chat_history], ["POLY history"])
 
 
 if __name__ == "__main__":

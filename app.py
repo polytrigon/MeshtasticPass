@@ -4264,6 +4264,12 @@ class MeshtasticPassApp(App[None]):
             0: ChannelChatState()
         }
         self.chat_history = self._channel_states[0].entries
+        # True while _mount_channel_transcript is clearing and remounting
+        # the chat transcript. During that window _insert_chat_widget (a
+        # live message arriving mid-rebuild) must NOT mount its own end-of-
+        # history marker -- the rebuild owns that and will mount exactly
+        # one, and a second mount would collide on the fixed widget ID.
+        self._transcript_rebuilding = False
         self.unread_count = 0
         self.transcript_new_count = 0
         # Direct Messages are a DISTINCT conversation model from channel
@@ -4307,6 +4313,15 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
+        # The canonical local node ID of the physical radio whose CHAT
+        # conversation namespace is currently live (Problem 1 -- per-
+        # physical-radio CHAT history isolation). Only ever set to a
+        # RESOLVED ONLINE identity; never cleared to None by a transient
+        # CONNECTING event. Mirrored into chat_store via set_local_node_id
+        # so every persistence read/write is scoped to exactly this radio;
+        # a different connected radio never leaks this one's history, and
+        # switching back restores it.
+        self._local_radio_node_id: str | None = None
         # Local wall-clock moment AUTO SYNC last completed a clock-set
         # successfully in THIS session -- never the radio's own time
         # (see RadioService.sync_clock: AdminMessage has no get-time
@@ -7530,9 +7545,11 @@ class MeshtasticPassApp(App[None]):
             chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
         await transcript.remove_children()
+        self._transcript_rebuilding = True
         widgets = self._initial_chat_widgets(channel_index, state)
         if widgets:
             await transcript.mount(*widgets)
+        self._transcript_rebuilding = False
         if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_unread_messages_viewed()
             self._recount_unread()
@@ -7630,7 +7647,8 @@ class MeshtasticPassApp(App[None]):
         for marker in transcript.query(StartOfChannelHistoryMarker):
             marker.remove()
         if not self._has_older_history and self.chat_store is not None:
-            self._ensure_end_history_marker(transcript)
+            if not self._transcript_rebuilding:
+                self._ensure_end_history_marker(transcript)
         if self.current_tab != "chat" or self._chat_mode != "channel":
             following = self._following_chat_widget(insert_index)
             transcript.mount(self._chat_entry_widget(entry), before=following)
@@ -10379,7 +10397,7 @@ class MeshtasticPassApp(App[None]):
             await control.remove()
             transcript = self.query_one("#chat-log", ChatTranscript)
             first_widget = next(iter(transcript.query(ChatEntryWidget)), None)
-            if first_widget is not None:
+            if first_widget is not None and not self._transcript_rebuilding:
                 await transcript.mount(EndOfChatHistoryMarker(), before=first_widget)
             self._capture_current_channel_state()
             return
@@ -10712,6 +10730,77 @@ class MeshtasticPassApp(App[None]):
         """Restore the host terminal cursor; safe to call repeatedly."""
         self._terminal_cursor.restore()
 
+    def _activate_local_radio_namespace(self, local_node_id: str | None) -> None:
+        """Bind CHAT persistence + in-memory state to one physical radio.
+
+        Problem 1 (per-physical-radio CHAT history isolation). The
+        canonical local node ID is the ONLY thing that namespaces CHAT
+        state -- never long/short name, serial device path, network or
+        modem preset, or display label. A radio switch (POLY -> SOHO)
+        remaps the active namespace; switching back (SOHO -> POLY)
+        restores the original radio's persisted state.
+
+        Only a RESOLVED ONLINE identity is ever kept here (`local_node_id`
+        becomes this store's namespace). A transient CONNECTING event
+        carrying info=None must NEVER be mistaken for "the radio changed":
+        it happens in the middle of an ordinary reconnect of the SAME
+        radio, and treating it as a different-radio switch would falsely
+        drop the just-reconnected radio's own in-memory conversation
+        state (and, by emptying its entries, defeat the current-channel
+        identity reconcile's fresh==current no-op path). So a None local
+        node id only defers the namespace: reads surface nothing (no
+        other radio's state is ever shown while the identity is
+        unresolved), but no cached conversation is discarded.
+
+        When the connected radio's RESOLVED local node ID genuinely
+        CHANGES (POLY -> SOHO), every in-memory per-conversation cache
+        (channel histories, drafts, unread markers, DM list/histories) is
+        discarded so nothing can leak across radios; the display then
+        rebuilds purely from the NEW namespace (which reads nothing for a
+        radio with no stored history, producing an empty CHAT as
+        required).
+        """
+        if local_node_id is None:
+            # Identity unresolved (e.g. the transient CONNECTING event
+            # before the radio reports its node ID). Do NOT rebind the
+            # store to a NULL namespace: for a store the caller already
+            # bound to a radio (tests, or a value inherited from the
+            # constructor path) that would silently switch filtering to
+            # "matches nothing" and hide real history. Keep whatever
+            # namespace is active; the resolved ONLINE identity below is
+            # what actually (re)activates it.
+            return
+        if local_node_id == self._local_radio_node_id:
+            if self.chat_store is not None:
+                self.chat_store.set_local_node_id(local_node_id)
+            return
+        previous_node_id = self._local_radio_node_id
+        self._local_radio_node_id = local_node_id
+        if self.chat_store is not None:
+            self.chat_store.set_local_node_id(local_node_id)
+        if previous_node_id is None:
+            # First resolved identity for this app run -- there was no
+            # PREVIOUS radio whose mounted conversation state needs
+            # discarding (any state accumulated so far was, by definition,
+            # already read under this very namespace, e.g. messages that
+            # arrived within the same run before the identity resolved).
+            return
+        # A different physical radio is now attached: no conversation
+        # state owned by the previous radio may remain live in memory.
+        self._channel_states = {
+            0: ChannelChatState()
+        }
+        self.chat_history = self._channel_states[0].entries
+        self.current_channel_index = 0
+        self._dm_states = {}
+        self.current_dm_node_id = None
+        self._dm_conversation_order = []
+        self._dm_list_highlighted_index = 0
+        self.unread_count = 0
+        self.dm_unread_count = 0
+        self.transcript_new_count = 0
+        self._new_dm_mode = False
+
     def _show_connection(
         self,
         state: RadioState,
@@ -10763,6 +10852,9 @@ class MeshtasticPassApp(App[None]):
         # docstring.
         if not (state is RadioState.ONLINE and was_online):
             self._reset_clock_sync_state()
+        self._activate_local_radio_namespace(
+            info.node_id if state is RadioState.ONLINE and info is not None else None
+        )
         if state is RadioState.ONLINE and info is not None and info.channels:
             self._invalidate_reassigned_channel_caches(info.channels)
             # Locally-hid (CTRL+D) configured channels are excluded at this

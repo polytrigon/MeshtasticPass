@@ -38,6 +38,12 @@ from radio_service import (
 
 
 SIMULATED_DEVICE_PATHS = ("/dev/ttyUSB0", "/dev/ttyUSB1")
+# The deterministic canonical local node ID the simulated radio reports
+# as its own identity. Tests that pre-seed ChatStore history for the
+# simulated radio must set_local_node_id to this before writing, so the
+# seeded rows live in the SAME per-radio namespace the app activates on
+# connect (CHAT state-integrity -- per-physical-radio history isolation).
+SIMULATED_LOCAL_NODE_ID = "!51a00001"
 SIMULATED_CHANNELS = (
     ChannelInfo(0, "LongFast", stable_key="sim-longfast"),
     ChannelInfo(1, "Hiking", stable_key="sim-hiking"),
@@ -221,7 +227,7 @@ class SimulatedRadioService:
         self.device_path = device_path
         self.info = RadioInfo(
             device_path=self.device_path,
-            node_id="!51a00001",
+            node_id=SIMULATED_LOCAL_NODE_ID,
             long_name="Simulated Node",
             short_name="SIM",
             firmware_version="sim-1.0.0",

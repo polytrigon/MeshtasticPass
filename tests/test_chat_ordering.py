@@ -13,7 +13,11 @@ from textual.widgets import Static
 from app import ChatEntryWidget, ChatTranscript, LoadOlderControl, MeshtasticPassApp
 from app_settings import AppSettings
 from chat_store import ChatStore
-from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
+from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_MESSAGES,
+    SimulatedRadioService,
+)
 from theme_palette import THEME_PALETTES
 from viewport_menu import ViewportMenu
 
@@ -110,6 +114,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_normal_aged_packet_dedupe_and_history_load_do_not_notify(self) -> None:
         store = ChatStore.open(self.db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         store.add_incoming(
             packet_id=2001,
             node_id="!history",
@@ -247,6 +252,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delayed_insert_respects_default_mounted_cap(self) -> None:
         store = ChatStore.open(self.db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         for index in range(100):
             store.add_incoming(
                 packet_id=4700 + index,
@@ -276,6 +282,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_older_than_mounted_window_persists_until_load_older(self) -> None:
         store = ChatStore.open(self.db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         for index in range(100):
             store.add_incoming(
                 packet_id=5000 + index,
@@ -498,6 +505,7 @@ class ChatOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unrelated_selection_and_dedup_do_not_change_older_pending(self) -> None:
         store = ChatStore.open(self.db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         store.add_incoming(
             packet_id=7199,
             node_id="!history",
