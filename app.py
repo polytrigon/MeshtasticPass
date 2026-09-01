@@ -7414,6 +7414,44 @@ class MeshtasticPassApp(App[None]):
                 return channel.stable_key or None
         return None
 
+    def _resolve_index_by_stable_key(
+        self, channels: tuple[ChannelInfo, ...], stable_key: str | None
+    ) -> int | None:
+        """Resolve a channel STABLE identity to its index in `channels`.
+
+        Stable identity (ChannelInfo.stable_key) is the ONLY channel
+        identity used for CHAT conversation reconciliation -- never slot
+        index, display name, PRIMARY fallback label, or modem preset name.
+        `stable_key` None/"" means "unknown" (no authority to preserve a
+        conversation we cannot prove), so it yields None (caller falls
+        back deterministically). Returns the index of the FIRST visible
+        channel carrying that identity, or None if it is genuinely gone.
+        """
+        if not stable_key:
+            return None
+        for channel in channels:
+            if channel.stable_key == stable_key:
+                return channel.index
+        return None
+
+    def _deterministic_channel_fallback(
+        self, channels: tuple[ChannelInfo, ...]
+    ) -> int | None:
+        """One explicit, deterministic fallback for a genuinely-removed channel.
+
+        Preferred: PRIMARY (index 0) if an authoritative PRIMARY channel
+        exists; otherwise the first real configured channel. NEVER the NEW
+        CHANNEL sentinel (which is not a real ChannelInfo here). Returns
+        None only when there are no real channels to select at all.
+        """
+        if not channels:
+            return None
+        for channel in channels:
+            if channel.index == 0:
+                return channel.index
+        # No index-0 PRIMARY; use the first real configured channel.
+        return channels[0].index
+
     def _channel_label(self, channel_index: int) -> str:
         """The current channel selector's own presentation label.
 
@@ -10876,12 +10914,37 @@ class MeshtasticPassApp(App[None]):
             # Locally-hid (CTRL+D) configured channels are excluded at this
             # boundary -- the radio-authoritative snapshot is never mutated,
             # only the app-visible CHAT channel list is filtered.
+            #
+            # PROBLEM 3 (spontaneous old-history switch): reconcile the
+            # ACTIVE conversation by STABLE channel identity, never by slot
+            # index or display label. Capture the active channel's identity
+            # BEFORE the authoritative list is rebuilt, resolve that same
+            # identity against the refreshed list, and only fall back
+            # deterministically when it is genuinely gone -- so an async
+            # refresh, reorder, same-slot re-key, or display-label change
+            # can NEVER silently switch to another channel's history.
+            active_key = self._channel_key_for(self.current_channel_index)
             self._channels = self._filter_hidden_channels(info.channels)
             selector = self.query_one(ChannelSelector)
-            available_indexes = {channel.index for channel in self._channels}
-            selected_index = self.current_channel_index
-            if selected_index not in available_indexes:
-                selected_index = self._channels[0].index
+            resolved_index = self._resolve_index_by_stable_key(
+                self._channels, active_key
+            )
+            if resolved_index is not None:
+                # The active conversation still exists (same stable
+                # identity): keep it active. Only update the selector's
+                # presented value, never remount a different channel's
+                # history. If the identity at that index CHANGED (same
+                # slot re-keyed), _reconcile_current_channel_identity
+                # handles the remount below.
+                selected_index = resolved_index
+            else:
+                # The active channel is actually GONE (not merely reordered
+                # or renamed): take one explicit deterministic fallback.
+                selected_index = self._deterministic_channel_fallback(
+                    self._channels
+                )
+                if selected_index is None:
+                    selected_index = self.current_channel_index
             selector.set_options(
                 (
                     DropdownOption(channel.name, channel.index)

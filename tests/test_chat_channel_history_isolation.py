@@ -591,5 +591,289 @@ class PrimaryChannelIdentityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([e.text for e in app.chat_history], ["primary history"])
 
 
+class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    """Problem 3: an async channel/config refresh must never spontaneously
+    switch away from the active stable channel identity.
+
+    Reconciliation preserves the active conversation by STABLE identity
+    (ChannelInfo.stable_key), not slot/index, display label, PRIMARY
+    fallback, modem preset, or "first option". A channel that merely
+    reorders, re-keys a same slot, or changes its display label stays
+    active; only a genuinely-removed channel falls back deterministically.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        self.chat_db_path = self.root / "chat.db"
+
+    @staticmethod
+    def _radio() -> SimulatedRadioService:
+        return SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+
+    @staticmethod
+    async def _wait_online(pilot, app) -> None:
+        for _ in range(15):
+            await pilot.pause()
+            if app._radio_state is RadioState.ONLINE:
+                break
+        assert app._radio_state is RadioState.ONLINE
+        for _ in range(5):
+            await pilot.pause()
+
+    @staticmethod
+    def _seed(store: ChatStore, channel_index: int, text: str, key: str) -> None:
+        store.add_incoming(
+            packet_id=hash(text) % 1_000_000,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=channel_index,
+            text=text,
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key=key,
+        )
+
+    async def test_async_refresh_with_channel_a_still_present_keeps_a(self) -> None:
+        """A is active; A still exists after a refresh -> A stays mounted and
+        B's old history never mounts (failure classes A and B combined)."""
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "A history", "id:a")
+        self._seed(store, 1, "B history", "id:b")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info,
+            channels=(
+                ChannelInfo(0, "Alpha", stable_key="id:a"),
+                ChannelInfo(1, "Beta", stable_key="id:b"),
+            ),
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:a")
+
+            # Async refresh: same channels, A still present (unchanged
+            # identity and index). Reconcile must keep A active, never
+            # mount B (failure class B: selector stays, transcript must
+            # NOT drift onto B's history).
+            radio.info = replace(
+                radio.info,
+                channels=(
+                    ChannelInfo(0, "Alpha", stable_key="id:a"),
+                    ChannelInfo(1, "Beta", stable_key="id:b"),
+                ),
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            self.assertNotIn("B history", [e.text for e in app.chat_history])
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:a")
+
+    async def test_option_reorder_or_label_change_preserves_a(self) -> None:
+        """Reordering or renaming the same channel (same slot) must not switch
+        away -- the active stable identity is preserved regardless of order or
+        presentation label."""
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "A history", "id:a")
+        self._seed(store, 1, "B history", "id:b")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info,
+            channels=(
+                ChannelInfo(0, "Alpha", stable_key="id:a"),
+                ChannelInfo(1, "Beta", stable_key="id:b"),
+            ),
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            # Re-present the SAME channels, order swapped, A still index 0
+            # but listed second. Label unchanged; identity unchanged.
+            radio.info = replace(
+                radio.info,
+                channels=(
+                    ChannelInfo(1, "Beta", stable_key="id:b"),
+                    ChannelInfo(0, "Alpha", stable_key="id:a"),
+                ),
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:a")
+            # Same stable identity, different DISPLAY label.
+            radio.info = replace(
+                radio.info,
+                channels=(
+                    ChannelInfo(0, "Alpha Renamed", stable_key="id:a"),
+                    ChannelInfo(1, "Beta Renamed", stable_key="id:b"),
+                ),
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:a")
+            self.assertEqual(app._channel_label(app.current_channel_index), "Alpha Renamed")
+
+    async def test_same_index_rekeyed_preserves_active_conversation(self) -> None:
+        """Slot 0 silently re-keyed (id:a -> id:b) must not surface A's history."""
+        from app import ChannelInfo, MeshtasticPassApp, StartOfChannelHistoryMarker
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "A history", "id:a")
+        self._seed(store, 0, "B history", "id:b")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info, channels=(ChannelInfo(0, "Alpha", stable_key="id:a"),)
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            # Same slot re-keyed to B without a user action.
+            radio.info = replace(
+                radio.info, channels=(ChannelInfo(0, "Beta", stable_key="id:b"),)
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            # Current channel is still index 0 (slot unchanged); the mounted
+            # history must now be B's, never A's -- the selector and transcript
+            # agree on the SAME new stable identity.
+            self.assertEqual(app.current_channel_index, 0)
+            self.assertEqual([e.text for e in app.chat_history], ["B history"])
+            self.assertNotIn("A history", [e.text for e in app.chat_history])
+
+    async def test_genuine_removal_falls_back_to_primary_first(self) -> None:
+        """A removed entirely -> deterministic fallback to PRIMARY (index 0)."""
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "PRIMARY history", "id:primary")
+        self._seed(store, 1, "A history", "id:a")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info,
+            channels=(
+                ChannelInfo(0, "LongFast", stable_key="id:primary"),
+                ChannelInfo(1, "Alpha", stable_key="id:a"),
+            ),
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            await app._switch_channel(1)
+            await pilot.pause()
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            # A is now genuinely removed from the radio config.
+            radio.info = replace(
+                radio.info, channels=(ChannelInfo(0, "LongFast", stable_key="id:primary"),)
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            # Fallback: PRIMARY (index 0) still exists -> A's removal lands there.
+            self.assertEqual(app.current_channel_index, 0)
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:primary")
+            self.assertEqual([e.text for e in app.chat_history], ["PRIMARY history"])
+
+    async def test_display_label_change_preserves_primary_identity(self) -> None:
+        """PRIMARY display-label/fallback changes must not affect identity."""
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "primary history", "id:primary")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info, channels=(ChannelInfo(0, "PRIMARY", stable_key="id:primary"),)
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["primary history"])
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:primary")
+            # Same identity, different presentation label.
+            radio.info = replace(
+                radio.info, channels=(ChannelInfo(0, "PRIMARY (default)", stable_key="id:primary"),)
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["primary history"])
+            self.assertEqual(app._channel_key_for(app.current_channel_index), "id:primary")
+
+    async def test_removal_fallback_never_selects_new_channel_sentinel(self) -> None:
+        """Fallback must select a REAL channel, never the NEW CHANNEL sentinel."""
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "PRIMARY history", "id:primary")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info, channels=(ChannelInfo(0, "LongFast", stable_key="id:primary"),)
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            # The sentinel is never a ChannelInfo -- confirm the deterministic
+            # fallback ignores any non-index-0 synthetic value and lands on a
+            # real channel that actually exists.
+            self.assertEqual(app._deterministic_channel_fallback(()), None)
+            self.assertEqual(
+                app._deterministic_channel_fallback(
+                    (ChannelInfo(1, "Alpha", stable_key="id:a"),)
+                ),
+                1,
+            )
+
+    async def test_per_radio_namespace_stays_correct_across_refresh(self) -> None:
+        """A refresh must not leak one radio's history into another (Problem 1
+        preserved through Problem 3's reconciliation)."""
+        from app import ChannelInfo, MeshtasticPassApp
+
+        store = ChatStore.open(self.chat_db_path)
+        # POLY owns some history in this namespace.
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        self._seed(store, 0, "A history", "id:a")
+        radio = self._radio()
+        radio.info = replace(
+            radio.info, channels=(ChannelInfo(0, "Alpha", stable_key="id:a"),)
+        )
+        app = MeshtasticPassApp(radio, self.settings, chat_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+            # The connected radio reports its OWN canonical node ID set to a
+            # DIFFERENT identity than the one that owns the seeded history.
+            # Its namespace has no history, so CHAT is empty and stays empty
+            # across a refresh -- no leakage from the previous radio.
+            radio.info = replace(
+                radio.info,
+                node_id="!b1b2b3b4",
+                channels=(ChannelInfo(0, "Alpha", stable_key="id:a"),),
+            )
+            radio.simulate_reconnect()
+            await self._wait_online(pilot, app)
+            self.assertEqual(app._local_radio_node_id, "!b1b2b3b4")
+            self.assertEqual([e.text for e in app.chat_history], [])
+
+
 if __name__ == "__main__":
     unittest.main()
