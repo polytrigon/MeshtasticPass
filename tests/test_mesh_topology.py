@@ -219,6 +219,39 @@ def client_state(
     )
 
 
+def setUpModule() -> None:
+    """Neutralize the periodic real-clock MESH refresh for this module.
+
+    MeshtasticPassApp.on_mount starts a 1.0s set_interval calling
+    _refresh_chat_timestamps, which forwards straight into
+    _refresh_mesh(wall_now) -- and _refresh_mesh falls back to real
+    time() whenever wall_now is None (the periodic-tick case). Every
+    test below injects its own fixed, synthetic `now`/`wall_now`
+    directly (e.g. app._refresh_mesh(wall_now=1_700_000_000.0)); if a
+    single test's pilot.pause() sequence happens to take a real second
+    or more, that live timer fires mid-test and silently re-derives the
+    board from actual wall-clock time, making every synthetic node look
+    impossibly stale (this is what produced the intermittent
+    "selected_node_id reverts to YOU" / "relay_stages empty" failures
+    seen only in full-suite runs, never in isolation -- confirmed by
+    disabling just this forwarding and rerunning the whole file clean).
+    Stopping the timer right after mount removes the race without
+    touching production code or any test's own explicit time handling.
+    """
+    global _ORIGINAL_ON_MOUNT
+    _ORIGINAL_ON_MOUNT = MeshtasticPassApp.on_mount
+
+    def _on_mount_without_periodic_mesh_refresh(self: MeshtasticPassApp) -> None:
+        _ORIGINAL_ON_MOUNT(self)
+        self._chat_timestamp_timer.stop()
+
+    MeshtasticPassApp.on_mount = _on_mount_without_periodic_mesh_refresh
+
+
+def tearDownModule() -> None:
+    MeshtasticPassApp.on_mount = _ORIGINAL_ON_MOUNT
+
+
 class MeshTopologyModelTests(unittest.TestCase):
     def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
         """MESH GPS PLACEMENT: real distance now genuinely differentiates
