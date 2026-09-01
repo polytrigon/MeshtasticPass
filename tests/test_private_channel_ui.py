@@ -805,9 +805,9 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.pause()
             app.query_one("#chat-log").focus()
             await pilot.pause()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
-            # CTRL+E opens the EDIT CHANNEL overlay with the current values.
+            # CTRL+P opens the EDIT CHANNEL overlay with the current values.
             self.assertTrue(app._edit_channel_editor_open)
             self.assertEqual(app.query_one("#edit-channel-name").value, "SECRET")
             # CHANNEL KEY is a COPY KEY action; the real key is kept internally.
@@ -824,7 +824,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertTrue(app._edit_channel_overlay.has_class("channel-editor-overlay"))
 
     async def test_edit_channel_is_a_floating_overlay_not_a_replacement_view(self) -> None:
-        """CTRL+E opens EDIT CHANNEL as a floating panel on the popup layer --
+        """CTRL+P opens EDIT CHANNEL as a floating panel on the popup layer --
         the existing CHAT transcript stays mounted/visible, and the overlay
         never swaps the CHAT channel view."""
         from radio_service import ChannelInfo
@@ -846,7 +846,7 @@ class PskHeaderTests(PrivateChannelUiBase):
                 app.query_one("#chat-channel-content").current, "chat-conversation"
             )
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             self.assertTrue(app._edit_channel_editor_open)
             # The CHAT channel view is NOT replaced; the transcript stays.
@@ -924,7 +924,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.query_one("#chat-log").focus()
             await pilot.pause()
             footer = str(app.query_one("#footer").render())
-            self.assertIn("CTRL+E edit", footer)
+            self.assertIn("CTRL+P edit channel", footer)
             self.assertNotIn("P copy psk", footer)
             self.assertNotIn("CTRL+D delete", footer)
 
@@ -943,8 +943,8 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.current_channel_index = 1
             app.query_one("#chat-log").focus()
             await pilot.pause()
-            # CTRL+E opens the EDIT CHANNEL overlay.
-            await pilot.press("ctrl+e")
+            # CTRL+P opens the EDIT CHANNEL overlay.
+            await pilot.press("ctrl+p")
             await pilot.pause()
             self.assertTrue(app._edit_channel_editor_open)
             # Enter the in-place DELETE CHANNEL confirmation.
@@ -997,7 +997,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.current_channel_index = 1
             app.query_one("#chat-log").focus()
             await pilot.pause()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             app._enter_edit_channel_delete_confirm()
             await pilot.pause()
@@ -1101,7 +1101,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertEqual(app.current_channel_index, 1)
             self.assertNotIsInstance(app.focused, Input)
             footer = str(app.query_one("#footer").render())
-            self.assertIn("CTRL+E edit", footer)
+            self.assertIn("CTRL+P edit channel", footer)
             self.assertNotIn("P copy psk", footer)
             self.assertNotIn("CTRL+D delete", footer)
             # Focus the composer -> composer footer.
@@ -1114,7 +1114,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.press("escape")
             await pilot.pause()
             footer = str(app.query_one("#footer").render())
-            self.assertIn("CTRL+E edit", footer)
+            self.assertIn("CTRL+P edit channel", footer)
             self.assertNotIn("CTRL+D delete", footer)
             self.assertNotIn("P copy psk", footer)
 
@@ -1244,7 +1244,7 @@ class EditChannelFormTests(PrivateChannelUiBase):
             b64 = self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             self.assertTrue(app._edit_channel_editor_open)
             # Editing the name, then CANCEL discards it.
@@ -1263,7 +1263,7 @@ class EditChannelFormTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             app.query_one("#edit-channel-name").value = "RENAMED"
             app._save_edit_channel()
@@ -1279,7 +1279,7 @@ class EditChannelFormTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             # Enter DELETE CHANNEL confirmation, then NO returns to the form.
             app._enter_edit_channel_delete_confirm()
@@ -1324,7 +1324,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             # Complete form is mounted and the CHANNEL NAME field is focused
             # (never the EDIT CHANNEL title).
@@ -1348,7 +1348,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             self.assertEqual(self._focused_id(app), "edit-channel-name")
             await pilot.press("down")
@@ -1375,7 +1375,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             # Type a new name into the focused CHANNEL NAME field.
             app.query_one("#edit-channel-name").value = ""
@@ -1405,7 +1405,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             app.current_channel_index = 1
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             # DOWN name -> key -> delete.
             await pilot.press("down", "down")
@@ -1440,7 +1440,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             # Type a pending name.
             app.query_one("#edit-channel-name").value = ""
@@ -1473,7 +1473,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             await pilot.press("down", "down")
             await pilot.pause()
@@ -1493,7 +1493,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             self.assertIsNotNone(app.query_one("#chat-log"))
             self.assertEqual(app.query_one("#chat-channel-content").current, "chat-conversation")
@@ -1510,7 +1510,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             b64 = self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             copied = []
             app.copy_to_clipboard = lambda text: copied.append(text)
@@ -1534,7 +1534,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             # DEL CHANNEL label (not DELETE CHANNEL).
             self.assertEqual(
@@ -1559,15 +1559,103 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             overlay = app._edit_channel_overlay
             self.assertIsNotNone(overlay)
-            # Height is auto (hugs content), NOT 1fr/full chat height.
-            self.assertEqual(str(overlay.styles.height), "auto")
             # Compact padding on all four sides (1 cell each).
             pad = overlay.styles.padding
             self.assertEqual((pad.top, pad.bottom, pad.left, pad.right), (1, 1, 1, 1))
+            # ACTUAL rendered geometry: the overlay must hug its content, not
+            # fill the viewport. The edit form has ~6 rows (title, 2 fields,
+            # DEL, SAVE/CANCEL row, error); its rendered height must be far
+            # less than the 30-row viewport, and it must sit fully inside the
+            # viewport (top > viewport top, bottom < viewport bottom).
+            viewport = app.screen.region
+            region = overlay.region
+            self.assertLessEqual(region.height, 12)
+            self.assertLess(region.height, viewport.height)
+            self.assertGreaterEqual(region.y, viewport.y)
+            self.assertLess(region.bottom, viewport.bottom)
+
+    async def test_delete_confirmation_shrinks_the_overlay(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            form_height = app._edit_channel_overlay.region.height
+            # Enter DEL CHANNEL confirmation (name -> copy key -> del channel).
+            await pilot.press("down", "down")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_delete_confirm)
+            confirm_height = app._edit_channel_overlay.region.height
+            # The confirmation (title + YES/NO row) is SHORTER than the form.
+            self.assertLess(confirm_height, form_height)
+
+    async def test_copy_key_and_del_channel_focus_use_accent_text(self) -> None:
+        from theme_palette import THEME_PALETTES
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            accent = THEME_PALETTES[app._current_theme].accent.upper()
+            copy_key = app.query_one("#edit-channel-copy-key")
+            del_channel = app.query_one("#edit-channel-delete")
+            # Unfocused: normal text color (not ACCENT, no background highlight).
+            copy_key.focus()
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-copy-key")
+            # Focused action text is ACCENT (no background highlight introduced).
+            self.assertEqual(str(copy_key.styles.color.hex).upper(), accent)
+            del_channel.focus()
+            await pilot.pause()
+            self.assertEqual(str(del_channel.styles.color.hex).upper(), accent)
+            # No selection background is introduced on focus (the established
+            # $selection_background #181818 must not appear).
+            self.assertNotEqual(copy_key.styles.background.rgb, (24, 24, 24))
+
+    async def test_ctrl_p_opens_and_ctrl_e_does_not(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertFalse(app._edit_channel_editor_open)
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_editor_open)
+
+    async def test_footer_advertises_ctrl_p_not_ctrl_e(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            app._update_footer()
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.pause()
+            footer = str(app.query_one("#footer").render())
+            self.assertIn("CTRL+P edit channel", footer)
+            self.assertNotIn("CTRL+E edit", footer)
 
     async def test_channel_name_has_no_blue_default_focus_treatment(self) -> None:
         app = self._make_app()
@@ -1577,7 +1665,7 @@ class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
             self._private(app, name="SECRET")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("ctrl+e")
+            await pilot.press("ctrl+p")
             await pilot.pause()
             name_input = app.query_one("#edit-channel-name")
             # The input is focused but uses the established form treatment --

@@ -3733,6 +3733,12 @@ class ChatEntryWidget(Vertical):
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
+    # The Textual command palette binds ctrl+p (priority=True) and would swallow
+    # the private-channel EDIT CHANNEL hotkey. This keyboard-first app has its
+    # own hotkey scheme and does not use the command palette, so it is disabled
+    # entirely -- freeing ctrl+p for CTRL+P edit-channel (see on_key).
+    ENABLE_COMMAND_PALETTE = False
+
     TITLE = "MeshtasticPass"
     CSS = f"""
     $snow_base: {THEME_PALETTES["snow"].base};
@@ -4075,9 +4081,34 @@ class MeshtasticPassApp(App[None]):
         border: solid $snow_dim;
         padding: 1;
         height: auto;
+        min-height: 0;
         scrollbar-size: 1 1;
         scrollbar-color: $snow_base;
         scrollbar-background: $snow_dim;
+    }
+
+    /* The overlay's inner form/confirmation panes must be CONTENT-sized too.
+       A plain Textual Vertical defaults to height: 1fr, which makes it claim
+       the remaining viewport height and (through the parent's auto-height
+       circular dependency) forces the whole floating overlay to stretch
+       full-height on hardware. Pinning these to auto breaks the 1fr chain so
+       the overlay tightly wraps its visible contents. */
+    #edit-channel-form, #edit-channel-delete-confirm {
+        height: auto;
+        min-height: 0;
+    }
+
+    /* Focused action controls in the overlay (COPY KEY, DEL CHANNEL, and the
+       SAVE/CANCEL/YES/NO rows) highlight with the SAME shared ACCENT text
+       color as .editor-actions .connection-action-row:focus -- text-only, no
+       background, no focus box. Unfocused state returns to the normal text
+       color. */
+    .channel-editor-overlay .connection-action-row:focus {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber .channel-editor-overlay .connection-action-row:focus {
+        color: $amber_accent;
     }
 
     Screen.theme-amber .channel-editor-overlay {
@@ -4669,7 +4700,7 @@ class MeshtasticPassApp(App[None]):
         self._pending_channel: PendingChannelConfig | None = None
         self._new_channel_error = ""
         self._new_channel_editor_open = False
-        # EDIT CHANNEL (private-channel CTRL+E): the transient CHAT-local
+        # EDIT CHANNEL (private-channel CTRL+P): the transient CHAT-local
         # overlay for editing the CURRENT private channel's name/key and
         # (after an in-place YES/NO confirm) locally deleting it. Distinct
         # from the configured-channel selector and from NEW CHANNEL. Zero
@@ -5245,7 +5276,7 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
         if (
-            event.key == "ctrl+e"
+            event.key == "ctrl+p"
             and self.current_tab == "chat"
             and self._chat_mode == "channel"
             and not self._new_channel_editor_open
@@ -5256,10 +5287,11 @@ class MeshtasticPassApp(App[None]):
                 for channel in self._channels
             )
         ):
-            # CTRL+E opens the EDIT CHANNEL overlay for a configured private/
+            # CTRL+P opens the EDIT CHANNEL overlay for a configured private/
             # configured (non-PRIMARY) channel. Zero writes/RF. PRIMARY
             # (index 0), the NEW CHANNEL editor, and the DM list are never
-            # targets.
+            # targets. (The composer's CTRL+E emoji-picker binding is
+            # unrelated and unchanged.)
             self._open_edit_channel()
             event.stop()
             return
@@ -8085,7 +8117,7 @@ class MeshtasticPassApp(App[None]):
 
         self._render_chat_status()
         # The footer must reflect the channel just selected (its context, e.g.
-        # private-channel CTRL+E edit). _switch_chat_mode's own
+        # private-channel CTRL+P edit). _switch_chat_mode's own
         # earlier _update_footer() ran before the channel index changed here,
         # so without this the footer is stale until the next focus event.
         self._update_footer()
@@ -10163,7 +10195,7 @@ class MeshtasticPassApp(App[None]):
         self._update_tab_bar()
         self._update_footer()
 
-    # ---- EDIT CHANNEL (private-channel CTRL+E) -------------------------
+    # ---- EDIT CHANNEL (private-channel CTRL+P) -------------------------
 
     def _current_private_channel(self) -> ChannelInfo | None:
         """The currently-selected configured channel, if it is a private one."""
@@ -10177,7 +10209,7 @@ class MeshtasticPassApp(App[None]):
 
         Prepopulates CHANNEL NAME with the current name and CHANNEL KEY with
         the actual current channel key (never a placeholder/masked fake key
-        when the real key is available). Zero writes/RF. CTRL+E is only
+        when the real key is available). Zero writes/RF. CTRL+P is only
         offered for a configured private/non-PRIMARY channel.
         """
         channel = self._current_private_channel()
@@ -11545,17 +11577,17 @@ class MeshtasticPassApp(App[None]):
         elif self.current_tab == "chat" and self._chat_mode == "channel":
             text = "C channel    D dms    F4 quit"
             # A configured private/configured (non-PRIMARY) channel offers
-            # CTRL+E (edit channel). The public/default PRIMARY channel offers
+            # CTRL+P (edit channel). The public/default PRIMARY channel offers
             # neither edit nor delete, so it keeps the base line.
             if self.current_channel_index > 0 and self._channel_psk_metadata_text():
                 text = (
                     "C channel    D dms    "
-                    "CTRL+E edit    F4 quit"
+                    "CTRL+P edit channel    F4 quit"
                 )
             elif self.current_channel_index > 0:
                 text = (
                     "C channel    D dms    "
-                    "CTRL+E edit    F4 quit"
+                    "CTRL+P edit channel    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
             text = "C channel    1-3 tabs    F4 quit"
