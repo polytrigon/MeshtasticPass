@@ -122,7 +122,7 @@ class DMTabAndConversationTests(DirectMessageAppTestsBase):
                 app._dm_state_for("!11111111"), app._dm_state_for("!22222222")
             )
 
-    async def test_escape_from_transcript_returns_to_conversation_list(self) -> None:
+    async def test_escape_from_transcript_does_not_leave_the_dm(self) -> None:
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
@@ -131,8 +131,9 @@ class DMTabAndConversationTests(DirectMessageAppTestsBase):
             app.query_one("#dm-log").focus()
             await pilot.press("escape")
             await pilot.pause()
-            self.assertIsNone(app.current_dm_node_id)
-            self.assertEqual(app.query_one("#dm-content").current, "dm-list")
+            # ESC inside an active DM must NOT navigate to the DM list.
+            self.assertEqual(app.current_dm_node_id, "!a11ce001")
+            self.assertEqual(app.query_one("#dm-content").current, "dm-conversation")
 
     async def test_escape_from_composer_returns_to_transcript_not_list(self) -> None:
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
@@ -145,6 +146,41 @@ class DMTabAndConversationTests(DirectMessageAppTestsBase):
             await pilot.pause()
             self.assertEqual(app.current_dm_node_id, "!a11ce001")
             self.assertIsInstance(app.focused, type(app.query_one("#dm-log")))
+
+    async def test_dm_dropdown_still_switches_to_another_dm(self) -> None:
+        from keyboard_dropdown import KeyboardDropdown
+
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!a11ce001", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            self.assertEqual(app.current_dm_node_id, "!a11ce001")
+            # Selecting another DM from the DM dropdown leaves the first DM.
+            selector = app.query_one(DMModeSelector)
+            selector.post_message(KeyboardDropdown.Selected(selector, "!b0b00002"))
+            await pilot.pause()
+            self.assertEqual(app.current_dm_node_id, "!b0b00002")
+            self.assertEqual(app.query_one("#dm-content").current, "dm-conversation")
+
+    async def test_channel_dropdown_still_leaves_a_dm(self) -> None:
+        from keyboard_dropdown import KeyboardDropdown
+
+        app = MeshtasticPassApp(_simulated_radio(), self.settings)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.open_dm("!a11ce001", long_name="Alice", short_name="ALC")
+            await pilot.pause()
+            self.assertEqual(app.current_dm_node_id, "!a11ce001")
+            # Selecting a channel from the channel dropdown leaves the DM.
+            selector = app.query_one(ChannelSelector)
+            selector.post_message(KeyboardDropdown.Selected(selector, 0))
+            await pilot.pause()
+            self.assertEqual(app._chat_mode, "channel")
+            self.assertEqual(app.query_one("#chat-content").current, "chat-channel")
+            self.assertEqual(
+                app.query_one("#chat-channel-content").current, "chat-conversation"
+            )
 
 
 class DMConversationListTests(DirectMessageAppTestsBase):
