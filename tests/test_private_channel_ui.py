@@ -811,9 +811,63 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertTrue(app._edit_channel_editor_open)
             self.assertEqual(app.query_one("#edit-channel-name").value, "SECRET")
             self.assertEqual(app.query_one("#edit-channel-key").value, b64)
+            # The CHAT channel view itself is NOT replaced -- it stays visible
+            # behind the floating overlay.
             self.assertEqual(
-                app.query_one("#chat-channel-content").current, "edit-channel-editor"
+                app.query_one("#chat-channel-content").current, "chat-conversation"
             )
+            self.assertIsNotNone(app._edit_channel_overlay)
+            self.assertTrue(app._edit_channel_overlay.has_class("channel-editor-overlay"))
+
+    async def test_edit_channel_is_a_floating_overlay_not_a_replacement_view(self) -> None:
+        """CTRL+E opens EDIT CHANNEL as a floating panel on the popup layer --
+        the existing CHAT transcript stays mounted/visible, and the overlay
+        never swaps the CHAT channel view."""
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._channels = (ChannelInfo(1, "SECRET"),)
+            app.current_channel_index = 1
+            app.radio.channel_psk_text = lambda index: base64.b64encode(
+                bytes(range(16))
+            ).decode("ascii")
+            await pilot.pause()
+            # CHAT transcript is mounted and the channel view is the active
+            # ContentSwitcher pane BEFORE opening the overlay.
+            self.assertIsNotNone(app.query_one("#chat-log"))
+            self.assertEqual(
+                app.query_one("#chat-channel-content").current, "chat-conversation"
+            )
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_editor_open)
+            # The CHAT channel view is NOT replaced; the transcript stays.
+            self.assertEqual(
+                app.query_one("#chat-channel-content").current, "chat-conversation"
+            )
+            self.assertIsNotNone(app.query_one("#chat-log"))
+            # A floating popup-layer panel is mounted with the shared class and
+            # the established form/action rows (NetworkFieldInput + editor-actions).
+            overlay = app._edit_channel_overlay
+            self.assertIsNotNone(overlay)
+            self.assertEqual(overlay.id, "edit-channel-overlay")
+            self.assertTrue(overlay.has_class("channel-editor-overlay"))
+            self.assertEqual(len(app.query("#edit-channel-name-row")), 1)
+            self.assertEqual(len(app.query("#edit-channel-key-row")), 1)
+            self.assertEqual(len(app.query("#edit-channel-save")), 1)
+            self.assertEqual(len(app.query("#edit-channel-cancel")), 1)
+            self.assertEqual(len(app.query("#edit-channel-delete")), 1)
+        # After the overlay closes, CHAT is still the active view.
+            app._close_edit_channel()
+            await pilot.pause()
+            self.assertEqual(
+                app.query_one("#chat-channel-content").current, "chat-conversation"
+            )
+            self.assertIsNotNone(app.query_one("#chat-log"))
 
     async def test_p_while_composer_focused_types_and_does_not_copy(self) -> None:
         from radio_service import ChannelInfo
@@ -893,10 +947,10 @@ class PskHeaderTests(PrivateChannelUiBase):
             app._enter_edit_channel_delete_confirm()
             await pilot.pause()
             self.assertTrue(app._edit_channel_delete_confirm)
-            self.assertEqual(
-                app.query_one("#edit-channel-content").current,
-                "edit-channel-delete-confirm",
-            )
+            overlay = app._edit_channel_overlay
+            self.assertIsNotNone(overlay)
+            self.assertEqual(overlay._mode, "delete-confirm")
+            self.assertTrue(app.query_one("#edit-channel-delete-confirm").display)
             # YES deletes SECRET locally; PRIMARY (MEDIUMSLOW) is kept.
             app._confirm_delete_edit_channel()
             for _ in range(15):
@@ -1230,9 +1284,10 @@ class EditChannelFormTests(PrivateChannelUiBase):
             app.edit_channel_delete_no(None)
             await pilot.pause()
             self.assertFalse(app._edit_channel_delete_confirm)
-            self.assertEqual(
-                app.query_one("#edit-channel-content").current, "edit-channel-form"
-            )
+            overlay = app._edit_channel_overlay
+            self.assertIsNotNone(overlay)
+            self.assertEqual(overlay._mode, "form")
+            self.assertTrue(app.query_one("#edit-channel-form").display)
             self.assertEqual([c.name for c in app._channels], ["SECRET"])
             # The channel was not deleted; the overlay is still open.
             self.assertTrue(app._edit_channel_editor_open)

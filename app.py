@@ -1083,6 +1083,133 @@ class EditChannelDeleteNo(Static):
             event.stop()
 
 
+class EditChannelOverlay(Vertical):
+    """Floating EDIT CHANNEL overlay mounted on the screen's popup layer.
+
+    Reuses the established MeshtasticPass floating-panel treatment used by the
+    node context menu and the emoji picker (a `layer: popup` absolute panel
+    with the same background/border), so the existing CHAT view stays visible
+    behind it. The form body reuses the SAME pieces NEW CHANNEL uses:
+    `NetworkFieldInput` rows (CHANNEL NAME / CHANNEL KEY), `page-title`, and
+    the `.editor-actions` SAVE/CANCEL pair with `connection-action-row`
+    controls. It is never a replacement content pane and never swaps the CHAT
+    transcript. `show_form` toggles between the edit form and the in-place
+    DELETE CHANNEL [ YES ] [ NO ] confirmation (children are swapped, never a
+    second overlay).
+    """
+
+    can_focus = False
+
+    def __init__(self, name: str, psk: str) -> None:
+        super().__init__(
+            classes="channel-editor-overlay",
+            id="edit-channel-overlay",
+        )
+        self._mode: str = "form"
+        self._name = name
+        self._psk = psk
+        self._error = ""
+
+    def on_mount(self) -> None:
+        # Populate the form inputs once the overlay (and its Input widgets)
+        # are actually mounted -- never synchronously right after mount().
+        name_inputs = list(self.query("#edit-channel-name"))
+        if name_inputs:
+            name_inputs[0].value = self._name
+        key_inputs = list(self.query("#edit-channel-key"))
+        if key_inputs:
+            key_inputs[0].value = self._psk
+        error_widgets = list(self.query("#edit-channel-error"))
+        if error_widgets:
+            error_widgets[0].display = bool(self._error)
+            error_widgets[0].update(self._error)
+
+    def set_values(self, name: str, psk: str) -> None:
+        self._name = name
+        self._psk = psk
+        name_inputs = list(self.query("#edit-channel-name"))
+        if name_inputs:
+            name_inputs[0].value = name
+        key_inputs = list(self.query("#edit-channel-key"))
+        if key_inputs:
+            key_inputs[0].value = psk
+
+    def set_error(self, error: str) -> None:
+        self._error = error
+        error_widgets = list(self.query("#edit-channel-error"))
+        if error_widgets:
+            error_widgets[0].display = bool(error)
+            error_widgets[0].update(error)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-channel-form"):
+            yield Static("EDIT CHANNEL", classes="page-title", markup=False)
+            yield NetworkFieldInput(
+                label="CHANNEL NAME",
+                widget_id="edit-channel-name-row",
+                input_id="edit-channel-name",
+                collapsible=False,
+            )
+            yield NetworkFieldInput(
+                label="CHANNEL KEY",
+                widget_id="edit-channel-key-row",
+                input_id="edit-channel-key",
+                collapsible=False,
+            )
+            yield Static(
+                "[ DELETE CHANNEL ]",
+                id="edit-channel-delete",
+                classes="connection-action-row",
+                markup=False,
+            )
+            with Horizontal(
+                id="edit-channel-actions",
+                classes="editor-actions",
+                markup=False,
+            ):
+                yield EditChannelSave()
+                yield EditChannelCancel()
+            yield Static(id="edit-channel-error", markup=False)
+        with Vertical(id="edit-channel-delete-confirm"):
+            yield Static("DELETE CHANNEL", classes="page-title", markup=False)
+            with Horizontal(
+                id="edit-channel-delete-actions",
+                classes="editor-actions",
+                markup=False,
+            ):
+                yield EditChannelDeleteYes()
+                yield EditChannelDeleteNo()
+
+    def set_mode(self, mode: str) -> None:
+        """Switch between the edit form and the DELETE CHANNEL confirmation."""
+        self._mode = mode
+        # The two child panes are siblings; show exactly the one for `mode`.
+        # (These are the same overlay's children -- never a second popup.)
+        is_form = mode == "form"
+        for widget_id, show in (
+            ("edit-channel-form", is_form),
+            ("edit-channel-delete-confirm", not is_form),
+        ):
+            widgets = list(self.query(f"#{widget_id}"))
+            if widgets:
+                widgets[0].display = show
+
+    def place_over_chat(self) -> None:
+        """Position the floating overlay over the CHAT channel view.
+
+        Anchored to the CHAT page's visible area, confined to the viewport --
+        the same viewport-aware floating behavior the node context menu uses
+        (see viewport_menu.calculate_popup_placement).
+        """
+        from viewport_menu import calculate_popup_placement
+
+        chat = self.app.query_one("#content").region
+        placement = calculate_popup_placement(chat, self.app.screen.region, 44, 8)
+        self.styles.width = placement.width
+        self.styles.height = placement.height
+        self.styles.offset = (placement.x, placement.y)
+
+
 class SaveNetworkControl(Static):
     """[ SAVE ] -- validate the NEW NETWORK editor, then (after a
 
@@ -3788,7 +3915,8 @@ class MeshtasticPassApp(App[None]):
     }
 
     #connection .connection-action-row,
-    .editor-form .connection-action-row {
+    .editor-form .connection-action-row,
+    .channel-editor-overlay .connection-action-row {
         height: 1;
         min-height: 1;
         width: 1fr;
@@ -3871,19 +3999,28 @@ class MeshtasticPassApp(App[None]):
         height: 1fr;
     }
 
-    /* Shared CHAT channel-editor overlay treatment. Both the NEW CHANNEL
-       form and the EDIT CHANNEL form render as an overlaid form replacing
-       the channel conversation, rather than as a separate tab, and share
-       this exact visual/structure: a page-title heading, the labeled
-       CHANNEL NAME / CHANNEL KEY rows (via NetworkFieldInput), an
-       editor-actions [ SAVE ] [ CANCEL ] row, and an editor-hint line. The
-       class exists so the same treatment is invoked from both places
-       without duplicating rules; appearance is unchanged from how the
-       NEW CHANNEL editor already looks (the two forms now share one class
-       rather than one carrying bespoke styling). */
+    /* Shared CHAT channel-editor OVERLAY treatment. This is a FLOATING panel
+       mounted on the Screen's popup layer -- the same treatment the node
+       context menu (.viewport-menu) and the emoji picker (.emoji-picker)
+       already use -- so the existing CHAT view stays visible behind it. It is
+       NEVER a full-height replacement view. The form body reuses the existing
+       NEW CHANNEL pieces: NetworkFieldInput rows, .editor-actions, and
+       page-title. */
     .channel-editor-overlay {
-        height: 1fr;
-        min-height: 0;
+        layer: popup;
+        position: absolute;
+        background: #101010;
+        border: solid $snow_dim;
+        padding: 0 1;
+        scrollbar-size: 1 1;
+        scrollbar-color: $snow_base;
+        scrollbar-background: $snow_dim;
+    }
+
+    Screen.theme-amber .channel-editor-overlay {
+        border: solid $amber_dim;
+        scrollbar-color: $amber_base;
+        scrollbar-background: $amber_dim;
     }
 
     #radio-status {
@@ -4477,6 +4614,14 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_editor_open = False
         self._edit_channel_delete_confirm = False
         self._edit_channel_error = ""
+        # The current private-channel name + real key shown in the overlay,
+        # captured when it opens (never a placeholder/masked fake key).
+        self._edit_channel_name: str = ""
+        self._edit_channel_psk: str = ""
+        # The floating EDIT CHANNEL overlay widget when mounted (None when
+        # closed). It is a Screen-level popup-layer panel over the CHAT view,
+        # never a replacement content pane.
+        self._edit_channel_overlay: EditChannelOverlay | None = None
         # Guards against duplicate APPLY writes while an async apply is live.
         self._pending_apply_active = False
         # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
@@ -4795,7 +4940,7 @@ class MeshtasticPassApp(App[None]):
                                 )
                             with Vertical(
                                 id="new-channel-editor",
-                                classes="new-channel-editor editor-form channel-editor-overlay",
+                                classes="new-channel-editor editor-form",
                             ):
                                 yield Static(
                                     "NEW CHANNEL",
@@ -4827,58 +4972,6 @@ class MeshtasticPassApp(App[None]):
                                     markup=False,
                                 )
                                 yield Static(id="new-channel-error", markup=False)
-                            with Vertical(
-                                id="edit-channel-editor",
-                                classes="edit-channel-editor editor-form channel-editor-overlay",
-                            ):
-                                with ContentSwitcher(
-                                    initial="edit-channel-form", id="edit-channel-content"
-                                ):
-                                    with Vertical(id="edit-channel-form"):
-                                        yield Static(
-                                            "EDIT CHANNEL",
-                                            classes="page-title",
-                                            markup=False,
-                                        )
-                                        yield NetworkFieldInput(
-                                            label="CHANNEL NAME",
-                                            widget_id="edit-channel-name-row",
-                                            input_id="edit-channel-name",
-                                            collapsible=False,
-                                        )
-                                        yield NetworkFieldInput(
-                                            label="CHANNEL KEY",
-                                            widget_id="edit-channel-key-row",
-                                            input_id="edit-channel-key",
-                                            collapsible=False,
-                                        )
-                                        yield Static(
-                                            "[ DELETE CHANNEL ]",
-                                            id="edit-channel-delete",
-                                            classes="connection-action-row",
-                                            markup=False,
-                                        )
-                                        with Horizontal(
-                                            id="edit-channel-actions",
-                                            classes="editor-actions",
-                                            markup=False,
-                                        ):
-                                            yield EditChannelSave()
-                                            yield EditChannelCancel()
-                                        yield Static(id="edit-channel-error", markup=False)
-                                    with Vertical(id="edit-channel-delete-confirm"):
-                                        yield Static(
-                                            "DELETE CHANNEL",
-                                            classes="page-title",
-                                            markup=False,
-                                        )
-                                        with Horizontal(
-                                            id="edit-channel-delete-actions",
-                                            classes="editor-actions",
-                                            markup=False,
-                                        ):
-                                            yield EditChannelDeleteYes()
-                                            yield EditChannelDeleteNo()
                     with Vertical(id="chat-dms"):
                         yield Static(
                             id="dm-connection-status",
@@ -9997,12 +10090,8 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_editor_open = True
         self._edit_channel_delete_confirm = False
         self._edit_channel_error = ""
-        name_inputs = list(self.query("#edit-channel-name"))
-        if name_inputs:
-            name_inputs[0].value = channel.name
-        key_inputs = list(self.query("#edit-channel-key"))
-        if key_inputs:
-            key_inputs[0].value = self._channel_psk_metadata_text()
+        self._edit_channel_name = channel.name
+        self._edit_channel_psk = self._channel_psk_metadata_text()
         self._refresh_edit_channel()
         self._focus_edit_channel_field("name")
         self._update_footer()
@@ -10018,31 +10107,30 @@ class MeshtasticPassApp(App[None]):
         self._update_footer()
 
     def _refresh_edit_channel(self) -> None:
-        """Show/hide the EDIT CHANNEL overlay + its in-place delete confirm.
+        """Mount / unmount the floating EDIT CHANNEL overlay on the popup layer.
 
         Reflects `_edit_channel_editor_open` / `_edit_channel_delete_confirm`
-        / `_edit_channel_error`. Zero writes/RF. The inner ContentSwitcher
-        swaps between the form and the in-place DELETE CHANNEL YES/NO view
-        (never a second stacked overlay).
+        / `_edit_channel_error`. Zero writes/RF. The existing CHAT view is
+        NEVER replaced or swapped: the overlay is a floating panel on the
+        Screen's popup layer so CHAT stays visible behind it. When open, form
+        values are (re)applied and the panel switches between the edit form and
+        the in-place DELETE CHANNEL [ YES ] [ NO ] confirmation (same overlay,
+        never a second popup).
         """
-        switcher_widgets = list(self.query("#chat-channel-content"))
-        if switcher_widgets:
-            switcher_widgets[0].current = (
-                "edit-channel-editor"
-                if self._edit_channel_editor_open
-                else "chat-conversation"
-            )
-        inner_widgets = list(self.query("#edit-channel-content"))
-        if inner_widgets:
-            inner_widgets[0].current = (
-                "edit-channel-delete-confirm"
-                if self._edit_channel_delete_confirm
-                else "edit-channel-form"
-            )
-        error_widgets = list(self.query("#edit-channel-error"))
-        if error_widgets:
-            error_widgets[0].display = bool(self._edit_channel_error)
-            error_widgets[0].update(self._edit_channel_error)
+        overlay = self._edit_channel_overlay
+        if self._edit_channel_editor_open:
+            if overlay is None:
+                overlay = EditChannelOverlay(self._edit_channel_name, self._edit_channel_psk)
+                self._edit_channel_overlay = overlay
+                self.screen.mount(overlay)
+            overlay.set_mode("delete-confirm" if self._edit_channel_delete_confirm else "form")
+            overlay.place_over_chat()
+            overlay.set_values(self._edit_channel_name, self._edit_channel_psk)
+            overlay.set_error(self._edit_channel_error)
+        else:
+            if overlay is not None:
+                overlay.remove()
+                self._edit_channel_overlay = None
 
     # Vertical stops: CHANNEL NAME, CHANNEL KEY, DELETE CHANNEL, SAVE. CANCEL
     # is a horizontal sibling of SAVE (Right from SAVE / Left from CANCEL).
