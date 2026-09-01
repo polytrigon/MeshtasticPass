@@ -1736,13 +1736,21 @@ class ChatTranscript(VerticalScroll):
             app.call_after_refresh(app._clear_indicator_if_at_bottom)
             event.stop()
         elif event.key == "left":
-            app._focus_oldest_new_message()
+            if app._chat_mode == "dms" and app.current_dm_node_id is not None:
+                # A DM has no "oldest new across a channel" notion; LEFT
+                # just leaves focus on the DM transcript (no-op).
+                pass
+            else:
+                app._focus_oldest_new_message()
             event.stop()
         elif event.key == "right":
             app._return_to_present_and_type()
             event.stop()
         elif event.key == "end":
-            app._jump_to_newest()
+            if app._chat_mode == "dms" and app.current_dm_node_id is not None:
+                app.call_after_refresh(app._jump_dm_transcript_to_newest, self)
+            else:
+                app._jump_to_newest()
             event.stop()
 
 
@@ -7376,6 +7384,23 @@ class MeshtasticPassApp(App[None]):
     def _state_for(self, channel_index: int) -> ChannelChatState:
         return self._channel_states.setdefault(channel_index, ChannelChatState())
 
+    def _active_transcript(self) -> ChatTranscript:
+        """The transcript of the ACTIVE/VISIBLE conversation.
+
+        One central answer to "what owns the visible transcript?" The
+        active conversation is authoritative for selection/navigation/
+        context/ENTER: when CHAT is in DMS mode with a conversation open
+        that is #dm-log; otherwise (channel mode, or the DM list/new-DM
+        surfaces which have no message transcript) it is #chat-log. Every
+        up/down/left/right/ENTER/context path must resolve the transcript
+        through here, never a hard-coded '#chat-log', so a hidden CHANNEL
+        transcript can never receive a selection that belongs to a visible
+        DM (or vice versa).
+        """
+        if self._chat_mode == "dms" and self.current_dm_node_id is not None:
+            return self.query_one("#dm-log", ChatTranscript)
+        return self.query_one("#chat-log", ChatTranscript)
+
     def _channel_key_for(self, channel_index: int) -> str | None:
         """The live radio's own stable identity for this channel slot.
 
@@ -8454,13 +8479,25 @@ class MeshtasticPassApp(App[None]):
         transcript = self.query_one("#chat-log", ChatTranscript)
         return transcript.max_scroll_y - transcript.scroll_y <= 1
 
-    def _jump_to_newest(self) -> None:
-        transcript = self.query_one("#chat-log", ChatTranscript)
+    def _jump_transcript_to_newest(self, transcript: ChatTranscript) -> None:
+        """Scroll one transcript to its newest edge and clear its NEW indicator.
+
+        Shared by CHANNEL (_jump_to_newest) and DM (a DM transcript with a
+        single conversation has no new_below_ids bookkeeping; anchoring is
+        all it needs).
+        """
         transcript.anchor()
         transcript.scroll_end(animate=False)
+
+    def _jump_to_newest(self) -> None:
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        self._jump_transcript_to_newest(transcript)
         self._state_for(self.current_channel_index).new_below_ids.clear()
         self.transcript_new_count = 0
         self._update_transcript_indicator()
+
+    def _jump_dm_transcript_to_newest(self, transcript: ChatTranscript) -> None:
+        self._jump_transcript_to_newest(transcript)
 
     def _return_to_present_and_type(self) -> None:
         """Jump to the chronological edge and resume the preserved draft."""
@@ -8518,16 +8555,13 @@ class MeshtasticPassApp(App[None]):
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         """Vertical CHAT stops: every message is exactly ONE stop.
 
-        An actionable (FAILED/UNCONFIRMED) message's stop is its
-        RESEND control (⟲) -- the message's own ChatEntryWidget is
-        excluded so the message doesn't ALSO appear as a separate
-        stop, and DEL is excluded unconditionally (see item 5: "only
-        ⟲ participates in normal vertical message traversal"). An
-        ordinary message keeps its ChatEntryWidget as the stop, same
-        as always.
+        Works on the ACTIVE/VISIBLE transcript (see _active_transcript):
+        in DMS mode with a conversation open that is #dm-log, so a hidden
+        CHANNEL transcript's controls are never navigable/actionable while
+        a DM is visible (CHAT state-integrity -- DM context ownership).
         """
         targets: list[Static | ChatEntryWidget] = []
-        transcript = self.query_one("#chat-log", ChatTranscript)
+        transcript = self._active_transcript()
         for widget in transcript.walk_children():
             if isinstance(widget, MessageActionControl):
                 if widget.display and widget.action == "resend":
@@ -8568,23 +8602,30 @@ class MeshtasticPassApp(App[None]):
         targets = self._chat_navigation_targets()
         if not targets:
             if direction > 0:
-                self._focus_chat_composer()
+                self._focus_active_composer()
             return
         try:
             index = targets.index(self.focused)
             next_index = index + direction
             if direction > 0 and next_index >= len(targets):
-                self._focus_chat_composer()
+                self._focus_active_composer()
                 return
             target = targets[max(0, min(len(targets) - 1, next_index))]
         except ValueError:
             if direction > 0:
-                self._focus_chat_composer()
+                self._focus_active_composer()
                 return
             target = targets[-1]
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
+
+    def _focus_active_composer(self) -> None:
+        """Focus the composer of the ACTIVE conversation (CHANNEL vs DM)."""
+        if self._chat_mode == "dms" and self.current_dm_node_id is not None:
+            self._focus_dm_composer()
+        else:
+            self._focus_chat_composer()
 
     def _oldest_new_entry(self) -> ChatEntry | None:
         """Resolve the current channel's oldest actual NEW incoming entry."""
@@ -9586,41 +9627,16 @@ class MeshtasticPassApp(App[None]):
         self._update_footer()
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
-        targets: list[Static | ChatEntryWidget] = []
-        transcript = self.query_one("#dm-log", ChatTranscript)
-        for widget in transcript.walk_children():
-            if isinstance(widget, MessageActionControl):
-                if widget.display and widget.action == "resend":
-                    targets.append(widget)
-                continue
-            if (
-                isinstance(widget, ChatEntryWidget)
-                and widget.display
-                and not can_manual_resend(widget.entry)
-            ):
-                targets.append(widget)
-        return targets
+        # A DM has no LoadOlderControl, so the generic active-transcript
+        # navigation target set is exactly right; keep one authoritative
+        # implementation rather than a parallel, drifttable copy.
+        return self._chat_navigation_targets()
 
     def _move_dm_focus(self, direction: int) -> None:
-        targets = self._dm_navigation_targets()
-        if not targets:
-            if direction > 0:
-                self._focus_dm_composer()
-            return
-        try:
-            index = targets.index(self.focused)
-            next_index = index + direction
-            if direction > 0 and next_index >= len(targets):
-                self._focus_dm_composer()
-                return
-            target = targets[max(0, min(len(targets) - 1, next_index))]
-        except ValueError:
-            if direction > 0:
-                self._focus_dm_composer()
-                return
-            target = targets[-1]
-        target.focus()
-        target.scroll_visible(animate=False)
+        # Delegate: _move_chat_focus navigates the ACTIVE transcript (in
+        # DMS mode #dm-log) and focuses the ACTIVE composer, so DM and
+        # CHANNEL can never desync onto each other's contexts.
+        self._move_chat_focus(direction)
 
     def _focus_dm_composer(self) -> None:
         dm_input = self.query_one("#dm-input", Input)
