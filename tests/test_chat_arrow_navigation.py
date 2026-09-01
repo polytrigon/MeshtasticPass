@@ -22,6 +22,7 @@ from chat_store import ChatStore, OLDER_HISTORY_PAGE_SIZE
 from radio_service import DeliveryState
 from simulated_radio_service import (
     SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
     SIMULATED_MESSAGES,
     SimulatedRadioService,
 )
@@ -255,7 +256,7 @@ class ChatArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_left_reaches_unmounted_new_with_bounded_duplicate_free_pages(self) -> None:
         store = ChatStore.open(self.db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         for index in range(1, 261):
             store.add_incoming(
                 packet_id=20_000 + index,

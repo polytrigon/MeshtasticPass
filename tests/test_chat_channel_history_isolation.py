@@ -26,6 +26,7 @@ from chat_store import ChatStore
 from radio_service import ChannelInfo, RadioState, ReceivedMessage
 from simulated_radio_service import (
     SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
     SIMULATED_MESSAGES,
     SimulatedRadioService,
 )
@@ -69,7 +70,7 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
         MediumSlow before this (new) session ever opens.
         """
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         store.add_incoming(
             packet_id=1,
             node_id="!longfast1",
@@ -153,7 +154,7 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         store.add_incoming(
             packet_id=1,
             node_id="!longfast1",
@@ -278,7 +279,7 @@ class ChatChannelHistoryIsolationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_display_names_isolated_by_stable_key(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         store.add_incoming(
             packet_id=1,
             node_id="!alice",
@@ -441,7 +442,7 @@ class PerRadioNamespaceAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_radio_switch_isolates_and_restores_channel_history(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id("!a1a2a3a4")
+        store.set_local_profile("!a1a2a3a4", "SIM")
         store.add_incoming(
             packet_id=1, node_id="!a11ce001", sender_name="Alice Trail",
             sender_short_name="ALCE", channel_index=0, text="POLY history",
@@ -453,23 +454,23 @@ class PerRadioNamespaceAppTests(unittest.IsolatedAsyncioTestCase):
         async with poly_app.run_test(size=(100, 30)) as pilot:
             await self._wait_online(pilot, poly_app)
             self.assertEqual([e.text for e in poly_app.chat_history], ["POLY history"])
-            self.assertEqual(poly_app._local_radio_node_id, "!a1a2a3a4")
+            self.assertEqual(poly_app._active_profile_key, "!a1a2a3a4:SIM")
 
         # SOHO: a DIFFERENT physical radio, same logical channel config.
         # It must see NO POLY history -- CHAT opens empty.
         soho_store = ChatStore.open(self.chat_db_path)
-        soho_store.set_local_node_id("!b1b2b3b4")
+        soho_store.set_local_profile("!b1b2b3b4", "SIM")
         soho_app = MeshtasticPassApp(
             self._radio("!b1b2b3b4"), self.settings, chat_store=soho_store
         )
         async with soho_app.run_test(size=(100, 30)) as pilot:
             await self._wait_online(pilot, soho_app)
-            self.assertEqual(soho_app._local_radio_node_id, "!b1b2b3b4")
+            self.assertEqual(soho_app._active_profile_key, "!b1b2b3b4:SIM")
             self.assertEqual([e.text for e in soho_app.chat_history], [])
 
         # Back to POLY: its persisted history is restored, SOHO's is absent.
         poly_again = ChatStore.open(self.chat_db_path)
-        poly_again.set_local_node_id("!a1a2a3a4")
+        poly_again.set_local_profile("!a1a2a3a4", "SIM")
         poly2 = MeshtasticPassApp(
             self._radio("!a1a2a3a4"), self.settings, chat_store=poly_again
         )
@@ -566,7 +567,7 @@ class PrimaryChannelIdentityTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         # Seeded under an unnamed PRIMARY channel: no settings.id, no psk, so
         # its stable identity is "" (unknown).
         store.add_incoming(
@@ -649,7 +650,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "A history", "id:a")
         self._seed(store, 1, "B history", "id:b")
         radio = self._radio()
@@ -690,7 +691,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "A history", "id:a")
         self._seed(store, 1, "B history", "id:b")
         radio = self._radio()
@@ -737,7 +738,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp, StartOfChannelHistoryMarker
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "A history", "id:a")
         self._seed(store, 0, "B history", "id:b")
         radio = self._radio()
@@ -766,7 +767,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "PRIMARY history", "id:primary")
         self._seed(store, 1, "A history", "id:a")
         radio = self._radio()
@@ -799,7 +800,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "primary history", "id:primary")
         radio = self._radio()
         radio.info = replace(
@@ -824,7 +825,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
         from app import ChannelInfo, MeshtasticPassApp
 
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "PRIMARY history", "id:primary")
         radio = self._radio()
         radio.info = replace(
@@ -851,7 +852,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
 
         store = ChatStore.open(self.chat_db_path)
         # POLY owns some history in this namespace.
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self._seed(store, 0, "A history", "id:a")
         radio = self._radio()
         radio.info = replace(
@@ -872,7 +873,7 @@ class StableIdentityReconciliationTests(unittest.IsolatedAsyncioTestCase):
             )
             radio.simulate_reconnect()
             await self._wait_online(pilot, app)
-            self.assertEqual(app._local_radio_node_id, "!b1b2b3b4")
+            self.assertEqual(app._active_profile_key, "!b1b2b3b4:SIM")
             self.assertEqual([e.text for e in app.chat_history], [])
 
 
@@ -972,10 +973,10 @@ class MigrationLiveIngestTests(unittest.IsolatedAsyncioTestCase):
         store = ChatStore.open(self.chat_db_path)
         self.assertEqual(
             store._connection.execute("SELECT version FROM schema_version").fetchone()[0],
-            5,
+            6,
         )
         # legacy rows preserved but hidden after binding a real radio.
-        store.set_local_node_id("!aaaaaaaa")
+        store.set_local_profile("!aaaaaaaa", "SIM")
         page = store.load_recent_page(channel_index=0, channel_key=None)
         self.assertEqual([m.text for m in page.messages], [])
         rows = store._connection.execute(
@@ -994,7 +995,7 @@ class MigrationLiveIngestTests(unittest.IsolatedAsyncioTestCase):
         app = MeshtasticPassApp(self._radio("!aaaaaaaa"), self.settings, chat_store=reopened)
         async with app.run_test(size=(100, 30)) as pilot:
             await self._settle(pilot, app)
-            self.assertEqual(app._local_radio_node_id, "!aaaaaaaa")
+            self.assertEqual(app._active_profile_key, "!aaaaaaaa:SIM")
             self.assertEqual([e.text for e in app.chat_history], [])
             app._accept_received_message(
                 replace(
@@ -1043,13 +1044,13 @@ class MigrationLiveIngestTests(unittest.IsolatedAsyncioTestCase):
             )
 
             # Switch to a DIFFERENT radio: !aaaaaaaa history must vanish.
-            app._activate_local_radio_namespace("!bbbbbbbb")
+            app._activate_local_profile("!bbbbbbbb", "SIM")
             app._channels = (CI(0, "LongFast", stable_key="id:primary"),)
             self.assertEqual([e.text for e in app.chat_history], [])
 
         # Reopened under !bbbbbbbb: only its own (empty) history is visible.
         reopened_b = ChatStore.open(self.chat_db_path)
-        reopened_b.set_local_node_id("!bbbbbbbb")
+        reopened_b.set_local_profile("!bbbbbbbb", "SIM")
         self.assertEqual(
             [m.text for m in reopened_b.load_recent_page(channel_index=0, channel_key=None).messages],
             [],
@@ -1058,13 +1059,172 @@ class MigrationLiveIngestTests(unittest.IsolatedAsyncioTestCase):
 
         # Switching back to !aaaaaaaa restores its namespaced new history.
         reopened_a = ChatStore.open(self.chat_db_path)
-        reopened_a.set_local_node_id("!aaaaaaaa")
+        reopened_a.set_local_profile("!aaaaaaaa", "SIM")
         visible = [
             m.text
             for m in reopened_a.load_recent_page(channel_index=0, channel_key=None).messages
         ]
         self.assertIn("A new packet", visible)
         reopened_a.close()
+
+
+class LocalProfileAppTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end local CHAT history profile identity (node ID + SHORT NAME).
+
+    Covers connect-time activation (existing pairing reuse vs new-empty
+    profile), per-profile isolation of channel AND DM history, live SHORT
+    NAME rename (CASE 1 migrate / CASE 2 switch), LONG NAME changes never
+    affecting the profile, restart persistence, no automatic merging, and
+    unresolved identity exposing nothing.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.settings = AppSettings.load(
+            config_path=self.root / "config.json",
+            profile_path=self.root / "terminal.conf",
+        )
+        self.chat_db_path = self.root / "chat.db"
+
+    @staticmethod
+    def _radio(node_id: str, short_name: str) -> SimulatedRadioService:
+        radio = SimulatedRadioService(
+            connect_delay=0, message_interval=0, scripted_messages=()
+        )
+        radio.info = replace(radio.info, node_id=node_id, short_name=short_name)
+        return radio
+
+    @staticmethod
+    async def _wait_online(pilot, app) -> None:
+        for _ in range(15):
+            await pilot.pause()
+            if app._radio_state is RadioState.ONLINE:
+                break
+        assert app._radio_state is RadioState.ONLINE
+        for _ in range(8):
+            await pilot.pause()
+
+    def _open(self, node_id: str, short_name: str):
+        store = ChatStore.open(self.chat_db_path)
+        app = MeshtasticPassApp(self._radio(node_id, short_name), self.settings, chat_store=store)
+        return app, store
+
+    async def test_connect_creates_and_restores_profiles(self) -> None:
+        for short_name in ("POLY", "SOHO", "1234"):
+            app, store = self._open("!12345678", short_name)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_online(pilot, app)
+                self.assertEqual(app._active_profile_key, f"!12345678:{short_name}")
+            store.close()
+        check = ChatStore.open(self.chat_db_path)
+        self.assertEqual(
+            set(check.list_profile_keys()),
+            {"!12345678:POLY", "!12345678:SOHO", "!12345678:1234"},
+        )
+        check.close()
+
+    async def test_channel_and_dm_history_isolated_across_profiles(self) -> None:
+        for radio_id, short, text in (
+            ("!12345678", "POLY", "A history"),
+            ("!12345678", "SOHO", "B history"),
+            ("!12345678", "1234", "C history"),
+        ):
+            app, store = self._open(radio_id, short)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_online(pilot, app)
+                app._accept_received_message(
+                    replace(SIMULATED_MESSAGES[0], packet_id=hash(text) % 1_000_000,
+                            text=text, channel_index=0)
+                )
+                await pilot.pause()
+            store.close()
+        for radio_id, short, text in (
+            ("!12345678", "POLY", "A history"),
+            ("!12345678", "SOHO", "B history"),
+            ("!12345678", "1234", "C history"),
+        ):
+            app, store = self._open(radio_id, short)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_online(pilot, app)
+                self.assertEqual([e.text for e in app.chat_history], [text])
+            store.close()
+
+    async def test_live_rename_to_new_target_migrates_history(self) -> None:
+        app, store = self._open("!12345678", "POLY")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            app._accept_received_message(
+                replace(SIMULATED_MESSAGES[0], packet_id=11, text="A history", channel_index=0)
+            )
+            await pilot.pause()
+            for _ in range(5):
+                await pilot.pause()
+            # LIVE rename POLY -> JUNK (target new): history follows.
+            app._activate_local_profile("!12345678", "JUNK")
+            await pilot.pause()
+            self.assertEqual(app._active_profile_key, "!12345678:JUNK")
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+        store.close()
+        app2, store2 = self._open("!12345678", "POLY")
+        async with app2.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app2)
+            self.assertEqual([e.text for e in app2.chat_history], [])
+        store2.close()
+
+    async def test_live_rename_to_existing_profile_switches(self) -> None:
+        for short, text in (("POLY", "A history"), ("SOHO", "B history")):
+            app, store = self._open("!12345678", short)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_online(pilot, app)
+                app._accept_received_message(
+                    replace(SIMULATED_MESSAGES[0], packet_id=hash(text) % 1_000_000,
+                            text=text, channel_index=0)
+                )
+                await pilot.pause()
+            store.close()
+        # Current SOHO -> rename to POLY which already exists: switch to A.
+        app, store = self._open("!12345678", "SOHO")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            self.assertEqual([e.text for e in app.chat_history], ["B history"])
+            app._activate_local_profile("!12345678", "POLY")
+            await pilot.pause()
+            self.assertEqual(app._active_profile_key, "!12345678:POLY")
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+        store.close()
+        # B remains stored under SOHO.
+        app2, store2 = self._open("!12345678", "SOHO")
+        async with app2.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app2)
+            self.assertEqual([e.text for e in app2.chat_history], ["B history"])
+        store2.close()
+
+    async def test_long_name_change_does_not_affect_profile(self) -> None:
+        app, store = self._open("!12345678", "POLY")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app)
+            app._accept_received_message(
+                replace(SIMULATED_MESSAGES[0], packet_id=21, text="A history", channel_index=0)
+            )
+            await pilot.pause()
+            # A LONG NAME change is presentation-only: it is never delivered
+            # to _activate_local_profile (which only ever takes node_id +
+            # SHORT NAME), so re-activating with the SAME SHORT NAME keeps the
+            # SAME profile and does not switch/migrate.
+            app._activate_local_profile("!12345678", "POLY")
+            await pilot.pause()
+            self.assertEqual(app._active_profile_key, "!12345678:POLY")
+            self.assertEqual([e.text for e in app.chat_history], ["A history"])
+        store.close()
+        # Reconnect with the same SHORT NAME (regardless of LONG NAME) keeps A.
+        app2, store2 = self._open("!12345678", "POLY")
+        async with app2.run_test(size=(100, 30)) as pilot:
+            await self._wait_online(pilot, app2)
+            self.assertEqual(app2._active_profile_key, "!12345678:POLY")
+            self.assertEqual([e.text for e in app2.chat_history], ["A history"])
+        store2.close()
 
 
 if __name__ == "__main__":

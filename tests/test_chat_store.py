@@ -180,7 +180,7 @@ class ChatStoreTests(unittest.TestCase):
             "SELECT version FROM schema_version"
         ).fetchone()[0]
 
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertIsNone(messages[0].local_node_id)
         self.assertEqual([message.text for message in messages], ["preserved"])
         self.assertIsNone(messages[0].origin_sent_at)
@@ -1063,7 +1063,7 @@ class DirectMessagePersistenceTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v2 preserved"])
         self.assertIsNone(messages[0].dm_node_id)
@@ -1142,7 +1142,7 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v3 preserved"])
         self.assertIsNone(messages[0].channel_key)
@@ -1217,7 +1217,7 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         # local_node_id column now exists.
         columns = {
             column["name"]
@@ -1234,15 +1234,21 @@ class ChannelKeyIsolationTests(unittest.TestCase):
             [(row["text"], row["local_node_id"]) for row in rows],
             [("v4 channel preserved", None), ("v4 dm preserved", None)],
         )
-        # Legacy rows are hidden from a bound current-radio namespace.
-        reopened.set_local_node_id("!current")
+        # Legacy rows are hidden from a bound current-radio PROFILE.
+        reopened.set_active_profile("!deadbeef")
         page = reopened.load_recent_page(channel_index=0, channel_key=None)
         self.assertEqual([m.text for m in page.messages], [])
-        # No row was silently assigned to the connected radio.
+        # No row was silently assigned to the connected radio/profile; both
+        # legacy namespace columns stay NULL (preserved-but-hide).
         self.assertIsNone(
             reopened._connection.execute(
                 "SELECT local_node_id FROM messages LIMIT 1"
             ).fetchone()["local_node_id"]
+        )
+        self.assertIsNone(
+            reopened._connection.execute(
+                "SELECT profile_key FROM messages LIMIT 1"
+            ).fetchone()["profile_key"]
         )
         # Reopening again (a second initialization) does not corrupt it.
         reopened.close()
@@ -1250,13 +1256,13 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         self.addCleanup(second.close)
         self.assertEqual(
             second._connection.execute("SELECT version FROM schema_version").fetchone()[0],
-            5,
+            6,
         )
         versions = {
             row["version"]
             for row in second._connection.execute("SELECT version FROM schema_version").fetchall()
         }
-        self.assertEqual(versions, {5})
+        self.assertEqual(versions, {6})
         remaining = second._connection.execute(
             "SELECT text FROM messages ORDER BY id"
         ).fetchall()
@@ -1467,13 +1473,15 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         self.assertNotIn("stale longfast", [m.text for m in older.messages])
 
 
-class PerRadioNamespaceTests(unittest.TestCase):
-    """CHAT state-integrity: history is owned by canonical local node ID.
+class LocalProfileTests(unittest.TestCase):
+    """CHAT history is scoped by an explicit LOCAL HISTORY PROFILE.
 
-    The SAME logical network/channel/PSK/DM on two DIFFERENT physical
-    radios (POLY vs SOHO) must never share history. Rows written before
-    per-radio namespacing (local_node_id NULL) are preserved but never
-    returned (preserve-but-hide policy).
+    A profile is (canonical local node ID + canonical SHORT NAME). The same
+    node id under different short names (POLY vs SOHO vs 1234) is a distinct
+    namespace -- histories are NEVER merged. Legacy/unowned rows (profile_key
+    NULL) are preserved but never returned (preserve-but-hide). LIVE renames
+    either rekey the active profile's history (target pairing new) or switch
+    to the existing pairing (target known) -- never merge.
     """
 
     def setUp(self) -> None:
@@ -1483,7 +1491,7 @@ class PerRadioNamespaceTests(unittest.TestCase):
         self.store = ChatStore.open(self.path)
         self.addCleanup(self.store.close)
 
-    def _write(self, text: str) -> None:
+    def _write_channel(self, text: str, key: str = "id:primary") -> None:
         self.store.add_incoming(
             packet_id=hash(text) % 1_000_000,
             node_id="!a11ce001",
@@ -1493,91 +1501,201 @@ class PerRadioNamespaceTests(unittest.TestCase):
             text=text,
             radio_rx_at=100.0,
             received_at=100.0,
-            channel_key="id:primary",
+            channel_key=key,
         )
 
-    def test_channels_are_isolated_between_physical_radios(self) -> None:
-        self.store.set_local_node_id("!poly")
-        self._write("POLY primary history")
-        self.store.set_local_node_id("!soho")
-        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
-        self.assertTrue(not page.messages)
+    def _write_dm(self, text: str, dm: str = "!a11ce001") -> None:
         self.store.add_incoming(
-            packet_id=7,
-            node_id="!b",
-            sender_name="SOHO",
-            sender_short_name="SOHO",
+            packet_id=hash(text) % 1_000_000,
+            node_id=dm,
+            sender_name="Alice",
+            sender_short_name="ALC",
             channel_index=0,
-            text="SOHO primary history",
+            text=text,
             radio_rx_at=100.0,
             received_at=100.0,
-            channel_key="id:primary",
+            dm_node_id=dm,
         )
-        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
-        self.assertEqual([m.text for m in page.messages], ["SOHO primary history"])
-        self.store.set_local_node_id("!poly")
-        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
-        self.assertEqual([m.text for m in page.messages], ["POLY primary history"])
 
-    def test_same_settings_different_radios_do_not_merge_dm_history(self) -> None:
-        for node_id in ("!poly", "!soho"):
-            self.store.set_local_node_id(node_id)
-            self.store.add_incoming(
-                packet_id=1,
-                node_id="!a11ce001",
-                sender_name="Alice",
-                sender_short_name="ALC",
-                channel_index=0,
-                text=f"{node_id} DM",
-                radio_rx_at=100.0,
-                received_at=100.0,
-                dm_node_id="!a11ce001",
-            )
-        self.store.set_local_node_id("!poly")
-        page = self.store.load_recent_dm_page("!a11ce001")
-        self.assertEqual([m.text for m in page.messages], ["!poly DM"])
-        self.store.set_local_node_id("!soho")
-        page = self.store.load_recent_dm_page("!a11ce001")
-        self.assertEqual([m.text for m in page.messages], ["!soho DM"])
+    def test_profile_key_canonicalizes_node_and_short_name(self) -> None:
+        from chat_store import canonical_profile_key, canonical_short_name, split_profile_key
+        # node id canonicalized; short name stripped + uppercased.
+        self.assertEqual(canonical_profile_key("!12345678", "  poly "), "!12345678:POLY")
+        self.assertEqual(canonical_profile_key("12345678", "poly"), "!12345678:POLY")
+        self.assertEqual(canonical_short_name("poly"), "POLY")
+        self.assertEqual(canonical_short_name(None), "")
+        # no usable node id -> None (no authority).
+        self.assertIsNone(canonical_profile_key(None, "POLY"))
+        # split round-trips the node half.
+        node, short = split_profile_key("!12345678:POLY")
+        self.assertEqual(node, "!12345678")
+        self.assertEqual(short, "POLY")
 
-    def test_dm_conversation_list_is_per_radio(self) -> None:
-        self.store.set_local_node_id("!poly")
-        self.store.add_incoming(
-            packet_id=1, node_id="!a11ce001", sender_name="A",
-            sender_short_name="A", channel_index=0, text="poly dm",
-            radio_rx_at=100.0, received_at=100.0, dm_node_id="!a11ce001",
+    def test_profiles_are_isolated_by_short_name_not_node_id_alone(self) -> None:
+        # !aaaa + POLY vs !aaaa + SOHO vs !aaaa + 1234 -> three namespaces.
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_channel("POLY history")
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        self._write_channel("SOHO history")
+        self.store.set_active_profile("!aaaaaaaa:1234")
+        self._write_channel("1234 history")
+
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            ["POLY history"],
         )
-        self.store.set_local_node_id("!soho")
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            ["SOHO history"],
+        )
+        self.store.set_active_profile("!aaaaaaaa:1234")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            ["1234 history"],
+        )
+
+    def test_same_short_name_case_is_same_profile(self) -> None:
+        # The APP canonicalizes the short name (strip + uppercase) before
+        # binding, so "poly" and "POLY" resolve to the SAME profile key.
+        from chat_store import canonical_profile_key
+        low = canonical_profile_key("!aaaaaaaa", "poly")
+        self.assertEqual(low, "!aaaaaaaa:POLY")
+        self.store.set_active_profile(low)
+        self._write_channel("lower history")
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self.assertIn(
+            "lower history",
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+        )
+
+    def test_dm_history_isolated_per_profile(self) -> None:
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_dm("poly dm")
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        self._write_dm("soho dm")
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_dm_page("!a11ce001").messages],
+            ["poly dm"],
+        )
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_dm_page("!a11ce001").messages],
+            ["soho dm"],
+        )
+
+    def test_dm_conversation_list_is_per_profile(self) -> None:
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_dm("poly dm", dm="!a11ce001")
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
         self.assertEqual(self.store.list_dm_conversations(), [])
-        self.store.add_incoming(
-            packet_id=2, node_id="!b1111111", sender_name="B",
-            sender_short_name="B", channel_index=0, text="soho dm",
-            radio_rx_at=100.0, received_at=100.0, dm_node_id="!b1111111",
+        self._write_dm("soho dm", dm="!b1111111")
+        self.assertEqual(
+            [c[0] for c in self.store.list_dm_conversations()],
+            ["!b1111111"],
         )
-        self.assertEqual([c[0] for c in self.store.list_dm_conversations()], ["!b1111111"])
 
     def test_legacy_null_rows_are_preserved_but_hidden(self) -> None:
-        # Write before any namespace binding -> local_node_id stays NULL.
+        # Write before any profile bound -> profile_key stays NULL.
         self.store.add_incoming(
             packet_id=99, node_id="!old", sender_name="Old",
             sender_short_name="OLD", channel_index=0, text="legacy unowned",
             radio_rx_at=100.0, received_at=100.0, channel_key="id:primary",
         )
-        self.store.set_local_node_id("!poly")
+        self.store.set_active_profile("!aaaaaaaa:POLY")
         page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
         self.assertEqual([m.text for m in page.messages], [])
-        self.assertTrue(not page.messages)
-
-    def test_unknown_namespace_reads_nothing(self) -> None:
-        self.store.set_local_node_id("!poly")
-        self.store.add_incoming(
-            packet_id=5, node_id="!a", sender_name="A", sender_short_name="A",
-            channel_index=0, text="poly",
-            radio_rx_at=100.0, received_at=100.0, channel_key="id:primary",
+        # The legacy row is still physically present, unowned.
+        self.assertEqual(
+            self.store._connection.execute(
+                "SELECT local_node_id, profile_key FROM messages"
+            ).fetchone()["profile_key"],
+            None,
         )
-        self.store.set_local_node_id(None)
+
+    def test_unknown_unresolved_profile_reads_nothing(self) -> None:
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_channel("poly")
+        self.store.set_active_profile(None)
         page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
         self.assertTrue(not page.messages)
+
+    def test_new_packets_are_written_into_the_active_profile(self) -> None:
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_channel("new packet")
+        self.assertEqual(self.store._connection.execute(
+            "SELECT profile_key FROM messages"
+        ).fetchone()["profile_key"], "!aaaaaaaa:POLY")
+
+    def test_dedup_is_profile_aware(self) -> None:
+        # The SAME remote packet id under two different profiles are two rows.
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self.store.add_incoming(
+            packet_id=777, node_id="!bbbb", sender_name="B", sender_short_name="B",
+            channel_index=0, text="poly copy", radio_rx_at=100.0, received_at=100.0,
+            channel_key="id:primary",
+        )
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        r = self.store.add_incoming(
+            packet_id=777, node_id="!bbbb", sender_name="B", sender_short_name="B",
+            channel_index=0, text="soho copy", radio_rx_at=100.0, received_at=100.0,
+            channel_key="id:primary",
+        )
+        self.assertTrue(r.inserted)
+
+    def test_live_rename_new_target_rekeys_history(self) -> None:
+        # CASE 1: rename POLY -> JUNK when JUNK is unknown migrates the rows.
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_channel("history follows")
+        self.store.ensure_profile("!aaaaaaaa", "POLY")
+        self.store.migrate_profile_association("!aaaaaaaa:POLY", "!aaaaaaaa:JUNK")
+        self.store.set_active_profile("!aaaaaaaa:JUNK")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            ["history follows"],
+        )
+        # Original POLY pairing is now empty (never merged/duplicated).
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            [],
+        )
+
+    def test_live_rename_to_existing_profile_switches_not_migrates(self) -> None:
+        # CASE 2: rename SOHO -> POLY; POLY already exists with History A.
+        self.store.set_active_profile("!aaaaaaaa:POLY")
+        self._write_channel("A history")
+        self.store.ensure_profile("!aaaaaaaa", "POLY")
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        self._write_channel("B history")
+        self.store.ensure_profile("!aaaaaaaa", "SOHO")
+        # Live rename SOHO -> POLY: switch (do not migrate B into A).
+        self.store.switch_profile("!aaaaaaaa:POLY")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            ["A history"],
+        )
+        # B stays stored under SOHO.
+        self.store.set_active_profile("!aaaaaaaa:SOHO")
+        self.assertEqual(
+            [m.text for m in self.store.load_recent_page(channel_index=0, channel_key="id:primary").messages],
+            ["B history"],
+        )
+
+    def test_profiles_registry_persists_across_reopen(self) -> None:
+        self.store.ensure_profile("!aaaaaaaa", "POLY")
+        self.store.ensure_profile("!aaaaaaaa", "SOHO")
+        keys = set(self.store.list_profile_keys())
+        self.assertEqual(keys, {"!aaaaaaaa:POLY", "!aaaaaaaa:SOHO"})
+        self.store.close()
+        reopened = ChatStore.open(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(
+            set(reopened.list_profile_keys()),
+            {"!aaaaaaaa:POLY", "!aaaaaaaa:SOHO"},
+        )
 
 
 if __name__ == "__main__":

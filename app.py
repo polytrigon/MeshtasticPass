@@ -48,6 +48,9 @@ from chat_store import (
     OLDER_HISTORY_PAGE_SIZE,
     ChatStore,
     ChatStoreError,
+    canonical_profile_key,
+    normalize_profile_node_id,
+    split_profile_key,
 )
 from geo import format_distance_miles
 from host_timezone import detect_host_timezone
@@ -4321,15 +4324,17 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
-        # The canonical local node ID of the physical radio whose CHAT
-        # conversation namespace is currently live (Problem 1 -- per-
-        # physical-radio CHAT history isolation). Only ever set to a
-        # RESOLVED ONLINE identity; never cleared to None by a transient
-        # CONNECTING event. Mirrored into chat_store via set_local_node_id
-        # so every persistence read/write is scoped to exactly this radio;
-        # a different connected radio never leaks this one's history, and
-        # switching back restores it.
-        self._local_radio_node_id: str | None = None
+        # The LOCAL CHAT HISTORY PROFILE (canonical local node ID + canonical
+        # SHORT NAME) currently live. Only ever set to a RESOLVED ONLINE
+        # pairing; never cleared to None by a transient CONNECTING event.
+        # Mirrored into chat_store via set_active_profile so every persistence
+        # read/write is scoped to exactly this profile; a different (node ID +
+        # SHORT NAME) pairing never leaks its history, and switching back
+        # restores it. LONG NAME is NOT part of the profile (presentation only).
+        self._active_profile_key: str | None = None
+        # The most recently observed local SHORT NAME, used to build the
+        # profile key and to detect a live rename. Always the canonical form.
+        self._last_local_short_name: str | None = None
         # Local wall-clock moment AUTO SYNC last completed a clock-set
         # successfully in THIS session -- never the radio's own time
         # (see RadioService.sync_clock: AdminMessage has no get-time
@@ -5461,6 +5466,16 @@ class MeshtasticPassApp(App[None]):
             self._set_long_name_status("LONG NAME SAVED", "setting-success")
         else:
             self._set_short_name_status("SHORT NAME SAVED", "setting-success")
+            # A live SHORT NAME change: re-activate the local CHAT history
+            # profile so the (node ID + new SHORT NAME) pairing takes over
+            # (renaming/migrating or switching per the live-rename model)
+            # WITHOUT a reconnection. LONG NAME changes are ignored -- they
+            # never switch or migrate a profile.
+            info = event.info
+            self._activate_local_profile(
+                info.node_id if self._radio_state is RadioState.ONLINE else None,
+                info.short_name if self._radio_state is RadioState.ONLINE else None,
+            )
 
     @on(IdentitySaveFailed)
     def identity_save_failed(self, event: IdentitySaveFailed) -> None:
@@ -10807,70 +10822,99 @@ class MeshtasticPassApp(App[None]):
         """Restore the host terminal cursor; safe to call repeatedly."""
         self._terminal_cursor.restore()
 
-    def _activate_local_radio_namespace(self, local_node_id: str | None) -> None:
-        """Bind CHAT persistence + in-memory state to one physical radio.
+    def _activate_local_profile(
+        self,
+        node_id: str | None,
+        short_name: str | None = None,
+    ) -> None:
+        """Bind CHAT persistence + in-memory state to ONE local history profile.
 
-        Problem 1 (per-physical-radio CHAT history isolation). The
-        canonical local node ID is the ONLY thing that namespaces CHAT
-        state -- never long/short name, serial device path, network or
-        modem preset, or display label. A radio switch (POLY -> SOHO)
-        remaps the active namespace; switching back (SOHO -> POLY)
-        restores the original radio's persisted state.
+        The local CHAT history profile is (canonical local node ID +
+        canonical SHORT NAME) -- the privacy boundary is LOCAL DEVICE ACCESS,
+        not a cryptographic radio fingerprint. `node_id`+`short_name` names
+        the active profile; the store is bound to its durable profile_key
+        (see chat_store.canonical_profile_key). LONG NAME is never part of
+        the profile (presentation only, so a LONG NAME change never switches
+        or migrates a profile).
 
-        Only a RESOLVED ONLINE identity is ever kept here (`local_node_id`
-        becomes this store's namespace). A transient CONNECTING event
-        carrying info=None must NEVER be mistaken for "the radio changed":
-        it happens in the middle of an ordinary reconnect of the SAME
-        radio, and treating it as a different-radio switch would falsely
-        drop the just-reconnected radio's own in-memory conversation
-        state (and, by emptying its entries, defeat the current-channel
-        identity reconcile's fresh==current no-op path). So a None local
-        node id only defers the namespace: reads surface nothing (no
-        other radio's state is ever shown while the identity is
-        unresolved), but no cached conversation is discarded.
+        This is the SINGLE central place that activates a profile and applies
+        the LIVE-RENAME model:
+        - target pairing already EXISTS  -> switch to it (no merge/migrate)
+        - target pairing is NEW         -> migrate the current profile's
+          history into the new pairing (history follows the rename)
 
-        When the connected radio's RESOLVED local node ID genuinely
-        CHANGES (POLY -> SOHO), every in-memory per-conversation cache
-        (channel histories, drafts, unread markers, DM list/histories) is
-        discarded so nothing can leak across radios; the display then
-        rebuilds purely from the NEW namespace (which reads nothing for a
-        radio with no stored history, producing an empty CHAT as
-        required).
+        Only a RESOLVED ONLINE identity is ever kept here. A transient
+        CONNECTING event carrying info=None must NEVER be mistaken for "the
+        profile changed": it happens mid-reconnect of the SAME profile, and
+        treating it as a different-profile switch would falsely drop the
+        just-reconnected profile's own in-memory conversation state. So a
+        None identity only defers: reads surface nothing (preserve-but-hide)
+        but no cached conversation is discarded.
+
+        When the connected (node ID + SHORT NAME) profile genuinely changes,
+        every in-memory per-conversation cache (channel histories, drafts,
+        unread markers, DM list/histories) is discarded so nothing can leak;
+        the display then rebuilds from the NEW profile.
         """
-        if local_node_id is None:
+        if node_id is None:
             # Identity unresolved (e.g. the CONNECTING event before the
-            # radio reports its node ID). Bind the store to the "no radio"
-            # namespace so both reads and writes agree on hiding everything
-            # (preserve-but-hide): the pre-namespacing/unattributable rows
-            # (NULL) must not leak into view yet, and a message that arrives
-            # before the identity resolves is stored with no radio attribut
-            # but intentionally kept hidden -- consistent, never leaked.
-            # CHAT history isolation must NOT surface another radio's (or a
-            # legacy NULL row's) content while the identity is unresolved.
-            # This is a NO-OP when the store is already bound to a resolved
-            # radio (a transient CONNECTING in the middle of an ordinary
-            # reconnect of the SAME radio): the resolved ONLINE identity
-            # below is what re-activates that namespace.
+            # radio reports its node ID): bind the store to the "no profile"
+            # namespace so reads and writes agree on hiding everything.
+            # NO-OP when already bound to a resolved profile (an ordinary
+            # reconnect of the SAME profile must not be mistaken for one).
             if self.chat_store is not None and not self.chat_store.is_namespace_bound():
-                self.chat_store.set_local_node_id(None)
+                self.chat_store.set_active_profile(None)
             return
-        if local_node_id == self._local_radio_node_id:
+
+        self._last_local_short_name = short_name
+        profile_key = canonical_profile_key(node_id, short_name)
+        if profile_key is None:
+            return
+        if profile_key == self._active_profile_key:
+            # Same profile (may be a reconnect); keep it bound.
             if self.chat_store is not None:
-                self.chat_store.set_local_node_id(local_node_id)
+                self.chat_store.set_active_profile(profile_key)
             return
-        previous_node_id = self._local_radio_node_id
-        self._local_radio_node_id = local_node_id
+
+        previous_key = self._active_profile_key
+        self._active_profile_key = profile_key
+
         if self.chat_store is not None:
-            self.chat_store.set_local_node_id(local_node_id)
-        if previous_node_id is None:
-            # First resolved identity for this app run -- there was no
-            # PREVIOUS radio whose mounted conversation state needs
-            # discarding (any state accumulated so far was, by definition,
-            # already read under this very namespace, e.g. messages that
-            # arrived within the same run before the identity resolved).
+            # LIVE-RENAME decision, made BEFORE ensure_profile (which would
+            # otherwise create the target pairing and conceal the fact that
+            # it was genuinely NEW): only migrate when the previous profile
+            # shares THIS node id (a rename of the same physical radio) and
+            # only when the target pairing is genuinely NEW.
+            previous_node, _previous_short = split_profile_key(previous_key)
+            target_preexisting = self.chat_store.profile_exists(profile_key)
+            if (
+                previous_key is not None
+                and previous_node == normalize_profile_node_id(node_id)
+                and not target_preexisting
+                and previous_key != profile_key
+            ):
+                # CASE 1: target pairing is NEW -> migrate the current
+                # profile's rows into the new pairing (history follows the
+                # rename; never merged or duplicated).
+                self.chat_store.migrate_profile_association(
+                    previous_key, profile_key
+                )
+                self.chat_store.set_active_profile(profile_key)
+            else:
+                # CASE 2 (target already exists) or a fresh/other node
+                # profile: switch to it; no data is migrated/merged.
+                self.chat_store.switch_profile(profile_key)
+            # Ensure the (now-active) target pairing is durably recorded,
+            # creating it only if it did not already exist.
+            self.chat_store.ensure_profile(node_id, short_name)
+
+        if previous_key is None:
+            # First resolved profile for this app run -- nothing from a
+            # PREVIOUS profile needs discarding.
             return
-        # A different physical radio is now attached: no conversation
-        # state owned by the previous radio may remain live in memory.
+
+        # A different (node ID + SHORT NAME) profile is now active: no
+        # conversation state owned by the previous profile may remain live.
         self._channel_states = {
             0: ChannelChatState()
         }
@@ -10884,6 +10928,12 @@ class MeshtasticPassApp(App[None]):
         self.dm_unread_count = 0
         self.transcript_new_count = 0
         self._new_dm_mode = False
+        # Rehydrate the CURRENT channel's history from the newly-bound
+        # profile (the state was just reset so it is unlatched and loads
+        # fresh under the new profile). Keeps self.chat_history truthful
+        # immediately; the transcript remount (if any) is driven by the
+        # existing _show_connection/reconcile path.
+        self._restore_channel_state(self.current_channel_index)
 
     def _show_connection(
         self,
@@ -10936,8 +10986,9 @@ class MeshtasticPassApp(App[None]):
         # docstring.
         if not (state is RadioState.ONLINE and was_online):
             self._reset_clock_sync_state()
-        self._activate_local_radio_namespace(
-            info.node_id if state is RadioState.ONLINE and info is not None else None
+        self._activate_local_profile(
+            info.node_id if state is RadioState.ONLINE and info is not None else None,
+            info.short_name if state is RadioState.ONLINE and info is not None else None,
         )
         if state is RadioState.ONLINE and info is not None and info.channels:
             self._invalidate_reassigned_channel_caches(info.channels)

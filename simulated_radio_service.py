@@ -39,11 +39,13 @@ from radio_service import (
 
 SIMULATED_DEVICE_PATHS = ("/dev/ttyUSB0", "/dev/ttyUSB1")
 # The deterministic canonical local node ID the simulated radio reports
-# as its own identity. Tests that pre-seed ChatStore history for the
-# simulated radio must set_local_node_id to this before writing, so the
-# seeded rows live in the SAME per-radio namespace the app activates on
-# connect (CHAT state-integrity -- per-physical-radio history isolation).
+# as its own identity, and its canonical SHORT NAME. Tests that pre-seed
+# ChatStore history for the simulated radio must set_active_profile to
+# canonical_profile_key(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
+# before writing, so the seeded rows live in the SAME local history profile
+# the app activates on connect (CHAT history profile isolation).
 SIMULATED_LOCAL_NODE_ID = "!51a00001"
+SIMULATED_SHORT_NAME = "SIM"
 SIMULATED_CHANNELS = (
     ChannelInfo(0, "LongFast", stable_key="sim-longfast"),
     ChannelInfo(1, "Hiking", stable_key="sim-hiking"),

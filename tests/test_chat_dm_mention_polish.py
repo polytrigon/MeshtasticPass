@@ -26,6 +26,7 @@ from chat_store import ChatStore
 from radio_service import NodeMetadata, RadioState, ReceivedMessage
 from simulated_radio_service import (
     SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_SHORT_NAME,
     SIMULATED_MESSAGES,
     SimulatedRadioService,
 )
@@ -770,7 +771,7 @@ class ChannelDropdownOwnershipTests(ChatDmMentionAppTestsBase):
 class DmDropdownTests(ChatDmMentionAppTestsBase):
     async def test_d_opens_dropdown_with_real_conversations(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(store.close)
         store.add_incoming(
             packet_id=1,
@@ -813,7 +814,7 @@ class DmDropdownTests(ChatDmMentionAppTestsBase):
 
     async def test_dm_dropdown_orders_by_most_recent_activity(self) -> None:
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(store.close)
         store.add_incoming(
             packet_id=1,
@@ -850,7 +851,7 @@ class DmDropdownTests(ChatDmMentionAppTestsBase):
         selecting its own exact node_id.
         """
         store = ChatStore.open(self.chat_db_path)
-        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
+        store.set_local_profile(SIMULATED_LOCAL_NODE_ID, SIMULATED_SHORT_NAME)
         self.addCleanup(store.close)
         store.add_incoming(
             packet_id=1,
