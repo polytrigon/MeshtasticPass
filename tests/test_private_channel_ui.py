@@ -788,7 +788,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             header = str(app.query_one("#chat-header").render())
             self.assertNotIn("PSK", header)
 
-    async def test_p_copies_psk_only_when_composer_not_focused(self) -> None:
+    async def test_ctrl_e_opens_edit_channel_with_current_name_and_key(self) -> None:
         from radio_service import ChannelInfo
 
         app = self._make_app()
@@ -805,11 +805,15 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.pause()
             app.query_one("#chat-log").focus()
             await pilot.pause()
-            copied = []
-            app.copy_to_clipboard = lambda text: copied.append(text)
-            await pilot.press("p")
+            await pilot.press("ctrl+e")
             await pilot.pause()
-            self.assertEqual(copied, [b64])
+            # CTRL+E opens the EDIT CHANNEL overlay with the current values.
+            self.assertTrue(app._edit_channel_editor_open)
+            self.assertEqual(app.query_one("#edit-channel-name").value, "SECRET")
+            self.assertEqual(app.query_one("#edit-channel-key").value, b64)
+            self.assertEqual(
+                app.query_one("#chat-channel-content").current, "edit-channel-editor"
+            )
 
     async def test_p_while_composer_focused_types_and_does_not_copy(self) -> None:
         from radio_service import ChannelInfo
@@ -846,7 +850,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertNotIn("P copy psk", footer)
             self.assertNotIn("CTRL+D delete", footer)
 
-    async def test_private_channel_footer_offers_copy_no_channel_delete(self) -> None:
+    async def test_private_channel_footer_offers_edit_not_delete_or_copy(self) -> None:
         from radio_service import ChannelInfo
         import base64 as _b64
 
@@ -862,10 +866,11 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.query_one("#chat-log").focus()
             await pilot.pause()
             footer = str(app.query_one("#footer").render())
-            self.assertIn("P copy psk", footer)
-            self.assertIn("CTRL+D delete", footer)
+            self.assertIn("CTRL+E edit", footer)
+            self.assertNotIn("P copy psk", footer)
+            self.assertNotIn("CTRL+D delete", footer)
 
-    async def test_ctrl_d_deletes_private_channel_locally_and_not_primary(self) -> None:
+    async def test_edit_channel_delete_confirmation_removes_private_channel(self) -> None:
         from radio_service import ChannelInfo, RadioState
 
         app = self._make_app()
@@ -880,14 +885,27 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.current_channel_index = 1
             app.query_one("#chat-log").focus()
             await pilot.pause()
-            await pilot.press("ctrl+d")
+            # CTRL+E opens the EDIT CHANNEL overlay.
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_editor_open)
+            # Enter the in-place DELETE CHANNEL confirmation.
+            app._enter_edit_channel_delete_confirm()
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_delete_confirm)
+            self.assertEqual(
+                app.query_one("#edit-channel-content").current,
+                "edit-channel-delete-confirm",
+            )
+            # YES deletes SECRET locally; PRIMARY (MEDIUMSLOW) is kept.
+            app._confirm_delete_edit_channel()
             for _ in range(15):
                 await pilot.pause()
                 if app.current_channel_index == 0:
                     break
-            # SECRET removed locally; PRIMARY (MEDIUMSLOW) selected and kept.
             self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
             self.assertEqual(app.current_channel_index, 0)
+            self.assertFalse(app._edit_channel_editor_open)
 
     async def test_ctrl_d_does_not_delete_primary(self) -> None:
         from radio_service import ChannelInfo, RadioState
@@ -906,7 +924,7 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
             self.assertEqual(app.current_channel_index, 0)
 
-    async def test_ctrl_d_persists_hidden_identity_across_reload(self) -> None:
+    async def test_edit_channel_delete_persists_hidden_identity_across_reload(self) -> None:
         from radio_service import ChannelInfo, RadioState
 
         app = self._make_app()
@@ -921,7 +939,11 @@ class PskHeaderTests(PrivateChannelUiBase):
             app.current_channel_index = 1
             app.query_one("#chat-log").focus()
             await pilot.pause()
-            await pilot.press("ctrl+d")
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            app._enter_edit_channel_delete_confirm()
+            await pilot.pause()
+            app._confirm_delete_edit_channel()
             for _ in range(15):
                 await pilot.pause()
                 if app.current_channel_index == 0:
@@ -1021,8 +1043,9 @@ class PskHeaderTests(PrivateChannelUiBase):
             self.assertEqual(app.current_channel_index, 1)
             self.assertNotIsInstance(app.focused, Input)
             footer = str(app.query_one("#footer").render())
-            self.assertIn("CTRL+D delete", footer)
-            self.assertIn("P copy psk", footer)
+            self.assertIn("CTRL+E edit", footer)
+            self.assertNotIn("P copy psk", footer)
+            self.assertNotIn("CTRL+D delete", footer)
             # Focus the composer -> composer footer.
             app.query_one("#chat-input").focus()
             await pilot.pause()
@@ -1033,8 +1056,9 @@ class PskHeaderTests(PrivateChannelUiBase):
             await pilot.press("escape")
             await pilot.pause()
             footer = str(app.query_one("#footer").render())
-            self.assertIn("CTRL+D delete", footer)
-            self.assertIn("P copy psk", footer)
+            self.assertIn("CTRL+E edit", footer)
+            self.assertNotIn("CTRL+D delete", footer)
+            self.assertNotIn("P copy psk", footer)
 
     async def test_channel_footer_omits_arrow_and_enter_labels(self) -> None:
         app = self._make_app()
@@ -1136,57 +1160,83 @@ class SaveCancelSpacingTests(PrivateChannelUiBase):
             )
 
 
-class PskCopyConfirmationTests(PrivateChannelUiBase):
-    def _private(self, app):
+class EditChannelFormTests(PrivateChannelUiBase):
+    """EDIT CHANNEL overlay: SAVE applies a name edit; CANCEL and the
+    in-place DELETE CHANNEL NO path leave the channel unchanged; the key is
+    shown (never a fake/masked key)."""
+
+    def _private(self, app, name="SECRET"):
         import base64 as _b64
         from radio_service import ChannelInfo
 
         b64 = _b64.b64encode(bytes(range(16))).decode("ascii")
-        app._channels = (ChannelInfo(1, "SECRET"),)
+        app._channels = (ChannelInfo(1, name),)
         app.current_channel_index = 1
         app.radio.channel_psk_text = lambda index: b64
         return b64
 
-    async def test_psk_copy_success_uses_accent_and_dismisses(self) -> None:
-        app = self._make_app()
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause()
-            app.show_tab("chat")
-            await pilot.pause()
-            b64 = self._private(app)
-            copied = []
-            app.copy_to_clipboard = lambda text: copied.append(text)
-            app.query_one("#chat-log").focus()
-            await pilot.pause()
-            await pilot.press("p")
-            await pilot.pause()
-            self.assertEqual(copied, [b64])
-            w = app.query_one("#send-error")
-            self.assertTrue(w.has_class("setting-accent"))
-            self.assertEqual(str(w.render()), "PSK COPIED")
-            # Simulate the 10s auto-dismiss timer firing.
-            app._auto_dismiss_send_error()
-            await pilot.pause()
-            self.assertFalse(w.has_class("setting-accent"))
-            self.assertEqual(str(w.render()), "")
+    async def test_cancel_leaves_channel_unchanged(self) -> None:
+        import base64 as _b64
+        from radio_service import ChannelInfo
 
-    async def test_psk_copy_failure_uses_error(self) -> None:
         app = self._make_app()
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             app.show_tab("chat")
+            b64 = self._private(app, name="SECRET")
             await pilot.pause()
-            self._private(app)
-            app.copy_to_clipboard = lambda text: (_ for _ in ()).throw(
-                OSError("clipboard unavailable")
-            )
             app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
             await pilot.pause()
-            await pilot.press("p")
+            self.assertTrue(app._edit_channel_editor_open)
+            # Editing the name, then CANCEL discards it.
+            app.query_one("#edit-channel-name").value = "RENAMED"
+            app.query_one("#edit-channel-name").focus()
+            app.edit_channel_cancel(None)
             await pilot.pause()
-            w = app.query_one("#send-error")
-            self.assertEqual(str(w.render()), "PSK COPY FAILED")
-            self.assertFalse(w.has_class("setting-accent"))
+            self.assertFalse(app._edit_channel_editor_open)
+            self.assertEqual(app._channels[0].name, "SECRET")
+
+    async def test_save_applies_name_edit(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            app.query_one("#edit-channel-name").value = "RENAMED"
+            app._save_edit_channel()
+            await pilot.pause()
+            self.assertFalse(app._edit_channel_editor_open)
+            self.assertEqual([c.name for c in app._channels], ["RENAMED"])
+
+    async def test_delete_no_returns_to_form_without_deleting(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            # Enter DELETE CHANNEL confirmation, then NO returns to the form.
+            app._enter_edit_channel_delete_confirm()
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_delete_confirm)
+            app.edit_channel_delete_no(None)
+            await pilot.pause()
+            self.assertFalse(app._edit_channel_delete_confirm)
+            self.assertEqual(
+                app.query_one("#edit-channel-content").current, "edit-channel-form"
+            )
+            self.assertEqual([c.name for c in app._channels], ["SECRET"])
+            # The channel was not deleted; the overlay is still open.
+            self.assertTrue(app._edit_channel_editor_open)
+
 
 class ChatNetworkIdentityTests(PrivateChannelUiBase):
     async def test_unnamed_primary_channel_label_is_primary_not_mediumslow(

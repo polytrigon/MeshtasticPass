@@ -957,6 +957,132 @@ class NewChannelCancel(Static):
             event.stop()
 
 
+class EditChannelSave(Static):
+    """[ SAVE ] -- apply edits to the currently-edited private channel."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ SAVE ]",
+            id="edit-channel-save",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
+class EditChannelCancel(Static):
+    """[ CANCEL ] -- close the EDIT CHANNEL editor without changes. Zero RF."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ CANCEL ]",
+            id="edit-channel-cancel",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
+class EditChannelDelete(Static):
+    """[ DELETE CHANNEL ] -- enter the in-place YES/NO confirmation for the
+    currently-edited private channel. Selectable, but does NOT delete."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ DELETE CHANNEL ]",
+            id="edit-channel-delete",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
+class EditChannelDeleteYes(Static):
+    """[ YES ] -- confirm deletion of the current private channel."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ YES ]",
+            id="edit-channel-delete-yes",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
+class EditChannelDeleteNo(Static):
+    """[ NO ] -- return to the EDIT CHANNEL form without deleting."""
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ NO ]",
+            id="edit-channel-delete-no",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
 class SaveNetworkControl(Static):
     """[ SAVE ] -- validate the NEW NETWORK editor, then (after a
 
@@ -3745,6 +3871,21 @@ class MeshtasticPassApp(App[None]):
         height: 1fr;
     }
 
+    /* Shared CHAT channel-editor overlay treatment. Both the NEW CHANNEL
+       form and the EDIT CHANNEL form render as an overlaid form replacing
+       the channel conversation, rather than as a separate tab, and share
+       this exact visual/structure: a page-title heading, the labeled
+       CHANNEL NAME / CHANNEL KEY rows (via NetworkFieldInput), an
+       editor-actions [ SAVE ] [ CANCEL ] row, and an editor-hint line. The
+       class exists so the same treatment is invoked from both places
+       without duplicating rules; appearance is unchanged from how the
+       NEW CHANNEL editor already looks (the two forms now share one class
+       rather than one carrying bespoke styling). */
+    .channel-editor-overlay {
+        height: 1fr;
+        min-height: 0;
+    }
+
     #radio-status {
         height: 2;
     }
@@ -4328,6 +4469,14 @@ class MeshtasticPassApp(App[None]):
         self._pending_channel: PendingChannelConfig | None = None
         self._new_channel_error = ""
         self._new_channel_editor_open = False
+        # EDIT CHANNEL (private-channel CTRL+E): the transient CHAT-local
+        # overlay for editing the CURRENT private channel's name/key and
+        # (after an in-place YES/NO confirm) locally deleting it. Distinct
+        # from the configured-channel selector and from NEW CHANNEL. Zero
+        # writes/RF except the (explicit) deletion path/SAVE.
+        self._edit_channel_editor_open = False
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
         # Guards against duplicate APPLY writes while an async apply is live.
         self._pending_apply_active = False
         # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
@@ -4646,7 +4795,7 @@ class MeshtasticPassApp(App[None]):
                                 )
                             with Vertical(
                                 id="new-channel-editor",
-                                classes="new-channel-editor editor-form",
+                                classes="new-channel-editor editor-form channel-editor-overlay",
                             ):
                                 yield Static(
                                     "NEW CHANNEL",
@@ -4678,6 +4827,58 @@ class MeshtasticPassApp(App[None]):
                                     markup=False,
                                 )
                                 yield Static(id="new-channel-error", markup=False)
+                            with Vertical(
+                                id="edit-channel-editor",
+                                classes="edit-channel-editor editor-form channel-editor-overlay",
+                            ):
+                                with ContentSwitcher(
+                                    initial="edit-channel-form", id="edit-channel-content"
+                                ):
+                                    with Vertical(id="edit-channel-form"):
+                                        yield Static(
+                                            "EDIT CHANNEL",
+                                            classes="page-title",
+                                            markup=False,
+                                        )
+                                        yield NetworkFieldInput(
+                                            label="CHANNEL NAME",
+                                            widget_id="edit-channel-name-row",
+                                            input_id="edit-channel-name",
+                                            collapsible=False,
+                                        )
+                                        yield NetworkFieldInput(
+                                            label="CHANNEL KEY",
+                                            widget_id="edit-channel-key-row",
+                                            input_id="edit-channel-key",
+                                            collapsible=False,
+                                        )
+                                        yield Static(
+                                            "[ DELETE CHANNEL ]",
+                                            id="edit-channel-delete",
+                                            classes="connection-action-row",
+                                            markup=False,
+                                        )
+                                        with Horizontal(
+                                            id="edit-channel-actions",
+                                            classes="editor-actions",
+                                            markup=False,
+                                        ):
+                                            yield EditChannelSave()
+                                            yield EditChannelCancel()
+                                        yield Static(id="edit-channel-error", markup=False)
+                                    with Vertical(id="edit-channel-delete-confirm"):
+                                        yield Static(
+                                            "DELETE CHANNEL",
+                                            classes="page-title",
+                                            markup=False,
+                                        )
+                                        with Horizontal(
+                                            id="edit-channel-delete-actions",
+                                            classes="editor-actions",
+                                            markup=False,
+                                        ):
+                                            yield EditChannelDeleteYes()
+                                            yield EditChannelDeleteNo()
                     with Vertical(id="chat-dms"):
                         yield Static(
                             id="dm-connection-status",
@@ -4888,23 +5089,53 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
         if (
-            event.key == "ctrl+d"
+            event.key == "ctrl+e"
             and self.current_tab == "chat"
             and self._chat_mode == "channel"
             and not self._new_channel_editor_open
+            and not self._edit_channel_editor_open
             and self.current_channel_index > 0
             and any(
                 channel.index == self.current_channel_index
                 for channel in self._channels
             )
         ):
-            # CTRL+D deletes a configured private/configured (non-PRIMARY)
-            # channel from the app-visible list/state, locally only. Zero
-            # radio writes/RF. PRIMARY (index 0) and the NEW CHANNEL editor
-            # are never targets.
-            self._delete_current_channel()
+            # CTRL+E opens the EDIT CHANNEL overlay for a configured private/
+            # configured (non-PRIMARY) channel. Zero writes/RF. PRIMARY
+            # (index 0), the NEW CHANNEL editor, and the DM list are never
+            # targets.
+            self._open_edit_channel()
             event.stop()
             return
+        if self._edit_channel_editor_open and self.current_tab == "chat":
+            # EDIT CHANNEL overlay is active: UP/DOWN navigate its fields,
+            # ESC cancels/moves back. Printable characters and ENTER are left
+            # to the focused editor field/control so typing works normally.
+            if event.key == "escape":
+                if self._edit_channel_delete_confirm:
+                    # ESC from the in-place DELETE CHANNEL YES/NO returns to the
+                    # form (does not delete, does not discard form values).
+                    self._edit_channel_delete_confirm = False
+                    self._edit_channel_error = ""
+                    self._refresh_edit_channel()
+                    self._focus_edit_channel_field("name")
+                else:
+                    self._close_edit_channel()
+                event.stop()
+                return
+            if event.key in ("up", "down"):
+                self._move_edit_channel_focus(-1 if event.key == "up" else 1)
+                event.stop()
+                return
+            focused_field = self._edit_channel_focused_field()
+            if event.key == "right" and focused_field == "save":
+                self._focus_edit_channel_field("cancel")
+                event.stop()
+                return
+            if event.key == "left" and focused_field == "cancel":
+                self._focus_edit_channel_field("save")
+                event.stop()
+                return
         if self._new_channel_editor_open and self.current_tab == "chat":
             # NEW CHANNEL editor is active: UP/DOWN navigate the editor
             # fields, ESC cancels. Printable characters and ENTER are left
@@ -5029,14 +5260,6 @@ class MeshtasticPassApp(App[None]):
                 selector.open_menu()
                 event.stop()
                 return
-            if event.key == "p" and self.current_channel_index > 0 and self._channel_psk_metadata_text():
-                # Only when the current channel is a configured private one and
-                # the composer is NOT focused (the Input branch above already
-                # returned for a focused composer, so 'p'/'P' would otherwise
-                # type normally). Copies the normalized Base64 PSK; zero RF.
-                self._copy_current_psk()
-                event.stop()
-                return
             if event.key == "left":
                 self._focus_oldest_new_message()
                 event.stop()
@@ -5133,7 +5356,13 @@ class MeshtasticPassApp(App[None]):
                     return
             else:
                 if event.key == "escape":
-                    self._close_dm_conversation()
+                    # ESC inside an ACTIVE DM must NOT leave the DM (it must not
+                    # navigate back to the top-level DM conversation list). The
+                    # only ways to leave a DM are selecting another DM from the
+                    # DM dropdown or selecting a channel from the channel
+                    # dropdown. ESC here is a no-op: focus stays on the DM
+                    # transcript (the composer's own ESC already returned
+                    # to it above), and current_dm_node_id is preserved.
                     event.stop()
                     return
                 transcript = self.query_one("#dm-log", ChatTranscript)
@@ -7692,7 +7921,7 @@ class MeshtasticPassApp(App[None]):
 
         self._render_chat_status()
         # The footer must reflect the channel just selected (its context, e.g.
-        # private-channel CTRL+D delete / P copy psk). _switch_chat_mode's own
+        # private-channel CTRL+E edit). _switch_chat_mode's own
         # earlier _update_footer() ran before the channel index changed here,
         # so without this the footer is stale until the next focus event.
         self._update_footer()
@@ -9547,12 +9776,57 @@ class MeshtasticPassApp(App[None]):
         if self._new_channel_editor_open:
             self._focus_new_channel_field("key" if self._new_channel_error else "save")
 
+    @on(Input.Submitted, "#edit-channel-name")
+    def edit_channel_name_submitted(self, _event: Input.Submitted) -> None:
+        if self._edit_channel_editor_open:
+            self._focus_edit_channel_field("key")
+
+    @on(Input.Submitted, "#edit-channel-key")
+    def edit_channel_key_submitted(self, _event: Input.Submitted) -> None:
+        if self._edit_channel_editor_open:
+            self._focus_edit_channel_field(
+                "delete" if self._edit_channel_error else "delete"
+            )
+
     @on(NewChannelCancel.Activated)
     def new_channel_cancel(self, _event: NewChannelCancel.Activated) -> None:
         if not self._new_channel_editor_open:
             return
         self._cancel_new_channel()
         self.query_one("#chat-log", ChatTranscript).focus()
+
+    @on(EditChannelSave.Activated)
+    def edit_channel_save(self, _event: EditChannelSave.Activated) -> None:
+        if not self._edit_channel_editor_open:
+            return
+        self._save_edit_channel()
+
+    @on(EditChannelCancel.Activated)
+    def edit_channel_cancel(self, _event: EditChannelCancel.Activated) -> None:
+        if not self._edit_channel_editor_open:
+            return
+        self._close_edit_channel()
+
+    @on(EditChannelDelete.Activated)
+    def edit_channel_delete(self, _event: EditChannelDelete.Activated) -> None:
+        if not self._edit_channel_editor_open:
+            return
+        self._enter_edit_channel_delete_confirm()
+
+    @on(EditChannelDeleteYes.Activated)
+    def edit_channel_delete_yes(self, _event: EditChannelDeleteYes.Activated) -> None:
+        if not self._edit_channel_delete_confirm:
+            return
+        self._confirm_delete_edit_channel()
+
+    @on(EditChannelDeleteNo.Activated)
+    def edit_channel_delete_no(self, _event: EditChannelDeleteNo.Activated) -> None:
+        if not self._edit_channel_delete_confirm:
+            return
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
+        self._refresh_edit_channel()
+        self._focus_edit_channel_field("name")
 
     def _pending_channel_psk_summary(self) -> str:
         """The generated/normalized key text for the pending editor, or "".
@@ -9587,47 +9861,6 @@ class MeshtasticPassApp(App[None]):
                 return ""
             return psk
         return ""
-
-    def _copy_current_psk(self) -> bool:
-        """Copy the current configured channel's normalized Base64 PSK.
-
-        Reuses Textual's built-in clipboard mechanism (App.copy_to_clipboard,
-        OSC 52) -- no new dependency. Returns True when a private-channel PSK
-        was available and copied; the PSK is never printed/logged. A compact
-        ACCENT confirmation uses the existing CHAT status row (#send-error) with
-        the app's established timed-dismiss convention; a genuine clipboard
-        failure uses ERROR.
-        """
-        psk = self._channel_psk_metadata_text()
-        if not psk:
-            return False
-        try:
-            self.copy_to_clipboard(psk)
-        except Exception:
-            self._show_send_error("PSK COPY FAILED")
-            return False
-        self._show_psk_copy_status("PSK COPIED")
-        return True
-
-    def _show_psk_copy_status(self, message: str) -> None:
-        """Show a compact ACCENT PSK-copy confirmation on the CHAT status row.
-
-        Reuses the existing timed-dismiss convention (_send_error_dismiss_timer
-        + _auto_dismiss_send_error, SEND_ERROR_AUTO_DISMISS_SECONDS) so the
-        confirmation clears itself without any focus/navigation change. The PSK
-        itself is never part of the message.
-        """
-        if self._send_error_dismiss_timer is not None:
-            self._send_error_dismiss_timer.stop()
-            self._send_error_dismiss_timer = None
-        self._send_error_message = message
-        widgets = list(self.query("#send-error"))
-        if widgets:
-            widgets[0].add_class("setting-accent")
-        self._send_error_dismiss_timer = self.set_timer(
-            SEND_ERROR_AUTO_DISMISS_SECONDS, self._auto_dismiss_send_error
-        )
-        self._render_chat_status()
 
     def _chat_header_network_text(self) -> str:
         """The active NETWORK identity shown first in the CHAT header.
@@ -9737,6 +9970,205 @@ class MeshtasticPassApp(App[None]):
         )
         self._update_tab_bar()
         self._update_footer()
+
+    # ---- EDIT CHANNEL (private-channel CTRL+E) -------------------------
+
+    def _current_private_channel(self) -> ChannelInfo | None:
+        """The currently-selected configured channel, if it is a private one."""
+        for channel in self._channels:
+            if channel.index == self.current_channel_index and channel.index > 0:
+                return channel
+        return None
+
+    def _open_edit_channel(self) -> None:
+        """Open the EDIT CHANNEL overlay for the current private channel.
+
+        Prepopulates CHANNEL NAME with the current name and CHANNEL KEY with
+        the actual current channel key (never a placeholder/masked fake key
+        when the real key is available). Zero writes/RF. CTRL+E is only
+        offered for a configured private/non-PRIMARY channel.
+        """
+        channel = self._current_private_channel()
+        if channel is None:
+            return
+        if self.current_tab != "chat":
+            self.show_tab("chat")
+        self._switch_chat_mode("channel")
+        self._edit_channel_editor_open = True
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
+        name_inputs = list(self.query("#edit-channel-name"))
+        if name_inputs:
+            name_inputs[0].value = channel.name
+        key_inputs = list(self.query("#edit-channel-key"))
+        if key_inputs:
+            key_inputs[0].value = self._channel_psk_metadata_text()
+        self._refresh_edit_channel()
+        self._focus_edit_channel_field("name")
+        self._update_footer()
+
+    def _close_edit_channel(self) -> None:
+        """Close the EDIT CHANNEL overlay without applying anything. Zero RF."""
+        self._edit_channel_editor_open = False
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
+        self._refresh_edit_channel()
+        if self.current_tab == "chat" and self._chat_mode == "channel":
+            self.query_one("#chat-log", ChatTranscript).focus()
+        self._update_footer()
+
+    def _refresh_edit_channel(self) -> None:
+        """Show/hide the EDIT CHANNEL overlay + its in-place delete confirm.
+
+        Reflects `_edit_channel_editor_open` / `_edit_channel_delete_confirm`
+        / `_edit_channel_error`. Zero writes/RF. The inner ContentSwitcher
+        swaps between the form and the in-place DELETE CHANNEL YES/NO view
+        (never a second stacked overlay).
+        """
+        switcher_widgets = list(self.query("#chat-channel-content"))
+        if switcher_widgets:
+            switcher_widgets[0].current = (
+                "edit-channel-editor"
+                if self._edit_channel_editor_open
+                else "chat-conversation"
+            )
+        inner_widgets = list(self.query("#edit-channel-content"))
+        if inner_widgets:
+            inner_widgets[0].current = (
+                "edit-channel-delete-confirm"
+                if self._edit_channel_delete_confirm
+                else "edit-channel-form"
+            )
+        error_widgets = list(self.query("#edit-channel-error"))
+        if error_widgets:
+            error_widgets[0].display = bool(self._edit_channel_error)
+            error_widgets[0].update(self._edit_channel_error)
+
+    # Vertical stops: CHANNEL NAME, CHANNEL KEY, DELETE CHANNEL, SAVE. CANCEL
+    # is a horizontal sibling of SAVE (Right from SAVE / Left from CANCEL).
+    _EDIT_CHANNEL_FIELD_ORDER = ("name", "key", "delete", "save")
+
+    def _edit_channel_focused_field(self) -> str:
+        focused_id = getattr(self.focused, "id", None)
+        for field, selector in (
+            ("name", "edit-channel-name"),
+            ("key", "edit-channel-key"),
+            ("delete", "edit-channel-delete"),
+            ("save", "edit-channel-save"),
+            ("cancel", "edit-channel-cancel"),
+            ("delete_yes", "edit-channel-delete-yes"),
+            ("delete_no", "edit-channel-delete-no"),
+        ):
+            if focused_id == selector:
+                return field
+        return "name"
+
+    def _focus_edit_channel_field(self, field: str) -> None:
+        widget_ids = {
+            "name": "#edit-channel-name",
+            "key": "#edit-channel-key",
+            "delete": "#edit-channel-delete",
+            "save": "#edit-channel-save",
+            "cancel": "#edit-channel-cancel",
+            "delete_yes": "#edit-channel-delete-yes",
+            "delete_no": "#edit-channel-delete-no",
+        }
+        widgets = list(self.query(widget_ids[field]))
+        if widgets:
+            widgets[0].focus()
+            if isinstance(widgets[0], Input):
+                widgets[0].cursor_position = len(widgets[0].value)
+
+    def _move_edit_channel_focus(self, direction: int) -> None:
+        order = self._EDIT_CHANNEL_FIELD_ORDER
+        current = self._edit_channel_focused_field()
+        if current == "cancel":
+            current = "save"
+        try:
+            index = order.index(current)
+        except ValueError:
+            index = 0
+        target = order[max(0, min(len(order) - 1, index + direction))]
+        self._focus_edit_channel_field(target)
+
+    def _edit_channel_values(self) -> tuple[str, str]:
+        name_inputs = list(self.query("#edit-channel-name"))
+        key_inputs = list(self.query("#edit-channel-key"))
+        return (
+            name_inputs[0].value if name_inputs else "",
+            key_inputs[0].value if key_inputs else "",
+        )
+
+    def _save_edit_channel(self) -> bool:
+        """Apply the edited CHANNEL NAME (and key) to the current channel.
+
+        Editing a channel is a local, app-visible operation backed by the same
+        channel list: the name is updated in-place and the PSK is left as the
+        current one. Zero radio writes/RF (echoing the NEW CHANNEL editor's
+        local-only draft model; a future hardware APPLY boundary is separate).
+        Returns True on success.
+        """
+        channel = self._current_private_channel()
+        if channel is None:
+            return False
+        name, _key = self._edit_channel_values()
+        name = name.strip()
+        if not name:
+            self._edit_channel_error = "CHANNEL NAME REQUIRED"
+            self._edit_channel_editor_open = True
+            self._refresh_edit_channel()
+            return False
+        updated = tuple(
+            replace(ch, name=name) if ch.index == channel.index else ch
+            for ch in self._channels
+        )
+        self._channels = updated
+        selector = self.query_one(ChannelSelector)
+        selector.set_options(
+            (
+                DropdownOption(ch.name, ch.index)
+                for ch in self._channels
+            ),
+            value=self.current_channel_index,
+        )
+        self._edit_channel_editor_open = False
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
+        self._refresh_edit_channel()
+        if self.current_tab == "chat" and self._chat_mode == "channel":
+            self.query_one("#chat-log", ChatTranscript).focus()
+        self._update_footer()
+        return True
+
+    def _enter_edit_channel_delete_confirm(self) -> None:
+        """Swap the EDIT CHANNEL form for the in-place DELETE CHANNEL YES/NO."""
+        self._edit_channel_delete_confirm = True
+        self._edit_channel_error = ""
+        self._refresh_edit_channel()
+        self._focus_edit_channel_field("delete_yes")
+
+    def _confirm_delete_edit_channel(self) -> None:
+        """YES: delete the current private channel via the existing path, then
+        close the overlay and switch to the remaining/default channel."""
+        channel = self._current_private_channel()
+        if channel is None:
+            self._close_edit_channel()
+            return
+        index = channel.index
+        self._edit_channel_editor_open = False
+        self._edit_channel_delete_confirm = False
+        self._refresh_edit_channel()
+        self._delete_current_channel_by_index(index)
+
+    def _delete_current_channel_by_index(self, index: int) -> None:
+        """Delete the channel at `index` from the app-visible list/state.
+
+        Reuses the SAME local list-deletion semantics as _delete_current_channel
+        (hide via settings.hidden_channel_ids, switch to the next remaining
+        channel) so EDIT/DELETE-CHANNEL and CTRL+D stay one path. Zero RF.
+        """
+        self.current_channel_index = index
+        self._delete_current_channel()
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         # A DM has no LoadOlderControl, so the generic active-transcript
@@ -10922,17 +11354,17 @@ class MeshtasticPassApp(App[None]):
         elif self.current_tab == "chat" and self._chat_mode == "channel":
             text = "C channel    D dms    F4 quit"
             # A configured private/configured (non-PRIMARY) channel offers
-            # copy-PSK and CTRL+D (local list deletion). The public/default
-            # PRIMARY channel offers neither.
+            # CTRL+E (edit channel). The public/default PRIMARY channel offers
+            # neither edit nor delete, so it keeps the base line.
             if self.current_channel_index > 0 and self._channel_psk_metadata_text():
                 text = (
                     "C channel    D dms    "
-                    "CTRL+D delete    P copy psk    F4 quit"
+                    "CTRL+E edit    F4 quit"
                 )
             elif self.current_channel_index > 0:
                 text = (
                     "C channel    D dms    "
-                    "CTRL+D delete    F4 quit"
+                    "CTRL+E edit    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
             text = "C channel    1-3 tabs    F4 quit"
