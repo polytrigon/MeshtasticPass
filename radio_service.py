@@ -2734,19 +2734,18 @@ class RadioService:
 
     @staticmethod
     def _primary_channel_default_name(local_node: Any) -> str:
-        """Derive the unnamed primary channel label from the radio preset."""
-        try:
-            from meshtastic.protobuf import config_pb2
+        """UI fallback label for an UNNAMED primary (index 0) logical channel.
 
-            lora = local_node.localConfig.lora
-            if not lora.use_preset:
-                return ""
-            enum_name = config_pb2.Config.LoRaConfig.ModemPreset.Name(
-                lora.modem_preset
-            )
-        except (ImportError, AttributeError, KeyError, TypeError, ValueError):
-            return ""
-        return "".join(part.title() for part in enum_name.split("_"))
+        Returns "PRIMARY" -- the display-only fallback for a primary logical
+        channel with no meaningful configured name. It is NEVER the modem/radio
+        preset (e.g. "MediumSlow"): MEDIUM SLOW is the RF modem preset, not the
+        Meshtastic logical-channel identity, so it must not be presented as the
+        channel name. "PRIMARY" never reaches the radio (presentation only); the
+        channel's authoritative identity (settings.id / channel hash) is
+        unchanged. A genuinely named primary channel uses its real name instead
+        (see _read_channel_info).
+        """
+        return "PRIMARY"
 
 
 # Compact UI wording for the write STAGE a NETWORK apply failed at

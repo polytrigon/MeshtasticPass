@@ -1188,6 +1188,73 @@ class PskCopyConfirmationTests(PrivateChannelUiBase):
             self.assertEqual(str(w.render()), "PSK COPY FAILED")
             self.assertFalse(w.has_class("setting-accent"))
 
+class ChatNetworkIdentityTests(PrivateChannelUiBase):
+    async def test_unnamed_primary_channel_label_is_primary_not_mediumslow(
+        self,
+    ) -> None:
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            # A primary logical channel with no meaningful name is displayed as
+            # PRIMARY (never the modem preset "MediumSlow"/"MEDIUMSLOW").
+            app._channels = (ChannelInfo(0, "PRIMARY"),)
+            self.assertEqual(app._channel_label(0), "PRIMARY")
+            self.assertNotIn("MediumSlow", app._channel_label(0))
+            self.assertNotIn("MEDIUMSLOW", app._channel_label(0))
+
+    async def test_named_primary_uses_real_logical_channel_name(self) -> None:
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._channels = (ChannelInfo(0, "My Channel"),)
+            self.assertEqual(app._channel_label(0), "My Channel")
+
+    async def test_header_network_identity_and_current_radio_fallback(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._selected_network = "NYC MS48"
+            app._network_unmatched = False
+            app._refresh_chat_header_network()
+            await pilot.pause()
+            self.assertEqual(str(app.query_one("#chat-network").render()), "NYC MS48")
+            app._network_unmatched = True
+            app._refresh_chat_header_network()
+            await pilot.pause()
+            self.assertEqual(
+                str(app.query_one("#chat-network").render()), "CURRENT RADIO"
+            )
+
+    async def test_network_and_channel_header_are_separate_concepts(self) -> None:
+        from radio_service import ChannelInfo
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            await pilot.pause()
+            app._selected_network = "NYC MS48"
+            app._network_unmatched = False
+            app._channels = (ChannelInfo(0, "PRIMARY"), ChannelInfo(1, "SECRET"))
+            app._refresh_chat_header_network()
+            app._update_footer()
+            await pilot.pause()
+            # Header shows NETWORK value; channel selector shows the PRIMARY
+            # logical channel, never the modem preset.
+            self.assertEqual(str(app.query_one("#chat-network").render()), "NYC MS48")
+            self.assertEqual(app._channel_label(0), "PRIMARY")
+            self.assertEqual(app._channel_label(1), "SECRET")
+
 
 if __name__ == "__main__":
     unittest.main()

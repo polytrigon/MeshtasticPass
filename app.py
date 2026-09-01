@@ -3672,6 +3672,23 @@ class MeshtasticPassApp(App[None]):
         min-height: 2;
     }
 
+    /* Active NETWORK identity, shown as the first CHAT header value before the
+       logical-channel selector -- presentation only, never written to the
+       radio. DIM like the separators, ellipsized on overflow. */
+    #chat-network {
+        width: auto;
+        max-width: 30%;
+        height: auto;
+        min-height: 2;
+        text-style: bold;
+        text-overflow: ellipsis;
+        color: $snow_dim;
+    }
+
+    Screen.theme-amber #chat-network {
+        color: $amber_dim;
+    }
+
     #chat-title, #chat-dm-selector {
         width: auto;
         max-width: 70%;
@@ -3681,7 +3698,7 @@ class MeshtasticPassApp(App[None]):
         text-overflow: ellipsis;
     }
 
-    #chat-header-bullet {
+    #chat-header-bullet, #chat-network-bullet {
         width: 3;
         height: auto;
         min-height: 2;
@@ -3689,7 +3706,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #chat-header-bullet {
+    Screen.theme-amber #chat-header-bullet,
+    Screen.theme-amber #chat-network-bullet {
         color: $amber_dim;
     }
 
@@ -4533,6 +4551,18 @@ class MeshtasticPassApp(App[None]):
                 # a plain, non-focusable Static -- purely a visual
                 # separator (item 6).
                 with Horizontal(id="chat-header"):
+                    yield Static(
+                        "",
+                        id="chat-network",
+                        classes="chat-network",
+                        markup=False,
+                    )
+                    yield Static(
+                        "•",
+                        id="chat-network-bullet",
+                        classes="chat-header-bullet",
+                        markup=False,
+                    )
                     yield ChannelSelector(self._channels, self.current_channel_index)
                     yield Static(
                         "•",
@@ -9434,6 +9464,31 @@ class MeshtasticPassApp(App[None]):
         )
         self._render_chat_status()
 
+    def _chat_header_network_text(self) -> str:
+        """The active NETWORK identity shown first in the CHAT header.
+
+        Presentation only. When the current radio configuration matches a saved
+        NETWORK preset, shows that preset's NETWORK NAME (e.g. "NYC MS48");
+        otherwise reuses the established NETWORK UI "CURRENT RADIO" fallback.
+        Never the modem preset, and never written to the radio.
+        """
+        return (
+            UNMATCHED_NETWORK_LABEL if self._network_unmatched else self._selected_network
+        )
+
+    def _refresh_chat_header_network(self) -> None:
+        """Render / hide the CHAT header's leading NETWORK identity value.
+
+        Sets #chat-network text and hides it (and its separator) while not
+        ONLINE, mirroring how the bullet/DM selector are hidden by
+        _update_chat_connection_state. Zero RF.
+        """
+        # ONLINE gating is handled by _update_chat_connection_state; here we
+        # only (re)render the value when the network identity is known.
+        widgets = list(self.query("#chat-network"))
+        if widgets:
+            widgets[0].update(self._chat_header_network_text())
+
     def _filter_hidden_channels(
         self, channels: tuple[ChannelInfo, ...]
     ) -> tuple[ChannelInfo, ...]:
@@ -10891,6 +10946,13 @@ class MeshtasticPassApp(App[None]):
         bullets = list(self.query("#chat-header-bullet"))
         if bullets:
             bullets[0].display = online
+        net_widgets = list(self.query("#chat-network"))
+        net_bullets = list(self.query("#chat-network-bullet"))
+        if net_widgets:
+            net_widgets[0].display = online
+        if net_bullets:
+            net_bullets[0].display = online
+        self._refresh_chat_header_network()
         dm_selectors = list(self.query(DMModeSelector))
         if dm_selectors:
             dm_selector = dm_selectors[0]
