@@ -4128,21 +4128,15 @@ class MeshtasticPassApp(App[None]):
        widget color only (e.g. before the very first refresh_delivery_
        state call paints the spans). */
     .chat-entry.delivery-sending .chat-entry-delivery,
+    .chat-entry.delivery-sent .chat-entry-delivery,
     .chat-entry.delivery-heard .chat-entry-delivery {
         color: $snow_accent;
     }
 
     Screen.theme-amber .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-amber .chat-entry.delivery-sent .chat-entry-delivery,
     Screen.theme-amber .chat-entry.delivery-heard .chat-entry-delivery {
         color: $amber_accent;
-    }
-
-    .chat-entry.delivery-sent .chat-entry-delivery {
-        color: $snow_base;
-    }
-
-    Screen.theme-amber .chat-entry.delivery-sent .chat-entry-delivery {
-        color: $amber_base;
     }
 
     .chat-entry.delivery-unconfirmed .chat-entry-delivery {

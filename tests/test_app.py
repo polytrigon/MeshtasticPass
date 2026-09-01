@@ -4323,7 +4323,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(entry.delivery_state, DeliveryState.SENT)
             self.assertIn(DeliveryState.SENT, DeliveryState)
 
-            # Item 9/28: -> SENDING=ACCENT, ✓ SENT=BASE, ✓✓ HEARD=ACCENT,
+            # Item 9/28: -> SENDING=ACCENT, ✓ SENT=ACCENT, ✓✓ HEARD=ACCENT,
             # ⟐ UNCONFIRMED=ACCENT2, ✕ FAILED=ERROR.
             for theme in ("snow", "amber"):
                 palette = THEME_PALETTES[theme]
@@ -4345,7 +4345,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(widget.has_class("delivery-sent"))
                 self.assertEqual(
                     widget.delivery_label.visual_style.foreground.hex6,
-                    palette.base.upper(),
+                    palette.accent.upper(),
                 )
 
                 entry.delivery_state = DeliveryState.HEARD

@@ -1255,6 +1255,5 @@ class ChatNetworkIdentityTests(PrivateChannelUiBase):
             self.assertEqual(app._channel_label(0), "PRIMARY")
             self.assertEqual(app._channel_label(1), "SECRET")
 
-
 if __name__ == "__main__":
     unittest.main()
