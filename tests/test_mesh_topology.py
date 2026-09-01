@@ -99,6 +99,7 @@ from radio_service import (
     TracerouteState,
 )
 from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
     SIMULATED_LOCAL_POSITION,
     SIMULATED_MESSAGES,
     SIMULATED_NODES,
@@ -2061,6 +2062,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         old_timestamp = now - 10 * 24 * 60 * 60
 
         first_process_store = ChatStore.open(db_path)
+        first_process_store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         first_process_store.add_incoming(
             packet_id=1,
             node_id="!a11ce001",
@@ -2074,6 +2076,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         first_process_store.close()
 
         second_process_store = ChatStore.open(db_path)
+        second_process_store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         self.addCleanup(second_process_store.close)
         app = self._make_app(chat_store=second_process_store)
         async with app.run_test(size=(90, 28)) as pilot:
@@ -2107,6 +2110,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         old_timestamp = now - 30 * 24 * 60 * 60
 
         store = ChatStore.open(db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         store.add_incoming(
             packet_id=1,
             node_id="!a11ce001",
@@ -2131,6 +2135,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
         store.close()
 
         store = ChatStore.open(db_path)
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         self.addCleanup(store.close)
         app = self._make_app(chat_store=store)
         async with app.run_test(size=(90, 28)) as pilot:

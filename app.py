@@ -1736,13 +1736,21 @@ class ChatTranscript(VerticalScroll):
             app.call_after_refresh(app._clear_indicator_if_at_bottom)
             event.stop()
         elif event.key == "left":
-            app._focus_oldest_new_message()
+            if app._chat_mode == "dms" and app.current_dm_node_id is not None:
+                # A DM has no "oldest new across a channel" notion; LEFT
+                # just leaves focus on the DM transcript (no-op).
+                pass
+            else:
+                app._focus_oldest_new_message()
             event.stop()
         elif event.key == "right":
             app._return_to_present_and_type()
             event.stop()
         elif event.key == "end":
-            app._jump_to_newest()
+            if app._chat_mode == "dms" and app.current_dm_node_id is not None:
+                app.call_after_refresh(app._jump_dm_transcript_to_newest, self)
+            else:
+                app._jump_to_newest()
             event.stop()
 
 
@@ -4264,6 +4272,12 @@ class MeshtasticPassApp(App[None]):
             0: ChannelChatState()
         }
         self.chat_history = self._channel_states[0].entries
+        # True while _mount_channel_transcript is clearing and remounting
+        # the chat transcript. During that window _insert_chat_widget (a
+        # live message arriving mid-rebuild) must NOT mount its own end-of-
+        # history marker -- the rebuild owns that and will mount exactly
+        # one, and a second mount would collide on the fixed widget ID.
+        self._transcript_rebuilding = False
         self.unread_count = 0
         self.transcript_new_count = 0
         # Direct Messages are a DISTINCT conversation model from channel
@@ -4307,6 +4321,15 @@ class MeshtasticPassApp(App[None]):
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
+        # The canonical local node ID of the physical radio whose CHAT
+        # conversation namespace is currently live (Problem 1 -- per-
+        # physical-radio CHAT history isolation). Only ever set to a
+        # RESOLVED ONLINE identity; never cleared to None by a transient
+        # CONNECTING event. Mirrored into chat_store via set_local_node_id
+        # so every persistence read/write is scoped to exactly this radio;
+        # a different connected radio never leaks this one's history, and
+        # switching back restores it.
+        self._local_radio_node_id: str | None = None
         # Local wall-clock moment AUTO SYNC last completed a clock-set
         # successfully in THIS session -- never the radio's own time
         # (see RadioService.sync_clock: AdminMessage has no get-time
@@ -7361,6 +7384,23 @@ class MeshtasticPassApp(App[None]):
     def _state_for(self, channel_index: int) -> ChannelChatState:
         return self._channel_states.setdefault(channel_index, ChannelChatState())
 
+    def _active_transcript(self) -> ChatTranscript:
+        """The transcript of the ACTIVE/VISIBLE conversation.
+
+        One central answer to "what owns the visible transcript?" The
+        active conversation is authoritative for selection/navigation/
+        context/ENTER: when CHAT is in DMS mode with a conversation open
+        that is #dm-log; otherwise (channel mode, or the DM list/new-DM
+        surfaces which have no message transcript) it is #chat-log. Every
+        up/down/left/right/ENTER/context path must resolve the transcript
+        through here, never a hard-coded '#chat-log', so a hidden CHANNEL
+        transcript can never receive a selection that belongs to a visible
+        DM (or vice versa).
+        """
+        if self._chat_mode == "dms" and self.current_dm_node_id is not None:
+            return self.query_one("#dm-log", ChatTranscript)
+        return self.query_one("#chat-log", ChatTranscript)
+
     def _channel_key_for(self, channel_index: int) -> str | None:
         """The live radio's own stable identity for this channel slot.
 
@@ -7373,6 +7413,44 @@ class MeshtasticPassApp(App[None]):
             if channel.index == channel_index:
                 return channel.stable_key or None
         return None
+
+    def _resolve_index_by_stable_key(
+        self, channels: tuple[ChannelInfo, ...], stable_key: str | None
+    ) -> int | None:
+        """Resolve a channel STABLE identity to its index in `channels`.
+
+        Stable identity (ChannelInfo.stable_key) is the ONLY channel
+        identity used for CHAT conversation reconciliation -- never slot
+        index, display name, PRIMARY fallback label, or modem preset name.
+        `stable_key` None/"" means "unknown" (no authority to preserve a
+        conversation we cannot prove), so it yields None (caller falls
+        back deterministically). Returns the index of the FIRST visible
+        channel carrying that identity, or None if it is genuinely gone.
+        """
+        if not stable_key:
+            return None
+        for channel in channels:
+            if channel.stable_key == stable_key:
+                return channel.index
+        return None
+
+    def _deterministic_channel_fallback(
+        self, channels: tuple[ChannelInfo, ...]
+    ) -> int | None:
+        """One explicit, deterministic fallback for a genuinely-removed channel.
+
+        Preferred: PRIMARY (index 0) if an authoritative PRIMARY channel
+        exists; otherwise the first real configured channel. NEVER the NEW
+        CHANNEL sentinel (which is not a real ChannelInfo here). Returns
+        None only when there are no real channels to select at all.
+        """
+        if not channels:
+            return None
+        for channel in channels:
+            if channel.index == 0:
+                return channel.index
+        # No index-0 PRIMARY; use the first real configured channel.
+        return channels[0].index
 
     def _channel_label(self, channel_index: int) -> str:
         """The current channel selector's own presentation label.
@@ -7387,6 +7465,22 @@ class MeshtasticPassApp(App[None]):
             if channel.index == channel_index:
                 return channel.name
         return f"Channel {channel_index + 1}"
+
+    def _refresh_channel_start_marker(self, channel_index: int) -> None:
+        """Re-render an empty channel's START marker with the current label.
+
+        The marker is mounted as soon as a channel is touched, which can be
+        during the pre-identity CONNECTING window (when 'Channel N' is the
+        fallback name). Once the live channel name is known this updates the
+        marker text in place -- a targeted Static update, never a full
+        transcript remount, so it cannot duplicate or race mounted widgets.
+        """
+        label = self._channel_label(channel_index)
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        for marker in transcript.query(StartOfChannelHistoryMarker):
+            text = f"This is the start of {label} channel history"
+            if str(marker.render()) != text:
+                marker.update(text)
 
     def _capture_current_channel_state(self) -> None:
         state = self._state_for(self.current_channel_index)
@@ -7530,9 +7624,11 @@ class MeshtasticPassApp(App[None]):
             chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
         await transcript.remove_children()
+        self._transcript_rebuilding = True
         widgets = self._initial_chat_widgets(channel_index, state)
         if widgets:
             await transcript.mount(*widgets)
+        self._transcript_rebuilding = False
         if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_unread_messages_viewed()
             self._recount_unread()
@@ -7593,6 +7689,13 @@ class MeshtasticPassApp(App[None]):
         # live identity changes again.
         state.loaded_key = key
         if fresh_ids == current_ids:
+            # Content did not change, but the mounted START-of-history marker
+            # may still carry the pre-identity placeholder label (e.g. it was
+            # mounted during CONNECTING with the fallback "Channel N" name):
+            # refresh its label to the now-known real channel name. This is a
+            # targeted marker re-render, never a full transcript remount, so
+            # it cannot race or duplicate any mounted message widgets.
+            self._refresh_channel_start_marker(channel_index)
             return
         # A GENUINE difference: `state.entries`/self.chat_history are only
         # ever replaced with fresh objects in THIS branch, never on the
@@ -7630,7 +7733,8 @@ class MeshtasticPassApp(App[None]):
         for marker in transcript.query(StartOfChannelHistoryMarker):
             marker.remove()
         if not self._has_older_history and self.chat_store is not None:
-            self._ensure_end_history_marker(transcript)
+            if not self._transcript_rebuilding:
+                self._ensure_end_history_marker(transcript)
         if self.current_tab != "chat" or self._chat_mode != "channel":
             following = self._following_chat_widget(insert_index)
             transcript.mount(self._chat_entry_widget(entry), before=following)
@@ -8436,13 +8540,25 @@ class MeshtasticPassApp(App[None]):
         transcript = self.query_one("#chat-log", ChatTranscript)
         return transcript.max_scroll_y - transcript.scroll_y <= 1
 
-    def _jump_to_newest(self) -> None:
-        transcript = self.query_one("#chat-log", ChatTranscript)
+    def _jump_transcript_to_newest(self, transcript: ChatTranscript) -> None:
+        """Scroll one transcript to its newest edge and clear its NEW indicator.
+
+        Shared by CHANNEL (_jump_to_newest) and DM (a DM transcript with a
+        single conversation has no new_below_ids bookkeeping; anchoring is
+        all it needs).
+        """
         transcript.anchor()
         transcript.scroll_end(animate=False)
+
+    def _jump_to_newest(self) -> None:
+        transcript = self.query_one("#chat-log", ChatTranscript)
+        self._jump_transcript_to_newest(transcript)
         self._state_for(self.current_channel_index).new_below_ids.clear()
         self.transcript_new_count = 0
         self._update_transcript_indicator()
+
+    def _jump_dm_transcript_to_newest(self, transcript: ChatTranscript) -> None:
+        self._jump_transcript_to_newest(transcript)
 
     def _return_to_present_and_type(self) -> None:
         """Jump to the chronological edge and resume the preserved draft."""
@@ -8500,16 +8616,13 @@ class MeshtasticPassApp(App[None]):
     def _chat_navigation_targets(self) -> list[Static | ChatEntryWidget]:
         """Vertical CHAT stops: every message is exactly ONE stop.
 
-        An actionable (FAILED/UNCONFIRMED) message's stop is its
-        RESEND control (⟲) -- the message's own ChatEntryWidget is
-        excluded so the message doesn't ALSO appear as a separate
-        stop, and DEL is excluded unconditionally (see item 5: "only
-        ⟲ participates in normal vertical message traversal"). An
-        ordinary message keeps its ChatEntryWidget as the stop, same
-        as always.
+        Works on the ACTIVE/VISIBLE transcript (see _active_transcript):
+        in DMS mode with a conversation open that is #dm-log, so a hidden
+        CHANNEL transcript's controls are never navigable/actionable while
+        a DM is visible (CHAT state-integrity -- DM context ownership).
         """
         targets: list[Static | ChatEntryWidget] = []
-        transcript = self.query_one("#chat-log", ChatTranscript)
+        transcript = self._active_transcript()
         for widget in transcript.walk_children():
             if isinstance(widget, MessageActionControl):
                 if widget.display and widget.action == "resend":
@@ -8550,23 +8663,30 @@ class MeshtasticPassApp(App[None]):
         targets = self._chat_navigation_targets()
         if not targets:
             if direction > 0:
-                self._focus_chat_composer()
+                self._focus_active_composer()
             return
         try:
             index = targets.index(self.focused)
             next_index = index + direction
             if direction > 0 and next_index >= len(targets):
-                self._focus_chat_composer()
+                self._focus_active_composer()
                 return
             target = targets[max(0, min(len(targets) - 1, next_index))]
         except ValueError:
             if direction > 0:
-                self._focus_chat_composer()
+                self._focus_active_composer()
                 return
             target = targets[-1]
         target.focus()
         target.scroll_visible(animate=False)
         self.call_after_refresh(self._clear_indicator_if_at_bottom)
+
+    def _focus_active_composer(self) -> None:
+        """Focus the composer of the ACTIVE conversation (CHANNEL vs DM)."""
+        if self._chat_mode == "dms" and self.current_dm_node_id is not None:
+            self._focus_dm_composer()
+        else:
+            self._focus_chat_composer()
 
     def _oldest_new_entry(self) -> ChatEntry | None:
         """Resolve the current channel's oldest actual NEW incoming entry."""
@@ -9568,41 +9688,16 @@ class MeshtasticPassApp(App[None]):
         self._update_footer()
 
     def _dm_navigation_targets(self) -> list[Static | ChatEntryWidget]:
-        targets: list[Static | ChatEntryWidget] = []
-        transcript = self.query_one("#dm-log", ChatTranscript)
-        for widget in transcript.walk_children():
-            if isinstance(widget, MessageActionControl):
-                if widget.display and widget.action == "resend":
-                    targets.append(widget)
-                continue
-            if (
-                isinstance(widget, ChatEntryWidget)
-                and widget.display
-                and not can_manual_resend(widget.entry)
-            ):
-                targets.append(widget)
-        return targets
+        # A DM has no LoadOlderControl, so the generic active-transcript
+        # navigation target set is exactly right; keep one authoritative
+        # implementation rather than a parallel, drifttable copy.
+        return self._chat_navigation_targets()
 
     def _move_dm_focus(self, direction: int) -> None:
-        targets = self._dm_navigation_targets()
-        if not targets:
-            if direction > 0:
-                self._focus_dm_composer()
-            return
-        try:
-            index = targets.index(self.focused)
-            next_index = index + direction
-            if direction > 0 and next_index >= len(targets):
-                self._focus_dm_composer()
-                return
-            target = targets[max(0, min(len(targets) - 1, next_index))]
-        except ValueError:
-            if direction > 0:
-                self._focus_dm_composer()
-                return
-            target = targets[-1]
-        target.focus()
-        target.scroll_visible(animate=False)
+        # Delegate: _move_chat_focus navigates the ACTIVE transcript (in
+        # DMS mode #dm-log) and focuses the ACTIVE composer, so DM and
+        # CHANNEL can never desync onto each other's contexts.
+        self._move_chat_focus(direction)
 
     def _focus_dm_composer(self) -> None:
         dm_input = self.query_one("#dm-input", Input)
@@ -10379,7 +10474,7 @@ class MeshtasticPassApp(App[None]):
             await control.remove()
             transcript = self.query_one("#chat-log", ChatTranscript)
             first_widget = next(iter(transcript.query(ChatEntryWidget)), None)
-            if first_widget is not None:
+            if first_widget is not None and not self._transcript_rebuilding:
                 await transcript.mount(EndOfChatHistoryMarker(), before=first_widget)
             self._capture_current_channel_state()
             return
@@ -10712,6 +10807,84 @@ class MeshtasticPassApp(App[None]):
         """Restore the host terminal cursor; safe to call repeatedly."""
         self._terminal_cursor.restore()
 
+    def _activate_local_radio_namespace(self, local_node_id: str | None) -> None:
+        """Bind CHAT persistence + in-memory state to one physical radio.
+
+        Problem 1 (per-physical-radio CHAT history isolation). The
+        canonical local node ID is the ONLY thing that namespaces CHAT
+        state -- never long/short name, serial device path, network or
+        modem preset, or display label. A radio switch (POLY -> SOHO)
+        remaps the active namespace; switching back (SOHO -> POLY)
+        restores the original radio's persisted state.
+
+        Only a RESOLVED ONLINE identity is ever kept here (`local_node_id`
+        becomes this store's namespace). A transient CONNECTING event
+        carrying info=None must NEVER be mistaken for "the radio changed":
+        it happens in the middle of an ordinary reconnect of the SAME
+        radio, and treating it as a different-radio switch would falsely
+        drop the just-reconnected radio's own in-memory conversation
+        state (and, by emptying its entries, defeat the current-channel
+        identity reconcile's fresh==current no-op path). So a None local
+        node id only defers the namespace: reads surface nothing (no
+        other radio's state is ever shown while the identity is
+        unresolved), but no cached conversation is discarded.
+
+        When the connected radio's RESOLVED local node ID genuinely
+        CHANGES (POLY -> SOHO), every in-memory per-conversation cache
+        (channel histories, drafts, unread markers, DM list/histories) is
+        discarded so nothing can leak across radios; the display then
+        rebuilds purely from the NEW namespace (which reads nothing for a
+        radio with no stored history, producing an empty CHAT as
+        required).
+        """
+        if local_node_id is None:
+            # Identity unresolved (e.g. the CONNECTING event before the
+            # radio reports its node ID). Bind the store to the "no radio"
+            # namespace so both reads and writes agree on hiding everything
+            # (preserve-but-hide): the pre-namespacing/unattributable rows
+            # (NULL) must not leak into view yet, and a message that arrives
+            # before the identity resolves is stored with no radio attribut
+            # but intentionally kept hidden -- consistent, never leaked.
+            # CHAT history isolation must NOT surface another radio's (or a
+            # legacy NULL row's) content while the identity is unresolved.
+            # This is a NO-OP when the store is already bound to a resolved
+            # radio (a transient CONNECTING in the middle of an ordinary
+            # reconnect of the SAME radio): the resolved ONLINE identity
+            # below is what re-activates that namespace.
+            if self.chat_store is not None and not self.chat_store.is_namespace_bound():
+                self.chat_store.set_local_node_id(None)
+            return
+        if local_node_id == self._local_radio_node_id:
+            if self.chat_store is not None:
+                self.chat_store.set_local_node_id(local_node_id)
+            return
+        previous_node_id = self._local_radio_node_id
+        self._local_radio_node_id = local_node_id
+        if self.chat_store is not None:
+            self.chat_store.set_local_node_id(local_node_id)
+        if previous_node_id is None:
+            # First resolved identity for this app run -- there was no
+            # PREVIOUS radio whose mounted conversation state needs
+            # discarding (any state accumulated so far was, by definition,
+            # already read under this very namespace, e.g. messages that
+            # arrived within the same run before the identity resolved).
+            return
+        # A different physical radio is now attached: no conversation
+        # state owned by the previous radio may remain live in memory.
+        self._channel_states = {
+            0: ChannelChatState()
+        }
+        self.chat_history = self._channel_states[0].entries
+        self.current_channel_index = 0
+        self._dm_states = {}
+        self.current_dm_node_id = None
+        self._dm_conversation_order = []
+        self._dm_list_highlighted_index = 0
+        self.unread_count = 0
+        self.dm_unread_count = 0
+        self.transcript_new_count = 0
+        self._new_dm_mode = False
+
     def _show_connection(
         self,
         state: RadioState,
@@ -10763,17 +10936,45 @@ class MeshtasticPassApp(App[None]):
         # docstring.
         if not (state is RadioState.ONLINE and was_online):
             self._reset_clock_sync_state()
+        self._activate_local_radio_namespace(
+            info.node_id if state is RadioState.ONLINE and info is not None else None
+        )
         if state is RadioState.ONLINE and info is not None and info.channels:
             self._invalidate_reassigned_channel_caches(info.channels)
             # Locally-hid (CTRL+D) configured channels are excluded at this
             # boundary -- the radio-authoritative snapshot is never mutated,
             # only the app-visible CHAT channel list is filtered.
+            #
+            # PROBLEM 3 (spontaneous old-history switch): reconcile the
+            # ACTIVE conversation by STABLE channel identity, never by slot
+            # index or display label. Capture the active channel's identity
+            # BEFORE the authoritative list is rebuilt, resolve that same
+            # identity against the refreshed list, and only fall back
+            # deterministically when it is genuinely gone -- so an async
+            # refresh, reorder, same-slot re-key, or display-label change
+            # can NEVER silently switch to another channel's history.
+            active_key = self._channel_key_for(self.current_channel_index)
             self._channels = self._filter_hidden_channels(info.channels)
             selector = self.query_one(ChannelSelector)
-            available_indexes = {channel.index for channel in self._channels}
-            selected_index = self.current_channel_index
-            if selected_index not in available_indexes:
-                selected_index = self._channels[0].index
+            resolved_index = self._resolve_index_by_stable_key(
+                self._channels, active_key
+            )
+            if resolved_index is not None:
+                # The active conversation still exists (same stable
+                # identity): keep it active. Only update the selector's
+                # presented value, never remount a different channel's
+                # history. If the identity at that index CHANGED (same
+                # slot re-keyed), _reconcile_current_channel_identity
+                # handles the remount below.
+                selected_index = resolved_index
+            else:
+                # The active channel is actually GONE (not merely reordered
+                # or renamed): take one explicit deterministic fallback.
+                selected_index = self._deterministic_channel_fallback(
+                    self._channels
+                )
+                if selected_index is None:
+                    selected_index = self.current_channel_index
             selector.set_options(
                 (
                     DropdownOption(channel.name, channel.index)

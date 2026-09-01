@@ -9,7 +9,7 @@ import sqlite3
 from threading import RLock
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
 
@@ -58,6 +58,21 @@ class StoredMessage:
     # history. See CHAT channel-history isolation (FINAL MESHTASTIC
     # POLISH pass) and this field's own precedent, dm_node_id.
     channel_key: str | None = None
+    # This row's OWNING physical/local radio's canonical node ID. A
+    # row belongs to exactly one local radio conversation namespace --
+    # CHAT state lives under (canonical local node ID -> conversation
+    # identity). Two different radios (POLY vs SOHO) running identical
+    # network/channel/PSK/DM settings must never share history, so this
+    # is always part of every read filter and every write stamp.
+    # NULL means "written before per-radio namespacing existed" or
+    # "local identity was not yet resolved when the row was written".
+    # The preserve-but-hide migration policy guarantees such a NULL
+    # row is NEVER returned by any read (every query filters
+    # local_node_id = <resolved id>, and a NULL equality never matches),
+    # so pre-namespacing history is kept on disk but never presented as
+    # belonging to any radio. Writes that occur before the radio's local
+    # node ID is resolved are likewise never surfaced.
+    local_node_id: str | None = None
 
     @property
     def message_time(self) -> float | None:
@@ -112,6 +127,71 @@ class ChatStore:
         self.path = path
         self._lock = RLock()
         self._closed = False
+        # The owning physical/local radio namespace. Every write is
+        # stamped with this and every read is filtered by it, so CHAT
+        # state is isolated per canonical local node ID. None means
+        # "local radio identity not yet resolved": reads surface no
+        # history and writes are stored but later hidden (the preserve-
+        # but-hide migration/compatibility policy -- never present a
+        # row as belonging to a radio we cannot prove owned it).
+        self._local_node_id: str | None = None
+        # Whether the namespace was EVER explicitly bound. A raw
+        # ChatStore that never calls set_local_node_id (older Store
+        # tests, hand-run tools) is left namespace-unfiltered so its
+        # write-then-read round trips still work exactly as before;
+        # once the app resolves a canonical local node ID it always
+        # calls set_local_node_id, which turns the namespace filter on
+        # permanently for the life of this store.
+        self._namespace_bound: bool = False
+
+    def set_local_node_id(self, node_id: str | None) -> None:
+        """Bind this store to one physical/local radio's namespace.
+
+        Call it once the canonical local node ID is resolved (or
+        resolve it to None while unknown). The store does not read or
+        write any conversation state outside this namespace. Switching
+        from one radio to another requires nothing more than calling
+        this again with the new ID -- every subsequent read/write is
+        then scoped to the new radio; no other radio's rows match.
+        """
+        self._local_node_id = node_id
+        self._namespace_bound = True
+
+    def is_namespace_bound(self) -> bool:
+        """Whether this store's per-radio namespace has been set at all.
+
+        A store the app never bound (raw unit tests / hand tools) keeps its
+        pre-namespacing behavior (reads unfiltered, writes namespace-less);
+        once the app resolves a radio identity it always binds, turning the
+        namespace filter on permanently for this store's lifetime.
+        """
+        return self._namespace_bound
+
+    @property
+    def _ns_filter(self) -> str:
+        """SQL fragment narrowing a read to the bound radio namespace.
+
+        Empty (no filter) when the namespace was never explicitly bound
+        (a raw Store used directly without the app -- its write-then-
+        read round trips must behave exactly as before namespacing). Once
+        bound, every read is narrowed to local_node_id = <active id>; a
+        None id matches nothing, so an unresolved radio surfaces no state.
+        """
+        return " AND local_node_id = ?" if self._namespace_bound else ""
+
+    def _ns_params(self) -> tuple:
+        """Parameter values paired with _ns_filter (emptied when unbound)."""
+        return (self._local_node_id,) if self._namespace_bound else ()
+
+    def _ns_value(self) -> str | None:
+        """The namespace stamped on a newly-written row.
+
+        The active radio namespace once bound; None otherwise (a raw
+        Store never bound by the app writes namespace-less rows that a
+        later bound store treats as unowned and hides -- the
+        preserve-but-hide compatibility policy).
+        """
+        return self._local_node_id if self._namespace_bound else None
 
     @classmethod
     def open(cls, path: Path | str | None = None) -> "ChatStore":
@@ -226,8 +306,8 @@ class ChatStore:
             INSERT OR IGNORE INTO messages (
                 direction, packet_id, node_id, sender_name, sender_short_name,
                 channel_index, text, origin_sent_at, radio_rx_at, received_at, local_sent_at,
-                delivery_state, created_at, dm_node_id, channel_key
-            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                delivery_state, created_at, dm_node_id, channel_key, local_node_id
+            ) VALUES ('incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
         """
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -245,17 +325,18 @@ class ChatStore:
                     created_at,
                     dm_node_id,
                     channel_key,
+                    self._ns_value(),
                 ),
             )
             if cursor.rowcount:
                 return InsertResult(int(cursor.lastrowid), True)
             row = connection.execute(
-                """
+                f"""
                 SELECT id FROM messages
                 WHERE direction = 'incoming' AND node_id = ?
-                    AND packet_id = ? AND channel_index = ? AND dm_node_id IS ?
+                    AND packet_id = ? AND channel_index = ? AND dm_node_id IS ?{self._ns_filter}
                 """,
-                (node_id, packet_id, channel_index, dm_node_id),
+                (node_id, packet_id, channel_index, dm_node_id, *self._ns_params()),
             ).fetchone()
             if row is None:
                 raise ChatStoreError("Incoming message was not stored.")
@@ -278,8 +359,8 @@ class ChatStore:
                     direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
                     received_at, local_sent_at, delivery_state, created_at, dm_node_id,
-                    channel_key
-                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                    channel_key, local_node_id
+                ) VALUES ('outgoing', NULL, NULL, 'YOU', NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel_index,
@@ -290,6 +371,7 @@ class ChatStore:
                     local_sent_at,
                     dm_node_id,
                     channel_key,
+                    self._ns_value(),
                 ),
             )
             return int(cursor.lastrowid)
@@ -399,16 +481,17 @@ class ChatStore:
         """
         with self._transaction() as connection:
             connection.execute(
-                """
+                f"""
                 DELETE FROM send_attempts
                 WHERE message_id IN (
-                    SELECT id FROM messages WHERE dm_node_id = ?
+                    SELECT id FROM messages WHERE dm_node_id = ?{self._ns_filter}
                 )
                 """,
-                (dm_node_id,),
+                (dm_node_id, *self._ns_params()),
             )
             cursor = connection.execute(
-                "DELETE FROM messages WHERE dm_node_id = ?", (dm_node_id,)
+                f"DELETE FROM messages WHERE dm_node_id = ?{self._ns_filter}",
+                (dm_node_id, *self._ns_params()),
             )
             return cursor.rowcount
 
@@ -445,14 +528,14 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT id, direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
                     received_at, local_sent_at, delivery_state, created_at, dm_node_id,
-                    channel_key
+                    channel_key, local_node_id
                     FROM (
                         SELECT * FROM messages
-                        WHERE channel_index = ? AND dm_node_id IS NULL
+                        WHERE channel_index = ? AND dm_node_id IS NULL{self._ns_filter}
                             AND (? IS NULL OR channel_key = ? OR channel_key IS NULL)
                         ORDER BY
                             COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
@@ -465,7 +548,7 @@ class ChatStore:
                         received_at ASC,
                         id ASC
                     """,
-                    (channel_index, channel_key, channel_key, limit + 1),
+                    (channel_index, *self._ns_params(), channel_key, channel_key, limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load CHAT history: {error}") from error
@@ -494,17 +577,18 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT
                         LOWER(node_id) AS node_id,
                         MAX(COALESCE(origin_sent_at, radio_rx_at)) AS message_time
                     FROM messages
                     WHERE direction = 'incoming'
                         AND node_id IS NOT NULL
-                        AND dm_node_id IS NULL
+                        AND dm_node_id IS NULL{self._ns_filter}
                         AND COALESCE(origin_sent_at, radio_rx_at) IS NOT NULL
                     GROUP BY LOWER(node_id)
-                    """
+                    """,
+                    self._ns_params(),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(
@@ -539,7 +623,7 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     WITH cursor AS (
                         SELECT
                             COALESCE(
@@ -553,9 +637,9 @@ class ChatStore:
                     SELECT messages.id, direction, packet_id, node_id, sender_name,
                         sender_short_name, messages.channel_index, text, origin_sent_at,
                         radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
-                        dm_node_id, channel_key
+                        dm_node_id, channel_key, local_node_id
                     FROM messages CROSS JOIN cursor
-                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL
+                    WHERE messages.channel_index = ? AND messages.dm_node_id IS NULL{self._ns_filter}
                         AND (? IS NULL OR messages.channel_key = ? OR messages.channel_key IS NULL)
                         AND (
                         COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
@@ -582,6 +666,7 @@ class ChatStore:
                         before_message_id,
                         channel_index,
                         channel_index,
+                        *self._ns_params(),
                         channel_key,
                         channel_key,
                         limit + 1,
@@ -613,13 +698,14 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT id, direction, packet_id, node_id, sender_name,
                     sender_short_name, channel_index, text, origin_sent_at, radio_rx_at,
-                    received_at, local_sent_at, delivery_state, created_at, dm_node_id
+                    received_at, local_sent_at, delivery_state, created_at, dm_node_id,
+                    local_node_id
                     FROM (
                         SELECT * FROM messages
-                        WHERE dm_node_id = ?
+                        WHERE dm_node_id = ?{self._ns_filter}
                         ORDER BY
                             COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at) DESC,
                             received_at DESC,
@@ -631,7 +717,7 @@ class ChatStore:
                         received_at ASC,
                         id ASC
                     """,
-                    (dm_node_id, limit + 1),
+                    (dm_node_id, *self._ns_params(), limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not load DM history: {error}") from error
@@ -664,7 +750,7 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     WITH cursor AS (
                         SELECT
                             COALESCE(
@@ -678,9 +764,9 @@ class ChatStore:
                     SELECT messages.id, direction, packet_id, node_id, sender_name,
                         sender_short_name, messages.channel_index, text, origin_sent_at,
                         radio_rx_at, received_at, local_sent_at, delivery_state, created_at,
-                        dm_node_id
+                        dm_node_id, local_node_id
                     FROM messages CROSS JOIN cursor
-                    WHERE messages.dm_node_id = ? AND (
+                    WHERE messages.dm_node_id = ?{self._ns_filter} AND (
                         COALESCE(origin_sent_at, radio_rx_at, local_sent_at, received_at)
                             < cursor.order_time
                         OR (
@@ -705,6 +791,7 @@ class ChatStore:
                         before_message_id,
                         dm_node_id,
                         dm_node_id,
+                        *self._ns_params(),
                         limit + 1,
                     ),
                 ).fetchall()
@@ -732,7 +819,7 @@ class ChatStore:
             with self._lock:
                 self._ensure_open()
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT
                         dm_node_id,
                         MAX(
@@ -744,10 +831,11 @@ class ChatStore:
                             END
                         ) AS latest_message_time
                     FROM messages
-                    WHERE dm_node_id IS NOT NULL
+                    WHERE dm_node_id IS NOT NULL{self._ns_filter}
                     GROUP BY dm_node_id
                     ORDER BY latest_message_time DESC
-                    """
+                    """,
+                    self._ns_params(),
                 ).fetchall()
         except sqlite3.DatabaseError as error:
             raise ChatStoreError(f"Could not list DM conversations: {error}") from error
@@ -791,7 +879,7 @@ class ChatStore:
                             created_at
                         FROM messages
                         WHERE channel_index = ?
-                            AND direction = 'incoming'
+                            AND direction = 'incoming'{self._ns_filter}
                             AND id IN ({placeholders})
                         ORDER BY
                             COALESCE(
@@ -801,7 +889,7 @@ class ChatStore:
                             id ASC
                         LIMIT 1
                         """,
-                        (channel_index, *chunk),
+                        (channel_index, *self._ns_params(), *chunk),
                     ).fetchone()
                     if row is not None:
                         candidate = StoredMessage(**dict(row))
@@ -866,7 +954,8 @@ class ChatStore:
                         delivery_state TEXT,
                         created_at REAL NOT NULL,
                         dm_node_id TEXT,
-                        channel_key TEXT
+                        channel_key TEXT,
+                        local_node_id TEXT
                     );
 
                     CREATE TABLE IF NOT EXISTS send_attempts (
@@ -893,7 +982,19 @@ class ChatStore:
                     )
                 else:
                     current_version = int(row["version"])
-                    if current_version not in (1, 2, 3, SCHEMA_VERSION):
+                    # Any version from 1 up to (and including) the current
+                    # SCHEMA_VERSION is a supported database that must be
+                    # migrated in place (each historical bump below adds its
+                    # own column); only a database claiming a FUTURE version
+                    # is genuinely unsupported. A literal tuple like
+                    # "(1, 2, 3, SCHEMA_VERSION)" silently breaks the moment
+                    # a bump is applied without updating it -- e.g. the v4 ->
+                    # v5 per-radio bump left "4" out, so an existing valid
+                    # v4 database raised "Unsupported CHAT schema version 4"
+                    # instead of migrating. Ranging over every prior version
+                    # makes the migration path correct and restart-safe no
+                    # matter how many times the version is advanced.
+                    if not (1 <= current_version <= SCHEMA_VERSION):
                         raise ChatStoreError(
                             f"Unsupported CHAT schema version {current_version}."
                         )
@@ -929,6 +1030,19 @@ class ChatStore:
                         connection.execute(
                             "ALTER TABLE messages ADD COLUMN channel_key TEXT"
                         )
+                    if current_version <= 4 and "local_node_id" not in columns:
+                        # v4 -> v5: add per-physical/local-radio CHAT
+                        # namespace (CHAT state-integrity). Unlike
+                        # channel_key, a NULL local_node_id is NEVER
+                        # grandfathered into queries -- the preserve-
+                        # but-hide migration policy keeps pre-namespacing
+                        # rows on disk but never returns them, so a
+                        # radio can never surface history it did not
+                        # actually own. Rows are only ever stamped with
+                        # a resolved local node ID going forward.
+                        connection.execute(
+                            "ALTER TABLE messages ADD COLUMN local_node_id TEXT"
+                        )
                     if current_version != SCHEMA_VERSION:
                         connection.execute(
                             "UPDATE schema_version SET version = ?",
@@ -953,11 +1067,25 @@ class ChatStore:
                 # itself stays genuinely NULL for a channel row -- every
                 # `dm_node_id IS NULL` filter elsewhere is unaffected --
                 # only this index's own notion of "equal" is coerced.
+                #
+                # local_node_id is included so the SAME remote packet
+                # arriving on two different physical radios is treated as
+                # two distinct observations (each radio has its own
+                # namespace) rather than being deduplicated away across
+                # radios. COALESCE(local_node_id, '') mirrors the
+                # dm_node_id reasoning: a pre-namespacing NULL row must
+                # not collide with every other NULL row.
                 connection.execute("DROP INDEX IF EXISTS incoming_packet_identity")
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX incoming_packet_identity
-                    ON messages(node_id, packet_id, channel_index, COALESCE(dm_node_id, ''))
+                    ON messages(
+                        node_id,
+                        packet_id,
+                        channel_index,
+                        COALESCE(dm_node_id, ''),
+                        COALESCE(local_node_id, '')
+                    )
                     WHERE direction = 'incoming' AND packet_id IS NOT NULL
                     """
                 )

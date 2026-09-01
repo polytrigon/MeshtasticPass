@@ -25,7 +25,11 @@ from app_settings import AppSettings
 from chat_store import ChatStore
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
 from radio_service import ChannelInfo, DeliveryState
-from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
+from simulated_radio_service import (
+    SIMULATED_LOCAL_NODE_ID,
+    SIMULATED_MESSAGES,
+    SimulatedRadioService,
+)
 
 
 class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
@@ -280,6 +284,7 @@ class MilestoneDropdownChannelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_channel_switch_uses_indexed_sqlite_history_without_duplicates(self) -> None:
         store = ChatStore.open(Path(self.directory.name) / "chat.db")
+        store.set_local_node_id(SIMULATED_LOCAL_NODE_ID)
         for channel, text in ((0, "primary history"), (1, "hiking history")):
             store.add_incoming(
                 packet_id=9000 + channel,

@@ -2669,6 +2669,13 @@ class RadioService:
             settings = getattr(channel, "settings", None)
             raw_name = getattr(settings, "name", "")
             name = raw_name.strip() if isinstance(raw_name, str) else ""
+            # The authoritative configured channel NAME (raw_text, possibly
+            # empty for an unnamed primary) -- NEVER the display-resolved
+            # "PRIMARY"/"MediumSlow" fallback, which is presentation only.
+            # channel identity (see _channel_stable_key) must come from the
+            # real configured name + psk/settings.id, so changing the
+            # fallback label cannot change a conversation's stable key.
+            configured_name = name
             if not name and index == 0:
                 name = RadioService._primary_channel_default_name(local_node)
             resolved_name = name or f"Channel {index + 1}"
@@ -2676,20 +2683,27 @@ class RadioService:
                 ChannelInfo(
                     index,
                     resolved_name,
-                    stable_key=RadioService._channel_stable_key(settings, resolved_name),
+                    stable_key=RadioService._channel_stable_key(
+                        settings, configured_name
+                    ),
                 )
             )
             seen_indexes.add(index)
         return tuple(sorted(result, key=lambda channel: channel.index))
 
     @staticmethod
-    def _channel_stable_key(settings: Any, resolved_name: str) -> str:
+    def _channel_stable_key(settings: Any, configured_name: str) -> str:
         """This channel's own cryptographic/assigned identity (CHAT
 
         channel-history isolation) -- NEVER the radio-assigned slot
         index, which a user can freely reassign to a completely
         different channel (e.g. reconfiguring slot 0 from "LongFast" to
-        "MediumSlow") while keeping the SAME index. Preference order:
+        "MediumSlow") while keeping the SAME index, and NEVER the
+        DISPLAY-only fallback label (e.g. "PRIMARY", or the modem-preset
+        name "MediumSlow") -- presentation must never become identity.
+        `configured_name` is the channel's real configured `settings.name`
+        (empty for an unnamed primary), not a resolved display label.
+        Preference order:
 
         1. Channel.settings.id -- PROTOBUF-SOURCE-VERIFIED (channel_pb2.pyi):
            "Used to construct a globally unique channel ID... Any time
@@ -2701,19 +2715,23 @@ class RadioService:
         2. meshtastic.util.generate_channel_hash(name, psk) -- the SAME
            8-bit "channel number" hash Meshtastic's own official tooling
            (meshtastic.node) already computes for channel disambiguation,
-           paired with the resolved display name here specifically to
+           paired with the REAL configured name here specifically to
            close the "two different names happen to hash the same" case
            (the hash alone has a real, if small, 1-in-256 collision
            floor for two independently-chosen PSKs -- not eliminated by
            this pairing, just not made worse by name-only guessing).
-        3. The resolved display name alone, if `settings`/`psk` are
-           unavailable for some reason -- strictly better than the bare
-           index (a rename is at least a DELIBERATE, visible user
-           action, unlike a same-index slot reassignment), even though
-           it cannot detect a same-name-different-PSK reassignment.
+        3. The real configured name alone, if `settings` is present but
+           carries no `id`/`psk` -- strictly better than the bare index
+           (a rename is at least a DELIBERATE, visible user action,
+           unlike a same-index slot reassignment), even though it cannot
+           detect a same-name-different-PSK reassignment. An empty
+           configured name (an unnamed primary with no assigned id and
+           no PSK) has genuinely no identity of its own, so this returns
+           "" (honestly "unknown") rather than the display label.
 
-        Returns "" (never a fabricated key) only if `settings` itself
-        is entirely unavailable -- callers treat "" as "unknown," the
+        Returns "" (never a fabricated key) when `settings` itself is
+        unavailable, or when a neither-named-nor-cryptographically-tagged
+        channel has no identity -- callers treat "" as "unknown," the
         same honest default a pre-connection placeholder channel uses.
         """
         if settings is None:
@@ -2726,11 +2744,11 @@ class RadioService:
             try:
                 from meshtastic.util import generate_channel_hash
 
-                channel_hash = generate_channel_hash(resolved_name, bytes(psk))
+                channel_hash = generate_channel_hash(configured_name, bytes(psk))
             except Exception:
-                return resolved_name
-            return f"hash:{resolved_name}:{channel_hash}"
-        return resolved_name
+                return configured_name
+            return f"hash:{configured_name}:{channel_hash}"
+        return configured_name
 
     @staticmethod
     def _primary_channel_default_name(local_node: Any) -> str:
