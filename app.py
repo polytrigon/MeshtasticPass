@@ -1054,7 +1054,7 @@ class EditChannelDeleteYes(Static):
             self.post_message(self.Activated())
             event.stop()
         elif event.key == "escape":
-            self.app._close_edit_channel()
+            self.app._cancel_edit_channel_delete_confirm()
             event.stop()
 
 
@@ -1079,7 +1079,7 @@ class EditChannelDeleteNo(Static):
             self.post_message(self.Activated())
             event.stop()
         elif event.key == "escape":
-            self.app._close_edit_channel()
+            self.app._cancel_edit_channel_delete_confirm()
             event.stop()
 
 
@@ -1111,8 +1111,11 @@ class EditChannelOverlay(Vertical):
         self._error = ""
 
     def on_mount(self) -> None:
-        # Populate the form inputs once the overlay (and its Input widgets)
-        # are actually mounted -- never synchronously right after mount().
+        # Populate the form inputs and show the COMPLETE form immediately, then
+        # focus CHANNEL NAME -- all AFTER composition (screen.mount is async,
+        # so these child widgets do not exist until on_mount runs). The title
+        # ("EDIT CHANNEL") is a heading only and never receives focus.
+        self.set_mode("form")
         name_inputs = list(self.query("#edit-channel-name"))
         if name_inputs:
             name_inputs[0].value = self._name
@@ -1123,6 +1126,7 @@ class EditChannelOverlay(Vertical):
         if error_widgets:
             error_widgets[0].display = bool(self._error)
             error_widgets[0].update(self._error)
+        self.app._focus_edit_channel_field("name")
 
     def set_values(self, name: str, psk: str) -> None:
         self._name = name
@@ -1156,12 +1160,7 @@ class EditChannelOverlay(Vertical):
                 input_id="edit-channel-key",
                 collapsible=False,
             )
-            yield Static(
-                "[ DELETE CHANNEL ]",
-                id="edit-channel-delete",
-                classes="connection-action-row",
-                markup=False,
-            )
+            yield EditChannelDelete()
             with Horizontal(
                 id="edit-channel-actions",
                 classes="editor-actions",
@@ -1199,14 +1198,15 @@ class EditChannelOverlay(Vertical):
 
         Anchored to the CHAT page's visible area, confined to the viewport --
         the same viewport-aware floating behavior the node context menu uses
-        (see viewport_menu.calculate_popup_placement).
+        (see viewport_menu.calculate_popup_placement). Height stays auto so the
+        COMPLETE form (title + NAME + KEY + DELETE + SAVE/CANCEL) renders
+        immediately, never clipped to a too-small fixed height.
         """
         from viewport_menu import calculate_popup_placement
 
         chat = self.app.query_one("#content").region
-        placement = calculate_popup_placement(chat, self.app.screen.region, 44, 8)
+        placement = calculate_popup_placement(chat, self.app.screen.region, 44, 9)
         self.styles.width = placement.width
-        self.styles.height = placement.height
         self.styles.offset = (placement.x, placement.y)
 
 
@@ -4012,6 +4012,7 @@ class MeshtasticPassApp(App[None]):
         background: #101010;
         border: solid $snow_dim;
         padding: 0 1;
+        height: auto;
         scrollbar-size: 1 1;
         scrollbar-color: $snow_base;
         scrollbar-background: $snow_dim;
@@ -5227,6 +5228,14 @@ class MeshtasticPassApp(App[None]):
                 return
             if event.key == "left" and focused_field == "cancel":
                 self._focus_edit_channel_field("save")
+                event.stop()
+                return
+            if event.key == "right" and focused_field == "delete_yes":
+                self._focus_edit_channel_field("delete_no")
+                event.stop()
+                return
+            if event.key == "left" and focused_field == "delete_no":
+                self._focus_edit_channel_field("delete_yes")
                 event.stop()
                 return
         if self._new_channel_editor_open and self.current_tab == "chat":
@@ -9877,9 +9886,7 @@ class MeshtasticPassApp(App[None]):
     @on(Input.Submitted, "#edit-channel-key")
     def edit_channel_key_submitted(self, _event: Input.Submitted) -> None:
         if self._edit_channel_editor_open:
-            self._focus_edit_channel_field(
-                "delete" if self._edit_channel_error else "delete"
-            )
+            self._focus_edit_channel_field("delete")
 
     @on(NewChannelCancel.Activated)
     def new_channel_cancel(self, _event: NewChannelCancel.Activated) -> None:
@@ -10093,7 +10100,9 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_name = channel.name
         self._edit_channel_psk = self._channel_psk_metadata_text()
         self._refresh_edit_channel()
-        self._focus_edit_channel_field("name")
+        # CHANNEL NAME is focused by the overlay's own on_mount (after the
+        # async mount composes the child widgets) -- not synchronously here,
+        # which would run before the Input widgets exist.
         self._update_footer()
 
     def _close_edit_channel(self) -> None:
@@ -10125,7 +10134,6 @@ class MeshtasticPassApp(App[None]):
                 self.screen.mount(overlay)
             overlay.set_mode("delete-confirm" if self._edit_channel_delete_confirm else "form")
             overlay.place_over_chat()
-            overlay.set_values(self._edit_channel_name, self._edit_channel_psk)
             overlay.set_error(self._edit_channel_error)
         else:
             if overlay is not None:
@@ -10234,6 +10242,14 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_error = ""
         self._refresh_edit_channel()
         self._focus_edit_channel_field("delete_yes")
+
+    def _cancel_edit_channel_delete_confirm(self) -> None:
+        """ESC/NO from the DELETE CHANNEL confirmation: return to the edit form
+        WITHOUT deleting and WITHOUT discarding pending form values."""
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
+        self._refresh_edit_channel()
+        self._focus_edit_channel_field("name")
 
     def _confirm_delete_edit_channel(self) -> None:
         """YES: delete the current private channel via the existing path, then

@@ -1293,6 +1293,210 @@ class EditChannelFormTests(PrivateChannelUiBase):
             self.assertTrue(app._edit_channel_editor_open)
 
 
+class EditChannelKeyboardFlowTests(PrivateChannelUiBase):
+    """Exercise the ACTUAL keyboard flow of the floating EDIT CHANNEL overlay,
+    asserting the FOCUSED control after each keypress (not just widget
+    existence) -- mirroring NEW CHANNEL's own navigation."""
+
+    def _private(self, app, name="SECRET"):
+        import base64 as _b64
+        from radio_service import ChannelInfo
+
+        b64 = _b64.b64encode(bytes(range(16))).decode("ascii")
+        app._channels = (ChannelInfo(1, name),)
+        app.current_channel_index = 1
+        app.radio.channel_psk_text = lambda index: b64
+        return b64
+
+    @staticmethod
+    def _focused_id(app) -> str:
+        return getattr(app.focused, "id", None) or ""
+
+    async def test_open_focuses_name_not_title_and_populates(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            # Complete form is mounted and the CHANNEL NAME field is focused
+            # (never the EDIT CHANNEL title).
+            self.assertTrue(app._edit_channel_editor_open)
+            self.assertEqual(self._focused_id(app), "edit-channel-name")
+            self.assertEqual(app.query_one("#edit-channel-name").value, "SECRET")
+            key = app.query_one("#edit-channel-key")
+            self.assertTrue(key.value)  # actual current key populated
+            # The title is present but not the focused widget.
+            self.assertNotEqual(self._focused_id(app), "edit-channel-overlay")
+            title = app.query_one("#edit-channel-form").query_one(".page-title")
+            self.assertEqual(str(title.render()), "EDIT CHANNEL")
+
+    async def test_down_arrow_flow_and_save_cancel_navigation(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-name")
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-key")
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete")
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-save")
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-cancel")
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-save")
+
+    async def test_typing_changes_name_and_save_applies(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            # Type a new name into the focused CHANNEL NAME field.
+            app.query_one("#edit-channel-name").value = ""
+            app.query_one("#edit-channel-name").focus()
+            await pilot.press(*"RENAMED")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#edit-channel-name").value, "RENAMED")
+            # Move to SAVE and ENTER it.
+            for _ in range(3):
+                await pilot.press("down")
+                await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-save")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertFalse(app._edit_channel_editor_open)
+            self.assertEqual([c.name for c in app._channels], ["RENAMED"])
+
+    async def test_enter_on_delete_enters_confirmation_and_yes_deletes(self) -> None:
+        from radio_service import ChannelInfo, RadioState
+
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            app._radio_state = RadioState.ONLINE
+            app._channels = (ChannelInfo(0, "MEDIUMSLOW"), ChannelInfo(1, "SECRET"))
+            app.current_channel_index = 1
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            # DOWN name -> key -> delete.
+            await pilot.press("down", "down")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_delete_confirm)
+            # YES is focused initially.
+            self.assertEqual(self._focused_id(app), "edit-channel-delete-yes")
+            # RIGHT -> NO, LEFT -> YES.
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete-no")
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete-yes")
+            # ENTER on YES deletes.
+            await pilot.press("enter")
+            for _ in range(15):
+                await pilot.pause()
+                if app.current_channel_index == 0:
+                    break
+            self.assertEqual([c.name for c in app._channels], ["MEDIUMSLOW"])
+            self.assertFalse(app._edit_channel_editor_open)
+
+    async def test_enter_on_no_returns_to_form_preserving_values(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            # Type a pending name.
+            app.query_one("#edit-channel-name").value = ""
+            app.query_one("#edit-channel-name").focus()
+            await pilot.press(*"DRAFT")
+            await pilot.pause()
+            # DOWN to delete, ENTER -> confirm.
+            await pilot.press("down", "down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete-yes")
+            # RIGHT -> NO, ENTER -> back to form.
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(self._focused_id(app), "edit-channel-delete-no")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertFalse(app._edit_channel_delete_confirm)
+            self.assertEqual(self._focused_id(app), "edit-channel-name")
+            # Pending value survived the NO.
+            self.assertEqual(app.query_one("#edit-channel-name").value, "DRAFT")
+            self.assertEqual([c.name for c in app._channels], ["SECRET"])
+
+    async def test_escape_from_confirm_returns_to_form(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            await pilot.press("down", "down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app._edit_channel_delete_confirm)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app._edit_channel_delete_confirm)
+            self.assertEqual(self._focused_id(app), "edit-channel-name")
+
+    async def test_underlying_chat_stays_mounted_throughout(self) -> None:
+        app = self._make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.show_tab("chat")
+            self._private(app, name="SECRET")
+            await pilot.pause()
+            app.query_one("#chat-log").focus()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            self.assertIsNotNone(app.query_one("#chat-log"))
+            self.assertEqual(app.query_one("#chat-channel-content").current, "chat-conversation")
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsNotNone(app.query_one("#chat-log"))
+            self.assertEqual(app.query_one("#chat-channel-content").current, "chat-conversation")
+
+
 class ChatNetworkIdentityTests(PrivateChannelUiBase):
     async def test_unnamed_primary_channel_label_is_primary_not_mediumslow(
         self,
