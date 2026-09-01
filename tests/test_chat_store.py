@@ -180,7 +180,8 @@ class ChatStoreTests(unittest.TestCase):
             "SELECT version FROM schema_version"
         ).fetchone()[0]
 
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
+        self.assertIsNone(messages[0].local_node_id)
         self.assertEqual([message.text for message in messages], ["preserved"])
         self.assertIsNone(messages[0].origin_sent_at)
         self.assertIsNone(messages[0].dm_node_id)
@@ -1062,11 +1063,12 @@ class DirectMessagePersistenceTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v2 preserved"])
         self.assertIsNone(messages[0].dm_node_id)
         self.assertIsNone(messages[0].channel_key)
+        self.assertIsNone(messages[0].local_node_id)
         # The migrated store must correctly support new DM traffic too.
         reopened.add_incoming(
             packet_id=1,
@@ -1140,10 +1142,125 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v3 preserved"])
         self.assertIsNone(messages[0].channel_key)
+        self.assertIsNone(messages[0].local_node_id)
+
+    def test_v4_database_migrates_cleanly_and_preserves_legacy_rows(self) -> None:
+        """A valid schema-v4 database must open and migrate deterministically
+        to v5 (per-radio local_node_id namespace), not raise "Unsupported
+        CHAT schema version 4".
+
+        Regression: the v4 -> v5 bump changed SCHEMA_VERSION to 5 but the
+        supported-version guard -- a literal "(1, 2, 3, SCHEMA_VERSION)"
+        tuple -- was not updated to include 4, so a real v4 database raised
+        "Unsupported CHAT schema version 4" before the v4 -> v5 migration
+        could run. PRESERVE BUT HIDE: legacy rows stay physically present
+        with local_node_id = NULL and are NOT attributed to any radio.
+        """
+        self.store.close()
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """
+            DROP TABLE IF EXISTS send_attempts;
+            DROP TABLE IF EXISTS messages;
+            DROP TABLE IF EXISTS schema_version;
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (4);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                packet_id INTEGER,
+                node_id TEXT,
+                sender_name TEXT,
+                sender_short_name TEXT,
+                channel_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                origin_sent_at REAL,
+                radio_rx_at REAL,
+                received_at REAL NOT NULL,
+                local_sent_at REAL,
+                delivery_state TEXT,
+                created_at REAL NOT NULL,
+                dm_node_id TEXT,
+                channel_key TEXT
+            );
+            CREATE TABLE send_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES messages(id),
+                packet_id INTEGER,
+                state TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                completed_at REAL,
+                error TEXT
+            );
+            INSERT INTO messages VALUES (
+                1, 'incoming', 88, '!v4node', 'V4 Node', 'V4', 0,
+                'v4 channel preserved', 200, 201, 201, NULL, NULL, 201, NULL, NULL
+            );
+            INSERT INTO messages VALUES (
+                2, 'outgoing', NULL, NULL, 'YOU', NULL, 0,
+                'v4 dm preserved', NULL, NULL, 202, 202, 'SENT', 202, '!a11ce001', NULL
+            );
+            INSERT INTO send_attempts VALUES (
+                1, 2, 838484544, 'SENT', 202, NULL, NULL
+            );
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        reopened = ChatStore.open(self.path)
+        self.addCleanup(reopened.close)
+        version = reopened._connection.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        self.assertEqual(version, 5)
+        # local_node_id column now exists.
+        columns = {
+            column["name"]
+            for column in reopened._connection.execute(
+                "PRAGMA table_info(messages)"
+            ).fetchall()
+        }
+        self.assertIn("local_node_id", columns)
+        # Legacy rows are physically present and NOT attributed to a radio.
+        rows = reopened._connection.execute(
+            "SELECT text, local_node_id FROM messages ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["text"], row["local_node_id"]) for row in rows],
+            [("v4 channel preserved", None), ("v4 dm preserved", None)],
+        )
+        # Legacy rows are hidden from a bound current-radio namespace.
+        reopened.set_local_node_id("!current")
+        page = reopened.load_recent_page(channel_index=0, channel_key=None)
+        self.assertEqual([m.text for m in page.messages], [])
+        # No row was silently assigned to the connected radio.
+        self.assertIsNone(
+            reopened._connection.execute(
+                "SELECT local_node_id FROM messages LIMIT 1"
+            ).fetchone()["local_node_id"]
+        )
+        # Reopening again (a second initialization) does not corrupt it.
+        reopened.close()
+        second = ChatStore.open(self.path)
+        self.addCleanup(second.close)
+        self.assertEqual(
+            second._connection.execute("SELECT version FROM schema_version").fetchone()[0],
+            5,
+        )
+        versions = {
+            row["version"]
+            for row in second._connection.execute("SELECT version FROM schema_version").fetchall()
+        }
+        self.assertEqual(versions, {5})
+        remaining = second._connection.execute(
+            "SELECT text FROM messages ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(remaining), 2)
 
     def test_channel_key_none_returns_every_row_unfiltered(self) -> None:
         """Identity not yet known -- e.g. before the radio connects --
@@ -1348,6 +1465,119 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         )
 
         self.assertNotIn("stale longfast", [m.text for m in older.messages])
+
+
+class PerRadioNamespaceTests(unittest.TestCase):
+    """CHAT state-integrity: history is owned by canonical local node ID.
+
+    The SAME logical network/channel/PSK/DM on two DIFFERENT physical
+    radios (POLY vs SOHO) must never share history. Rows written before
+    per-radio namespacing (local_node_id NULL) are preserved but never
+    returned (preserve-but-hide policy).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "chat.db"
+        self.store = ChatStore.open(self.path)
+        self.addCleanup(self.store.close)
+
+    def _write(self, text: str) -> None:
+        self.store.add_incoming(
+            packet_id=hash(text) % 1_000_000,
+            node_id="!a11ce001",
+            sender_name="Alice Trail",
+            sender_short_name="ALCE",
+            channel_index=0,
+            text=text,
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key="id:primary",
+        )
+
+    def test_channels_are_isolated_between_physical_radios(self) -> None:
+        self.store.set_local_node_id("!poly")
+        self._write("POLY primary history")
+        self.store.set_local_node_id("!soho")
+        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
+        self.assertTrue(not page.messages)
+        self.store.add_incoming(
+            packet_id=7,
+            node_id="!b",
+            sender_name="SOHO",
+            sender_short_name="SOHO",
+            channel_index=0,
+            text="SOHO primary history",
+            radio_rx_at=100.0,
+            received_at=100.0,
+            channel_key="id:primary",
+        )
+        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
+        self.assertEqual([m.text for m in page.messages], ["SOHO primary history"])
+        self.store.set_local_node_id("!poly")
+        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
+        self.assertEqual([m.text for m in page.messages], ["POLY primary history"])
+
+    def test_same_settings_different_radios_do_not_merge_dm_history(self) -> None:
+        for node_id in ("!poly", "!soho"):
+            self.store.set_local_node_id(node_id)
+            self.store.add_incoming(
+                packet_id=1,
+                node_id="!a11ce001",
+                sender_name="Alice",
+                sender_short_name="ALC",
+                channel_index=0,
+                text=f"{node_id} DM",
+                radio_rx_at=100.0,
+                received_at=100.0,
+                dm_node_id="!a11ce001",
+            )
+        self.store.set_local_node_id("!poly")
+        page = self.store.load_recent_dm_page("!a11ce001")
+        self.assertEqual([m.text for m in page.messages], ["!poly DM"])
+        self.store.set_local_node_id("!soho")
+        page = self.store.load_recent_dm_page("!a11ce001")
+        self.assertEqual([m.text for m in page.messages], ["!soho DM"])
+
+    def test_dm_conversation_list_is_per_radio(self) -> None:
+        self.store.set_local_node_id("!poly")
+        self.store.add_incoming(
+            packet_id=1, node_id="!a11ce001", sender_name="A",
+            sender_short_name="A", channel_index=0, text="poly dm",
+            radio_rx_at=100.0, received_at=100.0, dm_node_id="!a11ce001",
+        )
+        self.store.set_local_node_id("!soho")
+        self.assertEqual(self.store.list_dm_conversations(), [])
+        self.store.add_incoming(
+            packet_id=2, node_id="!b1111111", sender_name="B",
+            sender_short_name="B", channel_index=0, text="soho dm",
+            radio_rx_at=100.0, received_at=100.0, dm_node_id="!b1111111",
+        )
+        self.assertEqual([c[0] for c in self.store.list_dm_conversations()], ["!b1111111"])
+
+    def test_legacy_null_rows_are_preserved_but_hidden(self) -> None:
+        # Write before any namespace binding -> local_node_id stays NULL.
+        self.store.add_incoming(
+            packet_id=99, node_id="!old", sender_name="Old",
+            sender_short_name="OLD", channel_index=0, text="legacy unowned",
+            radio_rx_at=100.0, received_at=100.0, channel_key="id:primary",
+        )
+        self.store.set_local_node_id("!poly")
+        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
+        self.assertEqual([m.text for m in page.messages], [])
+        self.assertTrue(not page.messages)
+
+    def test_unknown_namespace_reads_nothing(self) -> None:
+        self.store.set_local_node_id("!poly")
+        self.store.add_incoming(
+            packet_id=5, node_id="!a", sender_name="A", sender_short_name="A",
+            channel_index=0, text="poly",
+            radio_rx_at=100.0, received_at=100.0, channel_key="id:primary",
+        )
+        self.store.set_local_node_id(None)
+        page = self.store.load_recent_page(channel_index=0, channel_key="id:primary")
+        self.assertTrue(not page.messages)
 
 
 if __name__ == "__main__":

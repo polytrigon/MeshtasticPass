@@ -95,7 +95,7 @@ class RadioServiceTests(unittest.TestCase):
         self.assertEqual(
             RadioService._read_channel_info(local_node),
             (
-                ChannelInfo(0, "PRIMARY", stable_key="PRIMARY"),
+                ChannelInfo(0, "PRIMARY", stable_key=""),
                 ChannelInfo(1, "Hiking", stable_key="Hiking"),
             ),
         )
@@ -170,7 +170,7 @@ class RadioServiceTests(unittest.TestCase):
 
         result = RadioService._read_channel_info(local_node)
 
-        self.assertEqual(result, (ChannelInfo(0, "PRIMARY", stable_key="PRIMARY"),))
+        self.assertEqual(result, (ChannelInfo(0, "PRIMARY", stable_key=""),))
 
     def test_reading_channel_info_touches_only_already_synced_data(self) -> None:
         """Item 20/33: _read_channel_info is a pure function over the
