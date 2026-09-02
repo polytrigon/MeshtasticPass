@@ -3284,19 +3284,19 @@ class MeshTopologyView(Container):
                     # exact RouteDiscovery order -- never sorted, never
                     # re-derived from hop count or grid position). An EMPTY
                     # forward is explicit DIRECT (YOU->destination, zero
-                    # relays) and overrides any stale generic staging. Only
-                    # relays actually on the board are routed through (a
-                    # relay with no rendered cell cannot be drawn to); their
-                    # order among survivors is preserved.
+                    # relays) and overrides any stale generic staging.
+                    # Relay admission is GUARANTEED (see mesh_state.
+                    # build_mesh_working_set), so every relay normally has a
+                    # center. Honest degradation: if a known relay genuinely
+                    # has no render position, we NEVER compress the chain
+                    # into a fabricated YOU->A->TARGET -- instead we skip the
+                    # connector for this destination entirely (truthful
+                    # "unlinked" rather than a fabricated bridge).
+                    chain_relays = tuple(explicit_forward)
+                    if not all(relay_id in centers for relay_id in chain_relays):
+                        continue
                     chain_node_ids = route_chain_node_ids(
-                        you_id,
-                        remote_id,
-                        tuple(
-                            relay_id
-                            for relay_id in explicit_forward
-                            if relay_id in centers
-                        ),
-                        (),
+                        you_id, remote_id, chain_relays, ()
                     )
                     is_explicit = True
                 else:

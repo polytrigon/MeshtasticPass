@@ -270,6 +270,36 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         self.assertTrue(relays[0].is_relay)
         self.assertEqual(relays[0].node.long_name, "RelayX")
 
+    def test_identified_relay_survives_capacity_bounding(self) -> None:
+        """An identified traceroute relay MUST stay admitted even when the
+        normal NodeDB/CHAT population already fills max_remote_nodes: a relay
+        named in a successful RouteDiscovery forward chain has to render, or
+        the explicit route would silently compress into a fabricated
+        YOU->A->TARGET (see app.py's route_chain_node_ids). The capacity cap
+        is readability, not a license to drop route evidence.
+        """
+        # max_remote_nodes full competitors, each newer than the last, with
+        # NO timing anywhere for the relay (it is bare, canonical-ID-only).
+        last_message_at = {
+            f"!n{i:04x}": NOW - i for i in range(DEFAULT_MAX_REMOTE_NODES)
+        }
+        result = build_mesh_working_set(
+            [YOU],
+            now=NOW,
+            last_message_at=last_message_at,
+            identified_relay_ids=("!ffff0001", "!ffff0002"),
+        )
+        relay_ids = {
+            state.node.node_id
+            for state in result
+            if state.node.node_id in ("!ffff0001", "!ffff0002")
+        }
+        self.assertEqual(relay_ids, {"!ffff0001", "!ffff0002"})
+        # The bounded cap is still honoured for the general pool but the
+        # route-required relays are retained on top of it (they rank last, so
+        # no higher-ranked real node is displaced).
+        self.assertGreaterEqual(len(result) - 1, DEFAULT_MAX_REMOTE_NODES)
+
     def test_nodedb_only_node_with_no_chat_history_still_appears(self) -> None:
         """The core NodeDB-first behavior: a node the radio has passively
 

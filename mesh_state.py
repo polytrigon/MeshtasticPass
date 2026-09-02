@@ -398,7 +398,25 @@ def build_mesh_working_set(
         )
 
     candidates.sort(key=rank_key)
-    bounded = tuple(candidates[: max(0, max_remote_nodes)])
+    bounded = candidates[: max(0, max_remote_nodes)]
+    # Identified traceroute relays are GUARANTEED admission: a node named in a
+    # successful RouteDiscovery forward chain must render, or the explicit route
+    # would silently compress (a missing intermediate relay must never become a
+    # fabricated YOU->A->TARGET, see app.py's route_chain_node_ids). The
+    # max_remote_nodes cap is a readability preference, never a license to drop
+    # route evidence -- so any identified relay that ranked outside the cap is
+    # re-admitted. They rank last anyway (no timing), so this only ever restores
+    # a route-required relay, never displaces a higher-ranked real node.
+    if identified_relays:
+        bounded_ids = {state.node.node_id for state in bounded}
+        for state in candidates:
+            if (
+                state.node.node_id in identified_relays
+                and state.node.node_id not in bounded_ids
+            ):
+                bounded.append(state)
+                bounded_ids.add(state.node.node_id)
+    bounded = tuple(bounded)
 
     if local is None:
         return bounded

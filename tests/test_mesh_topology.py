@@ -9755,6 +9755,111 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
 
+    async def test_two_relay_route_survives_capacity_and_never_compresses(self) -> None:
+        """Under a working set already at max_remote_nodes, the identified
+        relays of an active explicit route are STILL admitted and rendered, so
+        YOU->A->B->TARGET is drawn in full -- it must never silently compress
+        to YOU->A->TARGET because an intermediate relay was ranked out.
+        """
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001", "!ffff0002"),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            now = time.time()
+
+            def packed():
+                nodes = [
+                    NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                    # Destination Alice + a full capacity worth of live remotes.
+                    NodeMetadata(
+                        "!a1111111", "Alice", "ALC", 0,
+                        last_heard=now - 5, position=north_of_local(2),
+                    ),
+                ]
+                # A full capacity of competing active remotes.
+                for i in range(DEFAULT_MAX_REMOTE_NODES):
+                    nodes.append(
+                        NodeMetadata(
+                            f"!cap{i:04x}", f"Cap{i}", f"C{i}", 1,
+                            last_heard=now - 6, position=north_of_local(3 + i),
+                        )
+                    )
+                return tuple(nodes)
+
+            app.radio.get_known_nodes = packed
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            both_relays_present = {
+                "!ffff0001", "!ffff0002"
+            }.issubset({s.node.node_id for s in view.working_set})
+            self.assertTrue(both_relays_present)
+            chain = self._chain_for(view, "!a1111111")
+            self.assertTrue(chain.explicit)
+            self.assertEqual(
+                chain.node_ids, (you_id, "!ffff0001", "!ffff0002", "!a1111111")
+            )
+
+    async def test_missing_relay_never_compresses_to_direct_you_to_target(
+        self,
+    ) -> None:
+        """If a known explicit relay genuinely cannot be rendered, the
+        destination gets NO connector (truthful unlink) rather than a
+        fabricated YOU->TARGET / A->TARGET bridge that the traceroute never
+        observed. Direct () is the ONLY way a zero-relay path is valid. This
+        guards the exceptional branch (relay admission is normally guaranteed,
+        so we simulate one relay failing to survive admission).
+        """
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001", "!ffff0002"),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            # The stored evidence has a TWO-relay forward chain, but we force a
+            # single known relay to fail admission (exceptional condition). The
+            # renderer must NOT bridge across the missing !ffff0002.
+            app._identified_traceroute_relay_ids = lambda: ("!ffff0001",)
+            app.radio.get_known_nodes = lambda nodes=(
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    "!a1111111", "Alice", "ALC", 1,
+                    last_heard=time.time() - 5, position=north_of_local(2),
+                ),
+                NodeMetadata(
+                    "!b2222222", "Bob", "BOB", 1,
+                    last_heard=time.time() - 5, position=south_of_local(2),
+                ),
+                NodeMetadata("!ffff0001", "RelayA", "RA", 1,
+                             last_heard=time.time() - 5),
+            ): nodes
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chains = [c for c in view.connector_chains if c.destination_id == "!a1111111"]
+            # Honest degradation: no connector for this destination at all --
+            # never a compressed YOU->A->TARGET bridge across the missing relay.
+            self.assertEqual(chains, [])
+            self.assertNotIn(
+                "!a1111111",
+                {c.destination_id for c in view.connector_chains},
+            )
+
     # ---- One active trace at a time -------------------------------------
 
     async def test_repeated_attempt_while_pending_is_a_deterministic_no_op(
