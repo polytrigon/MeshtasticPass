@@ -76,6 +76,7 @@ from mesh_topology import (
     build_topology,
     compact_node_label,
     directional_target,
+    marching_ants_cells,
     place_within_bounds,
     project_to_viewport,
     route_chain,
@@ -222,6 +223,59 @@ def client_state(
 
 
 class MeshTopologyModelTests(unittest.TestCase):
+    def test_forward_route_evidence_prefers_forward_and_keeps_return(self) -> None:
+        from mesh_topology import RouteEvidence, forward_route_evidence
+        from radio_service import TracerouteResult
+
+        result = TracerouteResult(
+            destination_node_id="!target",
+            forward_route=("!a", "!b"),
+            forward_snr=(None, None, None),
+            return_route=("!c",),
+            return_snr=(None, None),
+            completed_at=1000.0,
+        )
+        evidence = forward_route_evidence(result)
+        self.assertEqual(
+            evidence,
+            RouteEvidence(
+                destination_node_id="!target",
+                forward=("!a", "!b"),
+                return_route=("!c",),
+            ),
+        )
+        # An EMPTY forward route is explicit DIRECT evidence, never "unknown".
+        direct = forward_route_evidence(
+            TracerouteResult(
+                destination_node_id="!target",
+                forward_route=(),
+                forward_snr=(None,),
+                return_route=(),
+                return_snr=(None,),
+                completed_at=1000.0,
+            )
+        )
+        self.assertEqual(direct.forward, ())
+        self.assertEqual(direct.destination_node_id, "!target")
+
+    def test_marching_ants_alternate_accent_and_dim_and_advance(self) -> None:
+        """marching_ants_cells marks an ordered connector path as an
+        alternating ACCENT/DIM band that shifts phase per frame -- the
+        terminal "marching ants" -- without changing any glyph or inventing
+        any geometry."""
+        # A straight 6-cell horizontal connector: (1..6, 0).
+        route = tuple((x, 0, "─") for x in range(1, 7))
+        frame0 = marching_ants_cells(route, 0, accent=True)
+        self.assertEqual([c[3] for c in frame0], [True, True, False, False, True, True])
+        self.assertEqual([c[2] for c in frame0], ["─"] * 6)
+        # Advancing the frame slides the alternating phase by one cell.
+        frame1 = marching_ants_cells(route, 1, accent=True)
+        self.assertEqual([c[3] for c in frame1], [False, True, True, False, False, True])
+        # Positions and glyphs are preserved exactly.
+        self.assertEqual([(c[0], c[1]) for c in frame1], [(x, 0) for x in range(1, 7)])
+        # An empty path yields no cells.
+        self.assertEqual(marching_ants_cells((), 0, accent=True), ())
+
     def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
         """MESH GPS PLACEMENT: real distance now genuinely differentiates
 
@@ -9369,6 +9423,83 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(app._traceroute_results), 1)
             self.assertEqual(
                 app._traceroute_results["!a1111111"].forward_route, ("!ffff0002",)
+            )
+
+    # ---- Session route evidence (topology) ------------------------------
+
+    async def test_success_stores_forward_route_evidence_not_return_symmetry(
+        self,
+    ) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+            traceroute_return_route=("!ffff0009",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            evidence = app._traceroute_routes["!a1111111"]
+            self.assertEqual(evidence.destination_node_id, "!a1111111")
+            self.assertEqual(evidence.forward, ("!ffff0001",))
+            # The return route is retained as evidence but never treated as a
+            # forward hop (no fabricated symmetry).
+            self.assertEqual(evidence.return_route, ("!ffff0009",))
+
+    async def test_identified_relay_admitted_to_mesh_working_set(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            working_ids = {
+                s.node.node_id for s in app.query_one(MeshTopologyView).working_set
+            }
+            # The relay is a REAL canonical ID admitted even though NodeDB has
+            # no metadata for it (bare minimal node, not a hop-count placeholder).
+            self.assertIn("!ffff0001", working_ids)
+
+    async def test_failed_trace_preserves_prior_route_evidence(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.FAILED,
+            ),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            # A failed trace must never erase the last successful evidence.
+            self.assertIn("!a1111111", app._traceroute_routes)
+            self.assertEqual(
+                app._traceroute_routes["!a1111111"].forward, ("!ffff0001",)
             )
 
     # ---- One active trace at a time -------------------------------------

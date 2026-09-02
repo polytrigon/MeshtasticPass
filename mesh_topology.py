@@ -18,7 +18,7 @@ from grapheme_text import (
     grapheme_clusters as _grapheme_clusters,
     truncate_to_cells as _truncate,
 )
-from radio_service import NodeMetadata
+from radio_service import NodeMetadata, TracerouteResult
 
 
 NODE_WIDTH = 18
@@ -1270,6 +1270,78 @@ def route_chain_avoiding(
             route_connector_avoiding(start[0], start[1], end[0], end[1], obstacles)
         )
     return tuple(cells)
+
+
+MARCHING_ANTS_GLYPHS = ("─", "│", "┐", "└", "┘", "┌")
+# One alternating "ant" is a run of MARCHING_ANTS_RUN cells of the SAME
+# phase; the next phase inverts (ACCENT <-> DIM), and the whole pattern
+# shifts by one cell per animation frame to read as marching along the line.
+MARCHING_ANTS_RUN = 2
+
+
+@dataclass(frozen=True)
+class RouteEvidence:
+    """Session topology evidence from one successful traceroute.
+
+    `forward` is the ordered tuple of canonical relay node IDs observed on
+    the FORWARD leg (YOU -> destination), excluding the endpoints -- an
+    empty tuple means an explicit DIRECT connection (zero relays), never
+    "unknown". `return_route` is the independent return leg, retained for
+    completeness but never used to fabricate forward-route symmetry: the
+    primary MESH topology is drawn from `forward` only. `destination_node_id`
+    is the canonical destination (the "*" marker target). Identity is always
+    canonical node ID, never LONG/SHORT name.
+    """
+
+    destination_node_id: str
+    forward: tuple[str, ...]
+    return_route: tuple[str, ...] = ()
+
+
+def forward_route_evidence(result: TracerouteResult) -> RouteEvidence:
+    """Build session route evidence from a successful TracerouteResult.
+
+    Prefers the FORWARD route for the primary topology; the return route is
+    retained alongside but never substituted for the forward route (they may
+    legitimately differ -- an asymmetric return path is not presented as
+    forward-route symmetry). Canonical node IDs only -- never names.
+    """
+    return RouteEvidence(
+        destination_node_id=result.destination_node_id,
+        forward=tuple(result.forward_route),
+        return_route=tuple(result.return_route),
+    )
+
+
+def marching_ants_cells(
+    route_cells: tuple[tuple[int, int, str], ...],
+    frame: int,
+    *,
+    accent: bool,
+) -> tuple[tuple[int, int, str, bool], ...]:
+    """Color a connector's cells as an alternating, marching "ants" band.
+
+    `route_cells` is the ordered (x, y, glyph) path a connector draws
+    (endpoints excluded, as route_connector produces). The returned tuple
+    carries (x, y, glyph, is_accent) where `is_accent` toggles every
+    MARCHING_ANTS_RUN cells and the phase advances by `frame` positions --
+    a terminal "marching ants" that means "traceroute in progress", NOT
+    that the final relay path is known (the caller still draws only a
+    direct YOU->destination line while pending; it never fabricates relay
+    nodes). Purely visual: it never changes the glyph, only which cells
+    render ACCENT vs DIM. Geometry-independent (works for horizontal,
+    vertical, and elbow'd connectors alike).
+    """
+    if not route_cells:
+        return ()
+    result: list[tuple[int, int, str, bool]] = []
+    for index, (x, y, glyph) in enumerate(route_cells):
+        # A periodic "on" run of MARCHING_ANTS_RUN cells; shifting the frame
+        # slides the whole alternating band one cell per tick so it reads as
+        # marching along the line (the "ant" travels forward).
+        on = ((index - frame) % (2 * MARCHING_ANTS_RUN)) < MARCHING_ANTS_RUN
+        result.append((x, y, glyph, on if accent else not on))
+    return tuple(result)
 
 
 def directional_target(

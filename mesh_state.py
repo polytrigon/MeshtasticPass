@@ -106,17 +106,14 @@ class MeshNodeState:
 
     Neither implies the other; a node can be CLIENT, RELAY, or both.
 
-    No data source currently available to this app (see
-    radio_service.RadioService._parse_text_packet) identifies which
-    specific node relayed a given packet -- an ordinary Meshtastic text
-    packet exposes only an aggregate hop COUNT (`hopsAway`), never
-    forwarder identity, and this app does not send traceroutes or any
-    other active discovery request to find out. `is_relay` is therefore
-    always False today. The field exists, and this dataclass is shaped
-    around it, so a future trustworthy source (should the SDK or a later
-    packet type expose one) can populate it without a model change --
-    but nothing in this codebase may set it from hop count, a configured
-    role, geographic position, or any other proxy/guess.
+    `is_relay` is set ONLY from a successful traceroute's forward route
+    (see build_mesh_working_set's `identified_relay_ids`): a node named
+    as an intermediate hop in a RouteDiscovery's forward path is
+    trustworthy evidence it relayed the route-request packet another
+    node originated. It is NEVER set from hop count (`hopsAway`), a
+    configured role, geographic position, or any other proxy/guess --
+    an ordinary Meshtastic text packet exposes only an aggregate hop
+    count, never forwarder identity.
     """
 
     node: NodeMetadata
@@ -154,6 +151,13 @@ class MeshNodeState:
         if freshest is not None and is_node_active(freshest, now):
             return MeshActivityTier.ACTIVE
         if freshest is None:
+            # An identified traceroute relay carries no NodeDB/CHAT timing,
+            # but its presence in a successful forward route is direct
+            # evidence it is currently relaying in the mesh -- a distinct
+            # signal from age (we do not fabricate a timestamp for it).
+            # It must therefore never be VERY_OLD'd off the board.
+            if self.is_relay:
+                return MeshActivityTier.ACTIVE
             return MeshActivityTier.VERY_OLD
         age = now - freshest
         if age < MESH_VERY_OLD_THRESHOLD_SECONDS:
@@ -181,6 +185,7 @@ def build_mesh_working_set(
     now: float,
     last_message_at: Mapping[str, float] | None = None,
     favorite_ids: Iterable[str] | None = None,
+    identified_relay_ids: Iterable[str] | None = None,
     max_remote_nodes: int = DEFAULT_MAX_REMOTE_NODES,
 ) -> tuple[MeshNodeState, ...]:
     """NodeDB-first working set: YOU plus a bounded, ranked set of real nodes.
@@ -207,7 +212,11 @@ def build_mesh_working_set(
     is_relay still drive glyph_is_solid's own STROKED-vs-FILLED node
     styling even though the unified bottom bar (mesh_state.
     format_mesh_node_bar_fields) no longer renders a ROLE field at all
-    (MESH GPS + UNIFIED BAR Part B). `last_interaction_at` remains
+    (MESH GPS + UNIFIED BAR Part B). The one exception to
+    is_relay=False is an identified traceroute relay (a node named in a
+    successful RouteDiscovery's forward path -- see `identified_relay_ids`
+    below), which is genuinely observed relaying and admitted as
+    is_relay=True even before NodeDB has metadata for it. `last_interaction_at` remains
     specifically CHAT interaction time (None when there is none) --
     unchanged meaning from before, still what is_stale() describes.
     format_mesh_node_bar_fields' own TIME field additionally considers
@@ -321,6 +330,22 @@ def build_mesh_working_set(
     candidate_ids = set(known_by_id) | set(normalized_interactions)
     if local is not None:
         candidate_ids.discard(local.node_id)
+    # Identified traceroute relays: real canonical node IDs the radio has not
+    # necessarily synced full NodeDB metadata for yet. Admitted WITHOUT a name
+    # or timestamp (they fall back to the bare canonical-ID NodeMetadata below,
+    # the same minimal-node convention an unseen CHAT participant already uses);
+    # later NodeDB/CHAT information enriches that SAME canonical node rather
+    # than creating a duplicate. Never invented from hop count -- only from
+    # actual successful-traceroute route evidence. They are never favored or
+    # ranked as CLIENT; they participate in the normal bounded ranking below.
+    identified_relays = {
+        normalized
+        for node_id in (identified_relay_ids or ())
+        if (normalized := normalize_mesh_node_id(node_id))
+    }
+    if local is not None:
+        identified_relays.discard(local.node_id)
+    candidate_ids |= identified_relays
 
     local_position = local.position if local is not None else None
     candidates: list[MeshNodeState] = []
@@ -331,7 +356,7 @@ def build_mesh_working_set(
             MeshNodeState(
                 node=node,
                 is_client=chat_interaction_at is not None,
-                is_relay=False,
+                is_relay=node_id in identified_relays,
                 last_interaction_at=chat_interaction_at,
                 # Straight-line geographic distance from YOU, derived only
                 # from stored GPS coordinates -- never from grid position,

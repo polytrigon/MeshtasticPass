@@ -72,14 +72,18 @@ from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
     PositionedNode,
     RelayStage,
+    RouteEvidence,
     TopologyLayout,
     assign_grid_slots,
     build_relay_stages,
     directional_target,
+    forward_route_evidence,
+    marching_ants_cells,
     mesh_board_marker_label,
     place_within_bounds,
     project_to_viewport,
     route_chain_avoiding,
+    route_connector_avoiding,
 )
 from node_activity import is_node_active
 from radio_capabilities import (
@@ -3332,6 +3336,39 @@ class MeshTopologyView(Container):
         # Moving focus away naturally restores ordinary styling on the
         # very next set_nodes() call -- nothing here persists paint
         # state across calls.
+        # Marching-ants trace-in-progress indication: while a traceroute is
+        # pending toward a real working-set node, draw a DIRECT animated
+        # YOU->destination connector. It is temporary activity visualization
+        # only ("a trace is in progress toward this node") -- never a claim
+        # that the final relay path is known, so no relay node is fabricated
+        # and the animation runs on the SAME connector geometry every other
+        # connector already uses. Purely visual: the connector's cells carry
+        # an alternating ACCENT/DIM phase, advanced by the pre-existing
+        # _advance_delivery_states tick (see marching_ants_cells).
+        active = getattr(self.app, "_active_traceroute", None)
+        if (
+            active is not None
+            and you_id in centers
+            and active.destination_node_id in centers
+        ):
+            direct = route_connector_avoiding(
+                centers[you_id][0],
+                centers[you_id][1],
+                centers[active.destination_node_id][0],
+                centers[active.destination_node_id][1],
+                frozenset(
+                    position
+                    for node_id, position in centers.items()
+                    if node_id not in (you_id, active.destination_node_id)
+                ),
+            )
+            frame = getattr(self.app, "_traceroute_animation_frame", 0)
+            for x, y, glyph, is_accent in marching_ants_cells(
+                direct, frame, accent=True
+            ):
+                color = palette.accent if is_accent else palette.dim_quarter
+                connector_cells.append((x, y, glyph, color))
+
         self.board.query_one(MeshCanvas).render_scene(
             board_width,
             board_height,
@@ -4880,6 +4917,12 @@ class MeshtasticPassApp(App[None]):
         # persisted to disk -- an app restart clears it completely.
         self._active_traceroute: ActiveTraceroute | None = None
         self._traceroute_results: dict[str, TracerouteResult] = {}
+        # Session topology route evidence (canonical forward relay chain per
+        # destination) -- the strongest trustworthy route currently known, so
+        # the MESH board can draw identified relay hops rather than only the
+        # NodeDB-derived anonymous hop-count stages. Populated only by a
+        # SUCCESSFUL trace (a failed/timed-out trace never touches it).
+        self._traceroute_routes: dict[str, RouteEvidence] = {}
         self._traceroute_banner: TracerouteBanner | None = None
         self._traceroute_banner_timer: Timer | None = None
         self._traceroute_timeout_timer: Timer | None = None
@@ -8372,6 +8415,22 @@ class MeshtasticPassApp(App[None]):
                     activity[key] = timestamp
         return activity
 
+    def _identified_traceroute_relay_ids(self) -> tuple[str, ...]:
+        """Canonical node IDs of relays observed on successful traceroutes.
+
+        The union of every forward route's intermediate relay IDs (never the
+        endpoints). These are REAL identities from successful RouteDiscovery
+        evidence -- not hop-count placeholders -- so they are admitted to the
+        MESH working set even before NodeDB has full metadata for them. Purely
+        read from in-memory session state; zero RF. A later failed trace never
+        erases them (only a newer successful trace replaces per-destination
+        evidence).
+        """
+        ids: set[str] = set()
+        for evidence in self._traceroute_routes.values():
+            ids.update(evidence.forward)
+        return tuple(sorted(ids))
+
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
 
@@ -8406,6 +8465,7 @@ class MeshtasticPassApp(App[None]):
             now=current_time,
             last_message_at=self._mesh_last_message_activity(),
             favorite_ids=self.settings.favorite_node_ids,
+            identified_relay_ids=self._identified_traceroute_relay_ids(),
         )
         # YOU's long_name/short_name from get_known_nodes() are NOT
         # reliable (that NodeDB record is frequently a bare synthesized
@@ -8850,6 +8910,20 @@ class MeshtasticPassApp(App[None]):
         if override is not None:
             widgets[0].update(override)
 
+    def _render_mesh_board_marching_ants(self) -> None:
+        """Repaint the MESH board so a pending trace's marching-ants connector
+        advances its alternating phase.
+
+        Reuses the existing _refresh_mesh path (which recomputes the working
+        set and calls set_nodes with the CURRENT _traceroute_animation_frame),
+        so the animation is driven by the pre-existing _advance_delivery_states
+        tick and never introduces a second timer. A no-op off the MESH tab or
+        while not ONLINE (the board is not live then).
+        """
+        if self.current_tab != "mesh":
+            return
+        self._refresh_mesh()
+
     def _start_traceroute(self, node: NodeMetadata) -> None:
         """TRACE ROUTE menu action (MESH's selected REMOTE node ENTER
 
@@ -8947,6 +9021,11 @@ class MeshtasticPassApp(App[None]):
         destination = result.destination_node_id
         self._clear_active_traceroute()
         self._traceroute_results[destination] = result
+        # Session route evidence (forward relay chain by canonical node ID,
+        # return route retained but never used to fabricate symmetry). A
+        # newer successful trace REPLACES the older evidence for the same
+        # destination; a failed trace never erases it (see _finish_traceroute_failure).
+        self._traceroute_routes[destination] = forward_route_evidence(result)
         self.query_one(MeshTopologyView).mark_traced(destination)
         self._show_traceroute_banner("TRACE SUCCEEDED", "accent")
         # Repaints the board (for the new "*" marker) AND the top status
@@ -9011,6 +9090,11 @@ class MeshtasticPassApp(App[None]):
             ) % TRACEROUTE_ARROW_POSITIONS
             if self._radio_state is RadioState.ONLINE:
                 self._render_mesh_top_status()
+                # Marching-ants: repaint the MESH board so the pending
+                # YOU->destination connector's alternating phase advances on
+                # this SAME pre-existing tick (no new timer). Only repaints
+                # the connector cells -- nodes are unchanged.
+                self._render_mesh_board_marching_ants()
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)

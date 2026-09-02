@@ -14,6 +14,7 @@ from mesh_state import (
     MESH_LINK_SNR_GOOD_DB,
     MESH_LINK_SNR_WEAK_DB,
     MESH_STALE_THRESHOLD_SECONDS,
+    MeshActivityTier,
     MeshLinkDisplay,
     MeshNodeBarFields,
     MeshNodeState,
@@ -227,6 +228,47 @@ class BuildMeshWorkingSetTests(unittest.TestCase):
         self.assertTrue(remote.is_client)
         self.assertFalse(remote.is_relay)
         self.assertEqual(remote.last_interaction_at, NOW - 10)
+
+    def test_identified_relay_admitted_as_relay_and_never_very_old(self) -> None:
+        """A successful traceroute's forward hop is a real canonical node ID
+        that NodeDB may not have synced yet. It must be admitted as a bare
+        minimal node (is_relay=True, no name/timestamp fabricated), never
+        VERY_OLD'd off the board for lacking timing, and later NodeDB data
+        enriches that SAME node rather than creating a duplicate.
+        """
+        alice = NodeMetadata("!alice", "Alice", "ALC", 1, NOW - 500)
+        result = build_mesh_working_set(
+            [YOU, alice],
+            now=NOW,
+            last_message_at={},
+            identified_relay_ids=("!ffff0001",),
+        )
+        remote_ids = {state.node.node_id for state in result if not state.node.is_local}
+        self.assertIn("!ffff0001", remote_ids)
+        relay = next(state for state in result if state.node.node_id == "!ffff0001")
+        self.assertTrue(relay.is_relay)
+        self.assertFalse(relay.is_client)
+        self.assertIsNone(relay.last_interaction_at)
+        self.assertIsNone(relay.node.last_heard)
+        # No timing info, but route evidence keeps it on the board (ACTIVE),
+        # never VERY_OLD.
+        self.assertNotEqual(relay.activity_tier(now=NOW), MeshActivityTier.VERY_OLD)
+
+    def test_identified_relay_enriched_by_nodedb_not_duplicated(self) -> None:
+        """When NodeDB also knows an identified relay, the SAME canonical
+        node is used (carrying its real name), not a second bare entry.
+        """
+        known_relay = NodeMetadata("!ffff0001", "RelayX", "RLX", 2, NOW - 5)
+        result = build_mesh_working_set(
+            [YOU, known_relay],
+            now=NOW,
+            last_message_at={},
+            identified_relay_ids=("!ffff0001",),
+        )
+        relays = [s for s in result if s.node.node_id == "!ffff0001"]
+        self.assertEqual(len(relays), 1)
+        self.assertTrue(relays[0].is_relay)
+        self.assertEqual(relays[0].node.long_name, "RelayX")
 
     def test_nodedb_only_node_with_no_chat_history_still_appears(self) -> None:
         """The core NodeDB-first behavior: a node the radio has passively
