@@ -1008,7 +1008,7 @@ class EditChannelCancel(Static):
 
 
 class EditChannelDelete(Static):
-    """[ DELETE CHANNEL ] -- enter the in-place YES/NO confirmation for the
+    """[ DEL CHANNEL ] -- enter the in-place YES/NO confirmation for the
     currently-edited private channel. Selectable, but does NOT delete."""
 
     can_focus = True
@@ -1018,7 +1018,7 @@ class EditChannelDelete(Static):
 
     def __init__(self) -> None:
         super().__init__(
-            "[ DELETE CHANNEL ]",
+            "[ DEL CHANNEL ]",
             id="edit-channel-delete",
             classes="connection-action-row",
             markup=False,
@@ -1031,6 +1031,62 @@ class EditChannelDelete(Static):
         elif event.key == "escape":
             self.app._close_edit_channel()
             event.stop()
+
+
+class CopyChannelKey(Static):
+    """[ COPY KEY ] -- copy the current channel's actual key to the clipboard.
+
+    Selectable/focusable. Uses Textual's built-in App.copy_to_clipboard (OSC 52,
+    the same mechanism the removed PSK-copy used); zero RF, no channel
+    mutation, the overlay stays open. The real key is never displayed, only
+    kept internally and copied on activation.
+    """
+
+    can_focus = True
+
+    class Activated(Message):
+        pass
+
+    def __init__(self) -> None:
+        super().__init__(
+            "[ COPY KEY ]",
+            id="edit-channel-copy-key",
+            classes="connection-action-row",
+            markup=False,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if event.key in ("enter",):
+            self.post_message(self.Activated())
+            event.stop()
+        elif event.key == "escape":
+            self.app._close_edit_channel()
+            event.stop()
+
+
+class ChannelEditActionRow(Horizontal):
+    """A labeled row in the EDIT CHANNEL overlay that holds a focusable action
+    (e.g. `[ COPY KEY ]` or `[ DEL CHANNEL ]`) instead of a text Input.
+
+    Reuses the EXACT layout primitives of NetworkFieldInput -- a 2-cell
+    selection gutter, a 13-cell connection-label, then the action control --
+    so the action's leading `[` lines up with the `[` of a CHANNEL NAME input
+    row and with every other labeled row in the established forms. An empty
+    label renders the action left-aligned to the SAME column (used for
+    `[ DEL CHANNEL ]` so it lines up under `[ COPY KEY ]`).
+    """
+
+    can_focus = False
+
+    def __init__(self, *, label: str, widget_id: str, control: Static) -> None:
+        super().__init__(id=widget_id, classes="connection-action-row")
+        self._label = label
+        self._control = control
+
+    def compose(self) -> ComposeResult:
+        yield Static(" ", classes="connection-selection-gutter", markup=False)
+        yield Static(self._label, classes="connection-label", markup=False)
+        yield self._control
 
 
 class EditChannelDeleteYes(Static):
@@ -1054,7 +1110,7 @@ class EditChannelDeleteYes(Static):
             self.post_message(self.Activated())
             event.stop()
         elif event.key == "escape":
-            self.app._close_edit_channel()
+            self.app._cancel_edit_channel_delete_confirm()
             event.stop()
 
 
@@ -1079,8 +1135,138 @@ class EditChannelDeleteNo(Static):
             self.post_message(self.Activated())
             event.stop()
         elif event.key == "escape":
-            self.app._close_edit_channel()
+            self.app._cancel_edit_channel_delete_confirm()
             event.stop()
+
+
+class EditChannelOverlay(Vertical):
+    """Floating EDIT CHANNEL overlay mounted on the screen's popup layer.
+
+    Reuses the established MeshtasticPass floating-panel treatment used by the
+    node context menu and the emoji picker (a `layer: popup` absolute panel
+    with the same background/border), so the existing CHAT view stays visible
+    behind it. The form body reuses the SAME pieces NEW CHANNEL uses:
+    `NetworkFieldInput` rows (CHANNEL NAME / CHANNEL KEY), `page-title`, and
+    the `.editor-actions` SAVE/CANCEL pair with `connection-action-row`
+    controls. It is never a replacement content pane and never swaps the CHAT
+    transcript. `show_form` toggles between the edit form and the in-place
+    DELETE CHANNEL [ YES ] [ NO ] confirmation (children are swapped, never a
+    second overlay).
+    """
+
+    can_focus = False
+
+    def __init__(self, name: str, psk: str) -> None:
+        super().__init__(
+            classes="channel-editor-overlay",
+            id="edit-channel-overlay",
+        )
+        self._mode: str = "form"
+        self._name = name
+        self._psk = psk
+        self._error = ""
+
+    def on_mount(self) -> None:
+        # Populate the CHANNEL NAME input and show the COMPLETE form
+        # immediately, then focus CHANNEL NAME -- all AFTER composition
+        # (screen.mount is async). The CHANNEL KEY row is a [ COPY KEY ]
+        # action (not an editable input), so the real key is kept internally
+        # (self._psk) and copied on activation, never displayed. The title is a
+        # heading only and never receives focus.
+        self.set_mode("form")
+        name_inputs = list(self.query("#edit-channel-name"))
+        if name_inputs:
+            name_inputs[0].value = self._name
+        error_widgets = list(self.query("#edit-channel-error"))
+        if error_widgets:
+            error_widgets[0].display = bool(self._error)
+            error_widgets[0].update(self._error)
+        self.app._focus_edit_channel_field("name")
+
+    def set_values(self, name: str, psk: str) -> None:
+        self._name = name
+        self._psk = psk
+        name_inputs = list(self.query("#edit-channel-name"))
+        if name_inputs:
+            name_inputs[0].value = name
+
+    def set_error(self, error: str) -> None:
+        self._error = error
+        error_widgets = list(self.query("#edit-channel-error"))
+        if error_widgets:
+            error_widgets[0].display = bool(error)
+            error_widgets[0].update(error)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-channel-form"):
+            yield Static("EDIT CHANNEL", classes="page-title", markup=False)
+            yield NetworkFieldInput(
+                label="CHANNEL NAME",
+                widget_id="edit-channel-name-row",
+                input_id="edit-channel-name",
+                collapsible=False,
+            )
+            # CHANNEL KEY is a COPY KEY action, not an editable/display key.
+            # The [ COPY KEY ] row and the [ DEL CHANNEL ] row both reuse the
+            # ChannelEditActionRow layout (gutter + connection-label + action),
+            # so their leading `[` line up with the CHANNEL NAME input's `[`.
+            yield ChannelEditActionRow(
+                label="CHANNEL KEY",
+                widget_id="edit-channel-key-row",
+                control=CopyChannelKey(),
+            )
+            yield ChannelEditActionRow(
+                label="",
+                widget_id="edit-channel-delete-row",
+                control=EditChannelDelete(),
+            )
+            with Horizontal(
+                id="edit-channel-actions",
+                classes="editor-actions",
+                markup=False,
+            ):
+                yield EditChannelSave()
+                yield EditChannelCancel()
+            yield Static(id="edit-channel-error", markup=False)
+        with Vertical(id="edit-channel-delete-confirm"):
+            yield Static("DELETE CHANNEL", classes="page-title", markup=False)
+            with Horizontal(
+                id="edit-channel-delete-actions",
+                classes="editor-actions",
+                markup=False,
+            ):
+                yield EditChannelDeleteYes()
+                yield EditChannelDeleteNo()
+
+    def set_mode(self, mode: str) -> None:
+        """Switch between the edit form and the DELETE CHANNEL confirmation."""
+        self._mode = mode
+        # The two child panes are siblings; show exactly the one for `mode`.
+        # (These are the same overlay's children -- never a second popup.)
+        is_form = mode == "form"
+        for widget_id, show in (
+            ("edit-channel-form", is_form),
+            ("edit-channel-delete-confirm", not is_form),
+        ):
+            widgets = list(self.query(f"#{widget_id}"))
+            if widgets:
+                widgets[0].display = show
+
+    def place_over_chat(self) -> None:
+        """Position the floating overlay over the CHAT channel view.
+
+        Anchored to the CHAT page's visible area, confined to the viewport --
+        the same viewport-aware floating behavior the node context menu uses
+        (see viewport_menu.calculate_popup_placement). Height stays auto so the
+        COMPLETE form (title + NAME + KEY + DELETE + SAVE/CANCEL) renders
+        immediately, never clipped to a too-small fixed height.
+        """
+        from viewport_menu import calculate_popup_placement
+
+        chat = self.app.query_one("#content").region
+        placement = calculate_popup_placement(chat, self.app.screen.region, 44, 9)
+        self.styles.width = placement.width
+        self.styles.offset = (placement.x, placement.y)
 
 
 class SaveNetworkControl(Static):
@@ -3547,6 +3733,12 @@ class ChatEntryWidget(Vertical):
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
+    # The Textual command palette binds ctrl+p (priority=True) and would swallow
+    # the private-channel EDIT CHANNEL hotkey. This keyboard-first app has its
+    # own hotkey scheme and does not use the command palette, so it is disabled
+    # entirely -- freeing ctrl+p for CTRL+P edit-channel (see on_key).
+    ENABLE_COMMAND_PALETTE = False
+
     TITLE = "MeshtasticPass"
     CSS = f"""
     $snow_base: {THEME_PALETTES["snow"].base};
@@ -3672,7 +3864,7 @@ class MeshtasticPassApp(App[None]):
 
     #long-name-input, #short-name-input,
     #network-name-input, #freq-slot-input, #key-input,
-    #new-channel-name, #new-channel-key {
+    #new-channel-name, #new-channel-key, #edit-channel-name {
         width: 16;
         height: 1;
         border: none;
@@ -3689,7 +3881,10 @@ class MeshtasticPassApp(App[None]):
     Screen.theme-amber #short-name-input,
     Screen.theme-amber #network-name-input,
     Screen.theme-amber #freq-slot-input,
-    Screen.theme-amber #key-input {
+    Screen.theme-amber #key-input,
+    Screen.theme-amber #new-channel-name,
+    Screen.theme-amber #new-channel-key,
+    Screen.theme-amber #edit-channel-name {
         color: $amber_base;
     }
 
@@ -3788,7 +3983,8 @@ class MeshtasticPassApp(App[None]):
     }
 
     #connection .connection-action-row,
-    .editor-form .connection-action-row {
+    .editor-form .connection-action-row,
+    .channel-editor-overlay .connection-action-row {
         height: 1;
         min-height: 1;
         width: 1fr;
@@ -3871,19 +4067,54 @@ class MeshtasticPassApp(App[None]):
         height: 1fr;
     }
 
-    /* Shared CHAT channel-editor overlay treatment. Both the NEW CHANNEL
-       form and the EDIT CHANNEL form render as an overlaid form replacing
-       the channel conversation, rather than as a separate tab, and share
-       this exact visual/structure: a page-title heading, the labeled
-       CHANNEL NAME / CHANNEL KEY rows (via NetworkFieldInput), an
-       editor-actions [ SAVE ] [ CANCEL ] row, and an editor-hint line. The
-       class exists so the same treatment is invoked from both places
-       without duplicating rules; appearance is unchanged from how the
-       NEW CHANNEL editor already looks (the two forms now share one class
-       rather than one carrying bespoke styling). */
+    /* Shared CHAT channel-editor OVERLAY treatment. This is a FLOATING panel
+       mounted on the Screen's popup layer -- the same treatment the node
+       context menu (.viewport-menu) and the emoji picker (.emoji-picker)
+       already use -- so the existing CHAT view stays visible behind it. It is
+       NEVER a full-height replacement view. The form body reuses the existing
+       NEW CHANNEL pieces: NetworkFieldInput rows, .editor-actions, and
+       page-title. */
     .channel-editor-overlay {
-        height: 1fr;
+        layer: popup;
+        position: absolute;
+        background: #101010;
+        border: solid $snow_dim;
+        padding: 1;
+        height: auto;
         min-height: 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: $snow_base;
+        scrollbar-background: $snow_dim;
+    }
+
+    /* The overlay's inner form/confirmation panes must be CONTENT-sized too.
+       A plain Textual Vertical defaults to height: 1fr, which makes it claim
+       the remaining viewport height and (through the parent's auto-height
+       circular dependency) forces the whole floating overlay to stretch
+       full-height on hardware. Pinning these to auto breaks the 1fr chain so
+       the overlay tightly wraps its visible contents. */
+    #edit-channel-form, #edit-channel-delete-confirm {
+        height: auto;
+        min-height: 0;
+    }
+
+    /* Focused action controls in the overlay (COPY KEY, DEL CHANNEL, and the
+       SAVE/CANCEL/YES/NO rows) highlight with the SAME shared ACCENT text
+       color as .editor-actions .connection-action-row:focus -- text-only, no
+       background, no focus box. Unfocused state returns to the normal text
+       color. */
+    .channel-editor-overlay .connection-action-row:focus {
+        color: $snow_accent;
+    }
+
+    Screen.theme-amber .channel-editor-overlay .connection-action-row:focus {
+        color: $amber_accent;
+    }
+
+    Screen.theme-amber .channel-editor-overlay {
+        border: solid $amber_dim;
+        scrollbar-color: $amber_base;
+        scrollbar-background: $amber_dim;
     }
 
     #radio-status {
@@ -4469,7 +4700,7 @@ class MeshtasticPassApp(App[None]):
         self._pending_channel: PendingChannelConfig | None = None
         self._new_channel_error = ""
         self._new_channel_editor_open = False
-        # EDIT CHANNEL (private-channel CTRL+E): the transient CHAT-local
+        # EDIT CHANNEL (private-channel CTRL+P): the transient CHAT-local
         # overlay for editing the CURRENT private channel's name/key and
         # (after an in-place YES/NO confirm) locally deleting it. Distinct
         # from the configured-channel selector and from NEW CHANNEL. Zero
@@ -4477,6 +4708,14 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_editor_open = False
         self._edit_channel_delete_confirm = False
         self._edit_channel_error = ""
+        # The current private-channel name + real key shown in the overlay,
+        # captured when it opens (never a placeholder/masked fake key).
+        self._edit_channel_name: str = ""
+        self._edit_channel_psk: str = ""
+        # The floating EDIT CHANNEL overlay widget when mounted (None when
+        # closed). It is a Screen-level popup-layer panel over the CHAT view,
+        # never a replacement content pane.
+        self._edit_channel_overlay: EditChannelOverlay | None = None
         # Guards against duplicate APPLY writes while an async apply is live.
         self._pending_apply_active = False
         # CHAT/DM/MENTION UX Part A: DM is no longer its own top-level
@@ -4795,7 +5034,7 @@ class MeshtasticPassApp(App[None]):
                                 )
                             with Vertical(
                                 id="new-channel-editor",
-                                classes="new-channel-editor editor-form channel-editor-overlay",
+                                classes="new-channel-editor editor-form",
                             ):
                                 yield Static(
                                     "NEW CHANNEL",
@@ -4827,58 +5066,6 @@ class MeshtasticPassApp(App[None]):
                                     markup=False,
                                 )
                                 yield Static(id="new-channel-error", markup=False)
-                            with Vertical(
-                                id="edit-channel-editor",
-                                classes="edit-channel-editor editor-form channel-editor-overlay",
-                            ):
-                                with ContentSwitcher(
-                                    initial="edit-channel-form", id="edit-channel-content"
-                                ):
-                                    with Vertical(id="edit-channel-form"):
-                                        yield Static(
-                                            "EDIT CHANNEL",
-                                            classes="page-title",
-                                            markup=False,
-                                        )
-                                        yield NetworkFieldInput(
-                                            label="CHANNEL NAME",
-                                            widget_id="edit-channel-name-row",
-                                            input_id="edit-channel-name",
-                                            collapsible=False,
-                                        )
-                                        yield NetworkFieldInput(
-                                            label="CHANNEL KEY",
-                                            widget_id="edit-channel-key-row",
-                                            input_id="edit-channel-key",
-                                            collapsible=False,
-                                        )
-                                        yield Static(
-                                            "[ DELETE CHANNEL ]",
-                                            id="edit-channel-delete",
-                                            classes="connection-action-row",
-                                            markup=False,
-                                        )
-                                        with Horizontal(
-                                            id="edit-channel-actions",
-                                            classes="editor-actions",
-                                            markup=False,
-                                        ):
-                                            yield EditChannelSave()
-                                            yield EditChannelCancel()
-                                        yield Static(id="edit-channel-error", markup=False)
-                                    with Vertical(id="edit-channel-delete-confirm"):
-                                        yield Static(
-                                            "DELETE CHANNEL",
-                                            classes="page-title",
-                                            markup=False,
-                                        )
-                                        with Horizontal(
-                                            id="edit-channel-delete-actions",
-                                            classes="editor-actions",
-                                            markup=False,
-                                        ):
-                                            yield EditChannelDeleteYes()
-                                            yield EditChannelDeleteNo()
                     with Vertical(id="chat-dms"):
                         yield Static(
                             id="dm-connection-status",
@@ -5089,7 +5276,7 @@ class MeshtasticPassApp(App[None]):
             event.stop()
             return
         if (
-            event.key == "ctrl+e"
+            event.key == "ctrl+p"
             and self.current_tab == "chat"
             and self._chat_mode == "channel"
             and not self._new_channel_editor_open
@@ -5100,10 +5287,11 @@ class MeshtasticPassApp(App[None]):
                 for channel in self._channels
             )
         ):
-            # CTRL+E opens the EDIT CHANNEL overlay for a configured private/
+            # CTRL+P opens the EDIT CHANNEL overlay for a configured private/
             # configured (non-PRIMARY) channel. Zero writes/RF. PRIMARY
             # (index 0), the NEW CHANNEL editor, and the DM list are never
-            # targets.
+            # targets. (The composer's CTRL+E emoji-picker binding is
+            # unrelated and unchanged.)
             self._open_edit_channel()
             event.stop()
             return
@@ -5134,6 +5322,14 @@ class MeshtasticPassApp(App[None]):
                 return
             if event.key == "left" and focused_field == "cancel":
                 self._focus_edit_channel_field("save")
+                event.stop()
+                return
+            if event.key == "right" and focused_field == "delete_yes":
+                self._focus_edit_channel_field("delete_no")
+                event.stop()
+                return
+            if event.key == "left" and focused_field == "delete_no":
+                self._focus_edit_channel_field("delete_yes")
                 event.stop()
                 return
         if self._new_channel_editor_open and self.current_tab == "chat":
@@ -7921,7 +8117,7 @@ class MeshtasticPassApp(App[None]):
 
         self._render_chat_status()
         # The footer must reflect the channel just selected (its context, e.g.
-        # private-channel CTRL+E edit). _switch_chat_mode's own
+        # private-channel CTRL+P edit). _switch_chat_mode's own
         # earlier _update_footer() ran before the channel index changed here,
         # so without this the footer is stale until the next focus event.
         self._update_footer()
@@ -9779,14 +9975,42 @@ class MeshtasticPassApp(App[None]):
     @on(Input.Submitted, "#edit-channel-name")
     def edit_channel_name_submitted(self, _event: Input.Submitted) -> None:
         if self._edit_channel_editor_open:
-            self._focus_edit_channel_field("key")
+            self._focus_edit_channel_field("copy_key")
 
-    @on(Input.Submitted, "#edit-channel-key")
-    def edit_channel_key_submitted(self, _event: Input.Submitted) -> None:
-        if self._edit_channel_editor_open:
-            self._focus_edit_channel_field(
-                "delete" if self._edit_channel_error else "delete"
-            )
+    @on(CopyChannelKey.Activated)
+    def edit_channel_copy_key(self, _event: CopyChannelKey.Activated) -> None:
+        if not self._edit_channel_editor_open:
+            return
+        # Copy the REAL current channel key (kept internally, never displayed)
+        # via Textual's built-in clipboard -- zero RF, no channel mutation, the
+        # overlay stays open.
+        key = self._channel_psk_metadata_text()
+        if not key:
+            self._show_send_error("PSK COPY FAILED")
+            return
+        try:
+            self.copy_to_clipboard(key)
+        except Exception:
+            self._show_send_error("PSK COPY FAILED")
+            return
+        self._show_psk_copy_status("PSK COPIED")
+
+    def _show_psk_copy_status(self, message: str) -> None:
+        """Compact ACCENT copy confirmation on the CHAT status row (#send-error),
+        reusing the established timed-dismiss convention (_send_error_dismiss_timer
+        + _auto_dismiss_send_error). The copied key is never part of the message.
+        """
+        if self._send_error_dismiss_timer is not None:
+            self._send_error_dismiss_timer.stop()
+            self._send_error_dismiss_timer = None
+        self._send_error_message = message
+        widgets = list(self.query("#send-error"))
+        if widgets:
+            widgets[0].add_class("setting-accent")
+        self._send_error_dismiss_timer = self.set_timer(
+            SEND_ERROR_AUTO_DISMISS_SECONDS, self._auto_dismiss_send_error
+        )
+        self._render_chat_status()
 
     @on(NewChannelCancel.Activated)
     def new_channel_cancel(self, _event: NewChannelCancel.Activated) -> None:
@@ -9971,7 +10195,7 @@ class MeshtasticPassApp(App[None]):
         self._update_tab_bar()
         self._update_footer()
 
-    # ---- EDIT CHANNEL (private-channel CTRL+E) -------------------------
+    # ---- EDIT CHANNEL (private-channel CTRL+P) -------------------------
 
     def _current_private_channel(self) -> ChannelInfo | None:
         """The currently-selected configured channel, if it is a private one."""
@@ -9985,7 +10209,7 @@ class MeshtasticPassApp(App[None]):
 
         Prepopulates CHANNEL NAME with the current name and CHANNEL KEY with
         the actual current channel key (never a placeholder/masked fake key
-        when the real key is available). Zero writes/RF. CTRL+E is only
+        when the real key is available). Zero writes/RF. CTRL+P is only
         offered for a configured private/non-PRIMARY channel.
         """
         channel = self._current_private_channel()
@@ -9997,14 +10221,12 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_editor_open = True
         self._edit_channel_delete_confirm = False
         self._edit_channel_error = ""
-        name_inputs = list(self.query("#edit-channel-name"))
-        if name_inputs:
-            name_inputs[0].value = channel.name
-        key_inputs = list(self.query("#edit-channel-key"))
-        if key_inputs:
-            key_inputs[0].value = self._channel_psk_metadata_text()
+        self._edit_channel_name = channel.name
+        self._edit_channel_psk = self._channel_psk_metadata_text()
         self._refresh_edit_channel()
-        self._focus_edit_channel_field("name")
+        # CHANNEL NAME is focused by the overlay's own on_mount (after the
+        # async mount composes the child widgets) -- not synchronously here,
+        # which would run before the Input widgets exist.
         self._update_footer()
 
     def _close_edit_channel(self) -> None:
@@ -10018,41 +10240,39 @@ class MeshtasticPassApp(App[None]):
         self._update_footer()
 
     def _refresh_edit_channel(self) -> None:
-        """Show/hide the EDIT CHANNEL overlay + its in-place delete confirm.
+        """Mount / unmount the floating EDIT CHANNEL overlay on the popup layer.
 
         Reflects `_edit_channel_editor_open` / `_edit_channel_delete_confirm`
-        / `_edit_channel_error`. Zero writes/RF. The inner ContentSwitcher
-        swaps between the form and the in-place DELETE CHANNEL YES/NO view
-        (never a second stacked overlay).
+        / `_edit_channel_error`. Zero writes/RF. The existing CHAT view is
+        NEVER replaced or swapped: the overlay is a floating panel on the
+        Screen's popup layer so CHAT stays visible behind it. When open, form
+        values are (re)applied and the panel switches between the edit form and
+        the in-place DELETE CHANNEL [ YES ] [ NO ] confirmation (same overlay,
+        never a second popup).
         """
-        switcher_widgets = list(self.query("#chat-channel-content"))
-        if switcher_widgets:
-            switcher_widgets[0].current = (
-                "edit-channel-editor"
-                if self._edit_channel_editor_open
-                else "chat-conversation"
-            )
-        inner_widgets = list(self.query("#edit-channel-content"))
-        if inner_widgets:
-            inner_widgets[0].current = (
-                "edit-channel-delete-confirm"
-                if self._edit_channel_delete_confirm
-                else "edit-channel-form"
-            )
-        error_widgets = list(self.query("#edit-channel-error"))
-        if error_widgets:
-            error_widgets[0].display = bool(self._edit_channel_error)
-            error_widgets[0].update(self._edit_channel_error)
+        overlay = self._edit_channel_overlay
+        if self._edit_channel_editor_open:
+            if overlay is None:
+                overlay = EditChannelOverlay(self._edit_channel_name, self._edit_channel_psk)
+                self._edit_channel_overlay = overlay
+                self.screen.mount(overlay)
+            overlay.set_mode("delete-confirm" if self._edit_channel_delete_confirm else "form")
+            overlay.place_over_chat()
+            overlay.set_error(self._edit_channel_error)
+        else:
+            if overlay is not None:
+                overlay.remove()
+                self._edit_channel_overlay = None
 
     # Vertical stops: CHANNEL NAME, CHANNEL KEY, DELETE CHANNEL, SAVE. CANCEL
     # is a horizontal sibling of SAVE (Right from SAVE / Left from CANCEL).
-    _EDIT_CHANNEL_FIELD_ORDER = ("name", "key", "delete", "save")
+    _EDIT_CHANNEL_FIELD_ORDER = ("name", "copy_key", "delete", "save")
 
     def _edit_channel_focused_field(self) -> str:
         focused_id = getattr(self.focused, "id", None)
         for field, selector in (
             ("name", "edit-channel-name"),
-            ("key", "edit-channel-key"),
+            ("copy_key", "edit-channel-copy-key"),
             ("delete", "edit-channel-delete"),
             ("save", "edit-channel-save"),
             ("cancel", "edit-channel-cancel"),
@@ -10066,7 +10286,7 @@ class MeshtasticPassApp(App[None]):
     def _focus_edit_channel_field(self, field: str) -> None:
         widget_ids = {
             "name": "#edit-channel-name",
-            "key": "#edit-channel-key",
+            "copy_key": "#edit-channel-copy-key",
             "delete": "#edit-channel-delete",
             "save": "#edit-channel-save",
             "cancel": "#edit-channel-cancel",
@@ -10091,13 +10311,9 @@ class MeshtasticPassApp(App[None]):
         target = order[max(0, min(len(order) - 1, index + direction))]
         self._focus_edit_channel_field(target)
 
-    def _edit_channel_values(self) -> tuple[str, str]:
+    def _edit_channel_name_value(self) -> str:
         name_inputs = list(self.query("#edit-channel-name"))
-        key_inputs = list(self.query("#edit-channel-key"))
-        return (
-            name_inputs[0].value if name_inputs else "",
-            key_inputs[0].value if key_inputs else "",
-        )
+        return name_inputs[0].value if name_inputs else ""
 
     def _save_edit_channel(self) -> bool:
         """Apply the edited CHANNEL NAME (and key) to the current channel.
@@ -10111,8 +10327,7 @@ class MeshtasticPassApp(App[None]):
         channel = self._current_private_channel()
         if channel is None:
             return False
-        name, _key = self._edit_channel_values()
-        name = name.strip()
+        name = self._edit_channel_name_value().strip()
         if not name:
             self._edit_channel_error = "CHANNEL NAME REQUIRED"
             self._edit_channel_editor_open = True
@@ -10146,6 +10361,14 @@ class MeshtasticPassApp(App[None]):
         self._edit_channel_error = ""
         self._refresh_edit_channel()
         self._focus_edit_channel_field("delete_yes")
+
+    def _cancel_edit_channel_delete_confirm(self) -> None:
+        """ESC/NO from the DELETE CHANNEL confirmation: return to the edit form
+        WITHOUT deleting and WITHOUT discarding pending form values."""
+        self._edit_channel_delete_confirm = False
+        self._edit_channel_error = ""
+        self._refresh_edit_channel()
+        self._focus_edit_channel_field("name")
 
     def _confirm_delete_edit_channel(self) -> None:
         """YES: delete the current private channel via the existing path, then
@@ -11354,17 +11577,17 @@ class MeshtasticPassApp(App[None]):
         elif self.current_tab == "chat" and self._chat_mode == "channel":
             text = "C channel    D dms    F4 quit"
             # A configured private/configured (non-PRIMARY) channel offers
-            # CTRL+E (edit channel). The public/default PRIMARY channel offers
+            # CTRL+P (edit channel). The public/default PRIMARY channel offers
             # neither edit nor delete, so it keeps the base line.
             if self.current_channel_index > 0 and self._channel_psk_metadata_text():
                 text = (
                     "C channel    D dms    "
-                    "CTRL+E edit    F4 quit"
+                    "CTRL+P edit channel    F4 quit"
                 )
             elif self.current_channel_index > 0:
                 text = (
                     "C channel    D dms    "
-                    "CTRL+E edit    F4 quit"
+                    "CTRL+P edit channel    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
             text = "C channel    1-3 tabs    F4 quit"
