@@ -70,6 +70,7 @@ from mesh_state import (
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
+    ConnectorChain,
     PositionedNode,
     RelayStage,
     RouteEvidence,
@@ -83,6 +84,7 @@ from mesh_topology import (
     place_within_bounds,
     project_to_viewport,
     route_chain_avoiding,
+    route_chain_node_ids,
     route_connector_avoiding,
 )
 from node_activity import is_node_active
@@ -2812,6 +2814,15 @@ class MeshTopologyView(Container):
         # erased by a later FAILED trace -- see MeshtasticPassApp.
         # _finish_traceroute_success, this set's only writer).
         self._traced_node_ids: frozenset[str] = frozenset()
+        # The connector plan the last set_nodes() drew: one ConnectorChain
+        # per rendered YOU-to-destination path, reflecting whether each was
+        # explicit successful-traceroute route evidence (identified relays,
+        # authoritative order) or the generic anonymous hops_away model.
+        self._connector_chains: tuple[ConnectorChain, ...] = ()
+
+    @property
+    def connector_chains(self) -> tuple[ConnectorChain, ...]:
+        return self._connector_chains
 
     @property
     def board(self) -> Container:
@@ -2974,7 +2985,24 @@ class MeshTopologyView(Container):
         # answers "what does my radio currently believe is active" via
         # rendered connectors, and "what else does my radio remember"
         # via dim, disconnected real nodes.
-        active_hop_counts = _mesh_active_hop_counts(working_set, now=now)
+        # Successful-traceroute route evidence overrides the anonymous
+        # hops_away-derived relay chain for THAT destination (see
+        # route_chain_node_ids: an explicit forward chain -- including an
+        # EMPTY one, which is explicit DIRECT evidence -- is authoritative and
+        # must replace, not merely augment, the generic staged path). This map
+        # is computed early so it can both exclude explicit destinations from
+        # anonymous relay-stage generation below AND drive the connector loop.
+        explicit_forward_by_dest: dict[str, tuple[str, ...]] = {}
+        for node_id, evidence in getattr(self.app, "_traceroute_routes", {}).items():
+            explicit_forward_by_dest[node_id] = evidence.forward
+        explicit_destinations = frozenset(explicit_forward_by_dest)
+        active_hop_counts = {
+            node_id: hop_count
+            for node_id, hop_count in _mesh_active_hop_counts(
+                working_set, now=now
+            ).items()
+            if node_id not in explicit_destinations
+        }
         # Relay-stage interpolation happens in the STABLE logical
         # coordinate space (MESH_LOGICAL_GRID_*), never the current
         # viewport's dynamic row/column count -- a relay chain's
@@ -3193,6 +3221,9 @@ class MeshTopologyView(Container):
             stages_by_client.setdefault(stage.source_node_id, []).append(stage)
         for stages in stages_by_client.values():
             stages.sort(key=lambda stage: stage.index)
+        # explicit_forward_by_dest / explicit_destinations were computed above
+        # (before anonymous relay-stage generation) so the connector loop can
+        # route explicit destinations through their identified relays.
 
         # STALE nodes (see MeshNodeState.activity_tier) now ALSO draw a
         # connector -- DIM + DOTTED, direct only (no relay chain: a
@@ -3213,6 +3244,22 @@ class MeshTopologyView(Container):
         # its connector chain. Starts empty so "no connectors at all"
         # (YOU missing from centers) also shows zero relay markers.
         connected_relay_ids: set[str] = set()
+        # The actual connector plan the loop below draws, recorded for
+        # inspection: one ConnectorChain per drawn YOU-to-destination path.
+        # `explicit` distinguishes a successful-traceroute-derived chain
+        # (identified relays, authoritative order) from a generic
+        # hops_away-derived anonymous-stage chain. A traced destination's
+        # explicit chain REPLACES its generic path -- never drawn twice.
+        connector_chains: list[ConnectorChain] = []
+        # A node that is an identified RELAY in some explicit forward chain
+        # (and not itself a traced destination) is a pure WAYPOINT: it renders
+        # as a real node but never gets an independent YOU->relay connector --
+        # its only connection is the destination chain routed through it.
+        identified_relay_ids = {
+            relay_id
+            for evidence in getattr(self.app, "_traceroute_routes", {}).values()
+            for relay_id in evidence.forward
+        }
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
@@ -3221,19 +3268,59 @@ class MeshTopologyView(Container):
                 tier = state.activity_tier(now=now)
                 if tier is MeshActivityTier.VERY_OLD:
                     continue
+                if (
+                    remote_id in identified_relay_ids
+                    and remote_id not in explicit_destinations
+                ):
+                    # Pure relay waypoint: its connector is the destination
+                    # chain passing through it, not an independent edge (and
+                    # never a fabricated direct YOU->relay connection).
+                    continue
                 is_stale = tier is MeshActivityTier.STALE
-                chain_stages = () if is_stale else stages_by_client.get(remote_id, ())
-                chain_ids = {remote_id, *(stage.node_id for stage in chain_stages)}
+                explicit_forward = explicit_forward_by_dest.get(remote_id)
+                if explicit_forward is not None:
+                    # Explicit successful-traceroute route: the connector
+                    # STARTS from this ordered forward chain (canonical IDs,
+                    # exact RouteDiscovery order -- never sorted, never
+                    # re-derived from hop count or grid position). An EMPTY
+                    # forward is explicit DIRECT (YOU->destination, zero
+                    # relays) and overrides any stale generic staging. Only
+                    # relays actually on the board are routed through (a
+                    # relay with no rendered cell cannot be drawn to); their
+                    # order among survivors is preserved.
+                    chain_node_ids = route_chain_node_ids(
+                        you_id,
+                        remote_id,
+                        tuple(
+                            relay_id
+                            for relay_id in explicit_forward
+                            if relay_id in centers
+                        ),
+                        (),
+                    )
+                    is_explicit = True
+                else:
+                    chain_stages = () if is_stale else stages_by_client.get(remote_id, ())
+                    chain_node_ids = route_chain_node_ids(
+                        you_id,
+                        remote_id,
+                        None,
+                        (
+                            stage.node_id
+                            for stage in chain_stages
+                            if stage.node_id in centers
+                        ),
+                    )
+                    is_explicit = False
+                # chain_ids is the set of NON-YOU cells this chain occupies:
+                # the destination plus any intermediate relays/stages. YOU is
+                # deliberately excluded, matching the original connector model
+                # -- a path never treats its own origin as an obstacle or as a
+                # candidate for "is the selection on this chain?" (selection of
+                # YOU itself must not paint every OUTGOING connector accent).
+                chain_ids = set(chain_node_ids) - {you_id}
                 is_selected = self._selected_node_id in chain_ids
-                chain_points = (
-                    centers[you_id],
-                    *(
-                        centers[stage.node_id]
-                        for stage in chain_stages
-                        if stage.node_id in centers
-                    ),
-                    centers[remote_id],
-                )
+                chain_points = tuple(centers[node_id] for node_id in chain_node_ids)
                 # Obstacles: every OTHER real node/relay-stage's own
                 # occupied cell -- never this chain's own endpoints or
                 # relay stages (see route_chain_avoiding/item 8: real
@@ -3273,9 +3360,11 @@ class MeshTopologyView(Container):
                 # (orphan-circle audit): an intermediate marker whose
                 # connector no longer visits it would otherwise stand
                 # on the board as an unexplained standalone circle.
-                relay_stage_ids_in_chain = {
-                    stage.node_id for stage in chain_stages if stage.node_id in centers
-                }
+                relay_stage_ids_in_chain = (
+                    {stage.node_id for stage in chain_stages if stage.node_id in centers}
+                    if not is_explicit
+                    else set()
+                )
                 if relay_stage_ids_in_chain & self._edge_node_ids:
                     route_cells = route_chain_avoiding(
                         (centers[you_id], centers[remote_id]), obstacles
@@ -3296,6 +3385,9 @@ class MeshTopologyView(Container):
                         # stage of this chain -- these markers have a
                         # visible line through them and may render.
                         connected_relay_ids |= relay_stage_ids_in_chain
+                connector_chains.append(
+                    ConnectorChain(remote_id, chain_node_ids, is_explicit, is_stale)
+                )
                 if is_selected:
                     color = palette.accent
                 elif is_stale:
@@ -3307,6 +3399,7 @@ class MeshTopologyView(Container):
                     color = palette.dim_base
                 target = selected_connector_cells if is_selected else connector_cells
                 target.extend((x, y, glyph, color) for x, y, glyph in route_cells)
+        self._connector_chains = tuple(connector_chains)
         # ORPHAN TOPOLOGY CIRCLE AUDIT invariant: every visible
         # synthetic hollow-circle relay marker participates in a
         # currently drawn connector chain. Decided HERE -- after the
@@ -3385,6 +3478,7 @@ class MeshTopologyView(Container):
         self._relay_stages = ()
         self._selected_node_id = ""
         self._edge_node_ids = frozenset()
+        self._connector_chains = ()
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "snow")
 
     def select_node(self, node_id: str) -> None:

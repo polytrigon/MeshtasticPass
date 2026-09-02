@@ -1272,6 +1272,60 @@ def route_chain_avoiding(
     return tuple(cells)
 
 
+def route_chain_node_ids(
+    you_id: str,
+    destination_id: str,
+    explicit_forward: tuple[str, ...] | None,
+    anonymous_stage_ids: Iterable[str],
+) -> tuple[str, ...]:
+    """The ordered chain of node IDs a destination's connector must route through.
+
+    Returns the exact node-ID chain (YOU first, destination last) that the
+    caller should interpolate a connector through.
+
+    This is the single place that decides whether a destination's connector is
+    drawn from EXPLICIT traceroute route evidence or from the generic
+    anonymous relay-stage (hops_away) model:
+
+    - `explicit_forward` is None: no successful traceroute evidence for this
+      destination. Route through the generic `anonymous_stage_ids`
+      (hops_away-derived hollow circles) exactly as before -- this destination
+      keeps the existing topology model unchanged.
+    - `explicit_forward == ()`: the traceroute's forward route was EMPTY, which
+      is explicit DIRECT (zero-relay) evidence: YOU -> destination with NO
+      intermediate relay, and it MUST override any stale generic
+      hops_away-derived anonymous staging. Topology-evidence precedence --
+      `hops_away` is never mutated, only the drawn chain is chosen here.
+    - `explicit_forward == (A, B)`: YOU -> A -> B -> destination, in the exact
+      RouteDiscovery order (never sorted, never re-derived from grid position
+      or hop count).
+
+    Canonical node IDs are identity throughout; names never participate.
+    """
+    if explicit_forward is None:
+        return (you_id, *anonymous_stage_ids, destination_id)
+    return (you_id, *explicit_forward, destination_id)
+
+
+@dataclass(frozen=True)
+class ConnectorChain:
+    """One drawn YOU-to-destination connector: the ordered chain of node IDs.
+
+    `node_ids` is the exact path the connector is drawn through (YOU first,
+    destination last), including intermediate identified relay node IDs and/or
+    anonymous `relay:<client>:<step>` stage IDs. `explicit` is True when the
+    chain comes from successful-traceroute `RouteEvidence.forward` (identified
+    relays, authoritative order) and False when it is the generic
+    `hops_away`-derived anonymous-stage chain. `stale` records whether the
+    destination's connector is the dim/dashed "no known-active route" style.
+    """
+
+    destination_id: str
+    node_ids: tuple[str, ...]
+    explicit: bool
+    stale: bool
+
+
 MARCHING_ANTS_GLYPHS = ("─", "│", "┐", "└", "┘", "┌")
 # One alternating "ant" is a run of MARCHING_ANTS_RUN cells of the SAME
 # phase; the next phase inverts (ACCENT <-> DIM), and the whole pattern
