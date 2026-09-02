@@ -1326,13 +1326,6 @@ class ConnectorChain:
     stale: bool
 
 
-MARCHING_ANTS_GLYPHS = ("─", "│", "┐", "└", "┘", "┌")
-# One alternating "ant" is a run of MARCHING_ANTS_RUN cells of the SAME
-# phase; the next phase inverts (ACCENT <-> DIM), and the whole pattern
-# shifts by one cell per animation frame to read as marching along the line.
-MARCHING_ANTS_RUN = 2
-
-
 @dataclass(frozen=True)
 class RouteEvidence:
     """Session topology evidence from one successful traceroute.
@@ -1365,37 +1358,6 @@ def forward_route_evidence(result: TracerouteResult) -> RouteEvidence:
         forward=tuple(result.forward_route),
         return_route=tuple(result.return_route),
     )
-
-
-def marching_ants_cells(
-    route_cells: tuple[tuple[int, int, str], ...],
-    frame: int,
-    *,
-    accent: bool,
-) -> tuple[tuple[int, int, str, bool], ...]:
-    """Color a connector's cells as an alternating, marching "ants" band.
-
-    `route_cells` is the ordered (x, y, glyph) path a connector draws
-    (endpoints excluded, as route_connector produces). The returned tuple
-    carries (x, y, glyph, is_accent) where `is_accent` toggles every
-    MARCHING_ANTS_RUN cells and the phase advances by `frame` positions --
-    a terminal "marching ants" that means "traceroute in progress", NOT
-    that the final relay path is known (the caller still draws only a
-    direct YOU->destination line while pending; it never fabricates relay
-    nodes). Purely visual: it never changes the glyph, only which cells
-    render ACCENT vs DIM. Geometry-independent (works for horizontal,
-    vertical, and elbow'd connectors alike).
-    """
-    if not route_cells:
-        return ()
-    result: list[tuple[int, int, str, bool]] = []
-    for index, (x, y, glyph) in enumerate(route_cells):
-        # A periodic "on" run of MARCHING_ANTS_RUN cells; shifting the frame
-        # slides the whole alternating band one cell per tick so it reads as
-        # marching along the line (the "ant" travels forward).
-        on = ((index - frame) % (2 * MARCHING_ANTS_RUN)) < MARCHING_ANTS_RUN
-        result.append((x, y, glyph, on if accent else not on))
-    return tuple(result)
 
 
 def directional_target(

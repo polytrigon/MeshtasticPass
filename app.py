@@ -79,13 +79,11 @@ from mesh_topology import (
     build_relay_stages,
     directional_target,
     forward_route_evidence,
-    marching_ants_cells,
     mesh_board_marker_label,
     place_within_bounds,
     project_to_viewport,
     route_chain_avoiding,
     route_chain_node_ids,
-    route_connector_avoiding,
 )
 from node_activity import is_node_active
 from radio_capabilities import (
@@ -2529,7 +2527,13 @@ class MeshNodeWidget(Static):
         super().__init__(classes="mesh-node", markup=False)
 
     def refresh_visual(
-        self, *, selected: bool, theme: str, now: float, traced: bool = False
+        self,
+        *,
+        selected: bool,
+        theme: str,
+        now: float,
+        traced: bool = False,
+        blink_on: bool | None = None,
     ) -> None:
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
         # The glyph shape itself is never altered by selection -- ACTIVE
@@ -2553,31 +2557,37 @@ class MeshNodeWidget(Static):
         # than passive last-heard staleness). This never moves the
         # glyph's own (grid_x, grid_y) anchor or its selected-composite
         # width -- only the single character/color drawn there.
+        palette = THEME_PALETTES[theme]
         if traced:
             glyph = "*"
-            color = THEME_PALETTES[theme].accent
+            color = palette.accent
         else:
             glyph = (
                 CIRCLE_SOLID_LARGE
                 if self.state.node.is_local or is_node_active(self.state.node.last_heard, now)
                 else CIRCLE_STROKED_LARGE
             )
-        style = Style(color=color, bold=selected)
+        # Pending-trace DOT blink: while a traceroute is in progress toward
+        # THIS node, its dot alternates BASE <-> ACCENT (blink_on False/True)
+        # using the existing traceroute animation tick. The dot color
+        # overrides the ordinary color -- including the selected-node ACCENT
+        # -- so the blink stays visible even while the target is focused. Only
+        # the dot's color changes: the glyph shape, position, label, and the
+        # selected halo (if any) are untouched. A focused traceroute target
+        # still blinks BASE/ACCENT rather than being masked by its normal
+        # focus/ACCENT styling.
+        dot_color = color if blink_on is None else (palette.accent if blink_on else palette.base)
         if selected:
-            # Bold alone reads as barely-different on many terminals, so
-            # the anchor cell's role glyph is flanked by a small dot in
-            # each immediately neighboring cell on the same row -- a real,
-            # ~3x wider visual footprint, not a font-weight trick. The
-            # widget's own width/offset (set in MeshTopologyView.set_nodes) keep the
-            # center *column* of this 3-cell composite exactly on the
-            # glyph's (grid_x, grid_y) anchor, so growing it can never
-            # move that coordinate.
+            # The selected composite's halo keeps the ORDINARY selected
+            # color; only the center dot carries the blink override.
+            halo_style = Style(color=color, bold=True)
+            dot_style = Style(color=dot_color, bold=True)
             content = Text(justify="center")
-            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
-            content.append(glyph, style=style)
-            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=halo_style)
+            content.append(glyph, style=dot_style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=halo_style)
         else:
-            content = Text(glyph, style=style)
+            content = Text(glyph, style=Style(color=dot_color, bold=False))
         self.update(content)
 
     def on_click(self, _event: Click) -> None:
@@ -2819,23 +2829,6 @@ class MeshTopologyView(Container):
         # explicit successful-traceroute route evidence (identified relays,
         # authoritative order) or the generic anonymous hops_away model.
         self._connector_chains: tuple[ConnectorChain, ...] = ()
-        # Render-only traceroute-animation cache (see
-        # _repaint_traceroute_animation): the STATIC board paint -- every cell
-        # of the full mesh canvas EXCEPT the temporary marching-ants trace
-        # connector -- plus the board's canvas dimensions and theme, captured
-        # at the last set_nodes(). Repainting a pending trace's ants must NOT
-        # rebuild the working set/placement/relay stages/topology, so we cache
-        # the static paint and only recompute the trace connector cell colors.
-        # None while no board is painted yet (e.g. before the first refresh).
-        self._static_connector_cells: tuple[tuple[int, int, str, str], ...] | None = None
-        self._static_board_width: int = 0
-        self._static_board_height: int = 0
-        self._static_theme: str = ""
-        # Geometry of the pending trace's direct YOU->destination connector,
-        # captured at the last set_nodes() and reused (frame-color-only) by
-        # every animation repaint so node placement is never recomputed to
-        # advance one ants frame.
-        self._traceroute_trace_geometry: tuple[tuple[int, int, str], ...] = ()
 
     @property
     def connector_chains(self) -> tuple[ConnectorChain, ...]:
@@ -3164,7 +3157,10 @@ class MeshTopologyView(Container):
             widget.styles.offset = (grid_x - width // 2, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
             traced = widget.node_id in self._traced_node_ids
-            widget.refresh_visual(selected=selected, theme=theme, now=now, traced=traced)
+            blink_on = self._pending_trace_blink_on(widget.node_id)
+            widget.refresh_visual(
+                selected=selected, theme=theme, now=now, traced=traced, blink_on=blink_on
+            )
 
         # Relay-stage placeholders share the same glyph anchor formula as
         # a real node's glyph (see MeshNodeWidget above) but never the
@@ -3446,69 +3442,10 @@ class MeshTopologyView(Container):
         # Moving focus away naturally restores ordinary styling on the
         # very next set_nodes() call -- nothing here persists paint
         # state across calls.
-        # Marching-ants trace-in-progress indication: while a traceroute is
-        # pending toward a real working-set node, draw a DIRECT animated
-        # YOU->destination connector. It is temporary activity visualization
-        # only ("a trace is in progress toward this node") -- never a claim
-        # that the final relay path is known, so no relay node is fabricated
-        # and the animation runs on the SAME connector geometry every other
-        # connector already uses. Purely visual: the connector's cells carry
-        # an alternating ACCENT/DIM phase, advanced by the pre-existing
-        # _advance_delivery_states tick (see marching_ants_cells).
-        #
-        # The trace cells are drawn AFTER the selected connector cells below:
-        # MeshCanvas's overlay dict keys on (x, y), so whoever is appended
-        # last wins a shared cell. A pending trace must stay visibly obvious
-        # even when the destination node is selected/focused, so its temporary
-        # marching-ants treatment OVERRIDES that connector's ordinary selected
-        # ACCENT paint rather than being hidden beneath it. Only the actively
-        # traced path gets this precedence; every other connector's selection
-        # styling is untouched.
-        active = getattr(self.app, "_active_traceroute", None)
-        trace_cells: list[tuple[int, int, str, str]] = []
-        trace_geometry: tuple[tuple[int, int, str], ...] = ()
-        if (
-            active is not None
-            and you_id in centers
-            and active.destination_node_id in centers
-        ):
-            trace_geometry = route_connector_avoiding(
-                centers[you_id][0],
-                centers[you_id][1],
-                centers[active.destination_node_id][0],
-                centers[active.destination_node_id][1],
-                frozenset(
-                    position
-                    for node_id, position in centers.items()
-                    if node_id not in (you_id, active.destination_node_id)
-                ),
-            )
-            frame = getattr(self.app, "_traceroute_animation_frame", 0)
-            trace_cells = [
-                (x, y, glyph, palette.accent if is_accent else palette.dim_quarter)
-                for x, y, glyph, is_accent in marching_ants_cells(
-                    trace_geometry, frame, accent=True
-                )
-            ]
-
-        # Cache the STATIC paint -- every non-trace connector cell (normal +
-        # selected) -- plus the canvas dimensions/theme, so a pending trace's
-        # animation tick can repaint just the marching-ants cells render-only
-        # (see _repaint_traceroute_animation) instead of rebuilding the working
-        # set / placement / relay stages / full topology each frame. The same
-        # geometry (trace_geometry) is cached so the repaint is frame-correct
-        # and never recomputes node placement.
-        static_cells = tuple(connector_cells) + tuple(selected_connector_cells)
-        self._static_connector_cells = static_cells
-        self._static_board_width = board_width
-        self._static_board_height = board_height
-        self._static_theme = theme
-        self._traceroute_trace_geometry = trace_geometry
-
         self.board.query_one(MeshCanvas).render_scene(
             board_width,
             board_height,
-            static_cells + tuple(trace_cells),
+            tuple(connector_cells) + tuple(selected_connector_cells),
             theme,
         )
 
@@ -3522,70 +3459,43 @@ class MeshTopologyView(Container):
         self._selected_node_id = ""
         self._edge_node_ids = frozenset()
         self._connector_chains = ()
-        self._traceroute_trace_geometry = ()
-        self._static_connector_cells = None
-        self._static_board_width = 0
-        self._static_board_height = 0
-        self._static_theme = ""
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "snow")
 
-    def repaint_traceroute_animation(self, frame: int) -> None:
-        """Render-only repaint of a pending trace's marching-ants connector.
+    def _pending_trace_blink_on(self, node_id: str) -> bool | None:
+        """The pending-trace blink override for a node's dot, or None.
 
-        This is the ONLY work done per animation frame while a trace is
-        pending: it re-applies the alternating ACCENT/DIM phase to the trace
-        connector's already-computed geometry and repaints the SAME static
-        board cells. It NEVER rebuilds the working set, node ranking, logical
-        placement, relay stages, or the full connector topology -- those are
-        recomputed only by set_nodes() (via _refresh_mesh), which runs when a
-        genuine topology/state change arrives or the trace resolves.
-
-        The static paint (_static_connector_cells) already includes the
-        selected-node ACCENT connector, and the trace cells are appended LAST
-        so they override that connector's ordinary selected styling for the
-        traced path (see set_nodes): the ants remain visible whether or not
-        the destination is focused.
-
-        A no-op if no board paint is cached yet (e.g. before the first
-        refresh) or there is no pending trace geometry to animate.
+        While a traceroute is pending toward `node_id`, its dot blinks between
+        BASE (blink off) and ACCENT (blink on) using the existing traceroute
+        animation tick; this returns the current phase. None for any other node
+        (no blink). Reading app state only -- never triggers a rebuild.
         """
-        if self._static_connector_cells is None:
-            return
-        if not self._traceroute_trace_geometry:
-            return
-        palette = THEME_PALETTES[self._static_theme]
-        trace_cells = tuple(
-            (x, y, glyph, palette.accent if is_accent else palette.dim_quarter)
-            for x, y, glyph, is_accent in marching_ants_cells(
-                self._traceroute_trace_geometry, frame, accent=True
-            )
-        )
-        self.board.query_one(MeshCanvas).render_scene(
-            self._static_board_width,
-            self._static_board_height,
-            self._static_connector_cells + trace_cells,
-            self._static_theme,
-        )
+        active = getattr(self.app, "_active_traceroute", None)
+        if active is None or active.destination_node_id != node_id:
+            return None
+        return bool(getattr(self.app, "_traceroute_blink_on", False))
 
-    def clear_traceroute_animation(self) -> None:
-        """Render-only stop of a pending trace's marching ants.
+    def refresh_node_dot(
+        self, node_id: str, *, blink_on: bool | None, theme: str, now: float
+    ) -> None:
+        """Render-only repaint of one node's dot.
 
-        Removes the temporary trace connector by repainting the cached static
-        board cells with an empty trace path -- ordinary connector styling
-        resumes immediately without a full _refresh_mesh() rebuild. A no-op if
-        no board paint is cached, or if the geometry is already cleared.
+        The narrowest render path for the pending-trace blink: it re-renders
+        just that node's MeshNodeWidget dot color (blink_on True -> ACCENT,
+        False -> BASE, None -> ordinary) without touching anything else. It
+        NEVER rebuilds the working set, ranking, placement, relay stages, or
+        the full connector topology; the node stays in exactly the same
+        position and only its dot color changes.
         """
-        if self._static_connector_cells is None:
-            return
-        if not self._traceroute_trace_geometry:
-            return
-        self._traceroute_trace_geometry = ()
-        self.board.query_one(MeshCanvas).render_scene(
-            self._static_board_width,
-            self._static_board_height,
-            self._static_connector_cells,
-            self._static_theme,
-        )
+        for widget in self.query(MeshNodeWidget):
+            if widget.node_id == node_id:
+                widget.refresh_visual(
+                    selected=widget.node_id == self._selected_node_id,
+                    theme=theme,
+                    now=now,
+                    traced=widget.node_id in self._traced_node_ids,
+                    blink_on=blink_on,
+                )
+                return
 
     def select_node(self, node_id: str) -> None:
         """Select a real working-set node by ID; anything else is a no-op.
@@ -5127,6 +5037,7 @@ class MeshtasticPassApp(App[None]):
         self._traceroute_banner_timer: Timer | None = None
         self._traceroute_timeout_timer: Timer | None = None
         self._traceroute_animation_frame = 0
+        self._traceroute_blink_on = False
         self._traceroute_request_seq = 0
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
@@ -9110,25 +9021,33 @@ class MeshtasticPassApp(App[None]):
         if override is not None:
             widgets[0].update(override)
 
-    def _render_mesh_board_marching_ants(self) -> None:
-        """Advance a pending trace's marching-ants connector on the MESH board.
+    def _render_mesh_traceroute_blink(self) -> None:
+        """Advance a pending trace's destination-dot blink on the MESH board.
 
         RENDER-ONLY: drives the pre-existing _advance_delivery_states tick and
-        asks the view to repaint from its cached static paint + the trace
-        connector geometry (see MeshTopologyView.repaint_traceroute_animation).
-        It never rebuilds the working set, ranking, placement, relay stages, or
-        full connector topology -- that full refresh happens only via
-        _refresh_mesh() on genuine topology/state changes or trace resolution.
-        This is what keeps the per-frame CPU cost low on the uConsole.
+        asks the view to re-render only the destination node's dot color (BASE
+        <-> ACCENT) via MeshTopologyView.refresh_node_dot. It never rebuilds
+        the working set, ranking, placement, relay stages, or full connector
+        topology -- that full refresh happens only via _refresh_mesh() on
+        genuine topology/state changes or trace resolution. This is what keeps
+        the per-frame CPU cost low on the uConsole.
 
         A no-op off the MESH tab (the board is not visible then).
         """
         if self.current_tab != "mesh":
             return
+        active = self._active_traceroute
+        if active is None:
+            return
         views = list(self.query(MeshTopologyView))
         if not views:
             return
-        views[0].repaint_traceroute_animation(self._traceroute_animation_frame)
+        views[0].refresh_node_dot(
+            active.destination_node_id,
+            blink_on=self._traceroute_blink_on,
+            theme=self._current_theme,
+            now=time(),
+        )
 
     def _start_traceroute(self, node: NodeMetadata) -> None:
         """TRACE ROUTE menu action (MESH's selected REMOTE node ENTER
@@ -9158,7 +9077,12 @@ class MeshtasticPassApp(App[None]):
             destination_short_name=_reply_mention_name(node),
         )
         self._traceroute_animation_frame = 0
+        self._traceroute_blink_on = True
         self._render_mesh_top_status()
+        # Begin the target-dot blink immediately (render-only, no full
+        # rebuild): the destination's dot starts ACCENT and alternates
+        # BASE/ACCENT on the existing _advance_delivery_states tick.
+        self._render_mesh_traceroute_blink()
         self._traceroute_timeout_timer = self.set_timer(
             TRACEROUTE_TIMEOUT_SECONDS,
             lambda: self._traceroute_timed_out(request_token),
@@ -9245,15 +9169,26 @@ class MeshtasticPassApp(App[None]):
         destination -- this never touches _traceroute_results/
         mark_traced at all.
         """
+        destination = (
+            self._active_traceroute.destination_node_id
+            if self._active_traceroute is not None
+            else None
+        )
         self._clear_active_traceroute()
         self._show_traceroute_banner("TRACE FAILED", "error")
         self._render_mesh_top_status()
-        # Stop the marching-ants connector immediately (render-only clear, not
-        # a full rebuild): ordinary connector styling resumes right away, and
-        # any prior trustworthy topology for this destination is preserved.
-        views = list(self.query(MeshTopologyView))
-        if views:
-            views[0].clear_traceroute_animation()
+        # Stop the target-dot blink immediately (render-only): ordinary dot
+        # styling resumes right away, and any prior trustworthy topology for
+        # this destination is preserved -- never fabricated or erased.
+        if destination is not None:
+            views = list(self.query(MeshTopologyView))
+            if views:
+                views[0].refresh_node_dot(
+                    destination,
+                    blink_on=None,
+                    theme=self._current_theme,
+                    now=time(),
+                )
 
     def _show_traceroute_banner(self, text: str, style_kind: str) -> None:
         self._traceroute_banner = TracerouteBanner(text, style_kind)
@@ -9292,21 +9227,22 @@ class MeshtasticPassApp(App[None]):
         for widget in self.query(ChatEntryWidget):
             widget.refresh_delivery_state(self._send_animation_frame)
         # TRACE ROUTE (Part C): reuses this SAME pre-existing 0.45s tick
-        # for its own one-active-arrow-of-three animation -- never a
-        # second timer (see TRACEROUTE_ARROW_POSITIONS). A no-op
-        # (neither branch below runs) whenever no trace is pending, so
-        # this adds no work at all outside an active trace.
+        # for its own one-active-arrow-of-three status animation AND the
+        # destination-dot blink -- never a second timer (see
+        # TRACEROUTE_ARROW_POSITIONS). A no-op whenever no trace is pending,
+        # so this adds no work at all outside an active trace.
         if self._active_traceroute is not None:
             self._traceroute_animation_frame = (
                 self._traceroute_animation_frame + 1
             ) % TRACEROUTE_ARROW_POSITIONS
+            # Toggle the target-dot blink phase (BASE <-> ACCENT) on this same
+            # tick -- a boolean flip, not a timer.
+            self._traceroute_blink_on = not self._traceroute_blink_on
             if self._radio_state is RadioState.ONLINE:
                 self._render_mesh_top_status()
-                # Marching-ants: repaint the MESH board so the pending
-                # YOU->destination connector's alternating phase advances on
-                # this SAME pre-existing tick (no new timer). Only repaints
-                # the connector cells -- nodes are unchanged.
-                self._render_mesh_board_marching_ants()
+                # Blink: re-render only the destination node's dot (render-only,
+                # no topology rebuild) -- the node stays in place.
+                self._render_mesh_traceroute_blink()
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)

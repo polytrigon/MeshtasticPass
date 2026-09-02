@@ -76,7 +76,6 @@ from mesh_topology import (
     build_topology,
     compact_node_label,
     directional_target,
-    marching_ants_cells,
     place_within_bounds,
     project_to_viewport,
     route_chain,
@@ -289,24 +288,6 @@ class MeshTopologyModelTests(unittest.TestCase):
 
         chain = route_chain_node_ids("!you", "!target", None, ())
         self.assertEqual(chain, ("!you", "!target"))
-
-    def test_marching_ants_alternate_accent_and_dim_and_advance(self) -> None:
-        """marching_ants_cells marks an ordered connector path as an
-        alternating ACCENT/DIM band that shifts phase per frame -- the
-        terminal "marching ants" -- without changing any glyph or inventing
-        any geometry."""
-        # A straight 6-cell horizontal connector: (1..6, 0).
-        route = tuple((x, 0, "─") for x in range(1, 7))
-        frame0 = marching_ants_cells(route, 0, accent=True)
-        self.assertEqual([c[3] for c in frame0], [True, True, False, False, True, True])
-        self.assertEqual([c[2] for c in frame0], ["─"] * 6)
-        # Advancing the frame slides the alternating phase by one cell.
-        frame1 = marching_ants_cells(route, 1, accent=True)
-        self.assertEqual([c[3] for c in frame1], [False, True, True, False, False, True])
-        # Positions and glyphs are preserved exactly.
-        self.assertEqual([(c[0], c[1]) for c in frame1], [(x, 0) for x in range(1, 7)])
-        # An empty path yields no cells.
-        self.assertEqual(marching_ants_cells((), 0, accent=True), ())
 
     def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
         """MESH GPS PLACEMENT: real distance now genuinely differentiates
@@ -9199,6 +9180,16 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id).render()
         )
 
+    def _dot_color(self, app: MeshtasticPassApp, node_id: str):
+        """The rendered foreground color of a node's DOT cell (the center
+        glyph, not the selected halo). Deterministic for blink assertions.
+        """
+        widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+        spans = widget.render().spans
+        # Selected nodes render [halo, dot, halo]; unselected render [dot].
+        span = spans[1] if len(spans) >= 3 else spans[0]
+        return span.style.foreground
+
     # ---- Menu gating ---------------------------------------------------
 
     async def test_remote_menu_offers_traceroute_you_never_does(self) -> None:
@@ -9860,15 +9851,114 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
                 {c.destination_id for c in view.connector_chains},
             )
 
-    # ---- Render-only pending-trace animation (no full refresh) ------------
+    # ---- Pending-trace destination-dot blink (no full refresh) ------------
 
-    async def test_pending_frame_advance_does_not_refresh_mesh(self) -> None:
-        """Advancing one marching-ants frame must NOT go through the full
-        _refresh_mesh()/set_nodes() rebuild path -- only the cached static
-        paint is repainted. Spied by counting calls to the full-refresh entry
-        point (which would rebuild the working set, ranking, placement, relay
-        stages, and full connector topology every frame).
-        """
+    async def test_starting_traceroute_begins_target_dot_blink(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+            # Before the trace, the target dot is its ordinary BASE color.
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+            app._start_traceroute(node)
+            # Blink begins immediately: phase is "on" and the dot is ACCENT.
+            self.assertTrue(app._traceroute_blink_on)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+    async def test_target_dot_alternates_base_and_accent_across_frames(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            # Each _advance_delivery_states call flips the phase deterministically;
+            # assert the DOT color right after each synchronous toggle (no pause,
+            # so the timer cannot interleave).
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+    async def test_focused_traceroute_target_still_blinks(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            # Focus the traced destination, then start the trace.
+            view.select_node("!a1111111")
+            app._refresh_mesh()
+            app._start_traceroute(node)
+            # Focus ACCENT is overridden by the blink for the DOT only: it
+            # still alternates (ACCENT here, BASE on the next tick).
+            self.assertEqual(view._selected_node_id, "!a1111111")
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+    async def test_unfocused_traceroute_target_blinks(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            # Unfocused target (selection stays on YOU) still blinks.
+            self.assertNotEqual(view._selected_node_id, "!a1111111")
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+    async def test_focusing_unrelated_node_does_not_blink_that_node(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            # Focus an UNRELATED node: its dot keeps ordinary selected ACCENT,
+            # never the pending-trace blink (only the traced target blinks).
+            view.select_node("!b2222222")
+            app._refresh_mesh()
+            self.assertEqual(view._selected_node_id, "!b2222222")
+            self.assertEqual(self._dot_color(app, "!b2222222"), Color.parse(palette.accent))
+            # The traced target still blinks.
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+    async def test_blink_frames_do_not_refresh_mesh(self) -> None:
         app = self._make_app(
             traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
         )
@@ -9889,34 +9979,31 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
 
             app._start_traceroute(node)
-            await pilot.pause()
-            # Ensure the static paint + trace geometry are cached.
             app._refresh_mesh()
-            await pilot.pause()
             calls_before = refresh_calls
             working_set_before = view.working_set
             base_positions_before = dict(view.base_positions)
             chains_before = view.connector_chains
+            node_offset_before = next(
+                w for w in app.query(MeshNodeWidget) if w.node_id == "!a1111111"
+            ).styles.offset
 
             app._advance_delivery_states()
-            await pilot.pause()
 
-            # No full refresh; working set / placement / topology / chains all
-            # identical; only the frame counter advanced.
+            # No full refresh: working set / placement / topology / chains all
+            # identical; the node dot never moved -- only its color changed.
             self.assertEqual(refresh_calls, calls_before)
             self.assertEqual(view.working_set, working_set_before)
             self.assertEqual(view.base_positions, base_positions_before)
             self.assertEqual(view.connector_chains, chains_before)
-            # The trace geometry cache is unchanged (same node positions).
             self.assertEqual(
-                view._traceroute_trace_geometry, view._traceroute_trace_geometry
+                next(
+                    w for w in app.query(MeshNodeWidget) if w.node_id == "!a1111111"
+                ).styles.offset,
+                node_offset_before,
             )
 
-    async def test_pending_frame_advance_repaints_only_trace_cells(self) -> None:
-        """Between two frames with no real mesh state change, the canvas is
-        re-rendered with the SAME static cells and only the trace connector's
-        marching-ants colors differ -- proving no topology was rebuilt.
-        """
+    async def test_no_temporary_traceroute_connector_is_rendered(self) -> None:
         app = self._make_app(
             traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
         )
@@ -9926,36 +10013,19 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
-
-            app._start_traceroute(node)
-            await pilot.pause()
-            app._refresh_mesh()
-            await pilot.pause()
-
             canvas = view.board.query_one(MeshCanvas)
-            _, _, frame0_cells, _ = canvas._signature
-            # Static paint cached by set_nodes; trace geometry cached too.
-            static_before = view._static_connector_cells
-            self.assertIsNotNone(static_before)
-            self.assertTrue(view._traceroute_trace_geometry)
+            connectors_before = canvas._signature[2]
 
-            app._advance_delivery_states()
-            await pilot.pause()
+            app._start_traceroute(node)
 
-            _, _, frame1_cells, _ = canvas._signature
-            # The static (non-trace) cells are byte-identical between frames.
-            self.assertEqual(static_before, view._static_connector_cells)
-            # Cells did change overall (the frame advanced).
-            self.assertNotEqual(frame0_cells, frame1_cells)
+            # Blink changes only the node dot, never the canvas connectors: the
+            # connector scene is byte-identical (no temporary trace connector).
+            self.assertEqual(canvas._signature[2], connectors_before)
 
-    async def test_focused_traced_target_still_shows_marching_ants(self) -> None:
-        """A pending trace's ants must override the traced-path connector's
-        ordinary selected ACCENT paint so the animation stays visible while the
-        destination is focused. The trace cells are drawn after / win any
-        shared cells with the selected connector.
-        """
+    async def test_success_stops_blink_and_applies_explicit_route(self) -> None:
         app = self._make_app(
-            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
         )
         async with app.run_test(size=(90, 28)) as pilot:
             you_id = app.radio.info.node_id
@@ -9966,24 +10036,17 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
             app._start_traceroute(node)
             await pilot.pause()
-            app._refresh_mesh()
-            await pilot.pause()
-            # Focus the traced destination.
-            view.select_node("!a1111111")
-            app._refresh_mesh()
-            await pilot.pause()
 
-            # The trace geometry remains (ants still animate), and the static
-            # paint itself is unchanged -- the ants overlay wins shared cells.
-            self.assertTrue(view._traceroute_trace_geometry)
-            self.assertEqual(view._selected_node_id, "!a1111111")
-            canvas = view.board.query_one(MeshCanvas)
-            self.assertIsNotNone(canvas._signature)
-            # Static paint does not contain the trace cells; they are added
-            # only at render time, so the traced path still shows ants.
-            self.assertIsNotNone(view._static_connector_cells)
+            # Success resolves: the "*" marker replaces the blink, and the
+            # completed explicit route topology is applied (no temporary
+            # connector, one explicit chain through the identified relay).
+            self.assertEqual(self._glyph_text(app, "!a1111111"), "*")
+            chains = [c for c in view.connector_chains if c.destination_id == "!a1111111"]
+            self.assertEqual(len(chains), 1)
+            self.assertTrue(chains[0].explicit)
+            self.assertEqual(chains[0].node_ids, (you_id, "!ffff0001", "!a1111111"))
 
-    async def test_unfocused_traced_target_still_shows_marching_ants(self) -> None:
+    async def test_failure_stops_blink(self) -> None:
         app = self._make_app(
             traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
         )
@@ -9993,66 +10056,36 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
 
             app._start_traceroute(node)
-            await pilot.pause()
-            app._refresh_mesh()
-            await pilot.pause()
-
-            # Unfocused (selection stays on YOU): ants still present.
-            self.assertTrue(view._traceroute_trace_geometry)
-            self.assertNotEqual(view._selected_node_id, "!a1111111")
-
-    async def test_focusing_unrelated_node_keeps_ants_on_trace_path(self) -> None:
-        app = self._make_app(
-            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
-        )
-        async with app.run_test(size=(90, 28)) as pilot:
-            you_id = app.radio.info.node_id
-            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
-            await self._open_mesh(pilot)
-            view = app.query_one(MeshTopologyView)
-            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
-
-            app._start_traceroute(node)
-            await pilot.pause()
-            app._refresh_mesh()
-            await pilot.pause()
-            # Focus an UNRELATED node.
-            view.select_node("!b2222222")
-            app._refresh_mesh()
-            await pilot.pause()
-
-            self.assertEqual(view._selected_node_id, "!b2222222")
-            # Trace geometry (the traced path) is still cached for animation.
-            self.assertTrue(view._traceroute_trace_geometry)
-
-    async def test_trace_resolution_restores_normal_connector_styling(self) -> None:
-        """After the trace resolves (failure here), the marching-ants connector
-        is cleared (render-only) and normal connector styling resumes.
-        """
-        app = self._make_app(
-            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
-        )
-        async with app.run_test(size=(90, 28)) as pilot:
-            you_id = app.radio.info.node_id
-            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
-            await self._open_mesh(pilot)
-            view = app.query_one(MeshTopologyView)
-            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
-
-            app._start_traceroute(node)
-            await pilot.pause()
-            app._refresh_mesh()
-            await pilot.pause()
-            self.assertTrue(view._traceroute_trace_geometry)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
 
             app._finish_traceroute_failure("simulated failure")
-            await pilot.pause()
 
-            # Ants cleared: trace geometry is gone, static paint kept.
-            self.assertEqual(view._traceroute_trace_geometry, ())
-            self.assertIsNotNone(view._static_connector_cells)
+            # Blink stops: the dot returns to its ordinary BASE color, and no
+            # trace is active any more.
+            self.assertIsNone(app._active_traceroute)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+    async def test_timeout_stops_blink(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            app._traceroute_timed_out(app._active_traceroute.request_token)
+
+            # Timeout stops the blink (same resolution path as failure).
+            self.assertIsNone(app._active_traceroute)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
 
     # ---- One active trace at a time -------------------------------------
 
