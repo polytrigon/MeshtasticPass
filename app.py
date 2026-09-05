@@ -70,16 +70,20 @@ from mesh_state import (
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
+    ConnectorChain,
     PositionedNode,
     RelayStage,
+    RouteEvidence,
     TopologyLayout,
     assign_grid_slots,
     build_relay_stages,
     directional_target,
+    forward_route_evidence,
     mesh_board_marker_label,
     place_within_bounds,
     project_to_viewport,
     route_chain_avoiding,
+    route_chain_node_ids,
 )
 from node_activity import is_node_active
 from radio_capabilities import (
@@ -2523,7 +2527,13 @@ class MeshNodeWidget(Static):
         super().__init__(classes="mesh-node", markup=False)
 
     def refresh_visual(
-        self, *, selected: bool, theme: str, now: float, traced: bool = False
+        self,
+        *,
+        selected: bool,
+        theme: str,
+        now: float,
+        traced: bool = False,
+        blink_on: bool | None = None,
     ) -> None:
         color = _mesh_node_color(self.state, selected=selected, theme=theme, now=now)
         # The glyph shape itself is never altered by selection -- ACTIVE
@@ -2547,31 +2557,37 @@ class MeshNodeWidget(Static):
         # than passive last-heard staleness). This never moves the
         # glyph's own (grid_x, grid_y) anchor or its selected-composite
         # width -- only the single character/color drawn there.
+        palette = THEME_PALETTES[theme]
         if traced:
             glyph = "*"
-            color = THEME_PALETTES[theme].accent
+            color = palette.accent
         else:
             glyph = (
                 CIRCLE_SOLID_LARGE
                 if self.state.node.is_local or is_node_active(self.state.node.last_heard, now)
                 else CIRCLE_STROKED_LARGE
             )
-        style = Style(color=color, bold=selected)
+        # Pending-trace DOT blink: while a traceroute is in progress toward
+        # THIS node, its dot alternates BASE <-> ACCENT (blink_on False/True)
+        # using the existing traceroute animation tick. The dot color
+        # overrides the ordinary color -- including the selected-node ACCENT
+        # -- so the blink stays visible even while the target is focused. Only
+        # the dot's color changes: the glyph shape, position, label, and the
+        # selected halo (if any) are untouched. A focused traceroute target
+        # still blinks BASE/ACCENT rather than being masked by its normal
+        # focus/ACCENT styling.
+        dot_color = color if blink_on is None else (palette.accent if blink_on else palette.base)
         if selected:
-            # Bold alone reads as barely-different on many terminals, so
-            # the anchor cell's role glyph is flanked by a small dot in
-            # each immediately neighboring cell on the same row -- a real,
-            # ~3x wider visual footprint, not a font-weight trick. The
-            # widget's own width/offset (set in MeshTopologyView.set_nodes) keep the
-            # center *column* of this 3-cell composite exactly on the
-            # glyph's (grid_x, grid_y) anchor, so growing it can never
-            # move that coordinate.
+            # The selected composite's halo keeps the ORDINARY selected
+            # color; only the center dot carries the blink override.
+            halo_style = Style(color=color, bold=True)
+            dot_style = Style(color=dot_color, bold=True)
             content = Text(justify="center")
-            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
-            content.append(glyph, style=style)
-            content.append(MESH_SELECTED_HALO_GLYPH, style=style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=halo_style)
+            content.append(glyph, style=dot_style)
+            content.append(MESH_SELECTED_HALO_GLYPH, style=halo_style)
         else:
-            content = Text(glyph, style=style)
+            content = Text(glyph, style=Style(color=dot_color, bold=False))
         self.update(content)
 
     def on_click(self, _event: Click) -> None:
@@ -2808,6 +2824,15 @@ class MeshTopologyView(Container):
         # erased by a later FAILED trace -- see MeshtasticPassApp.
         # _finish_traceroute_success, this set's only writer).
         self._traced_node_ids: frozenset[str] = frozenset()
+        # The connector plan the last set_nodes() drew: one ConnectorChain
+        # per rendered YOU-to-destination path, reflecting whether each was
+        # explicit successful-traceroute route evidence (identified relays,
+        # authoritative order) or the generic anonymous hops_away model.
+        self._connector_chains: tuple[ConnectorChain, ...] = ()
+
+    @property
+    def connector_chains(self) -> tuple[ConnectorChain, ...]:
+        return self._connector_chains
 
     @property
     def board(self) -> Container:
@@ -2970,7 +2995,24 @@ class MeshTopologyView(Container):
         # answers "what does my radio currently believe is active" via
         # rendered connectors, and "what else does my radio remember"
         # via dim, disconnected real nodes.
-        active_hop_counts = _mesh_active_hop_counts(working_set, now=now)
+        # Successful-traceroute route evidence overrides the anonymous
+        # hops_away-derived relay chain for THAT destination (see
+        # route_chain_node_ids: an explicit forward chain -- including an
+        # EMPTY one, which is explicit DIRECT evidence -- is authoritative and
+        # must replace, not merely augment, the generic staged path). This map
+        # is computed early so it can both exclude explicit destinations from
+        # anonymous relay-stage generation below AND drive the connector loop.
+        explicit_forward_by_dest: dict[str, tuple[str, ...]] = {}
+        for node_id, evidence in getattr(self.app, "_traceroute_routes", {}).items():
+            explicit_forward_by_dest[node_id] = evidence.forward
+        explicit_destinations = frozenset(explicit_forward_by_dest)
+        active_hop_counts = {
+            node_id: hop_count
+            for node_id, hop_count in _mesh_active_hop_counts(
+                working_set, now=now
+            ).items()
+            if node_id not in explicit_destinations
+        }
         # Relay-stage interpolation happens in the STABLE logical
         # coordinate space (MESH_LOGICAL_GRID_*), never the current
         # viewport's dynamic row/column count -- a relay chain's
@@ -3115,7 +3157,10 @@ class MeshTopologyView(Container):
             widget.styles.offset = (grid_x - width // 2, grid_y)
             centers[widget.node_id] = (grid_x, grid_y)
             traced = widget.node_id in self._traced_node_ids
-            widget.refresh_visual(selected=selected, theme=theme, now=now, traced=traced)
+            blink_on = self._pending_trace_blink_on(widget.node_id)
+            widget.refresh_visual(
+                selected=selected, theme=theme, now=now, traced=traced, blink_on=blink_on
+            )
 
         # Relay-stage placeholders share the same glyph anchor formula as
         # a real node's glyph (see MeshNodeWidget above) but never the
@@ -3189,6 +3234,9 @@ class MeshTopologyView(Container):
             stages_by_client.setdefault(stage.source_node_id, []).append(stage)
         for stages in stages_by_client.values():
             stages.sort(key=lambda stage: stage.index)
+        # explicit_forward_by_dest / explicit_destinations were computed above
+        # (before anonymous relay-stage generation) so the connector loop can
+        # route explicit destinations through their identified relays.
 
         # STALE nodes (see MeshNodeState.activity_tier) now ALSO draw a
         # connector -- DIM + DOTTED, direct only (no relay chain: a
@@ -3209,6 +3257,22 @@ class MeshTopologyView(Container):
         # its connector chain. Starts empty so "no connectors at all"
         # (YOU missing from centers) also shows zero relay markers.
         connected_relay_ids: set[str] = set()
+        # The actual connector plan the loop below draws, recorded for
+        # inspection: one ConnectorChain per drawn YOU-to-destination path.
+        # `explicit` distinguishes a successful-traceroute-derived chain
+        # (identified relays, authoritative order) from a generic
+        # hops_away-derived anonymous-stage chain. A traced destination's
+        # explicit chain REPLACES its generic path -- never drawn twice.
+        connector_chains: list[ConnectorChain] = []
+        # A node that is an identified RELAY in some explicit forward chain
+        # (and not itself a traced destination) is a pure WAYPOINT: it renders
+        # as a real node but never gets an independent YOU->relay connector --
+        # its only connection is the destination chain routed through it.
+        identified_relay_ids = {
+            relay_id
+            for evidence in getattr(self.app, "_traceroute_routes", {}).values()
+            for relay_id in evidence.forward
+        }
         if you_id is not None and you_id in centers:
             for state in working_set:
                 remote_id = state.node.node_id
@@ -3217,19 +3281,59 @@ class MeshTopologyView(Container):
                 tier = state.activity_tier(now=now)
                 if tier is MeshActivityTier.VERY_OLD:
                     continue
+                if (
+                    remote_id in identified_relay_ids
+                    and remote_id not in explicit_destinations
+                ):
+                    # Pure relay waypoint: its connector is the destination
+                    # chain passing through it, not an independent edge (and
+                    # never a fabricated direct YOU->relay connection).
+                    continue
                 is_stale = tier is MeshActivityTier.STALE
-                chain_stages = () if is_stale else stages_by_client.get(remote_id, ())
-                chain_ids = {remote_id, *(stage.node_id for stage in chain_stages)}
+                explicit_forward = explicit_forward_by_dest.get(remote_id)
+                if explicit_forward is not None:
+                    # Explicit successful-traceroute route: the connector
+                    # STARTS from this ordered forward chain (canonical IDs,
+                    # exact RouteDiscovery order -- never sorted, never
+                    # re-derived from hop count or grid position). An EMPTY
+                    # forward is explicit DIRECT (YOU->destination, zero
+                    # relays) and overrides any stale generic staging.
+                    # Relay admission is GUARANTEED (see mesh_state.
+                    # build_mesh_working_set), so every relay normally has a
+                    # center. Honest degradation: if a known relay genuinely
+                    # has no render position, we NEVER compress the chain
+                    # into a fabricated YOU->A->TARGET -- instead we skip the
+                    # connector for this destination entirely (truthful
+                    # "unlinked" rather than a fabricated bridge).
+                    chain_relays = tuple(explicit_forward)
+                    if not all(relay_id in centers for relay_id in chain_relays):
+                        continue
+                    chain_node_ids = route_chain_node_ids(
+                        you_id, remote_id, chain_relays, ()
+                    )
+                    is_explicit = True
+                else:
+                    chain_stages = () if is_stale else stages_by_client.get(remote_id, ())
+                    chain_node_ids = route_chain_node_ids(
+                        you_id,
+                        remote_id,
+                        None,
+                        (
+                            stage.node_id
+                            for stage in chain_stages
+                            if stage.node_id in centers
+                        ),
+                    )
+                    is_explicit = False
+                # chain_ids is the set of NON-YOU cells this chain occupies:
+                # the destination plus any intermediate relays/stages. YOU is
+                # deliberately excluded, matching the original connector model
+                # -- a path never treats its own origin as an obstacle or as a
+                # candidate for "is the selection on this chain?" (selection of
+                # YOU itself must not paint every OUTGOING connector accent).
+                chain_ids = set(chain_node_ids) - {you_id}
                 is_selected = self._selected_node_id in chain_ids
-                chain_points = (
-                    centers[you_id],
-                    *(
-                        centers[stage.node_id]
-                        for stage in chain_stages
-                        if stage.node_id in centers
-                    ),
-                    centers[remote_id],
-                )
+                chain_points = tuple(centers[node_id] for node_id in chain_node_ids)
                 # Obstacles: every OTHER real node/relay-stage's own
                 # occupied cell -- never this chain's own endpoints or
                 # relay stages (see route_chain_avoiding/item 8: real
@@ -3269,9 +3373,11 @@ class MeshTopologyView(Container):
                 # (orphan-circle audit): an intermediate marker whose
                 # connector no longer visits it would otherwise stand
                 # on the board as an unexplained standalone circle.
-                relay_stage_ids_in_chain = {
-                    stage.node_id for stage in chain_stages if stage.node_id in centers
-                }
+                relay_stage_ids_in_chain = (
+                    {stage.node_id for stage in chain_stages if stage.node_id in centers}
+                    if not is_explicit
+                    else set()
+                )
                 if relay_stage_ids_in_chain & self._edge_node_ids:
                     route_cells = route_chain_avoiding(
                         (centers[you_id], centers[remote_id]), obstacles
@@ -3292,6 +3398,9 @@ class MeshTopologyView(Container):
                         # stage of this chain -- these markers have a
                         # visible line through them and may render.
                         connected_relay_ids |= relay_stage_ids_in_chain
+                connector_chains.append(
+                    ConnectorChain(remote_id, chain_node_ids, is_explicit, is_stale)
+                )
                 if is_selected:
                     color = palette.accent
                 elif is_stale:
@@ -3303,6 +3412,7 @@ class MeshTopologyView(Container):
                     color = palette.dim_base
                 target = selected_connector_cells if is_selected else connector_cells
                 target.extend((x, y, glyph, color) for x, y, glyph in route_cells)
+        self._connector_chains = tuple(connector_chains)
         # ORPHAN TOPOLOGY CIRCLE AUDIT invariant: every visible
         # synthetic hollow-circle relay marker participates in a
         # currently drawn connector chain. Decided HERE -- after the
@@ -3348,7 +3458,44 @@ class MeshTopologyView(Container):
         self._relay_stages = ()
         self._selected_node_id = ""
         self._edge_node_ids = frozenset()
+        self._connector_chains = ()
         self.board.query_one(MeshCanvas).render_scene(1, 1, (), "snow")
+
+    def _pending_trace_blink_on(self, node_id: str) -> bool | None:
+        """The pending-trace blink override for a node's dot, or None.
+
+        While a traceroute is pending toward `node_id`, its dot blinks between
+        BASE (blink off) and ACCENT (blink on) using the existing traceroute
+        animation tick; this returns the current phase. None for any other node
+        (no blink). Reading app state only -- never triggers a rebuild.
+        """
+        active = getattr(self.app, "_active_traceroute", None)
+        if active is None or active.destination_node_id != node_id:
+            return None
+        return bool(getattr(self.app, "_traceroute_blink_on", False))
+
+    def refresh_node_dot(
+        self, node_id: str, *, blink_on: bool | None, theme: str, now: float
+    ) -> None:
+        """Render-only repaint of one node's dot.
+
+        The narrowest render path for the pending-trace blink: it re-renders
+        just that node's MeshNodeWidget dot color (blink_on True -> ACCENT,
+        False -> BASE, None -> ordinary) without touching anything else. It
+        NEVER rebuilds the working set, ranking, placement, relay stages, or
+        the full connector topology; the node stays in exactly the same
+        position and only its dot color changes.
+        """
+        for widget in self.query(MeshNodeWidget):
+            if widget.node_id == node_id:
+                widget.refresh_visual(
+                    selected=widget.node_id == self._selected_node_id,
+                    theme=theme,
+                    now=now,
+                    traced=widget.node_id in self._traced_node_ids,
+                    blink_on=blink_on,
+                )
+                return
 
     def select_node(self, node_id: str) -> None:
         """Select a real working-set node by ID; anything else is a no-op.
@@ -4880,10 +5027,17 @@ class MeshtasticPassApp(App[None]):
         # persisted to disk -- an app restart clears it completely.
         self._active_traceroute: ActiveTraceroute | None = None
         self._traceroute_results: dict[str, TracerouteResult] = {}
+        # Session topology route evidence (canonical forward relay chain per
+        # destination) -- the strongest trustworthy route currently known, so
+        # the MESH board can draw identified relay hops rather than only the
+        # NodeDB-derived anonymous hop-count stages. Populated only by a
+        # SUCCESSFUL trace (a failed/timed-out trace never touches it).
+        self._traceroute_routes: dict[str, RouteEvidence] = {}
         self._traceroute_banner: TracerouteBanner | None = None
         self._traceroute_banner_timer: Timer | None = None
         self._traceroute_timeout_timer: Timer | None = None
         self._traceroute_animation_frame = 0
+        self._traceroute_blink_on = False
         self._traceroute_request_seq = 0
         self._terminal_cursor = terminal_cursor or TerminalCursor()
         self._monitor = RadioMonitor(
@@ -8372,6 +8526,22 @@ class MeshtasticPassApp(App[None]):
                     activity[key] = timestamp
         return activity
 
+    def _identified_traceroute_relay_ids(self) -> tuple[str, ...]:
+        """Canonical node IDs of relays observed on successful traceroutes.
+
+        The union of every forward route's intermediate relay IDs (never the
+        endpoints). These are REAL identities from successful RouteDiscovery
+        evidence -- not hop-count placeholders -- so they are admitted to the
+        MESH working set even before NodeDB has full metadata for them. Purely
+        read from in-memory session state; zero RF. A later failed trace never
+        erases them (only a newer successful trace replaces per-destination
+        evidence).
+        """
+        ids: set[str] = set()
+        for evidence in self._traceroute_routes.values():
+            ids.update(evidence.forward)
+        return tuple(sorted(ids))
+
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
 
@@ -8406,6 +8576,7 @@ class MeshtasticPassApp(App[None]):
             now=current_time,
             last_message_at=self._mesh_last_message_activity(),
             favorite_ids=self.settings.favorite_node_ids,
+            identified_relay_ids=self._identified_traceroute_relay_ids(),
         )
         # YOU's long_name/short_name from get_known_nodes() are NOT
         # reliable (that NodeDB record is frequently a bare synthesized
@@ -8850,6 +9021,34 @@ class MeshtasticPassApp(App[None]):
         if override is not None:
             widgets[0].update(override)
 
+    def _render_mesh_traceroute_blink(self) -> None:
+        """Advance a pending trace's destination-dot blink on the MESH board.
+
+        RENDER-ONLY: drives the pre-existing _advance_delivery_states tick and
+        asks the view to re-render only the destination node's dot color (BASE
+        <-> ACCENT) via MeshTopologyView.refresh_node_dot. It never rebuilds
+        the working set, ranking, placement, relay stages, or full connector
+        topology -- that full refresh happens only via _refresh_mesh() on
+        genuine topology/state changes or trace resolution. This is what keeps
+        the per-frame CPU cost low on the uConsole.
+
+        A no-op off the MESH tab (the board is not visible then).
+        """
+        if self.current_tab != "mesh":
+            return
+        active = self._active_traceroute
+        if active is None:
+            return
+        views = list(self.query(MeshTopologyView))
+        if not views:
+            return
+        views[0].refresh_node_dot(
+            active.destination_node_id,
+            blink_on=self._traceroute_blink_on,
+            theme=self._current_theme,
+            now=time(),
+        )
+
     def _start_traceroute(self, node: NodeMetadata) -> None:
         """TRACE ROUTE menu action (MESH's selected REMOTE node ENTER
 
@@ -8878,7 +9077,12 @@ class MeshtasticPassApp(App[None]):
             destination_short_name=_reply_mention_name(node),
         )
         self._traceroute_animation_frame = 0
+        self._traceroute_blink_on = True
         self._render_mesh_top_status()
+        # Begin the target-dot blink immediately (render-only, no full
+        # rebuild): the destination's dot starts ACCENT and alternates
+        # BASE/ACCENT on the existing _advance_delivery_states tick.
+        self._render_mesh_traceroute_blink()
         self._traceroute_timeout_timer = self.set_timer(
             TRACEROUTE_TIMEOUT_SECONDS,
             lambda: self._traceroute_timed_out(request_token),
@@ -8947,6 +9151,11 @@ class MeshtasticPassApp(App[None]):
         destination = result.destination_node_id
         self._clear_active_traceroute()
         self._traceroute_results[destination] = result
+        # Session route evidence (forward relay chain by canonical node ID,
+        # return route retained but never used to fabricate symmetry). A
+        # newer successful trace REPLACES the older evidence for the same
+        # destination; a failed trace never erases it (see _finish_traceroute_failure).
+        self._traceroute_routes[destination] = forward_route_evidence(result)
         self.query_one(MeshTopologyView).mark_traced(destination)
         self._show_traceroute_banner("TRACE SUCCEEDED", "accent")
         # Repaints the board (for the new "*" marker) AND the top status
@@ -8960,9 +9169,26 @@ class MeshtasticPassApp(App[None]):
         destination -- this never touches _traceroute_results/
         mark_traced at all.
         """
+        destination = (
+            self._active_traceroute.destination_node_id
+            if self._active_traceroute is not None
+            else None
+        )
         self._clear_active_traceroute()
         self._show_traceroute_banner("TRACE FAILED", "error")
         self._render_mesh_top_status()
+        # Stop the target-dot blink immediately (render-only): ordinary dot
+        # styling resumes right away, and any prior trustworthy topology for
+        # this destination is preserved -- never fabricated or erased.
+        if destination is not None:
+            views = list(self.query(MeshTopologyView))
+            if views:
+                views[0].refresh_node_dot(
+                    destination,
+                    blink_on=None,
+                    theme=self._current_theme,
+                    now=time(),
+                )
 
     def _show_traceroute_banner(self, text: str, style_kind: str) -> None:
         self._traceroute_banner = TracerouteBanner(text, style_kind)
@@ -9001,16 +9227,22 @@ class MeshtasticPassApp(App[None]):
         for widget in self.query(ChatEntryWidget):
             widget.refresh_delivery_state(self._send_animation_frame)
         # TRACE ROUTE (Part C): reuses this SAME pre-existing 0.45s tick
-        # for its own one-active-arrow-of-three animation -- never a
-        # second timer (see TRACEROUTE_ARROW_POSITIONS). A no-op
-        # (neither branch below runs) whenever no trace is pending, so
-        # this adds no work at all outside an active trace.
+        # for its own one-active-arrow-of-three status animation AND the
+        # destination-dot blink -- never a second timer (see
+        # TRACEROUTE_ARROW_POSITIONS). A no-op whenever no trace is pending,
+        # so this adds no work at all outside an active trace.
         if self._active_traceroute is not None:
             self._traceroute_animation_frame = (
                 self._traceroute_animation_frame + 1
             ) % TRACEROUTE_ARROW_POSITIONS
+            # Toggle the target-dot blink phase (BASE <-> ACCENT) on this same
+            # tick -- a boolean flip, not a timer.
+            self._traceroute_blink_on = not self._traceroute_blink_on
             if self._radio_state is RadioState.ONLINE:
                 self._render_mesh_top_status()
+                # Blink: re-render only the destination node's dot (render-only,
+                # no topology rebuild) -- the node stays in place.
+                self._render_mesh_traceroute_blink()
 
     def _is_near_chat_bottom(self) -> bool:
         transcript = self.query_one("#chat-log", ChatTranscript)

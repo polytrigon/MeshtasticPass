@@ -222,6 +222,73 @@ def client_state(
 
 
 class MeshTopologyModelTests(unittest.TestCase):
+    def test_forward_route_evidence_prefers_forward_and_keeps_return(self) -> None:
+        from mesh_topology import RouteEvidence, forward_route_evidence
+        from radio_service import TracerouteResult
+
+        result = TracerouteResult(
+            destination_node_id="!target",
+            forward_route=("!a", "!b"),
+            forward_snr=(None, None, None),
+            return_route=("!c",),
+            return_snr=(None, None),
+            completed_at=1000.0,
+        )
+        evidence = forward_route_evidence(result)
+        self.assertEqual(
+            evidence,
+            RouteEvidence(
+                destination_node_id="!target",
+                forward=("!a", "!b"),
+                return_route=("!c",),
+            ),
+        )
+        # An EMPTY forward route is explicit DIRECT evidence, never "unknown".
+        direct = forward_route_evidence(
+            TracerouteResult(
+                destination_node_id="!target",
+                forward_route=(),
+                forward_snr=(None,),
+                return_route=(),
+                return_snr=(None,),
+                completed_at=1000.0,
+            )
+        )
+        self.assertEqual(direct.forward, ())
+        self.assertEqual(direct.destination_node_id, "!target")
+
+    def test_route_chain_node_ids_explicit_empty_forward_is_direct(self) -> None:
+        from mesh_topology import route_chain_node_ids
+
+        chain = route_chain_node_ids("!you", "!target", (), ("relay:!target:1", "relay:!target:2"))
+        # Empty forward = explicit DIRECT: the generic anonymous stages are
+        # superseded even though they were passed in.
+        self.assertEqual(chain, ("!you", "!target"))
+
+    def test_route_chain_node_ids_explicit_relay_order_never_sorted(self) -> None:
+        from mesh_topology import route_chain_node_ids
+
+        chain = route_chain_node_ids(
+            "!you", "!target", ("!b", "!a", "!c"), ("relay:!target:1",)
+        )
+        # Exact RouteDiscovery order preserved -- never alphabetical, never
+        # re-derived. The generic anonymous stages are ignored.
+        self.assertEqual(chain, ("!you", "!b", "!a", "!c", "!target"))
+
+    def test_route_chain_node_ids_no_evidence_uses_anonymous_stages(self) -> None:
+        from mesh_topology import route_chain_node_ids
+
+        chain = route_chain_node_ids(
+            "!you", "!target", None, ("relay:!target:1", "relay:!target:2")
+        )
+        self.assertEqual(chain, ("!you", "relay:!target:1", "relay:!target:2", "!target"))
+
+    def test_route_chain_node_ids_no_evidence_empty_stages_is_direct_generic(self) -> None:
+        from mesh_topology import route_chain_node_ids
+
+        chain = route_chain_node_ids("!you", "!target", None, ())
+        self.assertEqual(chain, ("!you", "!target"))
+
     def test_west_and_east_nodes_ordered_by_distance_not_proportionally(self) -> None:
         """MESH GPS PLACEMENT: real distance now genuinely differentiates
 
@@ -9113,6 +9180,16 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id).render()
         )
 
+    def _dot_color(self, app: MeshtasticPassApp, node_id: str):
+        """The rendered foreground color of a node's DOT cell (the center
+        glyph, not the selected halo). Deterministic for blink assertions.
+        """
+        widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == node_id)
+        spans = widget.render().spans
+        # Selected nodes render [halo, dot, halo]; unselected render [dot].
+        span = spans[1] if len(spans) >= 3 else spans[0]
+        return span.style.foreground
+
     # ---- Menu gating ---------------------------------------------------
 
     async def test_remote_menu_offers_traceroute_you_never_does(self) -> None:
@@ -9371,6 +9448,645 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
                 app._traceroute_results["!a1111111"].forward_route, ("!ffff0002",)
             )
 
+    # ---- Session route evidence (topology) ------------------------------
+
+    async def test_success_stores_forward_route_evidence_not_return_symmetry(
+        self,
+    ) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+            traceroute_return_route=("!ffff0009",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            evidence = app._traceroute_routes["!a1111111"]
+            self.assertEqual(evidence.destination_node_id, "!a1111111")
+            self.assertEqual(evidence.forward, ("!ffff0001",))
+            # The return route is retained as evidence but never treated as a
+            # forward hop (no fabricated symmetry).
+            self.assertEqual(evidence.return_route, ("!ffff0009",))
+
+    async def test_identified_relay_admitted_to_mesh_working_set(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            working_ids = {
+                s.node.node_id for s in app.query_one(MeshTopologyView).working_set
+            }
+            # The relay is a REAL canonical ID admitted even though NodeDB has
+            # no metadata for it (bare minimal node, not a hop-count placeholder).
+            self.assertIn("!ffff0001", working_ids)
+
+    async def test_failed_trace_preserves_prior_route_evidence(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.FAILED,
+            ),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            node = next(s.node for s in app.query_one(MeshTopologyView).working_set
+                        if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            # A failed trace must never erase the last successful evidence.
+            self.assertIn("!a1111111", app._traceroute_routes)
+            self.assertEqual(
+                app._traceroute_routes["!a1111111"].forward, ("!ffff0001",)
+            )
+
+    # ---- Actual rendered connector model ---------------------------------
+
+    def _chain_for(self, view, destination_id: str):
+        return next(c for c in view.connector_chains if c.destination_id == destination_id)
+
+    async def test_single_relay_trace_draws_you_to_relay_to_destination(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chain = self._chain_for(view, "!a1111111")
+            self.assertTrue(chain.explicit)
+            self.assertEqual(chain.node_ids, (you_id, "!ffff0001", "!a1111111"))
+            # The traced destination gets no anonymous relay stage; Bob (not
+            # traced) keeps his generic one.
+            self.assertNotIn("relay:!a1111111:1", view.base_positions)
+            self.assertIn("relay:!b2222222:1", view.base_positions)
+
+    async def test_two_relay_trace_preserves_exact_route_discovery_order(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0002", "!ffff0001"),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chain = self._chain_for(view, "!a1111111")
+            # Order reported by RouteDiscovery, never sorted / inferred.
+            self.assertEqual(
+                chain.node_ids, (you_id, "!ffff0002", "!ffff0001", "!a1111111")
+            )
+
+    async def test_explicit_route_replaces_generic_and_leaves_no_duplicate(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chains = [c for c in view.connector_chains if c.destination_id == "!a1111111"]
+            # Exactly ONE connector for the traced destination -- the explicit
+            # chain supersedes (never duplicates) the generic/anonymous path.
+            self.assertEqual(len(chains), 1)
+            self.assertTrue(chains[0].explicit)
+            self.assertEqual(
+                chains[0].node_ids, (you_id, "!ffff0001", "!a1111111")
+            )
+            # No anonymous relay stage remains for the traced destination.
+            self.assertFalse(any("relay:!a1111111" in c.node_ids for c in chains))
+
+    async def test_two_destinations_keep_independent_explicit_routes(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.SUCCEEDED,
+            ),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            bob = next(s.node for s in view.working_set if s.node.node_id == "!b2222222")
+
+            app._start_traceroute(alice)
+            await pilot.pause()
+            app.radio.traceroute_forward_route = ("!ffff0002", "!ffff0003")
+            app._start_traceroute(bob)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            alice_chain = self._chain_for(view, "!a1111111")
+            bob_chain = self._chain_for(view, "!b2222222")
+            self.assertEqual(alice_chain.node_ids, (you_id, "!ffff0001", "!a1111111"))
+            self.assertEqual(
+                bob_chain.node_ids, (you_id, "!ffff0002", "!ffff0003", "!b2222222")
+            )
+
+    async def test_newer_success_replaces_only_same_destination_route(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.SUCCEEDED,
+            ),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            alice = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            bob = next(s.node for s in view.working_set if s.node.node_id == "!b2222222")
+
+            app._start_traceroute(alice)
+            await pilot.pause()
+            app._start_traceroute(bob)
+            await pilot.pause()
+            # A newer, different successful trace to Bob replaces ONLY Bob's
+            # prior explicit path; Alice's stays.
+            app.radio.traceroute_forward_route = ("!ffff0009",)
+            app._start_traceroute(bob)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            alice_chain = self._chain_for(view, "!a1111111")
+            bob_chain = self._chain_for(view, "!b2222222")
+            self.assertEqual(alice_chain.node_ids, (you_id, "!ffff0001", "!a1111111"))
+            self.assertEqual(bob_chain.node_ids, (you_id, "!ffff0009", "!b2222222"))
+
+    async def test_failed_trace_preserves_previous_rendered_explicit_route(
+        self,
+    ) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(
+                SimulatedTracerouteOutcome.SUCCEEDED,
+                SimulatedTracerouteOutcome.FAILED,
+            ),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chain = self._chain_for(view, "!a1111111")
+            self.assertTrue(chain.explicit)
+            self.assertEqual(chain.node_ids, (you_id, "!ffff0001", "!a1111111"))
+
+    async def test_metadata_enrichment_keeps_canonical_route_identity(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+            chain_bare = self._chain_for(view, "!a1111111").node_ids
+
+            # NodeDB later supplies metadata for the same canonical relay ID:
+            # same identity, same route chain, only presentation is enriched.
+            def enriched():
+                return (
+                    NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                    NodeMetadata(
+                        "!a1111111", "Alice", "ALC", 1,
+                        last_heard=time.time() - 5, position=north_of_local(2),
+                    ),
+                    NodeMetadata(
+                        "!b2222222", "Bob", "BOB", 1,
+                        last_heard=time.time() - 5, position=south_of_local(2),
+                    ),
+                    NodeMetadata("!ffff0001", "RelayX", "RLX", 1,
+                                 last_heard=time.time() - 5),
+                )
+
+            app.radio.get_known_nodes = enriched
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chain_enriched = self._chain_for(view, "!a1111111")
+            self.assertTrue(chain_enriched.explicit)
+            self.assertEqual(chain_enriched.node_ids, chain_bare)
+            # Exactly one connector for the destination -- no duplicate route.
+            self.assertEqual(
+                len([c for c in view.connector_chains if c.destination_id == "!a1111111"]),
+                1,
+            )
+
+    async def test_two_relay_route_survives_capacity_and_never_compresses(self) -> None:
+        """Under a working set already at max_remote_nodes, the identified
+        relays of an active explicit route are STILL admitted and rendered, so
+        YOU->A->B->TARGET is drawn in full -- it must never silently compress
+        to YOU->A->TARGET because an intermediate relay was ranked out.
+        """
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001", "!ffff0002"),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            now = time.time()
+
+            def packed():
+                nodes = [
+                    NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                    # Destination Alice + a full capacity worth of live remotes.
+                    NodeMetadata(
+                        "!a1111111", "Alice", "ALC", 0,
+                        last_heard=now - 5, position=north_of_local(2),
+                    ),
+                ]
+                # A full capacity of competing active remotes.
+                for i in range(DEFAULT_MAX_REMOTE_NODES):
+                    nodes.append(
+                        NodeMetadata(
+                            f"!cap{i:04x}", f"Cap{i}", f"C{i}", 1,
+                            last_heard=now - 6, position=north_of_local(3 + i),
+                        )
+                    )
+                return tuple(nodes)
+
+            app.radio.get_known_nodes = packed
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            app._refresh_mesh()
+            await pilot.pause()
+
+            both_relays_present = {
+                "!ffff0001", "!ffff0002"
+            }.issubset({s.node.node_id for s in view.working_set})
+            self.assertTrue(both_relays_present)
+            chain = self._chain_for(view, "!a1111111")
+            self.assertTrue(chain.explicit)
+            self.assertEqual(
+                chain.node_ids, (you_id, "!ffff0001", "!ffff0002", "!a1111111")
+            )
+
+    async def test_missing_relay_never_compresses_to_direct_you_to_target(
+        self,
+    ) -> None:
+        """If a known explicit relay genuinely cannot be rendered, the
+        destination gets NO connector (truthful unlink) rather than a
+        fabricated YOU->TARGET / A->TARGET bridge that the traceroute never
+        observed. Direct () is the ONLY way a zero-relay path is valid. This
+        guards the exceptional branch (relay admission is normally guaranteed,
+        so we simulate one relay failing to survive admission).
+        """
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001", "!ffff0002"),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+            # The stored evidence has a TWO-relay forward chain, but we force a
+            # single known relay to fail admission (exceptional condition). The
+            # renderer must NOT bridge across the missing !ffff0002.
+            app._identified_traceroute_relay_ids = lambda: ("!ffff0001",)
+            app.radio.get_known_nodes = lambda nodes=(
+                NodeMetadata(you_id, is_local=True, position=LOCAL_GEO),
+                NodeMetadata(
+                    "!a1111111", "Alice", "ALC", 1,
+                    last_heard=time.time() - 5, position=north_of_local(2),
+                ),
+                NodeMetadata(
+                    "!b2222222", "Bob", "BOB", 1,
+                    last_heard=time.time() - 5, position=south_of_local(2),
+                ),
+                NodeMetadata("!ffff0001", "RelayA", "RA", 1,
+                             last_heard=time.time() - 5),
+            ): nodes
+            app._refresh_mesh()
+            await pilot.pause()
+
+            chains = [c for c in view.connector_chains if c.destination_id == "!a1111111"]
+            # Honest degradation: no connector for this destination at all --
+            # never a compressed YOU->A->TARGET bridge across the missing relay.
+            self.assertEqual(chains, [])
+            self.assertNotIn(
+                "!a1111111",
+                {c.destination_id for c in view.connector_chains},
+            )
+
+    # ---- Pending-trace destination-dot blink (no full refresh) ------------
+
+    async def test_starting_traceroute_begins_target_dot_blink(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+            # Before the trace, the target dot is its ordinary BASE color.
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+            app._start_traceroute(node)
+            # Blink begins immediately: phase is "on" and the dot is ACCENT.
+            self.assertTrue(app._traceroute_blink_on)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+    async def test_target_dot_alternates_base_and_accent_across_frames(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            # Each _advance_delivery_states call flips the phase deterministically;
+            # assert the DOT color right after each synchronous toggle (no pause,
+            # so the timer cannot interleave).
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+    async def test_focused_traceroute_target_still_blinks(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            # Focus the traced destination, then start the trace.
+            view.select_node("!a1111111")
+            app._refresh_mesh()
+            app._start_traceroute(node)
+            # Focus ACCENT is overridden by the blink for the DOT only: it
+            # still alternates (ACCENT here, BASE on the next tick).
+            self.assertEqual(view._selected_node_id, "!a1111111")
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+    async def test_unfocused_traceroute_target_blinks(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            # Unfocused target (selection stays on YOU) still blinks.
+            self.assertNotEqual(view._selected_node_id, "!a1111111")
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+            app._advance_delivery_states()
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+    async def test_focusing_unrelated_node_does_not_blink_that_node(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            # Focus an UNRELATED node: its dot keeps ordinary selected ACCENT,
+            # never the pending-trace blink (only the traced target blinks).
+            view.select_node("!b2222222")
+            app._refresh_mesh()
+            self.assertEqual(view._selected_node_id, "!b2222222")
+            self.assertEqual(self._dot_color(app, "!b2222222"), Color.parse(palette.accent))
+            # The traced target still blinks.
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+    async def test_blink_frames_do_not_refresh_mesh(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        refresh_calls = 0
+        original_refresh = app._refresh_mesh
+
+        def spied_refresh(*args, **kwargs):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return original_refresh(*args, **kwargs)
+
+        async with app.run_test(size=(90, 28)) as pilot:
+            app._refresh_mesh = spied_refresh
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            app._refresh_mesh()
+            calls_before = refresh_calls
+            working_set_before = view.working_set
+            base_positions_before = dict(view.base_positions)
+            chains_before = view.connector_chains
+            node_offset_before = next(
+                w for w in app.query(MeshNodeWidget) if w.node_id == "!a1111111"
+            ).styles.offset
+
+            app._advance_delivery_states()
+
+            # No full refresh: working set / placement / topology / chains all
+            # identical; the node dot never moved -- only its color changed.
+            self.assertEqual(refresh_calls, calls_before)
+            self.assertEqual(view.working_set, working_set_before)
+            self.assertEqual(view.base_positions, base_positions_before)
+            self.assertEqual(view.connector_chains, chains_before)
+            self.assertEqual(
+                next(
+                    w for w in app.query(MeshNodeWidget) if w.node_id == "!a1111111"
+                ).styles.offset,
+                node_offset_before,
+            )
+
+    async def test_no_temporary_traceroute_connector_is_rendered(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            canvas = view.board.query_one(MeshCanvas)
+            connectors_before = canvas._signature[2]
+
+            app._start_traceroute(node)
+
+            # Blink changes only the node dot, never the canvas connectors: the
+            # connector scene is byte-identical (no temporary trace connector).
+            self.assertEqual(canvas._signature[2], connectors_before)
+
+    async def test_success_stops_blink_and_applies_explicit_route(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,),
+            traceroute_forward_route=("!ffff0001",),
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+
+            app._start_traceroute(node)
+            await pilot.pause()
+
+            # Success resolves: the "*" marker replaces the blink, and the
+            # completed explicit route topology is applied (no temporary
+            # connector, one explicit chain through the identified relay).
+            self.assertEqual(self._glyph_text(app, "!a1111111"), "*")
+            chains = [c for c in view.connector_chains if c.destination_id == "!a1111111"]
+            self.assertEqual(len(chains), 1)
+            self.assertTrue(chains[0].explicit)
+            self.assertEqual(chains[0].node_ids, (you_id, "!ffff0001", "!a1111111"))
+
+    async def test_failure_stops_blink(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.accent))
+
+            app._finish_traceroute_failure("simulated failure")
+
+            # Blink stops: the dot returns to its ordinary BASE color, and no
+            # trace is active any more.
+            self.assertIsNone(app._active_traceroute)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
+    async def test_timeout_stops_blink(self) -> None:
+        app = self._make_app(
+            traceroute_outcomes=(SimulatedTracerouteOutcome.NO_RESPONSE,)
+        )
+        async with app.run_test(size=(90, 28)) as pilot:
+            you_id = app.radio.info.node_id
+            app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
+            await self._open_mesh(pilot)
+            view = app.query_one(MeshTopologyView)
+            node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
+            palette = THEME_PALETTES[app._current_theme]
+
+            app._start_traceroute(node)
+            app._traceroute_timed_out(app._active_traceroute.request_token)
+
+            # Timeout stops the blink (same resolution path as failure).
+            self.assertIsNone(app._active_traceroute)
+            self.assertEqual(self._dot_color(app, "!a1111111"), Color.parse(palette.base))
+
     # ---- One active trace at a time -------------------------------------
 
     async def test_repeated_attempt_while_pending_is_a_deterministic_no_op(
@@ -9543,9 +10259,11 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIs(app.focused, focused_before)
 
-    # ---- No visualization changes ----------------------------------------
+    # ---- Topology-evidence precedence over generic staging ----------------
 
-    async def test_traceroute_never_changes_connectors_or_placement(self) -> None:
+    async def test_successful_direct_trace_replaces_anonymous_staged_chain(
+        self,
+    ) -> None:
         app = self._make_app(
             traceroute_outcomes=(SimulatedTracerouteOutcome.SUCCEEDED,)
         )
@@ -9554,13 +10272,37 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_known_nodes = lambda nodes=self._two_remotes(you_id): nodes
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
-            positions_before = dict(view.base_positions)
+            # Alice has a nonzero NodeDB hops_away, so before the trace her
+            # connector is the generic anonymous staged chain.
+            self.assertIn("relay:!a1111111:1", view.base_positions)
+            real_positions_before = {
+                node_id: position
+                for node_id, position in view.base_positions.items()
+                if not node_id.startswith("relay:")
+            }
             node = next(s.node for s in view.working_set if s.node.node_id == "!a1111111")
 
             app._start_traceroute(node)
             await pilot.pause()
 
-            self.assertEqual(view.base_positions, positions_before)
+            chains = {c.destination_id: c for c in view.connector_chains}
+            alice_chain = chains["!a1111111"]
+            self.assertTrue(alice_chain.explicit)
+            # Empty forward route = explicit DIRECT evidence: the connector is
+            # YOU -> !a1111111 with zero relays, overriding the stale generic
+            # hops_away staging.
+            self.assertEqual(alice_chain.node_ids, (you_id, "!a1111111"))
+            self.assertNotIn("relay:!a1111111:1", view.base_positions)
+            # Only the now-superseded anonymous relay stage for this
+            # destination leaves the board; every real node's placement is
+            # unchanged (topology-evidence precedence is a connector rule,
+            # never a layout mutation).
+            real_positions_after = {
+                node_id: position
+                for node_id, position in view.base_positions.items()
+                if not node_id.startswith("relay:")
+            }
+            self.assertEqual(real_positions_after, real_positions_before)
 
     # ---- Requesting failure (radio not connected) -------------------------
 
