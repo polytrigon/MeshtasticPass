@@ -84,17 +84,25 @@ without the app closing. Direct messages are a mode inside CHAT rather than a
 separate tab, reached from the header's DM peer selector.
 
 **CONNECTION/CONFIG** is the radio connection, device selection, your identity,
-channel management, and appearance settings (SNOW and AMBER themes, UI scale).
+channel management, and appearance settings (SNOW, AMBER and MATRIX themes,
+UI scale).
 
 **CHAT** is the currently selected broadcast channel, with persistent history,
 per-message delivery state, and unread tracking. History survives restarts.
 
 **MESH** is a passive, YOU-centred board of the nodes around you. It never
 transmits to build itself -- everything on it comes from the radio's own node
-database and packets that arrived anyway. Nodes are placed by hop depth, dim as
-they go stale, and connect to you through markers standing in for the hops
-between. TRACE ROUTE is the one thing there that does transmit, and only when
-you ask it to.
+database and packets that arrived anyway.
+
+Nodes sit on rings by hop depth rather than by distance, because most nodes
+never report a position and distance-first placement put all of them on one
+shared fallback ring. Rings are ranked over the depths actually present, so a
+mesh whose nodes are 0, 4, 5 and 6 hops away uses four rings rather than
+leaving three empty ones in the middle; the innermost ring is reserved for
+direct neighbours, so "next to YOU" always means no intermediary. A connector
+carries one marker per ring it crosses -- not one per hop, which is why a
+6-hop node may show three. Nodes dim as they go stale. TRACE ROUTE is the one
+thing on this board that transmits, and only when you ask it to.
 
 ## What I would like tested
 
@@ -117,12 +125,15 @@ you ask it to.
   implemented.
 - Tested on one hardware combination: ClockworkPi uConsole plus a Meshtastic
   ESP32.
-- Two tests currently fail on `main`:
-  `test_collision_routing_fallback_cannot_leave_an_orphan_marker` and
-  `test_arrow_navigation_reaches_and_recenters_on_an_off_screen_node`. Both are
-  real and known; they are not caused by your setup.
-- Newer work -- a hop-depth ring layout for MESH and a third theme -- lives on
-  branches and is not on `main` yet.
+- Some tests currently fail on `main`, and they are known rather than caused by
+  your setup. Two are real defects
+  (`test_collision_routing_fallback_cannot_leave_an_orphan_marker` and
+  `test_arrow_navigation_reaches_and_recenters_on_an_off_screen_node`); the
+  rest still assert the older "one marker per hop" rule that the ring layout
+  replaced, and are being updated.
+- `test_you_and_remote_selection_yield_identical_logical_graph` is flaky. It
+  drives the board by hand while the app's own 1s refresh is running, and
+  sometimes loses that race. A re-run usually passes.
 
 ## Reporting problems
 
