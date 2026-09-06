@@ -121,14 +121,14 @@ THEME_PALETTES = {
         error=NEON_RED,
         confirm="#39FF14",
     ),
-    # AMBER: a neon-orange terminal. ACCENT is neon yellow, ACCENT2 is
-    # neon light blue, and CONFIRM is bright white -- deliberately NOT
-    # aliased to ACCENT's yellow, so a successful operation always reads
-    # as "white", independent of AMBER's own accent hue.
+    # AMBER: a neon-orange terminal. ACCENT is neon light blue, ACCENT2 is
+    # neon yellow, and CONFIRM is bright white -- deliberately NOT aliased
+    # to ACCENT's blue, so a successful operation always reads as "white",
+    # independent of AMBER's own accent hue.
     "amber": _palette(
         base="#FF8C00",
-        accent="#FFEA00",
-        accent2="#40C4FF",
+        accent="#40C4FF",
+        accent2="#FFEA00",
         error=NEON_RED,
         confirm="#F2F2F2",
     ),
