@@ -3838,6 +3838,73 @@ class ChatEntryWidget(Vertical):
                 event.stop()
 
 
+# Every widget resolves its color through one of the six semantic theme
+# tokens (see theme_palette), so the ONLY thing separating one theme's
+# stylesheet from another's is which theme's variables its rules read.
+# The theme override rules are therefore authored ONCE against the
+# {THEME} placeholder and expanded IN PLACE -- one copy per non-default
+# theme -- rather than transcribed by hand for each new theme.
+#
+# Expansion is in place, never hoisted to the end of the stylesheet,
+# because declaration order is load-bearing here: several rules in this
+# sheet win a deliberate same-specificity tie by being declared later
+# (see the width:1fr comment on the editor action rows). Copies of a
+# block sit adjacent to each other, so a theme override's position
+# relative to every non-theme rule is exactly what it was when the block
+# was hand-written for a single theme.
+#
+# The default theme (SNOW) needs no override rules and has no theme
+# class: the unprefixed rules read its variables directly. Adding a
+# theme is now a theme_palette entry plus a COLOR_CHOICES entry, and a
+# theme can no longer be half-applied -- the failure mode where a new
+# palette recolors every Python-side lookup while the CSS-styled widgets
+# silently keep rendering the default.
+CSS_DEFAULT_THEME = "snow"
+_CSS_THEME_PLACEHOLDER = "{THEME}"
+_CSS_THEME_TOKENS = ("base", "accent", "accent2", "dim", "confirm")
+
+
+def _theme_css_variables() -> str:
+    """Declare $<theme>_<token> for every theme, then the shared tokens."""
+    lines = [""]
+    for _label, theme in COLOR_CHOICES:
+        palette = THEME_PALETTES[theme]
+        for token in _CSS_THEME_TOKENS:
+            lines.append(f"    ${theme}_{token}: {getattr(palette, token)};")
+    lines.append(f"    $error: {ERROR};")
+    lines.append("    $selection_background: #181818;")
+    lines.append("    ")
+    return "\n".join(lines)
+
+
+def _expand_theme_overrides(css: str) -> str:
+    """Emit each {THEME}-placeholder rule block once per non-default theme.
+
+    Blocks are split on the stylesheet's own 4-space-indented closing
+    brace and rejoined unchanged, so a block without the placeholder is
+    passed through byte for byte and the sheet's source order is
+    preserved exactly.
+    """
+    themes = [
+        theme for _label, theme in COLOR_CHOICES if theme != CSS_DEFAULT_THEME
+    ]
+    separator = "\n    }\n"
+    blocks = css.split(separator)
+    tail = blocks.pop()
+    expanded: list[str] = []
+    for block in blocks:
+        block += separator
+        if _CSS_THEME_PLACEHOLDER in block:
+            expanded.append(
+                "".join(
+                    block.replace(_CSS_THEME_PLACEHOLDER, theme) for theme in themes
+                )
+            )
+        else:
+            expanded.append(block)
+    return "".join(expanded) + tail
+
+
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
@@ -3848,28 +3915,15 @@ class MeshtasticPassApp(App[None]):
     ENABLE_COMMAND_PALETTE = False
 
     TITLE = "MeshtasticPass"
-    CSS = f"""
-    $snow_base: {THEME_PALETTES["snow"].base};
-    $snow_accent: {THEME_PALETTES["snow"].accent};
-    $snow_accent2: {THEME_PALETTES["snow"].accent2};
-    $snow_dim: {THEME_PALETTES["snow"].dim};
-    $snow_confirm: {THEME_PALETTES["snow"].confirm};
-    $amber_base: {THEME_PALETTES["amber"].base};
-    $amber_accent: {THEME_PALETTES["amber"].accent};
-    $amber_accent2: {THEME_PALETTES["amber"].accent2};
-    $amber_dim: {THEME_PALETTES["amber"].dim};
-    $amber_confirm: {THEME_PALETTES["amber"].confirm};
-    $error: {ERROR};
-    $selection_background: #181818;
-    """ + """
+    CSS = _theme_css_variables() + _expand_theme_overrides("""
     Screen {
         background: #101010;
         color: $snow_base;
         layers: base popup;
     }
 
-    Screen.theme-amber {
-        color: $amber_base;
+    Screen.theme-{THEME} {
+        color: ${THEME}_base;
     }
 
     #tab-bar {
@@ -3914,11 +3968,11 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #connection-title,
-    Screen.theme-amber #style-title,
-    Screen.theme-amber #radio-title,
-    Screen.theme-amber #advanced-radio-title {
-        color: $amber_dim;
+    Screen.theme-{THEME} #connection-title,
+    Screen.theme-{THEME} #style-title,
+    Screen.theme-{THEME} #radio-title,
+    Screen.theme-{THEME} #advanced-radio-title {
+        color: ${THEME}_dim;
     }
 
     #connection-status, #connection-details, #identity-values, #radio-info {
@@ -3966,8 +4020,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber .identity-name-unavailable {
-        color: $amber_dim;
+    Screen.theme-{THEME} .identity-name-unavailable {
+        color: ${THEME}_dim;
     }
 
     #long-name-input, #short-name-input,
@@ -3985,15 +4039,15 @@ class MeshtasticPassApp(App[None]):
         width: 8;
     }
 
-    Screen.theme-amber #long-name-input,
-    Screen.theme-amber #short-name-input,
-    Screen.theme-amber #network-name-input,
-    Screen.theme-amber #freq-slot-input,
-    Screen.theme-amber #key-input,
-    Screen.theme-amber #new-channel-name,
-    Screen.theme-amber #new-channel-key,
-    Screen.theme-amber #edit-channel-name {
-        color: $amber_base;
+    Screen.theme-{THEME} #long-name-input,
+    Screen.theme-{THEME} #short-name-input,
+    Screen.theme-{THEME} #network-name-input,
+    Screen.theme-{THEME} #freq-slot-input,
+    Screen.theme-{THEME} #key-input,
+    Screen.theme-{THEME} #new-channel-name,
+    Screen.theme-{THEME} #new-channel-key,
+    Screen.theme-{THEME} #edit-channel-name {
+        color: ${THEME}_base;
     }
 
     .advanced-radio-editor {
@@ -4008,9 +4062,9 @@ class MeshtasticPassApp(App[None]):
         opacity: 1;
     }
 
-    Screen.theme-amber #long-name-input:disabled,
-    Screen.theme-amber #short-name-input:disabled {
-        color: $amber_dim;
+    Screen.theme-{THEME} #long-name-input:disabled,
+    Screen.theme-{THEME} #short-name-input:disabled {
+        color: ${THEME}_dim;
     }
 
     #long-name-status, #short-name-status, #timezone-status, #role-status,
@@ -4028,12 +4082,12 @@ class MeshtasticPassApp(App[None]):
         color: $snow_confirm;
     }
 
-    Screen.theme-amber #long-name-status,
-    Screen.theme-amber #short-name-status,
-    Screen.theme-amber #timezone-status,
-    Screen.theme-amber #role-status,
-    Screen.theme-amber #font-size-status {
-        color: $amber_confirm;
+    Screen.theme-{THEME} #long-name-status,
+    Screen.theme-{THEME} #short-name-status,
+    Screen.theme-{THEME} #timezone-status,
+    Screen.theme-{THEME} #role-status,
+    Screen.theme-{THEME} #font-size-status {
+        color: ${THEME}_confirm;
     }
 
     #long-name-status.setting-error, #short-name-status.setting-error,
@@ -4044,18 +4098,18 @@ class MeshtasticPassApp(App[None]):
 
     /* Textual's own CSS specificity (id, class, type) otherwise lets
        the theme-scoped CONFIRM override above win under AMBER, since
-       "Screen.theme-amber #widget" carries one more type-selector
+       "Screen.theme-{THEME} #widget" carries one more type-selector
        component than "#widget.setting-error" -- these repeat the
-       error color with that SAME extra Screen.theme-amber qualifier
+       error color with that SAME extra Screen.theme-{THEME} qualifier
        so ERROR always wins regardless of the active theme. $error is
        already theme-independent (NEON_RED in both palettes); only the
        selector's specificity needs raising here, not its value. */
-    Screen.theme-amber #long-name-status.setting-error,
-    Screen.theme-amber #short-name-status.setting-error,
-    Screen.theme-amber #timezone-status.setting-error,
-    Screen.theme-amber #role-status.setting-error,
-    Screen.theme-amber #font-size-status.setting-error,
-    Screen.theme-amber #color-status.setting-error {
+    Screen.theme-{THEME} #long-name-status.setting-error,
+    Screen.theme-{THEME} #short-name-status.setting-error,
+    Screen.theme-{THEME} #timezone-status.setting-error,
+    Screen.theme-{THEME} #role-status.setting-error,
+    Screen.theme-{THEME} #font-size-status.setting-error,
+    Screen.theme-{THEME} #color-status.setting-error {
         color: $error;
     }
 
@@ -4065,16 +4119,16 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
-    Screen.theme-amber .keyboard-dropdown {
-        color: $amber_base;
+    Screen.theme-{THEME} .keyboard-dropdown {
+        color: ${THEME}_base;
     }
 
     .keyboard-dropdown:focus {
         color: $snow_accent;
     }
 
-    Screen.theme-amber .keyboard-dropdown:focus {
-        color: $amber_accent;
+    Screen.theme-{THEME} .keyboard-dropdown:focus {
+        color: ${THEME}_accent;
     }
 
     /* Focused editor action controls (SAVE/CANCEL) highlight with the shared
@@ -4086,8 +4140,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .editor-actions .connection-action-row:focus {
-        color: $amber_accent;
+    Screen.theme-{THEME} .editor-actions .connection-action-row:focus {
+        color: ${THEME}_accent;
     }
 
     #connection .connection-action-row,
@@ -4106,8 +4160,8 @@ class MeshtasticPassApp(App[None]):
         background: $selection_background;
     }
 
-    Screen.theme-amber #chat-input {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #chat-input {
+        color: ${THEME}_accent2;
     }
 
     /* "> message" is Textual's OWN Input.placeholder, styled via the
@@ -4119,12 +4173,12 @@ class MeshtasticPassApp(App[None]):
        own built-in disabled-grey under AMBER; this targets that exact
        component class so the prompt shares the same AMBER ACCENT2
        identity as typed text. */
-    Screen.theme-amber #chat-input > .input--placeholder {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #chat-input > .input--placeholder {
+        color: ${THEME}_accent2;
     }
 
-    Screen.theme-amber .page-title {
-        color: $amber_accent;
+    Screen.theme-{THEME} .page-title {
+        color: ${THEME}_accent;
     }
 
     #chat-header {
@@ -4145,8 +4199,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #chat-network {
-        color: $amber_dim;
+    Screen.theme-{THEME} #chat-network {
+        color: ${THEME}_dim;
     }
 
     #chat-title, #chat-dm-selector {
@@ -4166,9 +4220,9 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #chat-header-bullet,
-    Screen.theme-amber #chat-network-bullet {
-        color: $amber_dim;
+    Screen.theme-{THEME} #chat-header-bullet,
+    Screen.theme-{THEME} #chat-network-bullet {
+        color: ${THEME}_dim;
     }
 
     #chat-content, #chat-channel, #chat-dms {
@@ -4215,14 +4269,14 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .channel-editor-overlay .connection-action-row:focus {
-        color: $amber_accent;
+    Screen.theme-{THEME} .channel-editor-overlay .connection-action-row:focus {
+        color: ${THEME}_accent;
     }
 
-    Screen.theme-amber .channel-editor-overlay {
-        border: solid $amber_dim;
-        scrollbar-color: $amber_base;
-        scrollbar-background: $amber_dim;
+    Screen.theme-{THEME} .channel-editor-overlay {
+        border: solid ${THEME}_dim;
+        scrollbar-color: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
     }
 
     #radio-status {
@@ -4281,8 +4335,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber #advanced-radio-status.setting-accent {
-        color: $amber_accent;
+    Screen.theme-{THEME} #advanced-radio-status.setting-accent {
+        color: ${THEME}_accent;
     }
 
     #advanced-radio-status.setting-error {
@@ -4293,8 +4347,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_confirm;
     }
 
-    Screen.theme-amber .setting-success {
-        color: $amber_confirm;
+    Screen.theme-{THEME} .setting-success {
+        color: ${THEME}_confirm;
     }
 
     #connection-error, #send-error, #radio-status.setting-error {
@@ -4311,12 +4365,12 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber #send-error.setting-accent {
-        color: $amber_accent;
+    Screen.theme-{THEME} #send-error.setting-accent {
+        color: ${THEME}_accent;
     }
 
-    Screen.theme-amber #send-error.older-message-notice {
-        color: $amber_accent;
+    Screen.theme-{THEME} #send-error.older-message-notice {
+        color: ${THEME}_accent;
     }
 
     #chat-log {
@@ -4330,13 +4384,13 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $snow_dim;
     }
 
-    Screen.theme-amber #chat-log, Screen.theme-amber #connection {
-        scrollbar-color: $amber_base;
-        scrollbar-color-hover: $amber_base;
-        scrollbar-color-active: $amber_base;
-        scrollbar-background: $amber_dim;
-        scrollbar-background-hover: $amber_dim;
-        scrollbar-background-active: $amber_dim;
+    Screen.theme-{THEME} #chat-log, Screen.theme-{THEME} #connection {
+        scrollbar-color: ${THEME}_base;
+        scrollbar-color-hover: ${THEME}_base;
+        scrollbar-color-active: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
+        scrollbar-background-hover: ${THEME}_dim;
+        scrollbar-background-active: ${THEME}_dim;
     }
 
     #mesh-status, #mesh-node-bar {
@@ -4347,8 +4401,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #mesh-status {
-        color: $amber_dim;
+    Screen.theme-{THEME} #mesh-status {
+        color: ${THEME}_dim;
     }
 
     #mesh-node-bar {
@@ -4370,8 +4424,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
-    Screen.theme-amber .dm-list-row {
-        color: $amber_base;
+    Screen.theme-{THEME} .dm-list-row {
+        color: ${THEME}_base;
     }
 
     .dm-list-row.highlighted {
@@ -4379,8 +4433,8 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    Screen.theme-amber .dm-list-row.highlighted {
-        color: $amber_accent;
+    Screen.theme-{THEME} .dm-list-row.highlighted {
+        color: ${THEME}_accent;
     }
 
     .dm-list-empty {
@@ -4388,8 +4442,8 @@ class MeshtasticPassApp(App[None]):
         height: 1;
     }
 
-    Screen.theme-amber .dm-list-empty {
-        color: $amber_dim;
+    Screen.theme-{THEME} .dm-list-empty {
+        color: ${THEME}_dim;
     }
 
     #dm-header {
@@ -4399,8 +4453,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
-    Screen.theme-amber #dm-header {
-        color: $amber_base;
+    Screen.theme-{THEME} #dm-header {
+        color: ${THEME}_base;
     }
 
     #dm-log {
@@ -4414,13 +4468,13 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $snow_dim;
     }
 
-    Screen.theme-amber #dm-log {
-        scrollbar-color: $amber_base;
-        scrollbar-color-hover: $amber_base;
-        scrollbar-color-active: $amber_base;
-        scrollbar-background: $amber_dim;
-        scrollbar-background-hover: $amber_dim;
-        scrollbar-background-active: $amber_dim;
+    Screen.theme-{THEME} #dm-log {
+        scrollbar-color: ${THEME}_base;
+        scrollbar-color-hover: ${THEME}_base;
+        scrollbar-color-active: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
+        scrollbar-background-hover: ${THEME}_dim;
+        scrollbar-background-active: ${THEME}_dim;
     }
 
     #dm-send-error {
@@ -4429,12 +4483,12 @@ class MeshtasticPassApp(App[None]):
         color: $error;
     }
 
-    Screen.theme-amber #dm-input {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #dm-input {
+        color: ${THEME}_accent2;
     }
 
-    Screen.theme-amber #dm-input > .input--placeholder {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #dm-input > .input--placeholder {
+        color: ${THEME}_accent2;
     }
 
     #mesh-view {
@@ -4491,22 +4545,22 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber .viewport-menu {
-        border: solid $amber_dim;
-        scrollbar-color: $amber_base;
-        scrollbar-background: $amber_dim;
+    Screen.theme-{THEME} .viewport-menu {
+        border: solid ${THEME}_dim;
+        scrollbar-color: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
     }
 
-    Screen.theme-amber .viewport-menu-row {
-        color: $amber_base;
+    Screen.theme-{THEME} .viewport-menu-row {
+        color: ${THEME}_base;
     }
 
-    Screen.theme-amber .viewport-menu-row.highlighted {
-        color: $amber_accent;
+    Screen.theme-{THEME} .viewport-menu-row.highlighted {
+        color: ${THEME}_accent;
     }
 
-    Screen.theme-amber .viewport-menu-row.informational {
-        color: $amber_dim;
+    Screen.theme-{THEME} .viewport-menu-row.informational {
+        color: ${THEME}_dim;
     }
 
     .emoji-picker {
@@ -4520,8 +4574,8 @@ class MeshtasticPassApp(App[None]):
         padding: 0 2 0 1;
     }
 
-    Screen.theme-amber .emoji-picker {
-        border: solid $amber_dim;
+    Screen.theme-{THEME} .emoji-picker {
+        border: solid ${THEME}_dim;
     }
 
     #load-older, .message-action {
@@ -4531,9 +4585,9 @@ class MeshtasticPassApp(App[None]):
         margin-bottom: 1;
     }
 
-    Screen.theme-amber #load-older,
-    Screen.theme-amber .message-action {
-        color: $amber_base;
+    Screen.theme-{THEME} #load-older,
+    Screen.theme-{THEME} .message-action {
+        color: ${THEME}_base;
     }
 
     .message-action-row {
@@ -4549,8 +4603,8 @@ class MeshtasticPassApp(App[None]):
         text-align: center;
     }
 
-    Screen.theme-amber #end-of-chat-history {
-        color: $amber_dim;
+    Screen.theme-{THEME} #end-of-chat-history {
+        color: ${THEME}_dim;
     }
 
     #start-of-channel-history {
@@ -4561,8 +4615,8 @@ class MeshtasticPassApp(App[None]):
         text-align: center;
     }
 
-    Screen.theme-amber #start-of-channel-history {
-        color: $amber_dim;
+    Screen.theme-{THEME} #start-of-channel-history {
+        color: ${THEME}_dim;
     }
 
     #load-older:focus, .message-action:focus {
@@ -4602,8 +4656,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent2;
     }
 
-    Screen.theme-amber .chat-entry.favorite-sender .chat-entry-author {
-        color: $amber_accent2;
+    Screen.theme-{THEME} .chat-entry.favorite-sender .chat-entry-author {
+        color: ${THEME}_accent2;
     }
 
     .chat-entry-separator, .chat-entry-delivery {
@@ -4617,14 +4671,14 @@ class MeshtasticPassApp(App[None]):
         text-style: dim;
     }
 
-    Screen.theme-amber .chat-entry-timestamp,
-    Screen.theme-amber .chat-entry-distance {
-        color: $amber_dim;
+    Screen.theme-{THEME} .chat-entry-timestamp,
+    Screen.theme-{THEME} .chat-entry-distance {
+        color: ${THEME}_dim;
     }
 
-    Screen.theme-amber .chat-entry-separator,
-    Screen.theme-amber .chat-entry-delivery {
-        color: $amber_dim;
+    Screen.theme-{THEME} .chat-entry-separator,
+    Screen.theme-{THEME} .chat-entry-delivery {
+        color: ${THEME}_dim;
     }
 
     /* Delivery color grammar (item 9/28): ✓✓ HEARD = ACCENT,
@@ -4643,18 +4697,18 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .chat-entry.delivery-sending .chat-entry-delivery,
-    Screen.theme-amber .chat-entry.delivery-sent .chat-entry-delivery,
-    Screen.theme-amber .chat-entry.delivery-heard .chat-entry-delivery {
-        color: $amber_accent;
+    Screen.theme-{THEME} .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-{THEME} .chat-entry.delivery-sent .chat-entry-delivery,
+    Screen.theme-{THEME} .chat-entry.delivery-heard .chat-entry-delivery {
+        color: ${THEME}_accent;
     }
 
     .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: $snow_accent2;
     }
 
-    Screen.theme-amber .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: $amber_accent2;
+    Screen.theme-{THEME} .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: ${THEME}_accent2;
     }
 
     .chat-entry.delivery-failed .chat-entry-delivery,
@@ -4682,8 +4736,8 @@ class MeshtasticPassApp(App[None]):
         background: $snow_accent2 20%;
     }
 
-    Screen.theme-amber .chat-entry.mention {
-        background: $amber_accent2 20%;
+    Screen.theme-{THEME} .chat-entry.mention {
+        background: ${THEME}_accent2 20%;
     }
 
     .chat-entry.mention:focus {
@@ -4697,11 +4751,11 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .chat-entry.new-message .chat-entry-author,
-    Screen.theme-amber .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-amber .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-amber .chat-entry.new-message .chat-entry-text {
-        color: $amber_accent;
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-author,
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-distance,
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-text {
+        color: ${THEME}_accent;
     }
 
     #chat-input {
@@ -4734,8 +4788,8 @@ class MeshtasticPassApp(App[None]):
         text-align: right;
     }
 
-    Screen.theme-amber #chat-new-below {
-        color: $amber_accent;
+    Screen.theme-{THEME} #chat-new-below {
+        color: ${THEME}_accent;
     }
 
     #footer {
@@ -4745,15 +4799,15 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #tab-bar,
-    Screen.theme-amber #footer {
-        color: $amber_dim;
+    Screen.theme-{THEME} #tab-bar,
+    Screen.theme-{THEME} #footer {
+        color: ${THEME}_dim;
     }
 
-    Screen.theme-amber #footer {
-        border-top: solid $amber_dim;
+    Screen.theme-{THEME} #footer {
+        border-top: solid ${THEME}_dim;
     }
-    """
+    """)
 
     def __init__(
         self,
