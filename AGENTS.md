@@ -2,9 +2,11 @@
 
 Durable, tool-agnostic engineering rules for anyone (human or coding agent)
 working on MeshtasticPass. This is the canonical shared rulebook; `CLAUDE.md`
-is a thin, vendor-specific pointer back here. `README.md` is the detailed
-design record; `CONTRIBUTING.md`, `PRIVACY.md`, and `SECURITY.md` are binding
-policy. Where the README and the code disagree, the code is the current truth.
+is a thin, vendor-specific pointer back here. `README.md` is the front door
+for people trying the app; `devJournal.md` is the detailed design record, kept
+milestone by milestone. `CONTRIBUTING.md`, `PRIVACY.md`, and `SECURITY.md` are
+binding policy. Where either document and the code disagree, the code is the
+current truth.
 
 ## What this project is
 
