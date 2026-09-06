@@ -404,27 +404,40 @@ def _ring_spread(index: int, count: int, radius: int) -> tuple[int, int]:
     ring render farther from YOU than one on an outer ring and undo the
     point of ringing by depth.
 
-    An even spread around the circle is deliberate, and specifically NOT
-    a horizontal bias toward the board's wider axis, which is the
-    tempting choice and measurably the wrong one. The board recentres on
-    the current selection (see app.py's _mesh_translated_positions), so
-    what decides whether a node clips is its distance from whichever
-    node is selected -- a PAIRWISE distance, not a distance from the
-    origin. Collapsing a ring's occupants onto the horizontal axis
-    maximises exactly that: two nodes at opposite ends sit 2*radius
-    apart in columns, so selecting one pushes the other off. Spread
-    evenly, the same occupants stay within radius*sqrt(2) of each other.
-    Measured over every selection on a real 8-node board, the even
-    spread clipped 3.1 nodes against 4.2 for a horizontal-first ordering
-    on a narrow viewport.
+    Placement starts due EAST and fans outward, alternating sides. Both
+    halves of that matter, and each was measured on a real 8-node board
+    (mostly positionless, depths 0/1/4/5/6):
 
-    Starts due north and proceeds clockwise, so a lone node on a ring
-    lands on the same cell _square_ring's cardinal-first order would
-    have given it.
+    - Starting east rather than north is what uses the board at all. A
+      ring typically holds one or two nodes, so an even spread beginning
+      due north put them at north and south -- the board spanned 4 rows
+      and ZERO columns, stacking everything onto the scarce axis while
+      21 columns sat empty. One logical column is DOT_GRID_SPACING_X
+      cells against DOT_GRID_SPACING_Y for a row, and the viewport shows
+      roughly twice as many columns either side of centre as rows, so
+      the vertical axis is where clipping happens.
+    - Fanning rather than staying horizontal is what stops the mirror
+      image of that bug. Placing evenly from east put a ring's two
+      occupants due east and due west -- zero rows, nine columns -- and
+      the board recentres on the current selection, so two nodes at
+      opposite ends of a ring sit 2*radius apart and selecting one
+      pushes the other off. That variant clipped 2.2 nodes at every
+      viewport size.
+
+    Measured clipping, narrow/medium/roomy viewports: 3.2/2.2/1.5 for
+    the north-first spread, 2.2/2.2/2.2 for a strictly horizontal one,
+    and 1.2/0.0/0.0 for this east-first fan.
+
+    Nodes that DO have a bearing never reach here -- their direction is
+    real information and is honoured exactly (see assign_grid_slots'
+    compass buckets and MODE B).
     """
     if radius <= 0 or count <= 0:
         return (0, 0)
-    angle = -pi / 2 + (2 * pi * index / count)
+    # 0, -1, +1, -2, +2 ... steps of pi/count out from due east.
+    step = (index + 1) // 2
+    side = 1 if index % 2 == 0 else -1
+    angle = side * (pi * step / max(1, count))
     return (round(radius * cos(angle)), round(radius * sin(angle)))
 
 
