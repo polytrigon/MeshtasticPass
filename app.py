@@ -2710,8 +2710,8 @@ class MeshRelayWidget(Static):
 def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
-    view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
-    app._update_mesh_node_bar(view.working_set, time())
+    view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=app._now())
+    app._update_mesh_node_bar(view.working_set, app._now())
 
 
 DOT_GRID_GLYPH = "·"
@@ -4808,6 +4808,34 @@ class MeshtasticPassApp(App[None]):
         border-top: solid ${THEME}_dim;
     }
     """)
+
+    # The app's single source of "now". Production leaves this None and
+    # every read falls through to the wall clock; a test assigns a
+    # callable so that NOTHING can overwrite the instant it is reasoning
+    # about -- including the 1s _refresh_chat_timestamps timer, which
+    # calls _refresh_mesh() with no wall_now because it has no fixture
+    # time to hand it.
+    #
+    # Before this seam existed, any test that took longer than one timer
+    # interval between its own controlled refresh and its assertion had
+    # its fixture time silently replaced by real wall-clock time. The
+    # fixtures are anchored at 1_700_000_000 (November 2023), so every
+    # fixture node aged out of the 2-hour active window at once: MESH(N)
+    # fell to 0, connectors and relay markers vanished, arrow navigation
+    # landed on a different node, and placement stopped reflowing. Each
+    # of those reads as a topology bug and none of them was one.
+    #
+    # The property that cost the most: the suite was least trustworthy
+    # on the SLOWEST machine, which is the uConsole -- the hardware this
+    # project treats as authoritative. Two full runs of the same module
+    # on commits that could not affect each other's outcomes shared only
+    # 4 of 23 and 29 failures.
+    _clock: Callable[[], float] | None = None
+
+    def _now(self) -> float:
+        """The app's current wall-clock time, in seconds since the epoch."""
+        clock = self._clock
+        return time() if clock is None else clock()
 
     def __init__(
         self,
@@ -7540,7 +7568,7 @@ class MeshtasticPassApp(App[None]):
             return
         self._clock_sync_in_progress = False
         if event.result.applied:
-            self._last_clock_sync_at = time()
+            self._last_clock_sync_at = self._now()
 
     @staticmethod
     def _snapshot_config_field(snapshot, section: str, field: str) -> str | None:
@@ -7938,7 +7966,7 @@ class MeshtasticPassApp(App[None]):
             return
         channel_index = message.channel_index or 0
         state = self._ensure_channel_loaded(channel_index)
-        app_received_at = time()
+        app_received_at = self._now()
         monotonic_now = monotonic()
         chat_is_visible = (
             self.current_tab == "chat"
@@ -8644,7 +8672,7 @@ class MeshtasticPassApp(App[None]):
             nodes = ()
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
-        current_time = time() if wall_now is None else wall_now
+        current_time = self._now() if wall_now is None else wall_now
         working_set = build_mesh_working_set(
             nodes,
             now=current_time,
@@ -8704,7 +8732,7 @@ class MeshtasticPassApp(App[None]):
         _refresh_chat_timestamps) to catch a node aging out while MESH
         isn't even the visible tab can never "reshuffle" anything.
         """
-        current_time = time() if wall_now is None else wall_now
+        current_time = self._now() if wall_now is None else wall_now
         if working_set is None:
             working_set = self._mesh_working_set(current_time)
         return sum(
@@ -8715,7 +8743,7 @@ class MeshtasticPassApp(App[None]):
 
     def _refresh_mesh(self, wall_now: float | None = None) -> None:
         """Refresh passive topology data without causing Meshtastic traffic."""
-        current_time = time() if wall_now is None else wall_now
+        current_time = self._now() if wall_now is None else wall_now
         # Computed exactly ONCE per cycle and threaded into every
         # consumer below -- the count ([3] MESH (N), via _update_tab_bar)
         # and the rendered board must describe the SAME snapshot of live
@@ -8906,12 +8934,12 @@ class MeshtasticPassApp(App[None]):
                 view.working_set,
                 view.base_positions,
                 theme=self._current_theme,
-                now=time(),
+                now=self._now(),
             )
             # The unified bar is selected-node-specific -- it must switch
             # to the newly selected node's own data immediately, not wait
             # for the next periodic _refresh_mesh() tick (up to ~1s later).
-            self._update_mesh_node_bar(view.working_set, time())
+            self._update_mesh_node_bar(view.working_set, self._now())
 
     def _open_mesh_node_menu(self) -> None:
         """ENTER on the currently focused MESH node opens the shared
@@ -9145,7 +9173,7 @@ class MeshtasticPassApp(App[None]):
             active.destination_node_id,
             blink_on=self._traceroute_blink_on,
             theme=self._current_theme,
-            now=time(),
+            now=self._now(),
         )
 
     def _start_traceroute(self, node: NodeMetadata) -> None:
@@ -9286,7 +9314,7 @@ class MeshtasticPassApp(App[None]):
                     destination,
                     blink_on=None,
                     theme=self._current_theme,
-                    now=time(),
+                    now=self._now(),
                 )
 
     def _show_traceroute_banner(self, text: str, style_kind: str) -> None:
@@ -10815,7 +10843,7 @@ class MeshtasticPassApp(App[None]):
         )
         entry = received_chat_entry(
             message,
-            app_received_at=time(),
+            app_received_at=self._now(),
             monotonic_now=monotonic(),
             unread=not dm_visible,
             is_new=True,
@@ -11159,11 +11187,11 @@ class MeshtasticPassApp(App[None]):
         if (
             include_rx_age
             and metadata.last_heard is not None
-            and metadata.last_heard <= time()
+            and metadata.last_heard <= self._now()
         ):
             items.append(
                 PopupItem(
-                    f"RX {format_relative_age(time() - metadata.last_heard)}",
+                    f"RX {format_relative_age(self._now() - metadata.last_heard)}",
                     actionable=False,
                 )
             )
@@ -11708,7 +11736,7 @@ class MeshtasticPassApp(App[None]):
             )
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
-                time(),
+                self._now(),
                 (entry.delivery_state or DeliveryState.SENDING).value,
             )
         except ChatStoreError as error:
@@ -11721,7 +11749,7 @@ class MeshtasticPassApp(App[None]):
         try:
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
-                time(),
+                self._now(),
             )
             self.chat_store.update_delivery_state(
                 entry.message_id,
@@ -11771,7 +11799,7 @@ class MeshtasticPassApp(App[None]):
         if state is not DeliveryState.SENDING:
             entry.confirmation_deadline = None
         completed_at = (
-            time()
+            self._now()
             if state in (
                 DeliveryState.HEARD,
                 DeliveryState.UNCONFIRMED,
@@ -11817,7 +11845,7 @@ class MeshtasticPassApp(App[None]):
         recomputes it correctly from the persisted local_sent_at alone,
         so this in-memory update only matters for the current session.
         """
-        wall_now = time()
+        wall_now = self._now()
         entry.local_sent_at = wall_now
         entry.age_reference = monotonic()
         if self.chat_store is not None and entry.message_id is not None:
