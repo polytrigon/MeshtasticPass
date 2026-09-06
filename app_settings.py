@@ -274,11 +274,26 @@ class AppSettings:
 
     @staticmethod
     def is_valid_device_path(value: Any) -> bool:
-        return isinstance(value, str) and bool(value.strip())
+        """Whether this is a usable connection target.
+
+        A target is a serial device path or a tcp://host[:port] address
+        (see serial_devices.parse_connection_target). The config key
+        keeps the name device_path: every settings file already written
+        holds a serial path under it, and renaming the key would silently
+        discard the saved preference of every existing install.
+        """
+        from serial_devices import ConnectionTargetError, parse_connection_target
+
+        try:
+            parse_connection_target(value)
+        except ConnectionTargetError:
+            return False
+        return True
 
     def set_device_path(self, device_path: str) -> None:
-        if not self.is_valid_device_path(device_path):
-            raise ValueError("USB device path cannot be empty.")
+        from serial_devices import parse_connection_target
+
+        parse_connection_target(device_path)
         self.device_path = device_path.strip()
 
     def set_clock_auto_sync(self, enabled: bool) -> None:

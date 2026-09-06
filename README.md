@@ -128,7 +128,15 @@ thing on this board that transmits, and only when you ask it to.
 
 1. **Does it connect?** Different radios, different USB devices, different
    Linux distributions. The connection path has only been exercised on a
-   uConsole with an ESP32.
+   uConsole with a USB-attached ESP32.
+
+   **If you have a HackerGadgets AIO board**, start `meshtasticd` as its
+   setup guide describes, then open CONNECTION/CONFIG: the RADIO list
+   should offer `meshtasticd (localhost:4403)` alongside any serial
+   devices. Picking it should connect, populate the identity and radio
+   rows, and let CHAT and MESH work normally. Tell me what happens either
+   way -- a failure here is more useful to me right now than a success
+   anywhere else.
 2. **Unplug the radio mid-session,** then plug it back in. It should reconnect on
    its own and keep working.
 3. **Send and receive on a real mesh.** Delivery states, ordering when packets
@@ -141,8 +149,13 @@ thing on this board that transmits, and only when you ask it to.
 
 ## Known limitations
 
-- USB serial only. `meshtasticd` and HackerGadgets integration are not
-  implemented.
+- **AIO / meshtasticd support is new and untested on real hardware.**
+  MeshtasticPass can now connect over TCP to a `meshtasticd` daemon as well
+  as to a USB serial radio, which is what a HackerGadgets uConsole AIO
+  board needs -- its SX1262 hangs off the Pi's SPI and has no serial port.
+  The parsing and discovery around it are unit-tested, but no one has yet
+  confirmed an actual connection to an AIO board. If you have one, this is
+  the single most useful thing you can try.
 - Tested on one hardware combination: ClockworkPi uConsole plus a Meshtastic
   ESP32.
 - Some tests in `tests/test_mesh_topology.py` fail. They are known, and none of
