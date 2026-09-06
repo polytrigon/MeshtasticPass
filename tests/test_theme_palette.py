@@ -40,7 +40,7 @@ class ThemePaletteTests(unittest.TestCase):
         """Item 27: CONFIRM stays distinct even where a theme's own
 
         accent and confirm colors happen to differ sharply -- AMBER's
-        accent is yellow, its confirm is white, and nothing in the
+        accent is light blue, its confirm is white, and nothing in the
         palette construction lets one silently fall back to the other.
         """
         amber = THEME_PALETTES["amber"]

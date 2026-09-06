@@ -67,11 +67,13 @@ from mesh_state import (
 )
 from mesh_topology import (
     DEFAULT_MAX_GRID_RADIUS,
+    ConnectorDestination,
     HORIZONTAL_GAP,
     NODE_HEIGHT,
     NODE_WIDTH,
     RelayStage,
     assign_grid_slots,
+    build_connector_scene,
     build_relay_stages,
     build_topology,
     compact_node_label,
@@ -1877,6 +1879,185 @@ class RouteChainTests(unittest.TestCase):
 
     def test_single_point_chain_is_empty(self) -> None:
         self.assertEqual(route_chain(((2, 2),)), ())
+
+
+class BuildConnectorSceneTests(unittest.TestCase):
+    """Pure tests for the drawn connector scene.
+
+    These assert the ACTUAL rendered connector model -- which path was
+    routed, in what color, in what paint order, and which anonymous relay
+    markers earned their place -- rather than merely that some state was
+    stored. No app mount, no widgets: build_connector_scene is pure, so
+    the topology it draws can be inspected directly.
+    """
+
+    YOU_ID = "!you00000"
+    TARGET = "!target00"
+    OTHER = "!other000"
+    ACCENT = "#40C4FF"
+    DIM = "#805500"
+    DASHED = frozenset({"╌", "╎"})
+
+    def scene(self, destinations, centers, *, selected="", edges=frozenset()):
+        return build_connector_scene(
+            destinations,
+            you_id=self.YOU_ID,
+            centers=centers,
+            selected_node_id=selected,
+            edge_node_ids=edges,
+            accent_color=self.ACCENT,
+            dim_color=self.DIM,
+        )
+
+    def test_direct_chain_draws_you_to_target_and_is_not_explicit(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, None)],
+            {self.YOU_ID: (0, 0), self.TARGET: (12, 0)},
+        )
+        self.assertEqual(len(result.chains), 1)
+        chain = result.chains[0]
+        self.assertEqual(chain.node_ids, (self.YOU_ID, self.TARGET))
+        self.assertFalse(chain.explicit)
+        self.assertFalse(chain.stale)
+        # route_connector fills every cell between the endpoints; the
+        # endpoints themselves are excluded (each node's glyph occludes
+        # its own cell).
+        self.assertEqual(
+            result.cells, tuple((x, 0, "─", self.DIM) for x in range(1, 12))
+        )
+        self.assertEqual(result.connected_relay_ids, frozenset())
+
+    def test_explicit_relay_order_is_drawn_exactly_never_sorted(self) -> None:
+        first, second = "!bbbb0000", "!aaaa0000"
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, (first, second))],
+            {
+                self.YOU_ID: (0, 0),
+                first: (8, 0),
+                second: (16, 0),
+                self.TARGET: (24, 0),
+            },
+        )
+        chain = result.chains[0]
+        # Exact RouteDiscovery order -- never alphabetical, never re-derived
+        # from hop count or grid position.
+        self.assertEqual(chain.node_ids, (self.YOU_ID, first, second, self.TARGET))
+        self.assertTrue(chain.explicit)
+
+    def test_explicit_empty_forward_is_direct_and_supersedes_staging(self) -> None:
+        stage = f"relay:{self.TARGET}:1"
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, (), (stage,))],
+            {self.YOU_ID: (0, 0), stage: (8, 4), self.TARGET: (16, 0)},
+        )
+        # An EMPTY forward route is explicit DIRECT evidence, never "unknown":
+        # it must override the generic anonymous staging, not merge with it.
+        self.assertEqual(result.chains[0].node_ids, (self.YOU_ID, self.TARGET))
+        self.assertTrue(result.chains[0].explicit)
+        self.assertNotIn(stage, result.connected_relay_ids)
+
+    def test_unrenderable_explicit_relay_skips_rather_than_compresses(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, ("!ghost000",))],
+            {self.YOU_ID: (0, 0), self.TARGET: (16, 0)},
+        )
+        # Truthful "unlinked" beats a fabricated bridge: a known relay with
+        # no render position must never collapse into a direct YOU->TARGET.
+        self.assertEqual(result.chains, ())
+        self.assertEqual(result.cells, ())
+
+    def test_generic_chain_routes_through_its_stage_and_keeps_the_marker(self) -> None:
+        stage = f"relay:{self.TARGET}:1"
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, None, (stage,))],
+            {self.YOU_ID: (0, 0), stage: (8, 4), self.TARGET: (16, 0)},
+        )
+        self.assertEqual(
+            result.chains[0].node_ids, (self.YOU_ID, stage, self.TARGET)
+        )
+        self.assertIn(stage, result.connected_relay_ids)
+
+    def test_edge_clipped_stage_falls_back_to_direct_and_drops_its_marker(self) -> None:
+        stage = f"relay:{self.TARGET}:1"
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, None, (stage,))],
+            {self.YOU_ID: (0, 0), stage: (8, 4), self.TARGET: (16, 0)},
+            edges=frozenset({stage}),
+        )
+        # The drawn line no longer visits the stage, so its marker is not
+        # connected -- an unvisited hollow circle must never stand alone.
+        self.assertNotIn(stage, result.connected_relay_ids)
+        drawn = {(x, y) for x, y, _glyph, _color in result.cells}
+        self.assertNotIn((8, 4), drawn)
+
+    def test_stale_chain_is_dim_and_dashed(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, True, None)],
+            {self.YOU_ID: (0, 0), self.TARGET: (12, 0)},
+        )
+        self.assertTrue(result.chains[0].stale)
+        self.assertTrue(all(color == self.DIM for _x, _y, _g, color in result.cells))
+        self.assertTrue(
+            any(glyph in self.DASHED for _x, _y, glyph, _c in result.cells)
+        )
+
+    def test_selected_stale_chain_stays_solid_accent(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, True, None)],
+            {self.YOU_ID: (0, 0), self.TARGET: (12, 0)},
+            selected=self.TARGET,
+        )
+        # Selection emphasis outranks the staleness treatment.
+        self.assertTrue(
+            all(color == self.ACCENT for _x, _y, _g, color in result.cells)
+        )
+        self.assertFalse(
+            any(glyph in self.DASHED for _x, _y, glyph, _c in result.cells)
+        )
+
+    def test_selected_route_is_painted_last(self) -> None:
+        result = self.scene(
+            [
+                ConnectorDestination(self.OTHER, False, None),
+                ConnectorDestination(self.TARGET, False, None),
+            ],
+            {self.YOU_ID: (0, 0), self.OTHER: (0, 8), self.TARGET: (12, 0)},
+            selected=self.TARGET,
+        )
+        colors = [color for _x, _y, _g, color in result.cells]
+        self.assertIn(self.ACCENT, colors)
+        self.assertIn(self.DIM, colors)
+        # The canvas overlay resolves a shared cell by last-write-wins, so
+        # every ACCENT cell must be appended after every ordinary one for the
+        # focused route to survive an overlap.
+        self.assertEqual(
+            colors, sorted(colors, key=lambda color: color == self.ACCENT)
+        )
+
+    def test_selecting_you_does_not_accent_every_outgoing_connector(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, None)],
+            {self.YOU_ID: (0, 0), self.TARGET: (12, 0)},
+            selected=self.YOU_ID,
+        )
+        self.assertTrue(all(color == self.DIM for _x, _y, _g, color in result.cells))
+
+    def test_missing_you_center_yields_an_entirely_empty_scene(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, None)],
+            {self.TARGET: (12, 0)},
+        )
+        self.assertEqual(result.cells, ())
+        self.assertEqual(result.chains, ())
+        self.assertEqual(result.connected_relay_ids, frozenset())
+
+    def test_destination_without_a_center_is_skipped(self) -> None:
+        result = self.scene(
+            [ConnectorDestination(self.TARGET, False, None)],
+            {self.YOU_ID: (0, 0)},
+        )
+        self.assertEqual(result.chains, ())
+        self.assertEqual(result.cells, ())
 
 
 class BoardLabelFiveCellLimitTests(unittest.TestCase):
