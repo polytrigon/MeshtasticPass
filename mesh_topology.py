@@ -1360,6 +1360,211 @@ def forward_route_evidence(result: TracerouteResult) -> RouteEvidence:
     )
 
 
+# A STALE connector's straight runs render dashed (see item 5 of the
+# MESH activity-model task: "STALE connection: DIM + DOTTED"), reusing
+# the SAME box-drawing weight (LIGHT) as the solid glyphs they replace
+# so the dash pattern reads as "the same kind of line, aged" rather
+# than a visually unrelated style. Elbow corners are left as their
+# solid glyph unchanged -- a "dashed corner" has no single-cell
+# box-drawing equivalent, and one corner cell alone does not read as
+# meaningfully dotted either way.
+_DASHED_CONNECTOR_GLYPHS = {"─": "╌", "│": "╎"}
+
+
+def dashed_glyph(glyph: str) -> str:
+    """The dashed counterpart of one straight connector run's glyph."""
+    return _DASHED_CONNECTOR_GLYPHS.get(glyph, glyph)
+
+
+@dataclass(frozen=True)
+class ConnectorDestination:
+    """One remote node ELIGIBLE for a YOU-to-destination connector.
+
+    Admission is the caller's decision, not this module's: whether a node
+    is local, VERY_OLD, or a pure identified-relay waypoint is
+    working-set policy (see app.py's MeshTopologyView.set_nodes and
+    mesh_state.MeshActivityTier), so only nodes that already earned a
+    connector reach build_connector_scene at all. What is carried here is
+    exactly what ROUTING and PAINTING need:
+
+    `is_stale` selects the DIM + dashed treatment (and, being stale, such
+    a destination is expected to arrive with no relay stages -- a stale
+    node keeps its last-known position but no known-active route).
+    `explicit_forward` is successful-traceroute route evidence for this
+    destination: an ordered tuple of canonical relay IDs, an EMPTY tuple
+    meaning explicit DIRECT (zero-relay) evidence, and None meaning no
+    evidence at all (use the generic anonymous staging instead) -- see
+    route_chain_node_ids, which owns that distinction.
+    `relay_stage_ids` is this destination's ordered anonymous relay-stage
+    IDs (nearest YOU first), used only when `explicit_forward` is None.
+    """
+
+    node_id: str
+    is_stale: bool
+    explicit_forward: tuple[str, ...] | None
+    relay_stage_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConnectorScene:
+    """Everything one render's connector pass produces, ready to paint.
+
+    `cells` is the final (x, y, glyph, color) overlay in DRAWING ORDER --
+    every ordinary connector first, then the selected node's own route
+    LAST. That ordering is behavior, not incidental: the canvas overlay
+    keys on (x, y), so whichever cell is appended last wins a shared
+    cell, and painting the focused route last is what keeps it fully
+    ACCENT wherever it is drawable no matter how many other connectors
+    cross it (see item 10).
+
+    `chains` is one ConnectorChain per drawn destination -- the
+    inspectable record of WHICH path was actually drawn (explicit
+    traceroute evidence vs generic hops_away staging), so a test can
+    assert the rendered topology rather than merely the stored state.
+
+    `connected_relay_ids` is the ORPHAN TOPOLOGY CIRCLE AUDIT result:
+    exactly those synthetic relay stages whose chain the drawn connector
+    genuinely routes through. Every direct-route fallback and every
+    skipped chain leaves its stages out, so a caller that displays only
+    these can never leave an anonymous hollow circle standing on the
+    board without a line through it.
+    """
+
+    cells: tuple[tuple[int, int, str, str], ...]
+    chains: tuple[ConnectorChain, ...]
+    connected_relay_ids: frozenset[str]
+
+
+def build_connector_scene(
+    destinations: Iterable[ConnectorDestination],
+    *,
+    you_id: str,
+    centers: Mapping[str, tuple[int, int]],
+    selected_node_id: str,
+    edge_node_ids: frozenset[str],
+    accent_color: str,
+    dim_color: str,
+) -> ConnectorScene:
+    """Route and paint every YOU-to-destination connector for one render.
+
+    Pure: given the same centers/destinations/selection it always yields
+    the identical scene, and it touches no widget, theme object, or app
+    state. Colors arrive as already-resolved strings (see
+    theme_palette.ThemePalette) so palette semantics stay the caller's.
+
+    Per destination, in the order given:
+
+    - The drawn chain is EXPLICIT traceroute evidence when
+      `explicit_forward` is not None, otherwise the generic anonymous
+      relay staging -- route_chain_node_ids owns that choice. An explicit
+      chain whose relays are not all renderable is SKIPPED entirely
+      rather than compressed: a missing intermediate relay must never
+      silently become a fabricated YOU->A->TARGET (truthful "unlinked"
+      beats a fabricated bridge).
+    - Obstacles are every OTHER node/stage cell -- never this chain's own
+      members, which are evidence-supported for exactly this connection.
+    - Two independent fallbacks both replace the chain's PATH with a
+      direct YOU-to-destination line. First, any relay stage clipped onto
+      a viewport edge (`edge_node_ids`): project_to_viewport clips each
+      position independently with no awareness of chain order, so a
+      recentred board can fling an intermediate stage far from its true
+      interpolated spot and break the chain's straight-line ordering.
+      Second, a routed chain whose cells repeat: obstacle-avoidance
+      detours alone can make a fully on-screen chain retrace itself.
+      Either way the chain's stages are withheld from
+      `connected_relay_ids`, so the now-unvisited markers are hidden
+      along with the path that used to justify them.
+    - A chain containing the current selection paints ACCENT and is
+      deferred to the end of `cells` (see ConnectorScene). Otherwise it
+      paints DIM, and a stale destination additionally has its straight
+      runs dashed -- a SELECTED stale chain stays solid ACCENT, exactly
+      as before: selection emphasis outranks the staleness treatment.
+
+    A `you_id` with no rendered center yields an entirely empty scene:
+    with no origin to draw from there are no connectors, and therefore no
+    connected relay markers either.
+    """
+    if you_id not in centers:
+        return ConnectorScene((), (), frozenset())
+
+    ordinary_cells: list[tuple[int, int, str, str]] = []
+    selected_cells: list[tuple[int, int, str, str]] = []
+    chains: list[ConnectorChain] = []
+    connected_relay_ids: set[str] = set()
+
+    for destination in destinations:
+        remote_id = destination.node_id
+        if remote_id not in centers:
+            continue
+        explicit_forward = destination.explicit_forward
+        if explicit_forward is not None:
+            if not all(relay_id in centers for relay_id in explicit_forward):
+                continue
+            chain_node_ids = route_chain_node_ids(
+                you_id, remote_id, explicit_forward, ()
+            )
+            is_explicit = True
+            # An explicit chain routes through IDENTIFIED relays, never
+            # anonymous stages, so it has no stage markers to justify.
+            stage_ids_in_chain: set[str] = set()
+        else:
+            renderable_stage_ids = tuple(
+                stage_id
+                for stage_id in destination.relay_stage_ids
+                if stage_id in centers
+            )
+            chain_node_ids = route_chain_node_ids(
+                you_id, remote_id, None, renderable_stage_ids
+            )
+            is_explicit = False
+            stage_ids_in_chain = set(renderable_stage_ids)
+
+        # The NON-YOU cells this chain occupies. YOU is deliberately
+        # excluded: a path never treats its own origin as an obstacle, and
+        # selecting YOU must not paint every outgoing connector ACCENT.
+        chain_ids = set(chain_node_ids) - {you_id}
+        is_selected = selected_node_id in chain_ids
+        chain_points = tuple(centers[node_id] for node_id in chain_node_ids)
+        obstacles = frozenset(
+            position
+            for node_id, position in centers.items()
+            if node_id not in chain_ids
+        )
+        direct_points = (centers[you_id], centers[remote_id])
+
+        if stage_ids_in_chain & edge_node_ids:
+            route_cells = route_chain_avoiding(direct_points, obstacles)
+        else:
+            route_cells = route_chain_avoiding(chain_points, obstacles)
+            if len({(x, y) for x, y, _glyph in route_cells}) != len(route_cells):
+                route_cells = route_chain_avoiding(direct_points, obstacles)
+            else:
+                connected_relay_ids |= stage_ids_in_chain
+
+        chains.append(
+            ConnectorChain(
+                remote_id, chain_node_ids, is_explicit, destination.is_stale
+            )
+        )
+        if is_selected:
+            color = accent_color
+        elif destination.is_stale:
+            color = dim_color
+            route_cells = tuple(
+                (x, y, dashed_glyph(glyph)) for x, y, glyph in route_cells
+            )
+        else:
+            color = dim_color
+        target = selected_cells if is_selected else ordinary_cells
+        target.extend((x, y, glyph, color) for x, y, glyph in route_cells)
+
+    return ConnectorScene(
+        tuple(ordinary_cells) + tuple(selected_cells),
+        tuple(chains),
+        frozenset(connected_relay_ids),
+    )
+
+
 def directional_target(
     current_node_id: str,
     layout: TopologyLayout,
