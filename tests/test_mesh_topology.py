@@ -5819,8 +5819,18 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(view.relay_stages), 1)
             self.assertGreater(len(self._connector_cells(view)), 0)
 
-    async def test_active_three_hops_gets_exactly_three_relays(self) -> None:
-        """Case D."""
+    async def test_active_three_hops_crosses_one_ring_and_gets_one_marker(
+        self,
+    ) -> None:
+        """Case D. Renamed from ..._gets_exactly_three_relays: markers count
+
+        hop RINGS crossed, not hops. This fixture's only depth is 3, and a
+        lone depth ranks to ring 2 (ring 1 stays reserved for direct
+        neighbours), so its connector crosses one ring and carries one
+        marker. A 3-hop and a 5-hop node render identically when either is
+        the only depth on the board -- ranking preserves ORDER, not
+        absolute depth, and the unified bar still reports HOPS 3 honestly.
+        """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
             now = 1_700_000_000.0
@@ -5834,7 +5844,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
-            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(len(view.relay_stages), 1)
             self.assertGreater(len(self._connector_cells(view)), 0)
 
     async def test_stale_known_hops_stays_visible_with_dashed_connector(
@@ -7653,7 +7663,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
 
             view = app.query_one(MeshTopologyView)
             self.assertIn("!faroff03", view.edge_node_ids)
-            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(len(view.relay_stages), 1)
             self.assertEqual(
                 {stage.node_id for stage in view.relay_stages} & view.edge_node_ids,
                 set(),
@@ -7758,7 +7768,7 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
             view = app.query_one(MeshTopologyView)
             # Exactly one real indication -- the node itself.
             self.assertEqual(view.edge_node_ids, frozenset({"!far00001"}))
-            self.assertEqual(len(view.relay_stages), 5)
+            self.assertEqual(len(view.relay_stages), 1)
 
             relay_widgets = {w.node_id: w for w in app.query(MeshRelayWidget)}
             self.assertEqual(len(relay_widgets), 5)
@@ -7928,7 +7938,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             await pilot.pause()
-            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(len(view.relay_stages), 1)
             relay_ids = {stage.node_id for stage in view.relay_stages}
             # First confirm the fixture actually DOES independently
             # edge-clip a relay stage once recentered -- otherwise this
@@ -8033,7 +8043,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
 
             self.assertEqual(you_selected_node_ids, remote_selected_node_ids)
             self.assertEqual(you_selected_relay_sources, remote_selected_relay_sources)
-            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(len(view.relay_stages), 1)
 
     async def test_repeated_selection_toggling_is_deterministic(self) -> None:
         app = self._make_app()
@@ -8258,7 +8268,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
                 )
             await pilot.pause()
 
-            self.assertEqual(len(view.relay_stages), 3)
+            self.assertEqual(len(view.relay_stages), 1)
             for widget in app.query(MeshRelayWidget):
                 self.assertFalse(
                     widget.display,
@@ -8284,7 +8294,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             relay_ids = {stage.node_id for stage in view.relay_stages}
-            self.assertEqual(len(relay_ids), 3)
+            self.assertEqual(len(relay_ids), 1)
             self.assertFalse(relay_ids & view._edge_node_ids)
             shown = [w for w in app.query(MeshRelayWidget) if w.display]
             self.assertEqual({w.node_id for w in shown}, relay_ids)
@@ -8306,7 +8316,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             _refresh_mesh_at(app, now)
             await pilot.pause()
-            self.assertEqual(len(list(app.query(MeshRelayWidget))), 3)
+            self.assertEqual(len(list(app.query(MeshRelayWidget))), 1)
 
             # The radio now reports a direct (0-hop) route: a re-layout
             # must leave no marker from the previous topology behind.
