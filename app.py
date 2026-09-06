@@ -2288,6 +2288,262 @@ def _mesh_hop_ring_ladder(seen_depths: Iterable[int]) -> dict[int, int]:
     return ladder
 
 
+# Selected-node "visually larger" treatment: a 3-cell-wide composite
+# (small dot + role glyph + small dot) replacing the ordinary 1-cell
+# glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
+# enough and why this stays a reliable-width text composite rather than
+# an ambiguous-width "big circle" Unicode glyph.
+MESH_SELECTED_GLYPH_WIDTH = 3
+MESH_SELECTED_HALO_GLYPH = "·"
+# The label physically above a node's glyph is a compact hint, not the
+# full identity -- that lives in the unified bottom bar (see
+# mesh_state.format_mesh_node_bar_fields, which always has the full Long
+# Name/Short Name, uncapped). Capped in DISPLAY CELLS (cell_len()), not
+# Python len(), so wide/CJK/emoji glyphs are counted by their actual
+# terminal width -- see mesh_topology.mesh_board_marker_label/_truncate
+# for the grapheme-safe truncation this limit is applied through (this
+# is the NAME portion's own budget -- TRACE ROUTE's "<marker> " prefix
+# adds two more cells on top, never shrinking the name itself).
+MESH_BOARD_LABEL_MAX_CELLS = 5
+
+
+@dataclass(frozen=True)
+class ActiveTraceroute:
+    """TRACE ROUTE Part C: the ONE currently in-flight traceroute (v1
+
+    allows exactly one at a time). `request_token` -- an app-local
+    sequence number assigned synchronously in _start_traceroute, BEFORE
+    any RF request is even sent -- is the sole correlation key: it is
+    known before the background worker starts, so a response (or a
+    same-thread/synchronous simulated one) can never race its own
+    assignment. `destination_short_name` is captured once, at request
+    time, for the "TRACING ROUTE TO <name>" status text -- never a live
+    re-lookup, so it can never go stale/blank if the destination's own
+    NodeDB record changes or the node temporarily drops out of the
+    working set mid-trace.
+    """
+
+    request_token: int
+    destination_node_id: str
+    destination_short_name: str
+
+
+@dataclass(frozen=True)
+class TracerouteBanner:
+    """The terminal TRACE SUCCEEDED/TRACE FAILED status text, shown in
+
+    #mesh-status for TRACEROUTE_BANNER_SECONDS before the normal status
+    (NO MESH DATA / blank) automatically returns -- see
+    MeshtasticPassApp._show_traceroute_banner/_dismiss_traceroute_banner.
+    """
+
+    text: str
+    style_kind: str  # "accent" (TRACE SUCCEEDED) or "error" (TRACE FAILED)
+
+
+# TRACE ROUTE's "TRACING ROUTE TO SHN  > > >" animation reuses the
+# EXACT visual language of CHAT's own SENDING arrows (see
+# SENDING_ARROW_FRAMES/_sending_arrows_text above): active = ACCENT,
+# inactive = the SAME dim_quarter token SENDING's own inactive arrow
+# uses. Three positions (not two, unlike SENDING) -- one active arrow
+# cycles 0 -> 1 -> 2 -> 0, advanced by the SAME pre-existing 0.45s
+# _delivery_timer/_advance_delivery_states tick SENDING already uses,
+# never a new timer (see _advance_delivery_states' own extension).
+TRACEROUTE_ARROW_GLYPH = ">"
+TRACEROUTE_ARROW_POSITIONS = 3
+# A UI-appropriate hard ceiling -- deliberately NOT the Meshtastic SDK's
+# own sendTraceRoute/waitForTraceRoute helper's blocking timeout (up to
+# hopLimit+1 multiples of a 300s base -- see RadioService.
+# send_traceroute's own docstring), which is designed for a CLI script
+# willing to wait indefinitely, not an interactive TUI. Long enough for
+# a real multi-hop LoRa round trip, short enough that "TRACING ROUTE"
+# never appears stuck.
+TRACEROUTE_TIMEOUT_SECONDS = 30.0
+# "Only an actual successful traceroute response counts as success... in
+# ACCENT for 10 seconds, then restore the normal top-left status" -- the
+# literal duration the spec gives, for both TRACE SUCCEEDED and TRACE
+# FAILED.
+TRACEROUTE_BANNER_SECONDS = 10.0
+
+
+def _mesh_node_color(state: MeshNodeState, *, selected: bool, theme: str, now: float) -> str:
+    """YOU is ALWAYS ACCENT2 -- a persistent identity anchor, entirely
+
+    independent of selection (see MESH FOLLOW-UP items 16-18): selecting
+    YOU never recolors it to ACCENT, and selecting a remote node never
+    recolors YOU either. Checked FIRST, before selection, so it can
+    never be overridden.
+
+    For a remote node, selection (ACCENT) overrides active/inactive
+    styling. A remote node's brightness otherwise uses the EXACT SAME
+    predicate as the MESH header's "ACTIVE N" count --
+    node_activity.is_node_active, keyed on RadioService's passive
+    last_heard -- so the two always visually agree: if the header says
+    ACTIVE 4, exactly the working set's real remote nodes satisfying
+    this same predicate render BASE. This is deliberately a different
+    concept from MeshNodeState.is_stale() (>24h since the last CHAT
+    interaction), which decides which nodes are worth ranking into the
+    working set at all (see mesh_state.build_mesh_working_set) -- not
+    how bright an already-displayed node looks. A node can therefore
+    show a merely-old interaction time ("2h") while still rendering
+    dim, and that is expected.
+
+    Node identity color and selected-ROUTE color (see
+    MeshTopologyView's connector-painting logic) are deliberately
+    independent: YOU's own connector may still paint ACCENT when YOU is
+    the current selection, while the YOU glyph/label themselves stay
+    ACCENT2 throughout -- ACCENT2 is a persistent identity anchor,
+    ACCENT is current selection/route emphasis, and the two are allowed
+    to differ on the very same node.
+    """
+    palette = THEME_PALETTES[theme]
+    if state.node.is_local:
+        return palette.accent2
+    if selected:
+        return palette.accent
+    if not is_node_active(state.node.last_heard, now):
+        return palette.dim_base
+    return palette.base
+
+
+def _mesh_relay_color(theme: str) -> str:
+    """An anonymous relay-stage placeholder is visual topology only: it
+
+    has no identity to be "heard" from, is never active/inactive, and
+    (unlike a real node) is never selectable, so it is always DIM_BASE
+    -- never ACCENT, regardless of theme, activity, or selection state
+    anywhere else on the board.
+    """
+    return THEME_PALETTES[theme].dim_base
+
+
+def _mesh_grid_pixel(row: int, column: int) -> tuple[int, int]:
+    """Convert a 1-indexed logical grid position to a pixel coordinate,
+
+    aligned exactly to a dot-grid intersection (DOT_GRID_SPACING_X/Y below).
+    """
+    return (column - 1) * DOT_GRID_SPACING_X, (row - 1) * DOT_GRID_SPACING_Y
+
+
+def _mesh_translated_positions(
+    base_positions: Mapping[str, tuple[int, int]],
+    selected_node_id: str,
+    *,
+    center_row: int,
+    center_column: int,
+) -> dict[str, tuple[int, int]]:
+    """Translate the whole current layout so the selected node sits at the
+
+    given center grid position (the CURRENT viewport's own center --
+    see MeshTopologyView.current_grid_dimensions, computed fresh from
+    the view's actual rendered size, never a fixed constant). This is a
+    pure whole-mesh translation: every node shifts by the same row/
+    column delta, so relative geometry between nodes never changes --
+    it is never an independent per-node recomputation, and it never
+    touches `base_positions` (the working set's fixed geographic/
+    fallback layout, itself independent of the viewport entirely) --
+    only a later clip into the visible grid (see
+    mesh_topology.project_to_viewport) can move a node off this exact
+    translated position, never this function.
+    """
+    selected = base_positions.get(selected_node_id)
+    if selected is None:
+        return dict(base_positions)
+    row_delta = center_row - selected[0]
+    column_delta = center_column - selected[1]
+    return {
+        node_id: (row + row_delta, column + column_delta)
+        for node_id, (row, column) in base_positions.items()
+    }
+
+
+def _mesh_directional_target(
+    base_positions: Mapping[str, tuple[int, int]],
+    current_node_id: str,
+    direction: str,
+) -> str | None:
+    """Pick the ID reached by an arrow press, reusing the shared
+
+    spatial-navigation rule (mesh_topology.directional_target) against
+    the CURRENT fixed, untranslated LOGICAL (row, column) positions --
+    not rendered pixel positions. DOT_GRID_SPACING_X/Y (4x2) make one
+    logical row-step visually shorter than one column-step on screen, a
+    purely cosmetic choice; ranking by pixel distance would let that
+    asymmetry distort "sensible direction". Direction is a property of
+    the mesh's logical geometry, not of wherever the selection happens
+    to be recentered on screen.
+
+    Candidates come directly from whatever `base_positions` the caller
+    passes -- e.g. _move_mesh_focus deliberately excludes anonymous
+    relay-stage IDs before calling this, since a relay stage is visual
+    topology only and must never become a navigation target -- rather
+    than from any node-role data baked into this function itself. No
+    node IDs are hardcoded: this is the same general nearest-candidate
+    rule for whatever position set the caller provides.
+    """
+    layout = TopologyLayout(
+        tuple(
+            PositionedNode(node=NodeMetadata(node_id), x=column, y=row, region="UNKNOWN")
+            for node_id, (row, column) in base_positions.items()
+        ),
+        width=MESH_LOGICAL_GRID_COLUMNS,
+        height=MESH_LOGICAL_GRID_ROWS,
+    )
+    target = directional_target(current_node_id, layout, direction)  # type: ignore[arg-type]
+    return target.node.node_id if target is not None else None
+
+
+def _mesh_hop_counts(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
+    """Real remote CLIENTs with a trustworthy, nonzero hop count -- used
+
+    ONLY for grid PLACEMENT (see _refresh_mesh's min_radius_by_id):
+    every such node, active or stale, reserves enough outward room for
+    its potential relay chain, so a node's position never needs to jump
+    outward the moment it later becomes active (see item 5 -- placement
+    stability is independent of current activity). An unknown hop count
+    (hops_away is None) is deliberately absent here and below: it must
+    never be treated as zero or imply any specific path depth.
+
+    NOT used for deciding which nodes actually render a relay chain or
+    connector -- see _mesh_active_hop_counts for that.
+    """
+    return {
+        state.node.node_id: state.node.hops_away
+        for state in working_set
+        if not state.node.is_local
+        and state.node.hops_away is not None
+        and state.node.hops_away > 0
+    }
+
+
+def _mesh_active_hop_counts(
+    working_set: tuple[MeshNodeState, ...], *, now: float
+) -> dict[str, int]:
+    """Real remote CLIENTs with a trustworthy, nonzero hop count AND
+
+    currently active (is_node_active(last_heard, now) -- the same
+    predicate the board's BASE/DIM_BASE styling and [3] MESH (N) use).
+
+    This -- not _mesh_hop_counts -- is what decides which nodes get an
+    anonymous relay chain and a connector line drawn back to YOU (see
+    MeshTopologyView.set_nodes): a stale node remains visible at its
+    last-known position as useful historical context, but the board
+    should never look like it is CURRENTLY connected to something it
+    hasn't heard from recently. Active connectivity is a rendering-only
+    decision, made fresh every refresh -- it never affects grid
+    placement (see _mesh_hop_counts), so a node's position stays stable
+    across an activity transition.
+    """
+    return {
+        state.node.node_id: state.node.hops_away
+        for state in working_set
+        if not state.node.is_local
+        and state.node.hops_away is not None
+        and state.node.hops_away > 0
+        and is_node_active(state.node.last_heard, now)
+    }
+
+
 class MeshNodeWidget(Static):
     """The node's glyph: a single cell, anchored exactly on its grid
 
