@@ -8246,7 +8246,9 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
-            with mock.patch("app.route_chain_avoiding", side_effect=duplicating):
+            with mock.patch(
+                "mesh_topology.route_chain_avoiding", side_effect=duplicating
+            ):
                 _pin_clock(app, 1_700_000_000.0)
                 view.set_nodes(
                     working_set,
