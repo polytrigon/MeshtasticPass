@@ -1,29 +1,31 @@
 # MeshtasticPass - A Custom uConsole Meshtastic Chat Client
 
-This project began because I was having a difficult time finding a custom 
+This project began because I was having a difficult time finding a custom
 meshtastic chat client that matched the aesthetic of the Clockwork uConsole.
-So at it's core it's a simple chat client that should handle the majority of
-functions that are neccessary to communicate on the meshtastic network. However
+So at its core it's a simple chat client that should handle the majority of
+functions that are necessary to communicate on the meshtastic network. However
 the ultimate goal is to build an extra layer on top of meshtastic that enables
-the sharing of profiles through proximity, similar to the <a href="https://www.nintendo.com/en-gb/Hardware/Nintendo-3DS-Family/StreetPass/What-is-StreetPass-/What-is-StreetPass-827701.html?srsltid=AfmBOooUZNyrtWkPAhIn3gKmHdLussQEdnuykfBuIPBdSH2fAcvNThEk">Nintendo 3DS street
-pass system.</a>
+the sharing of profiles through proximity, similar to the [Nintendo 3DS StreetPass
+system](https://www.nintendo.com/en-gb/Hardware/Nintendo-3DS-Family/StreetPass/What-is-StreetPass-/What-is-StreetPass-827701.html).
 
 Plug a Meshtastic ESP32 radio into a uConsole over USB and MeshtasticPass gives
 you channel chat, direct messages, persistent local history, delivery-state
 feedback, and a passive map of the mesh around you -- all in a terminal UI
 driven entirely from the keyboard, with no mouse and no touchscreen required.
 
+![The MESH board in the MATRIX theme, running on a ClockworkPi uConsole](assets/mesh-view.jpg)
+
 **This is early-stage software and is being shared for testing.** Expect rough
 edges, and see [Known limitations](#known-limitations) before you file anything.
 MeshtasticPass is an independent project, not affiliated with or endorsed by
 Meshtastic.
 
-# MeshtasticPass Philosophy
+## MeshtasticPass Philosophy
 
 MeshtasticPass isn't intended to be the end all be all most productive meshtastic
 chat client, for this reason the mesh view isn't your typical geographic-centric
-representation of the mesh. This is the root of the app's philosophy. Give you 
-just as much information as required. As mentioned above the ultimate goal of 
+representation of the mesh. This is the root of the app's philosophy. Give you
+just as much information as required. As mentioned above the ultimate goal of
 this app isn't to just be another chat client, it's to eventually enable peer
 to peer sharing of profiles on the meshtastic network through discrete packets.
 
@@ -97,9 +99,13 @@ Note that `q` is ordinary text, not a quit key -- you can type it in a message
 without the app closing. Direct messages are a mode inside CHAT rather than a
 separate tab, reached from the header's DM peer selector.
 
+![CONNECTION/CONFIG showing the connected radio, identity and preset](assets/settings-view.jpg)
+
 **CONNECTION/CONFIG** is the radio connection, device selection, your identity,
 channel management, and appearance settings (SNOW, AMBER and MATRIX themes,
 UI scale).
+
+![CHAT on the primary channel, with delivery ticks and relative receive times](assets/chat-view.jpg)
 
 **CHAT** is the currently selected broadcast channel, with persistent history,
 per-message delivery state, and unread tracking. History survives restarts.
