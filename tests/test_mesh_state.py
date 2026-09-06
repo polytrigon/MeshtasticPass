@@ -521,8 +521,9 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
     def test_you_fields_have_no_you_label_and_no_self_link(self) -> None:
         """YOU gets no literal "YOU" anywhere, HOPS "0", DISTANCE "--",
 
-        ELAPSE "NOW", accent2=True, and the honest no-link placeholder --
-        never a fabricated self-observation.
+        ELAPSE "NOW", accent2=True, and no LINK field at all -- never a
+        fabricated self-observation, and no longer a row of dashes
+        standing in for one.
         """
         state = MeshNodeState(
             node=YOU, is_client=False, is_relay=False, last_interaction_at=None
@@ -533,13 +534,13 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
         self.assertNotIn("YOU", fields.long_name)
         self.assertNotIn("YOU", fields.short_name)
         self.assertEqual(fields.hops_text, "0")
-        self.assertEqual(fields.distance_text, "--")
+        self.assertIsNone(fields.distance_text)
         self.assertEqual(fields.elapse_text, "NOW")
         self.assertTrue(fields.accent2)
-        self.assertEqual(fields.link_meter, MESH_LINK_METER_UNKNOWN)
-        self.assertEqual(fields.link_rssi_text, "--")
-        self.assertEqual(fields.link_snr_text, "--")
-        self.assertEqual(fields.gps_text, "--")
+        self.assertIsNone(fields.link_meter)
+        self.assertIsNone(fields.link_rssi_text)
+        self.assertIsNone(fields.link_snr_text)
+        self.assertIsNone(fields.gps_text)
 
     def test_you_with_real_gps_shows_coordinates(self) -> None:
         you_with_position = NodeMetadata(
@@ -551,8 +552,9 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
         fields = format_mesh_node_bar_fields(state, now=NOW)
         self.assertEqual(fields.gps_text, "40.7128, -74.0060")
         self.assertEqual(fields.gps_text_compact, "40.71,-74.01")
-        # DISTANCE from YOU to itself is always "--", GPS or not.
-        self.assertEqual(fields.distance_text, "--")
+        # There is no distance from YOU to itself, GPS or not -- the field
+        # is simply absent rather than a placeholder.
+        self.assertIsNone(fields.distance_text)
 
     def test_you_falls_back_to_node_id_when_no_names_at_all(self) -> None:
         state = MeshNodeState(
@@ -574,7 +576,7 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
         self.assertEqual(fields.long_name, "Bob Basecamp")
         self.assertEqual(fields.short_name, "BOB")
         self.assertEqual(fields.hops_text, "1")
-        self.assertEqual(fields.distance_text, "--")
+        self.assertIsNone(fields.distance_text)
         self.assertEqual(fields.elapse_text, "30m")
         self.assertFalse(fields.accent2)
 
@@ -614,13 +616,13 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
             distance_miles=None,
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.distance_text, "--")
+        self.assertIsNone(fields.distance_text)
 
-    def test_gps_is_dash_when_node_has_no_position(self) -> None:
+    def test_gps_is_absent_when_node_has_no_position(self) -> None:
         state = client_state(NodeMetadata("!bob", "Bob", "BOB", 1), last_interaction_at=NOW - 10)
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.gps_text, "--")
-        self.assertEqual(fields.gps_text_compact, "--")
+        self.assertIsNone(fields.gps_text)
+        self.assertIsNone(fields.gps_text_compact)
 
     def test_gps_shows_real_coordinates_when_present(self) -> None:
         node = NodeMetadata(
@@ -651,16 +653,16 @@ class FormatMeshNodeBarFieldsTests(unittest.TestCase):
     def test_missing_link_shows_the_honest_placeholder(self) -> None:
         """LINK preserves the passive direct-only semantics: no direct
 
-        observation for this node -> the honest placeholder, never a
+        observation for this node -> no LINK field at all, never a
         misattributed relayed reading.
         """
         state = client_state(
             NodeMetadata("!near", "Near", "NEAR", 1), last_interaction_at=NOW - 3
         )
         fields = format_mesh_node_bar_fields(state, now=NOW, link=None)
-        self.assertEqual(fields.link_meter, MESH_LINK_METER_UNKNOWN)
-        self.assertEqual(fields.link_rssi_text, "--")
-        self.assertEqual(fields.link_snr_text, "--")
+        self.assertIsNone(fields.link_meter)
+        self.assertIsNone(fields.link_rssi_text)
+        self.assertIsNone(fields.link_snr_text)
 
 
 class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
@@ -691,13 +693,14 @@ class FormatMeshNodeBarFieldsTimeTests(unittest.TestCase):
         fields = format_mesh_node_bar_fields(state, now=NOW)
         self.assertEqual(fields.elapse_text, format_relative_age(ACTIVE_WINDOW_SECONDS + 3 * 60))
 
-    def test_missing_last_heard_and_chat_history_stays_question_mark(self) -> None:
+    def test_missing_last_heard_and_chat_history_has_no_elapse(self) -> None:
         node = NodeMetadata("!nodata001", "No Data", "ND", 1, last_heard=None)
         state = MeshNodeState(
             node=node, is_client=False, is_relay=False, last_interaction_at=None
         )
         fields = format_mesh_node_bar_fields(state, now=NOW)
-        self.assertEqual(fields.elapse_text, "?")
+        # Nothing to report is reported as nothing, not as "?".
+        self.assertIsNone(fields.elapse_text)
 
     def test_chat_history_does_not_substitute_when_last_heard_is_fresher(self) -> None:
         node = NodeMetadata("!fresh0001", "Fresher", "FR", 1, last_heard=NOW - 10)
@@ -766,6 +769,34 @@ class FormatMeshLinkDisplayTests(unittest.TestCase):
         self.assertEqual(display.rssi_text, "-52")
         self.assertEqual(display.snr_text, "+10")  # round-half-to-even(9.5) == 10
         self.assertEqual(display.meter, "▂▄▆█")
+
+    def test_no_observation_is_not_available(self) -> None:
+        self.assertFalse(format_mesh_link_display(None, now=NOW).available)
+
+    def test_rssi_alone_still_counts_as_a_real_reading(self) -> None:
+        """SNR drives the meter, but an RSSI-only observation is still
+
+        something genuinely heard -- LINK is worth showing for it rather
+        than being suppressed as empty.
+        """
+        observation = LinkObservation(rssi=-52, snr=None, observed_at=NOW - 5)
+        self.assertTrue(format_mesh_link_display(observation, now=NOW).available)
+
+    def test_fresh_observation_carrying_neither_value_is_not_available(self) -> None:
+        """A fresh observation with no RSSI and no SNR conveys nothing, so
+
+        every field is a placeholder and the whole LINK field is empty --
+        available reports that, rather than the caller having to
+        string-match the placeholders back out.
+        """
+        observation = LinkObservation(rssi=None, snr=None, observed_at=NOW - 5)
+        self.assertFalse(format_mesh_link_display(observation, now=NOW).available)
+
+    def test_stale_observation_is_not_available(self) -> None:
+        observation = LinkObservation(
+            rssi=-52, snr=9.5, observed_at=NOW - ACTIVE_WINDOW_SECONDS
+        )
+        self.assertFalse(format_mesh_link_display(observation, now=NOW).available)
 
     def test_observation_at_exactly_active_window_is_stale(self) -> None:
         """Reuses the SAME ACTIVE_WINDOW_SECONDS boundary MESH's own
@@ -849,6 +880,94 @@ class FormatMeshNodeBarLineTests(unittest.TestCase):
         elapse_text="25s",
         accent2=False,
     )
+
+    SPARSE_FIELDS = MeshNodeBarFields(
+        long_name="SomeNode",
+        short_name="NODE",
+        hops_text="2",
+        gps_text=None,
+        gps_text_compact=None,
+        distance_text=None,
+        link_meter=None,
+        link_rssi_text=None,
+        link_snr_text=None,
+        elapse_text="25s",
+        accent2=False,
+    )
+
+    def test_absent_fields_are_omitted_not_padded_with_placeholders(self) -> None:
+        """The ordinary real-world node: no position reported, and no LINK
+
+        reading because this radio has not directly heard it recently.
+        Those fields have nothing to say, so they take no width -- the bar
+        is what is known about a node, not a fixed set of slots to be
+        filled with dashes.
+        """
+        text = format_mesh_node_bar_line(self.SPARSE_FIELDS, available_width=200)
+        self.assertEqual(text, "SomeNode • NODE • HOPS 2 • ELAPSE 25s")
+        for absent in ("GPS", "DISTANCE", "LINK"):
+            self.assertNotIn(absent, text)
+        self.assertNotIn("--", text)
+
+    def test_omitting_absent_fields_frees_width_for_what_remains(self) -> None:
+        full = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=200)
+        sparse = format_mesh_node_bar_line(self.SPARSE_FIELDS, available_width=200)
+        self.assertLess(cell_len(sparse), cell_len(full))
+        # At a width where the fully-populated bar has had to start dropping
+        # fields, the sparse one still shows everything it actually has.
+        narrow_width = cell_len(sparse)
+        self.assertEqual(
+            format_mesh_node_bar_line(self.SPARSE_FIELDS, available_width=narrow_width),
+            sparse,
+        )
+        self.assertLess(
+            cell_len(format_mesh_node_bar_line(
+                self.REMOTE_FIELDS, available_width=narrow_width
+            )),
+            cell_len(full),
+        )
+
+    def test_unknown_hop_count_still_states_itself(self) -> None:
+        """HOPS always renders, "?" included: hop depth is the one signal
+
+        that arrives consistently and the one the board organizes around,
+        so "we do not know how deep this node is" is worth stating --
+        unlike an absent GPS reading, whose absence says nothing beyond
+        "this node does not send position".
+        """
+        fields = MeshNodeBarFields(
+            long_name="SomeNode",
+            short_name="NODE",
+            hops_text="?",
+            gps_text=None,
+            gps_text_compact=None,
+            distance_text=None,
+            link_meter=None,
+            link_rssi_text=None,
+            link_snr_text=None,
+            elapse_text="25s",
+            accent2=False,
+        )
+        self.assertIn("HOPS ?", format_mesh_node_bar_line(fields, available_width=200))
+
+    def test_a_node_with_nothing_but_a_name_still_renders(self) -> None:
+        fields = MeshNodeBarFields(
+            long_name="Bare",
+            short_name="BR",
+            hops_text="?",
+            gps_text=None,
+            gps_text_compact=None,
+            distance_text=None,
+            link_meter=None,
+            link_rssi_text=None,
+            link_snr_text=None,
+            elapse_text=None,
+            accent2=False,
+        )
+        self.assertEqual(
+            format_mesh_node_bar_line(fields, available_width=200),
+            "Bare • BR • HOPS ?",
+        )
 
     def test_full_width_shows_the_complete_tier(self) -> None:
         text = format_mesh_node_bar_line(self.REMOTE_FIELDS, available_width=200)
