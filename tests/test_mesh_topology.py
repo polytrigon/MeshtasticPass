@@ -4315,9 +4315,11 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             # format_mesh_node_bar_fields).
             self.assertEqual(_bar_short_name(status), target_id)
             # No shared GPS fix (YOU has no position at all in this
-            # fixture) -> DISTANCE is the honest "--", never a
-            # fabricated/unit-suffixed unknown value.
-            self.assertEqual(_bar_field(status, "DISTANCE"), "--")
+            # fixture) -> DISTANCE is omitted entirely, never a
+            # fabricated/unit-suffixed unknown value and no longer a
+            # placeholder taking up width (see
+            # mesh_state.format_mesh_node_bar_line).
+            self.assertNotIn("DISTANCE", status)
             self.assertEqual(_bar_long_name(status), "No Short Name")
 
     async def test_distance_unchanged_by_recentering(self) -> None:
@@ -5236,9 +5238,9 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            # No shared GPS fix yet (YOU has none) -> DISTANCE is the
-            # honest "--", never a fabricated/unit-suffixed value.
-            self.assertEqual(_bar_field(_bar_text(app), "DISTANCE"), "--")
+            # No shared GPS fix yet (YOU has none) -> DISTANCE is omitted
+            # entirely, never a fabricated/unit-suffixed value.
+            self.assertNotIn("DISTANCE", _bar_text(app))
 
             gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
             app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
@@ -5287,9 +5289,9 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             _mesh_select_node(app, alice_id)
             await pilot.pause()
-            # No shared GPS fix any more (YOU lost it) -> DISTANCE is the
-            # honest "--", never a fabricated/unit-suffixed value.
-            self.assertEqual(_bar_field(_bar_text(app), "DISTANCE"), "--")
+            # No shared GPS fix any more (YOU lost it) -> DISTANCE is
+            # omitted entirely, never a fabricated/unit-suffixed value.
+            self.assertNotIn("DISTANCE", _bar_text(app))
 
     async def test_gps_cluster_coexists_with_fallback_nodes_without_collision(
         self,
@@ -6263,7 +6265,11 @@ class MeshNodeBarLayoutTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("Golf Sierra Portable", text)
             self.assertNotIn("…", text)
-            self.assertIn("LINK ---- -- / --", text)
+            # No LINK reading for this node, so the field is not rendered at
+            # all (see mesh_state.format_mesh_node_bar_line) -- the fullest
+            # tier still means "everything there is to say", not "every
+            # field, padded out with dashes".
+            self.assertNotIn("LINK", text)
             self.assertIn("Golf Sierra Portable • GSP", text)
             self.assertLessEqual(cell_len(text), bar_widget.size.width)
 
@@ -6359,8 +6365,8 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
 
         ANY node's real RSSI/SNR -- get_link_quality legitimately
         returns None for it (RadioService only ever records a
-        traversed_hops == 0 packet), and the display must show the
-        placeholder, never fabricate a plausible-looking number.
+        traversed_hops == 0 packet), and the display must simply omit
+        LINK, never fabricate a plausible-looking number.
         """
         app = self._make_app()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -6377,7 +6383,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!far00001")
             await pilot.pause()
             text = _bar_text(app)
-            self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
+            self.assertNotIn("LINK", text)
             self.assertEqual(_bar_field(text, "ELAPSE"), "3s")
 
     async def test_you_selected_never_queries_link(self) -> None:
@@ -6470,13 +6476,15 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             _bar_text(app)
             self.assertEqual(app.radio.sent_messages, ())
 
-    async def test_stale_link_observation_falls_back_to_honest_placeholder(self) -> None:
+    async def test_stale_link_observation_is_omitted_not_shown_as_current(self) -> None:
         """An observation older than ACTIVE_WINDOW_SECONDS must never be
 
         presented as current, even though RadioService itself still has
         it cached (see LinkQualityTests.
         test_same_radio_reconnect_preserves_link_observations) --
-        staleness is enforced at display time, not by the cache.
+        staleness is enforced at display time, not by the cache. A stale
+        reading is no reading, so LINK is omitted entirely rather than
+        rendered as dashes.
         """
         app = self._make_app()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -6495,7 +6503,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             _mesh_select_node(app, "!old00001")
             await pilot.pause()
             text = _bar_text(app)
-            self.assertEqual(_bar_field(text, "LINK"), "---- -- / --")
+            self.assertNotIn("LINK", text)
             self.assertEqual(_bar_field(text, "ELAPSE"), "3s")
 
 
@@ -9040,7 +9048,10 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
             app._show_connection(RadioState.ONLINE, v4_info)
             await pilot.pause()
             status = _bar_text(app)
-            self.assertEqual(_bar_field(status, "GPS"), "--")
+            # The new radio reports no position, and the old one's is never
+            # inherited -- so GPS is absent from the bar rather than showing
+            # a placeholder (and certainly not the previous radio's fix).
+            self.assertNotIn("GPS", status)
 
     async def test_menu_local_vs_remote_after_swap(self) -> None:
         app = self._make_app()

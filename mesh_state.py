@@ -474,11 +474,21 @@ class MeshLinkDisplay:
     underlying value is missing, never a fabricated number. Raw values
     are carried as already-formatted text (not a bare number) so a
     caller never needs its own second "-- vs formatted" branch.
+
+    `available` reports whether this display carries a REAL reading at
+    all: a fresh directly-heard observation that actually produced an
+    RSSI or an SNR. It is False both when there is no observation (or
+    only a stale one) and when a fresh observation carried neither
+    value -- in which case every field above is a placeholder and the
+    whole LINK field says nothing. Callers that would rather omit an
+    empty field than print dashes into it read this rather than
+    string-matching the placeholders (see format_mesh_node_bar_fields).
     """
 
     meter: str
     rssi_text: str
     snr_text: str
+    available: bool = False
 
 
 def _mesh_link_meter(snr: float | None) -> str:
@@ -533,6 +543,9 @@ def format_mesh_link_display(
                     if observation.snr is not None
                     else "--"
                 ),
+                available=(
+                    observation.rssi is not None or observation.snr is not None
+                ),
             )
     return MeshLinkDisplay(MESH_LINK_METER_UNKNOWN, "--", "--")
 
@@ -543,10 +556,26 @@ class MeshNodeBarFields:
 
     (MESH GPS + UNIFIED BAR Part B; label cleanup in the FINAL MESHTASTIC
     POLISH pass), replacing the previous separate bottom-left node-context
-    line and bottom-right LINK/LAST UPDATE line. Every field independently
-    resolves to something displayable -- "?"/"--"/MESH_LINK_METER_UNKNOWN,
-    never blank or fabricated -- so format_mesh_node_bar_line never needs
-    a second per-field missing-data branch.
+    line and bottom-right LINK/LAST UPDATE line.
+
+    A field that has NO real data to show is None, and
+    format_mesh_node_bar_line omits it from the rendered line entirely
+    rather than printing a placeholder into it. In practice most nodes
+    never report a position, and LINK only ever fills in for a node this
+    radio has directly heard recently, so the previous behavior spent a
+    third of a narrow bar on "GPS -- • DISTANCE -- • LINK ---- -- / --",
+    which says nothing and crowds out what does. This is the same rule
+    the local node already followed (see format_mesh_node_bar_line: YOU
+    omits DISTANCE/LINK/ELAPSE outright rather than showing placeholders
+    for facts that cannot apply to it) -- now applied wherever the data
+    is genuinely absent, not just where it is inapplicable.
+
+    long_name/short_name/hops_text are never None. HOPS deliberately
+    keeps its "?" rather than vanishing: hop depth is the one signal
+    that arrives consistently, and it is what the board organizes
+    around, so "we do not know how deep this node is" is itself worth
+    stating -- unlike an absent GPS reading, whose absence says nothing
+    beyond "this node does not send position".
 
     format_mesh_node_bar_line renders long_name/short_name as bare
     values with no "LONG NAME"/"SHORT NAME" descriptor prefix (removed
@@ -559,13 +588,13 @@ class MeshNodeBarFields:
     long_name: str
     short_name: str
     hops_text: str
-    gps_text: str
-    gps_text_compact: str
-    distance_text: str
-    link_meter: str
-    link_rssi_text: str
-    link_snr_text: str
-    elapse_text: str
+    gps_text: str | None
+    gps_text_compact: str | None
+    distance_text: str | None
+    link_meter: str | None
+    link_rssi_text: str | None
+    link_snr_text: str | None
+    elapse_text: str | None
     accent2: bool
 
 
@@ -578,15 +607,22 @@ def format_mesh_node_bar_fields(
 ) -> MeshNodeBarFields:
     """Resolve one selected node's raw field values for the unified bar.
 
+    A field with nothing real behind it resolves to None (see
+    MeshNodeBarFields) so the caller can omit it rather than print a
+    placeholder: no position means gps_text/gps_text_compact are None,
+    an unknown distance means distance_text is None, an absent or stale
+    LINK reading means all three link_* are None, and an unknown last-
+    seen time means elapse_text is None.
+
     YOU (state.node.is_local): HOPS is literally "0" (YOU is zero hops
     from itself by definition, regardless of whatever raw hops_away a
-    NodeDB record happens to carry for the local node), DISTANCE is
-    always "--" (no distance from yourself), ELAPSE is literally "NOW",
+    NodeDB record happens to carry for the local node), DISTANCE is None
+    (there is no distance from yourself), ELAPSE is literally "NOW",
     and `link` is expected to already be None from the caller (a radio
     has no RF link to itself -- see app.py's _update_mesh_node_bar,
     which never even calls get_link_quality for YOU); format_mesh_link_
-    display(None, ...) already resolves to the same honest placeholder
-    a real "never heard directly" remote gets, so no extra branch is
+    display(None, ...) reports available=False for that, exactly as it
+    does for a real "never heard directly" remote, so no extra branch is
     needed here either way.
 
     A remote's ELAPSE (renamed from TIME in the FINAL MESHTASTIC POLISH
@@ -602,24 +638,24 @@ def format_mesh_node_bar_fields(
     node = state.node
     long_name = _clean_text(node.long_name) or _clean_text(node.short_name) or node.node_id
     short_name = _clean_text(node.short_name) or node.node_id
-    gps_text = format_coordinates(node.position) if node.position is not None else "--"
+    gps_text = format_coordinates(node.position) if node.position is not None else None
     gps_text_compact = (
         f"{node.position.latitude:.2f},{node.position.longitude:.2f}"
         if node.position is not None
-        else "--"
+        else None
     )
     link_display = format_mesh_link_display(link, now=now)
 
     if node.is_local:
         hops_text = "0"
-        distance_text = "--"
+        distance_text = None
         elapse_text = "NOW"
     else:
         hops_text = f"{node.hops_away}" if node.hops_away is not None else "?"
         distance_text = (
             format_distance(state.distance_miles, metric=metric)
             if state.distance_miles is not None
-            else "--"
+            else None
         )
         last_seen_candidates = [
             timestamp
@@ -628,7 +664,7 @@ def format_mesh_node_bar_fields(
         ]
         last_seen_at = max(last_seen_candidates) if last_seen_candidates else None
         if last_seen_at is None or last_seen_at > now:
-            elapse_text = "?"
+            elapse_text = None
         else:
             elapse_text = format_relative_age(now - last_seen_at)
 
@@ -639,12 +675,27 @@ def format_mesh_node_bar_fields(
         gps_text=gps_text,
         gps_text_compact=gps_text_compact,
         distance_text=distance_text,
-        link_meter=link_display.meter,
-        link_rssi_text=link_display.rssi_text,
-        link_snr_text=link_display.snr_text,
+        link_meter=link_display.meter if link_display.available else None,
+        link_rssi_text=link_display.rssi_text if link_display.available else None,
+        link_snr_text=link_display.snr_text if link_display.available else None,
         elapse_text=elapse_text,
         accent2=node.is_local,
     )
+
+
+def _bar_field(label: str, value: str | None) -> str | None:
+    """One "LABEL value" bar segment, or None when there is no value.
+
+    None propagates through _bar_line, which drops it -- so an absent
+    field costs no width at all rather than printing its label followed
+    by a placeholder.
+    """
+    return None if value is None else f"{label} {value}"
+
+
+def _bar_line(*parts: str | None) -> str:
+    """Join the bar segments that actually have something to say."""
+    return " • ".join(part for part in parts if part)
 
 
 def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int) -> str:
@@ -664,49 +715,59 @@ def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int
     6. drop LINK too (long name - HOPS - ELAPSE) -- the bare minimum
        that still identifies the node and its two most essential facts
 
+    Those tiers describe what is dropped for WIDTH. Independently of
+    them, a field with no real data behind it (None -- see
+    MeshNodeBarFields) is never rendered at all, at any tier: most nodes
+    never report a position and LINK only fills in for a node this radio
+    has directly heard recently, so printing "GPS -- • DISTANCE -- •
+    LINK ---- -- / --" spent most of a narrow bar saying nothing. What
+    remains simply closes up, and the freed width goes to the fields
+    that do have something to report. A line can therefore be shorter
+    than its tier suggests, and tiers can coincide (dropping GPS from a
+    node that never had GPS changes nothing) -- harmless, since the
+    first tier that fits is the one returned.
+
     long name/short name render as bare values (FINAL MESHTASTIC POLISH
     pass: the "LONG NAME"/"SHORT NAME" descriptors were removed as
     redundant -- position alone already establishes which is which,
     long name always first); HOPS/GPS/DISTANCE/LINK/ELAPSE keep their
     own descriptor prefixes unchanged (ELAPSE itself renamed from TIME,
     same underlying freshness source and formatting -- see
-    format_mesh_node_bar_fields).
+    format_mesh_node_bar_fields). HOPS always renders, "?" included: it
+    is the one signal that arrives consistently and the one the board
+    organizes around, so an unknown hop depth is worth stating.
 
     `available_width <= 0` (not yet laid out) shows the fullest tier
     untouched, mirroring this MESH view's other width-aware lines
     (see mesh_state.py's own established convention). If even tier 6
     does not fit, grapheme-safe truncation is the final fallback.
 
-    The local YOU node (fields.accent2) is a deliberate exception:
-    DISTANCE ("no distance from yourself"), LINK ("no RF link to
-    itself") and ELAPSE ("NOW") carry no information for YOU, so they
-    are omitted entirely -- not shown as placeholders. YOU degrades
-    through its own short tier list (long name - short name - HOPS -
-    GPS, then drop GPS, then drop short name).
+    The local YOU node (fields.accent2) keeps its own short tier list
+    (long name - short name - HOPS - GPS, then drop GPS, then drop short
+    name): DISTANCE ("no distance from yourself"), LINK ("no RF link to
+    itself") and ELAPSE ("NOW") carry no information for YOU and are
+    never offered at all. That exception predates the general
+    absent-field rule above and is the precedent it generalizes -- the
+    difference being that YOU omits facts that cannot APPLY, while the
+    rule above omits facts that are merely UNKNOWN.
     """
+    hops = f"HOPS {fields.hops_text}"
     if fields.accent2:
         you_candidates = (
-            " • ".join((
+            _bar_line(
                 fields.long_name,
                 fields.short_name,
-                f"HOPS {fields.hops_text}",
-                f"GPS {fields.gps_text}",
-            )),
-            " • ".join((
+                hops,
+                _bar_field("GPS", fields.gps_text),
+            ),
+            _bar_line(
                 fields.long_name,
                 fields.short_name,
-                f"HOPS {fields.hops_text}",
-                f"GPS {fields.gps_text_compact}",
-            )),
-            " • ".join((
-                fields.long_name,
-                fields.short_name,
-                f"HOPS {fields.hops_text}",
-            )),
-            " • ".join((
-                fields.long_name,
-                f"HOPS {fields.hops_text}",
-            )),
+                hops,
+                _bar_field("GPS", fields.gps_text_compact),
+            ),
+            _bar_line(fields.long_name, fields.short_name, hops),
+            _bar_line(fields.long_name, hops),
         )
         if available_width <= 0:
             return you_candidates[0]
@@ -715,53 +776,45 @@ def format_mesh_node_bar_line(fields: MeshNodeBarFields, *, available_width: int
                 return candidate
         return truncate_to_cells(you_candidates[-1], available_width)
 
-    link_full = f"{fields.link_meter} {fields.link_rssi_text} / {fields.link_snr_text}"
-    link_compact = f"{fields.link_meter} {fields.link_rssi_text}/{fields.link_snr_text}"
+    link_full = (
+        None
+        if fields.link_meter is None
+        else f"LINK {fields.link_meter} {fields.link_rssi_text} / {fields.link_snr_text}"
+    )
+    link_compact = (
+        None
+        if fields.link_meter is None
+        else f"LINK {fields.link_meter} {fields.link_rssi_text}/{fields.link_snr_text}"
+    )
+    gps = _bar_field("GPS", fields.gps_text)
+    gps_compact = _bar_field("GPS", fields.gps_text_compact)
+    distance = _bar_field("DISTANCE", fields.distance_text)
+    elapse = _bar_field("ELAPSE", fields.elapse_text)
     candidates = (
-        " • ".join((
+        _bar_line(
             fields.long_name,
             fields.short_name,
-            f"HOPS {fields.hops_text}",
-            f"GPS {fields.gps_text}",
-            f"DISTANCE {fields.distance_text}",
-            f"LINK {link_full}",
-            f"ELAPSE {fields.elapse_text}",
-        )),
-        " • ".join((
+            hops,
+            gps,
+            distance,
+            link_full,
+            elapse,
+        ),
+        _bar_line(
             fields.long_name,
             fields.short_name,
-            f"HOPS {fields.hops_text}",
-            f"GPS {fields.gps_text_compact}",
-            f"DISTANCE {fields.distance_text}",
-            f"LINK {link_compact}",
-            f"ELAPSE {fields.elapse_text}",
-        )),
-        " • ".join((
-            fields.long_name,
-            fields.short_name,
-            f"HOPS {fields.hops_text}",
-            f"DISTANCE {fields.distance_text}",
-            f"LINK {link_compact}",
-            f"ELAPSE {fields.elapse_text}",
-        )),
-        " • ".join((
-            fields.long_name,
-            fields.short_name,
-            f"HOPS {fields.hops_text}",
-            f"LINK {link_compact}",
-            f"ELAPSE {fields.elapse_text}",
-        )),
-        " • ".join((
-            fields.long_name,
-            f"HOPS {fields.hops_text}",
-            f"LINK {link_compact}",
-            f"ELAPSE {fields.elapse_text}",
-        )),
-        " • ".join((
-            fields.long_name,
-            f"HOPS {fields.hops_text}",
-            f"ELAPSE {fields.elapse_text}",
-        )),
+            hops,
+            gps_compact,
+            distance,
+            link_compact,
+            elapse,
+        ),
+        _bar_line(
+            fields.long_name, fields.short_name, hops, distance, link_compact, elapse
+        ),
+        _bar_line(fields.long_name, fields.short_name, hops, link_compact, elapse),
+        _bar_line(fields.long_name, hops, link_compact, elapse),
+        _bar_line(fields.long_name, hops, elapse),
     )
     if available_width <= 0:
         return candidates[0]
