@@ -8728,7 +8728,25 @@ class MeshtasticPassApp(App[None]):
             # The depth ladder is layout state too: a completely different
             # node population's depths must not keep constraining this one.
             self._mesh_seen_hop_depths = set()
+            self._mesh_node_rings = {}
+        previous_rings = self._mesh_node_rings
         self._mesh_node_rings = self._mesh_hop_rings(working_set)
+        # A node whose RING changed must be re-placed, never handed back its
+        # remembered cell. MESH LAYOUT STABILITY suppresses movement caused
+        # by bookkeeping churn -- rank/index shifts, a neighbour appearing,
+        # an axis rescaling -- and a changed ring is the opposite of that: it
+        # is real, newly-observed topology information about THIS node, and
+        # the radius exists to show it. _place_group_sticky_first only
+        # compares a node's REGION (its compass/GPS/UNKNOWN placement
+        # category), which was sufficient while radius meant geographic
+        # distance and effectively never changed. With hop-depth rings it is
+        # not: a node that became a direct neighbour kept rendering out at
+        # the depth it used to have, markers and all, because its region was
+        # unchanged. Evicting only the nodes whose ring actually moved keeps
+        # every other node still, which is the invariant that matters.
+        for node_id, ring in self._mesh_node_rings.items():
+            if previous_rings.get(node_id, ring) != ring:
+                self._mesh_sticky_positions.pop(node_id.strip().lower(), None)
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
             # The outermost ring any node can occupy is the UNKNOWN-depth
