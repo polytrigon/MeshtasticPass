@@ -31,22 +31,26 @@ DEFAULT_FONT_SIZE = 16
 COLOR_CHOICES = (
     ("SNOW", "snow"),
     ("AMBER", "amber"),
+    ("MATRIX", "matrix"),
 )
 VALID_COLORS = tuple(value for _name, value in COLOR_CHOICES)
 DEFAULT_COLOR = "snow"
 # Deterministic migration for the three retired theme names (see the
 # theme-overhaul completion report for the full reasoning): "white" ->
-# "snow" and "orange" -> "amber" both keep their BASE hue. "green" has
-# no base-hue equivalent in the new two-theme palette -- SNOW is the
-# only remaining palette that still contains that exact neon green at
-# all (as its ACCENT, see theme_palette.THEME_PALETTES), so a "green"
-# theme user keeps seeing that same green prominently rather than
-# losing it outright under "orange"/AMBER, which shares nothing with
-# it. Never discards a color preference outright -- every legacy value
-# maps to a valid current one.
+# "snow" and "orange" -> "amber" both keep their BASE hue. "green" now
+# maps to MATRIX, whose BASE is a phosphor green -- when this map was
+# written the palette had no green-BASE theme at all and "green" was
+# routed to SNOW, which merely carries that neon green as its ACCENT.
+# MATRIX restores the actual base hue the preference asked for, so a
+# legacy "green" user gets a green terminal rather than a white one
+# with green highlights. (A config already REWRITTEN to "snow" by an
+# earlier load is a real preference now and is left alone -- this map
+# only ever sees values that have not been migrated yet.) Never
+# discards a color preference outright -- every legacy value maps to a
+# valid current one.
 _LEGACY_COLOR_MIGRATION = {
     "white": "snow",
-    "green": "snow",
+    "green": "matrix",
     "orange": "amber",
 }
 DEFAULT_DEVICE_PATH = "/dev/ttyUSB0"

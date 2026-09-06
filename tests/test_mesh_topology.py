@@ -36,6 +36,7 @@ from app import (
     MESH_LOGICAL_GRID_CENTER_ROW,
     MESH_LOGICAL_GRID_COLUMNS,
     MESH_LOGICAL_GRID_ROWS,
+    MESH_MAX_HOP_RING,
     MESH_SELECTED_GLYPH_WIDTH,
     MeshCanvas,
     MeshNodeLabelWidget,
@@ -53,6 +54,7 @@ from app import (
     _mesh_select_node,
     _mesh_translated_positions,
     _render_mesh_canvas,
+    _mesh_hop_ring_ladder,
 )
 from app_settings import AppSettings
 from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
@@ -132,6 +134,49 @@ def north_of_local(miles: float) -> GeoPosition:
 
 def south_of_local(miles: float) -> GeoPosition:
     return GeoPosition(-miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
+
+
+def _pin_clock(app: MeshtasticPassApp, wall_now: float) -> None:
+    """Pin the app's whole notion of "now" (see MeshtasticPassApp._now).
+
+    Call this before ANY assertion that depends on a fixture instant,
+    whichever door the test drives the board through -- _refresh_mesh,
+    _refresh_chat_timestamps, or MeshTopologyView.set_nodes directly.
+    Passing a fixture time to one of those entry points pins only that
+    call; the app's own 1s timer still calls _refresh_mesh() with no
+    wall_now and recomputes against the real clock, overwriting whatever
+    the test just established. Tests here use two fixture conventions --
+    the 1_700_000_000 anchor and real time.time() -- so the clock cannot
+    simply be pinned once for the module; each test pins the instant it
+    is actually reasoning about.
+    """
+    app._clock = lambda: wall_now
+
+
+def _refresh_mesh_at(app: MeshtasticPassApp, wall_now: float) -> None:
+    """Refresh MESH with the app's ENTIRE notion of "now" pinned to wall_now.
+
+    Handing wall_now to _refresh_mesh alone is not enough. The app's own
+    1s _refresh_chat_timestamps timer calls _refresh_mesh() with NO
+    wall_now -- it has no fixture time to pass -- and so recomputes
+    against the real wall clock. Any test that took longer than one
+    timer interval between its controlled refresh and its assertion
+    therefore had its fixture time silently replaced by real time, and
+    the fixtures here are anchored at 1_700_000_000 (November 2023): far
+    enough outside the 2-hour active window that EVERY fixture node aged
+    out at once. MESH(N) fell to 0, connectors and relay markers
+    disappeared, arrow navigation landed elsewhere, placement stopped
+    reflowing -- all of which read as topology bugs and none of which
+    were.
+
+    Pinning app._clock (see MeshtasticPassApp._now) closes that: a
+    background refresh recomputes at the SAME instant the test is
+    reasoning about, so a failure means the code is wrong rather than
+    that the run was slow. Use this instead of calling _refresh_mesh
+    with wall_now directly.
+    """
+    _pin_clock(app, wall_now)
+    app._refresh_mesh(wall_now=wall_now)
 
 
 def _bar_text(app: MeshtasticPassApp) -> str:
@@ -1085,6 +1130,217 @@ class MeshGridPlacementTests(unittest.TestCase):
 
 def _sticky_map(slots) -> dict:
     return {item.node.node_id.strip().lower(): (item.x, item.y, item.region) for item in slots}
+
+
+class MeshHopRingLadderTests(unittest.TestCase):
+    """Ranking depths and DISMISSING the rings nobody occupies.
+
+    A real mesh is not evenly distributed: nodes cluster at a handful of
+    depths with gaps between them. Ranking rather than using the raw hop
+    count is what lets the board constrict to the number of distinct
+    depths it actually has to express, which on a small viewport is the
+    difference between a node rendering and a node becoming an edge
+    indicator.
+    """
+
+    def test_absent_depths_get_no_ring_at_all(self) -> None:
+        """The real-hardware case: nodes at 0, 4, 5 and 6 hops need FOUR
+
+        rings, not seven. Spending radius on the three empty ones is what
+        pushed every node out to the board's edge.
+        """
+        self.assertEqual(
+            _mesh_hop_ring_ladder({0, 4, 5, 6}), {0: 1, 4: 2, 5: 3, 6: 4}
+        )
+
+    def test_contiguous_depths_rank_naturally(self) -> None:
+        self.assertEqual(_mesh_hop_ring_ladder({0, 1, 2}), {0: 1, 1: 2, 2: 3})
+
+    def test_ordering_is_always_preserved(self) -> None:
+        """Absolute depth is not what the radius says -- ORDER is. The bar
+
+        still reports the true hop count (see mesh_state.
+        format_mesh_node_bar_fields); the board only claims which node is
+        deeper than which.
+        """
+        ladder = _mesh_hop_ring_ladder({2, 9, 30})
+        rings = [ladder[depth] for depth in (2, 9, 30)]
+        self.assertEqual(rings, sorted(rings))
+        self.assertEqual(len(set(rings)), len(rings))
+
+    def test_ring_one_is_reserved_for_direct_neighbours(self) -> None:
+        """Ranking alone would hand ring 1 to whatever the shallowest depth
+
+        happened to be, so a mesh whose nodes all sit at 3 hops would put
+        every one of them against YOU as though directly reachable.
+        "Adjacent to YOU means no intermediary" is the one thing the
+        innermost ring has to keep meaning.
+        """
+        self.assertEqual(_mesh_hop_ring_ladder({3}), {3: 2})
+        self.assertEqual(_mesh_hop_ring_ladder({1, 2, 3}), {1: 2, 2: 3, 3: 4})
+        # A direct neighbour, when there is one, has ring 1 to itself.
+        self.assertEqual(_mesh_hop_ring_ladder({0, 3}), {0: 1, 3: 2})
+
+    def test_more_distinct_depths_than_rings_share_the_outermost(self) -> None:
+        """The board is bounded: beyond MESH_MAX_HOP_RING distinct depths,
+
+        the deepest share a ring rather than growing the board without
+        bound and clipping everything off the viewport.
+        """
+        ladder = _mesh_hop_ring_ladder(set(range(MESH_MAX_HOP_RING + 3)))
+        self.assertEqual(max(ladder.values()), MESH_MAX_HOP_RING)
+        self.assertEqual(min(ladder.values()), 1)
+
+    def test_unrankable_depths_never_appear(self) -> None:
+        """None is "not reported" and a negative count is not a depth this
+
+        app can honestly place -- neither is ranked, and the caller gives
+        both the separate unknown ring instead (see
+        MeshtasticPassApp._mesh_hop_rings).
+        """
+        self.assertEqual(_mesh_hop_ring_ladder({0, None, -1, 3}), {0: 1, 3: 2})
+
+    def test_an_empty_mesh_has_no_ladder(self) -> None:
+        self.assertEqual(_mesh_hop_ring_ladder(set()), {})
+
+
+class AssignGridSlotsHopRingTests(unittest.TestCase):
+    """HOP-DEPTH RINGS: radius means hop depth, geography means direction."""
+
+    def _radius(self, slots, node_id):
+        item = next(s for s in slots if s.node.node_id == node_id)
+        return round((item.x * item.x + item.y * item.y) ** 0.5)
+
+    def _slot(self, slots, node_id):
+        return next(s for s in slots if s.node.node_id == node_id)
+
+    def test_ring_sets_the_radius_outright_not_as_a_floor(self) -> None:
+        """The decisive difference from min_radius_by_id: a geographically
+
+        NEAR node that is several hops deep must ring OUT, and a distant
+        node reachable in one hop must ring IN. Under the old
+        distance-first model the near node could never move outward past
+        its compressed distance, and the far one could never come in.
+        """
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, LOCAL_GEO),
+            NodeMetadata("!near0000", "Near", "NR", 3, 1.0, False, north_of_local(0.2)),
+            NodeMetadata("!far00000", "Far", "FR", 0, 1.0, False, south_of_local(400)),
+        )
+        slots = assign_grid_slots(
+            nodes, max_radius=6, ring_by_id={"!near0000": 4, "!far00000": 1}
+        )
+        self.assertEqual(self._radius(slots, "!near0000"), 4)
+        self.assertEqual(self._radius(slots, "!far00000"), 1)
+
+    def test_bearing_still_chooses_direction(self) -> None:
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, LOCAL_GEO),
+            NodeMetadata("!n0000000", "N", "N", 1, 1.0, False, north_of_local(3)),
+            NodeMetadata("!s0000000", "S", "S", 1, 1.0, False, south_of_local(3)),
+            NodeMetadata("!e0000000", "E", "E", 1, 1.0, False, east_of_local(3)),
+            NodeMetadata("!w0000000", "W", "W", 1, 1.0, False, west_of_local(3)),
+        )
+        rings = {n.node_id: 2 for n in nodes[1:]}
+        slots = assign_grid_slots(nodes, max_radius=6, ring_by_id=rings)
+        self.assertLess(self._slot(slots, "!n0000000").y, 0)
+        self.assertGreater(self._slot(slots, "!s0000000").y, 0)
+        self.assertGreater(self._slot(slots, "!e0000000").x, 0)
+        self.assertLess(self._slot(slots, "!w0000000").x, 0)
+        # Same depth -> same ring, whatever their real distances are.
+        self.assertEqual(
+            {self._radius(slots, n.node_id) for n in nodes[1:]}, {2}
+        )
+
+    def test_positionless_nodes_land_at_their_ring_radius_not_a_corner(self) -> None:
+        """Spread around the ring's own circle, never a square perimeter:
+
+        a square's corners sit radius*sqrt(2) out, which would let a node
+        on an inner ring render farther from YOU than one on an outer
+        ring and undo the whole point of ringing by depth.
+        """
+        nodes = [NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None)]
+        rings = {}
+        for index in range(6):
+            node_id = f"!bare{index:04x}"
+            nodes.append(NodeMetadata(node_id, f"Bare{index}", None, 1, 1.0, False, None))
+            rings[node_id] = 2
+        slots = assign_grid_slots(tuple(nodes), max_radius=6, ring_by_id=rings)
+        for node_id in rings:
+            self.assertEqual(self._radius(slots, node_id), 2, node_id)
+
+    def test_deeper_ring_is_never_nearer_than_a_shallower_one(self) -> None:
+        nodes = [NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None)]
+        rings = {}
+        for ring in (1, 2, 3, 4, 5):
+            node_id = f"!ring{ring:04x}"
+            nodes.append(NodeMetadata(node_id, f"R{ring}", None, ring - 1, 1.0, False, None))
+            rings[node_id] = ring
+        slots = assign_grid_slots(tuple(nodes), max_radius=6, ring_by_id=rings)
+        radii = [self._radius(slots, f"!ring{ring:04x}") for ring in (1, 2, 3, 4, 5)]
+        self.assertEqual(radii, sorted(radii))
+        self.assertEqual(radii, [1, 2, 3, 4, 5])
+
+    def test_mode_b_keeps_relative_arrangement_at_the_hop_ring(self) -> None:
+        """YOU has no fix but several remotes do: their arrangement
+
+        relative to each other is real and survives as angular order,
+        while the radius they sit at becomes hop depth -- which, unlike
+        a bearing from YOU, is actually known.
+        """
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None),
+            NodeMetadata("!west0000", "West", "W", 1, 1.0, False, west_of_local(5)),
+            NodeMetadata("!east0000", "East", "E", 1, 1.0, False, east_of_local(5)),
+            NodeMetadata("!north000", "North", "N", 1, 1.0, False, north_of_local(5)),
+        )
+        rings = {n.node_id: 2 for n in nodes[1:]}
+        slots = assign_grid_slots(nodes, max_radius=6, ring_by_id=rings)
+        self.assertTrue(
+            all(self._slot(slots, n.node_id).region == "GPS_RELATIVE" for n in nodes[1:])
+        )
+        self.assertLess(
+            self._slot(slots, "!west0000").x, self._slot(slots, "!east0000").x
+        )
+        self.assertLess(
+            self._slot(slots, "!north000").y,
+            max(self._slot(slots, n).y for n in ("!west0000", "!east0000")),
+        )
+        self.assertEqual({self._radius(slots, n.node_id) for n in nodes[1:]}, {2})
+
+    def test_omitting_ring_by_id_reproduces_geography_first_placement(self) -> None:
+        """Every caller that predates hop rings -- build_topology included
+
+        -- must be completely unaffected.
+        """
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, LOCAL_GEO),
+            NodeMetadata("!near0000", "Near", "NR", 1, 1.0, False, north_of_local(0.5)),
+            NodeMetadata("!far00000", "Far", "FR", 1, 1.0, False, north_of_local(300)),
+        )
+        without = assign_grid_slots(nodes, max_radius=3)
+        explicit_none = assign_grid_slots(nodes, max_radius=3, ring_by_id=None)
+        self.assertEqual(without, explicit_none)
+        # Distance still orders them outward when no ring is supplied.
+        self.assertGreaterEqual(
+            self._radius(explicit_none, "!far00000"),
+            self._radius(explicit_none, "!near0000"),
+        )
+
+    def test_placement_is_independent_of_input_order(self) -> None:
+        nodes = [
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None),
+            NodeMetadata("!aaaa0000", "A", "A", 0, 1.0, False, None),
+            NodeMetadata("!bbbb0000", "B", "B", 2, 1.0, False, None),
+            NodeMetadata("!cccc0000", "C", "C", 1, 1.0, False, None),
+        ]
+        rings = {"!aaaa0000": 1, "!bbbb0000": 3, "!cccc0000": 2}
+        forward = assign_grid_slots(tuple(nodes), max_radius=6, ring_by_id=rings)
+        backward = assign_grid_slots(tuple(reversed(nodes)), max_radius=6, ring_by_id=rings)
+        self.assertEqual(
+            {s.node.node_id: (s.x, s.y) for s in forward},
+            {s.node.node_id: (s.x, s.y) for s in backward},
+        )
 
 
 class MeshLayoutStabilityStickyPositionTests(unittest.TestCase):
@@ -2393,7 +2649,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("!a11ce001", mounted_ids)
             await pilot.press("3")
             await pilot.pause()
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             alice = next(
@@ -2497,7 +2753,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.press("3")
             await pilot.pause()
-            app._refresh_mesh(wall_now=1_700_000_000.0)
+            _refresh_mesh_at(app, 1_700_000_000.0)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             remote_ids = {
@@ -2523,7 +2779,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             view = app.query_one(MeshTopologyView)
             first_positions = dict(view.base_positions)
-            app._refresh_mesh(wall_now=time.time())
+            _refresh_mesh_at(app, time.time())
             await pilot.pause()
             self.assertEqual(view.base_positions, first_positions)
 
@@ -2689,7 +2945,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 len(first_positions.values()), len(set(first_positions.values()))
             )
 
-            app._refresh_mesh(wall_now=1_700_000_100.0)
+            _refresh_mesh_at(app, 1_700_000_100.0)
             await pilot.pause()
             self.assertEqual(view.base_positions, first_positions)
 
@@ -2785,7 +3041,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 view.working_set, view.base_positions, theme=app._current_theme, now=1_700_000_100.0
             )
             await pilot.pause()
-            app._refresh_mesh(wall_now=1_700_000_100.0)
+            _refresh_mesh_at(app, 1_700_000_100.0)
             await pilot.pause()
             self.assertEqual(view.selected_node_id.lower(), alice_id.lower())
 
@@ -2814,7 +3070,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_known_nodes = lambda: (
                 NodeMetadata(app.radio.info.node_id, is_local=True, position=LOCAL_GEO),
             )
-            app._refresh_mesh(wall_now=1_700_000_100.0)
+            _refresh_mesh_at(app, 1_700_000_100.0)
             await pilot.pause()
             self.assertTrue(view.selected_node_id)
             selected_state = next(
@@ -3560,7 +3816,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             tab_bar = str(app.query_one("#tab-bar").render())
             self.assertIn("MESH(4)", tab_bar)
@@ -3609,7 +3865,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(len(view.relay_stages), 1)
@@ -3655,7 +3911,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
 
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -3710,7 +3966,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await self._open_mesh(pilot)
             palette = THEME_PALETTES[app._current_theme]
 
-            app._refresh_mesh(wall_now=heard_at + 10)
+            _refresh_mesh_at(app, heard_at + 10)
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
             self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
@@ -3719,7 +3975,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             # Same session, same tab -- only wall-clock time advanced past
             # the active window, exactly as the 1s timer would apply it.
-            app._refresh_mesh(wall_now=heard_at + ACTIVE_WINDOW_SECONDS + 50)
+            _refresh_mesh_at(app, heard_at + ACTIVE_WINDOW_SECONDS + 50)
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
             self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
@@ -3763,7 +4019,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertEqual(list(app.query("#mesh-title")), [])
@@ -3859,7 +4115,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -3868,7 +4124,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
             app._show_connection(RadioState.OFFLINE, message="lost")
             await pilot.pause()
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertEqual(app.current_tab, "mesh")
@@ -3907,7 +4163,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
 
@@ -3939,7 +4195,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertIn("MESH(2)", str(app.query_one("#tab-bar").render()))
 
@@ -3979,7 +4235,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -4000,7 +4256,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 NodeMetadata(app.radio.info.node_id, is_local=True, last_heard=now - 1),
             )
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
 
@@ -4040,10 +4296,12 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
 
+            _pin_clock(app, now)
             app._refresh_chat_timestamps(wall_now=now)
             await pilot.pause()
             self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
 
+            _pin_clock(app, now + ACTIVE_WINDOW_SECONDS + 50)
             app._refresh_chat_timestamps(wall_now=now + ACTIVE_WINDOW_SECONDS + 50)
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
@@ -4100,7 +4358,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         await self._open_mesh(pilot)
-        app._refresh_mesh(wall_now=now)
+        _refresh_mesh_at(app, now)
         await pilot.pause()
 
         view = app.query_one(MeshTopologyView)
@@ -4519,7 +4777,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.press("3")
             await pilot.pause()
-            app._refresh_mesh(wall_now=1_700_000_000.0)
+            _refresh_mesh_at(app, 1_700_000_000.0)
             await pilot.pause()
             palette = THEME_PALETTES[app._current_theme]
             stale_widget = next(
@@ -4550,7 +4808,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             for key in ("up", "down", "left", "right", "up", "down"):
                 await pilot.press(key)
                 await pilot.pause()
-            app._refresh_mesh(wall_now=1_700_000_100.0)
+            _refresh_mesh_at(app, 1_700_000_100.0)
             await pilot.pause()
             self.assertEqual(app.radio.sent_messages, ())
 
@@ -4573,7 +4831,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             for key in ("up", "down", "left", "right"):
                 await pilot.press(key)
                 await pilot.pause()
-            app._refresh_mesh(wall_now=1_700_000_100.0)
+            _refresh_mesh_at(app, 1_700_000_100.0)
             await pilot.pause()
 
 
@@ -4628,7 +4886,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             local_only = (NodeMetadata(app.radio.info.node_id, is_local=True),)
             app.radio.get_known_nodes = lambda: local_only
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -4643,7 +4901,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
                 NodeMetadata("!fresh002", "Fresh Two", last_heard=now - 5),
             )
             app.radio.get_known_nodes = lambda: fresh_nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             tab_bar = str(app.query_one("#tab-bar").render())
@@ -4676,7 +4934,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             app.radio.get_known_nodes = lambda: (local, a, b)
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertNotIn(
@@ -4686,7 +4944,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
 
             c = NodeMetadata("!cccccccc", "Node C", last_heard=now - 5)
             app.radio.get_known_nodes = lambda: (local, a, b, c)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             remote_ids = {
@@ -4708,7 +4966,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             far = NodeMetadata("!far00001", "Far Node", hops_away=1, last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, far): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(
@@ -4726,7 +4984,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
                 "!far00001", "Far Node", hops_away=3, last_heard=now - 4
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_now_3_hops): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(
                 len(
@@ -4750,7 +5008,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, moving): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             position_before = view.base_positions["!move0001"]
@@ -4760,7 +5018,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
                 "!move0001", "Mover", hops_away=1, last_heard=now - 4, position=position_b
             )
             app.radio.get_known_nodes = lambda nodes=(local, moved): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             position_after = view.base_positions["!move0001"]
             self.assertNotEqual(position_before, position_after)
@@ -4774,7 +5032,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             crosser = NodeMetadata("!cross001", "Crosser", last_heard=stale_last_heard)
             app.radio.get_known_nodes = lambda nodes=(local, crosser): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             palette = THEME_PALETTES[app._current_theme]
@@ -4786,7 +5044,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
 
             fresh_crosser = NodeMetadata("!cross001", "Crosser", last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, fresh_crosser): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             widget = next(w for w in app.query(MeshNodeWidget) if w.node_id == "!cross001")
             self.assertEqual(
@@ -4865,7 +5123,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda: (local, alice, bob, charlie, david)
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertIn("MESH(2)", str(app.query_one("#tab-bar").render()))
@@ -4902,7 +5160,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, crosser): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -4915,7 +5173,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
                 last_heard=now - 5, position=north_of_local(5),
             )
             app.radio.get_known_nodes = lambda nodes=(local, fresh_crosser): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
@@ -4947,7 +5205,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, active_node): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -4962,7 +5220,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
                 last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=south_of_local(5),
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale_node): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertIn("MESH(0)", str(app.query_one("#tab-bar").render()))
@@ -5012,7 +5270,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda: nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -5047,7 +5305,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -5068,8 +5326,9 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
         is a real node that is (a) currently ACTIVE, (b) present in the
         working set, (c) actually mounted as a MeshNodeWidget, and (d)
         rendered FILLED (see item 2) -- and that the owner's stage COUNT
-        exactly matches its hops_away, never more, never fewer. No
-        relay may ever exist without satisfying all four.
+        exactly matches the number of hop RINGS its connector crosses,
+        never more, never fewer. No relay may ever exist without
+        satisfying all four.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -5119,7 +5378,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda: nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             tab_bar = str(app.query_one("#tab-bar").render())
@@ -5155,18 +5414,29 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(stage.source_node_id, mounted_ids)
                 self.assertNotIn(stage.source_node_id, stale_ids)
 
-            # Exact stage count per active owner, no partial chains --
-            # Nova (0 hops) gets none.
-            for node_id, hops in expected_hops.items():
+            # Exact stage count per active owner, no partial chains.
+            # A marker is painted once per hop RING the connector
+            # crosses, not once per hops_away: rings are ranked over the
+            # depths actually seen (see _mesh_hop_ring_ladder), so this
+            # fixture's depths {0, 1, 2, 5} rank to rings {1, 2, 3, 4}
+            # and the 5-hop node crosses 3 rings, not 5. Nova (0 hops)
+            # sits on ring 1 and so gets none.
+            expected_markers = {"!skugh000": 1, "!d0ec0000": 2, "!b8b80000": 3}
+            self.assertEqual(
+                {node_id: app._mesh_node_rings[node_id] for node_id in expected_markers},
+                {node_id: count + 1 for node_id, count in expected_markers.items()},
+            )
+            for node_id, count in expected_markers.items():
                 owned = [s for s in view.relay_stages if s.source_node_id == node_id]
-                self.assertEqual(len(owned), hops)
+                self.assertEqual(len(owned), count)
                 self.assertEqual(
-                    sorted(s.index for s in owned), list(range(1, hops + 1))
+                    sorted(s.index for s in owned), list(range(1, count + 1))
                 )
+            self.assertEqual(app._mesh_node_rings["!nova0000"], 1)
             self.assertEqual(
                 sum(1 for s in view.relay_stages if s.source_node_id == "!nova0000"), 0
             )
-            self.assertEqual(len(view.relay_stages), sum(expected_hops.values()))
+            self.assertEqual(len(view.relay_stages), sum(expected_markers.values()))
 
             # Every mounted relay widget corresponds 1:1 to a computed
             # stage -- no leftover/orphan widget beyond what the model
@@ -5228,7 +5498,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -5244,7 +5514,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
 
             gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
             app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, alice_id)
             await pilot.pause()
@@ -5273,7 +5543,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             gps_you = NodeMetadata(you_id, is_local=True, position=LOCAL_GEO)
             app.radio.get_known_nodes = lambda: (gps_you, alice, bob)
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, alice_id)
             await pilot.pause()
@@ -5281,7 +5551,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
 
             no_gps_you = NodeMetadata(you_id, is_local=True, position=None)
             app.radio.get_known_nodes = lambda: (no_gps_you, alice, bob)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertLess(
@@ -5326,7 +5596,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             nodes = (local, alice, bob, david, charlie, erin)
             app.radio.get_known_nodes = lambda: nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -5357,7 +5627,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             position_before = view.base_positions["!ag1nggps"]
@@ -5367,7 +5637,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
                 last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale_alice, bob): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(view.base_positions["!ag1nggps"], position_before)
             palette = THEME_PALETTES[app._current_theme]
@@ -5396,7 +5666,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             base_positions_before = dict(view.base_positions)
@@ -5423,7 +5693,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, alice, bob): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(
@@ -5438,7 +5708,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
                 position=east_of_local(3),
             )
             app.radio.get_known_nodes = lambda nodes=(local, gps_alice, bob): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             # Now two GPS remotes -- relative geography kicks in, and
             # Alice (east) must land strictly east of Bob (west).
@@ -5499,7 +5769,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, unknown_hops): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
@@ -5525,7 +5795,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, zero_hops): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.relay_stages, ())
@@ -5543,7 +5813,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, one_hop): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(len(view.relay_stages), 1)
@@ -5561,7 +5831,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, three_hops): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(len(view.relay_stages), 3)
@@ -5587,7 +5857,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             self.assertEqual(view.relay_stages, ())
@@ -5637,7 +5907,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             ]
             app.radio.get_known_nodes = lambda nodes=tuple(nodes): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             self.assertIn("MESH(3)", str(app.query_one("#tab-bar").render()))
@@ -5669,7 +5939,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             position_before = view.base_positions["!transit1"]
@@ -5682,7 +5952,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
                 last_heard=now - 5, position=north_of_local(3),
             )
             app.radio.get_known_nodes = lambda nodes=(local, active): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(view.base_positions["!transit1"], position_before)
             active_cells = self._connector_cells(view)
@@ -5709,7 +5979,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, active): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             position_before = view.base_positions["!transit2"]
@@ -5722,7 +5992,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
                 last_heard=now - ACTIVE_WINDOW_SECONDS - 100, position=north_of_local(3),
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(view.base_positions["!transit2"], position_before)
             stale_cells = self._connector_cells(view)
@@ -6041,13 +6311,13 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             node = NodeMetadata("!ag1ng001", "Ager", last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, node): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             _mesh_select_node(app, "!ag1ng001")
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "5s")
 
-            app._refresh_mesh(wall_now=now + 30)
+            _refresh_mesh_at(app, now + 30)
             await pilot.pause()
             self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "35s")
 
@@ -6071,15 +6341,15 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             node = NodeMetadata("!st111111", "Steady", last_heard=now - 42)
             app.radio.get_known_nodes = lambda nodes=(local, node): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             _mesh_select_node(app, "!st111111")
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             first_text = _bar_text(app)
             self.assertEqual(_bar_field(first_text, "ELAPSE"), "42s")
 
             for _ in range(3):
-                app._refresh_mesh(wall_now=now)
+                _refresh_mesh_at(app, now)
                 await pilot.pause()
             self.assertEqual(_bar_text(app), first_text)
 
@@ -6097,15 +6367,15 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             old_heard = NodeMetadata("!upd00001", "Updater", last_heard=now - 90)
             app.radio.get_known_nodes = lambda nodes=(local, old_heard): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             _mesh_select_node(app, "!upd00001")
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "1m")
 
             fresh_heard = NodeMetadata("!upd00001", "Updater", last_heard=now)
             app.radio.get_known_nodes = lambda nodes=(local, fresh_heard): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(_bar_field(_bar_text(app), "ELAPSE"), "0s")
 
@@ -6124,9 +6394,9 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             node = NodeMetadata("!re1turn0", "Returner", last_heard=now - 5)
             app.radio.get_known_nodes = lambda nodes=(local, node): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             _mesh_select_node(app, "!re1turn0")
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertIn("ELAPSE", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
@@ -6139,9 +6409,9 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_bar_text(app), "")
 
             app._show_connection(RadioState.ONLINE, app.radio.info)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             _mesh_select_node(app, "!re1turn0")
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             # Remote node re-selected -> full bar returns (ELAPSE etc.).
             self.assertIn("ELAPSE", _bar_text(app))
@@ -6168,9 +6438,9 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, stale): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             _mesh_select_node(app, "!stale002")
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertIn("ELAPSE", _bar_text(app))
             self.assertFalse(app.query_one("#mesh-connection-status").display)
@@ -6350,7 +6620,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
                 if node_id == "!near0001"
                 else None
             )
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, "!near0001")
             await pilot.pause()
@@ -6378,7 +6648,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             far = NodeMetadata("!far00001", "Far Relay Client", "FAR", last_heard=now - 3, hops_away=2)
             app.radio.get_known_nodes = lambda nodes=(local, far): nodes
             app.radio.get_link_quality = lambda node_id: None
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, "!far00001")
             await pilot.pause()
@@ -6410,7 +6680,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
                 return LinkObservation(rssi=-40, snr=15.0, observed_at=now)
 
             app.radio.get_link_quality = get_link_quality
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, local.node_id)
             await pilot.pause()
@@ -6441,7 +6711,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
                 "!weak0001": LinkObservation(rssi=-110, snr=-15.0, observed_at=now - 1),
             }
             app.radio.get_link_quality = lambda node_id: readings.get(node_id)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             _mesh_select_node(app, "!strong01")
@@ -6469,7 +6739,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_link_quality = lambda node_id: LinkObservation(
                 rssi=-70, snr=2.0, observed_at=now - 3
             )
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, "!qz000001")
             await pilot.pause()
@@ -6498,7 +6768,7 @@ class MeshLinkQualityDisplayTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_link_quality = lambda node_id: LinkObservation(
                 rssi=-60, snr=4.0, observed_at=now - ACTIVE_WINDOW_SECONDS - 1
             )
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             _mesh_select_node(app, "!old00001")
             await pilot.pause()
@@ -6549,13 +6819,13 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
             b = NodeMetadata("!bbbb0002", "Bravo", "B", last_heard=now - 5, hops_away=1)
             app.radio.get_known_nodes = lambda nodes=(local, a, b): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
 
             # Ordinary passing time: last_heard age advances, nothing else.
-            app._refresh_mesh(wall_now=now + 10)
+            _refresh_mesh_at(app, now + 10)
             await pilot.pause()
             self.assertEqual(self._real_positions(view), before)
 
@@ -6570,7 +6840,7 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
             app.radio.get_known_nodes = lambda nodes=(local, a): nodes
             app.radio.get_link_quality = lambda node_id: None
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
@@ -6578,7 +6848,7 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_link_quality = lambda node_id: LinkObservation(
                 rssi=-70, snr=3.0, observed_at=now
             )
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(self._real_positions(view), before)
 
@@ -6593,7 +6863,7 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
             app.radio.get_known_nodes = lambda nodes=(local, a): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
@@ -6622,14 +6892,14 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             b = NodeMetadata("!bbbb0002", "Bravo", "B", last_heard=now - 5, hops_away=1)
             c = NodeMetadata("!cccc0003", "Charlie", "C", last_heard=now - 5, hops_away=1)
             app.radio.get_known_nodes = lambda nodes=(local, b, c): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
 
             aaron = NodeMetadata("!aaaa0001", "Aaron", "A", last_heard=now - 5, hops_away=1)
             app.radio.get_known_nodes = lambda nodes=(local, b, c, aaron): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             after = self._real_positions(view)
 
@@ -6651,7 +6921,7 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
                 "!far00001", "Far", "FR", last_heard=now - 5, hops_away=3
             )
             app.radio.get_known_nodes = lambda nodes=(local, near, far): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             near_before = self._real_positions(view)["!near0001"]
@@ -6665,7 +6935,7 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
                 hops_away=3,
             )
             app.radio.get_known_nodes = lambda nodes=(local, near, far_gone): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             positions = self._real_positions(view)
             self.assertNotIn("!far00001", positions)
@@ -6681,12 +6951,12 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
             local = NodeMetadata(app.radio.info.node_id, is_local=True)
             a = NodeMetadata("!aaaa0001", "Alpha", "A", last_heard=now - 5, hops_away=1)
             app.radio.get_known_nodes = lambda nodes=(local, a): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             first = self._real_positions(view)
             for _ in range(3):
-                app._refresh_mesh(wall_now=now)
+                _refresh_mesh_at(app, now)
                 await pilot.pause()
                 self.assertEqual(self._real_positions(view), first)
 
@@ -6721,7 +6991,7 @@ class MeshLayoutStabilityAppTests(unittest.IsolatedAsyncioTestCase):
                 position=north_of_local(50),
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_north): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             # Computed fresh (no unrelated leftover history), far_north
@@ -6776,7 +7046,7 @@ class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, gps_node): nodes
             app.radio.get_link_quality = lambda node_id: None
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
@@ -6784,7 +7054,7 @@ class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
             app.radio.get_link_quality = lambda node_id: LinkObservation(
                 rssi=-70, snr=3.0, observed_at=now
             )
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(self._real_positions(view), before)
 
@@ -6809,7 +7079,7 @@ class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
                     position=north_of_local(5.0),
                 ),
             ): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
@@ -6821,7 +7091,7 @@ class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
                     position=north_of_local(5.3),
                 ),
             ): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(self._real_positions(view), before)
 
@@ -6844,7 +7114,7 @@ class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
                     position=north_of_local(5),
                 ),
             ): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             view = app.query_one(MeshTopologyView)
             before = self._real_positions(view)
@@ -6857,7 +7127,7 @@ class MeshGpsInformedPlacementAppTests(unittest.IsolatedAsyncioTestCase):
                     position=south_of_local(5),
                 ),
             ): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             after = self._real_positions(view)
 
@@ -7085,6 +7355,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._fixture(you_id)
             view = app.query_one(MeshTopologyView)
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
 
@@ -7140,6 +7411,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._fixture(you_id)
             view = app.query_one(MeshTopologyView)
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
             self.assertIn("!alice001", view.edge_node_ids)
@@ -7190,8 +7462,10 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             # set -- populate it (defaulting selection to YOU) before
             # selecting ALICE, exactly as the production
             # _mesh_select_node/_move_mesh_focus call sequence does.
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             view.select_node("!alice001")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, view.base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
 
@@ -7225,6 +7499,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             }
             view = app.query_one(MeshTopologyView)
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
 
@@ -7270,7 +7545,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_client): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7305,7 +7580,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_active): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7332,7 +7607,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_active): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7373,7 +7648,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_multi_hop): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7447,7 +7722,7 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7477,7 +7752,7 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7531,7 +7806,7 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -7643,10 +7918,12 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             # set (see its own docstring), so the working set must be
             # established once first before selecting the remote node
             # and re-rendering to actually apply the recentering.
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7733,6 +8010,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             view = app.query_one(MeshTopologyView)
 
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7743,6 +8021,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             }
 
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7766,6 +8045,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             canvas = view.board.query_one(MeshCanvas)
 
             def current_connectors():
+                _pin_clock(app, 1_700_000_000.0)
                 view.set_nodes(
                     working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
                 )
@@ -7795,10 +8075,12 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             you_id = app.radio.info.node_id
             working_set, base_positions = self._fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7912,10 +8194,12 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._clipped_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7963,6 +8247,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
             with mock.patch("app.route_chain_avoiding", side_effect=duplicating):
+                _pin_clock(app, 1_700_000_000.0)
                 view.set_nodes(
                     working_set,
                     base_positions,
@@ -7990,6 +8275,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8016,7 +8302,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, hopped): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(len(list(app.query(MeshRelayWidget))), 3)
 
@@ -8027,7 +8313,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
                 position=north_of_local(3),
             )
             app.radio.get_known_nodes = lambda nodes=(local, rerouted): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(len(list(app.query(MeshRelayWidget))), 0)
 
@@ -8052,7 +8338,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             )
             app.radio.get_known_nodes = lambda nodes=(local, far, stale): nodes
             await self._open_mesh(pilot)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -8084,6 +8370,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
                 you_id, short_name="⛰️"
             )
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8103,10 +8390,12 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!near0003")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8131,10 +8420,12 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._clipped_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
             view.mark_traced("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8291,7 +8582,7 @@ class MeshResponsiveResizeAndFocusPersistenceTests(unittest.IsolatedAsyncioTestC
                 last_heard=now - 5, position=north_of_local(50),
             )
             app.radio.get_known_nodes = lambda nodes=(local, far_north): nodes
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
 
             view = app.query_one(MeshTopologyView)
@@ -8780,7 +9071,7 @@ class MeshDistanceUnitsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(_bar_field(status_before, "DISTANCE").endswith("km"))
 
             app.radio._config_sections["display"]["units"] = DISPLAY_UNITS_IMPERIAL
-            app._refresh_mesh(wall_now=time.time())
+            _refresh_mesh_at(app, time.time())
             await pilot.pause()
             status_after = _bar_text(app)
             self.assertTrue(_bar_field(status_after, "DISTANCE").endswith("mi"))
@@ -8985,7 +9276,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 NodeMetadata("!d0000001", "Y", "Y", 1, last_heard=now - 5),
             )
             await self._swap_to_v4(app, pilot, extra_nodes=extra_nodes)
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             tab_bar = str(app.query_one("#tab-bar").render())
             self.assertIn("MESH(3)", tab_bar)
@@ -9139,7 +9430,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             # A second, unrelated refresh (same working set) must not
             # evict a still-valid selection.
-            app._refresh_mesh(wall_now=now)
+            _refresh_mesh_at(app, now)
             await pilot.pause()
             self.assertEqual(view.selected_node_id, "!aaaaaaaa")
             you_state = next(s for s in view.working_set if s.node.is_local)
