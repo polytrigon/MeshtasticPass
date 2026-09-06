@@ -5281,8 +5281,9 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
         is a real node that is (a) currently ACTIVE, (b) present in the
         working set, (c) actually mounted as a MeshNodeWidget, and (d)
         rendered FILLED (see item 2) -- and that the owner's stage COUNT
-        exactly matches its hops_away, never more, never fewer. No
-        relay may ever exist without satisfying all four.
+        exactly matches the number of hop RINGS its connector crosses,
+        never more, never fewer. No relay may ever exist without
+        satisfying all four.
         """
         app = self._make_app()
         async with app.run_test(size=(90, 28)) as pilot:
@@ -5368,18 +5369,29 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(stage.source_node_id, mounted_ids)
                 self.assertNotIn(stage.source_node_id, stale_ids)
 
-            # Exact stage count per active owner, no partial chains --
-            # Nova (0 hops) gets none.
-            for node_id, hops in expected_hops.items():
+            # Exact stage count per active owner, no partial chains.
+            # A marker is painted once per hop RING the connector
+            # crosses, not once per hops_away: rings are ranked over the
+            # depths actually seen (see _mesh_hop_ring_ladder), so this
+            # fixture's depths {0, 1, 2, 5} rank to rings {1, 2, 3, 4}
+            # and the 5-hop node crosses 3 rings, not 5. Nova (0 hops)
+            # sits on ring 1 and so gets none.
+            expected_markers = {"!skugh000": 1, "!d0ec0000": 2, "!b8b80000": 3}
+            self.assertEqual(
+                {node_id: app._mesh_node_rings[node_id] for node_id in expected_markers},
+                {node_id: count + 1 for node_id, count in expected_markers.items()},
+            )
+            for node_id, count in expected_markers.items():
                 owned = [s for s in view.relay_stages if s.source_node_id == node_id]
-                self.assertEqual(len(owned), hops)
+                self.assertEqual(len(owned), count)
                 self.assertEqual(
-                    sorted(s.index for s in owned), list(range(1, hops + 1))
+                    sorted(s.index for s in owned), list(range(1, count + 1))
                 )
+            self.assertEqual(app._mesh_node_rings["!nova0000"], 1)
             self.assertEqual(
                 sum(1 for s in view.relay_stages if s.source_node_id == "!nova0000"), 0
             )
-            self.assertEqual(len(view.relay_stages), sum(expected_hops.values()))
+            self.assertEqual(len(view.relay_stages), sum(expected_markers.values()))
 
             # Every mounted relay widget corresponds 1:1 to a computed
             # stage -- no leftover/orphan widget beyond what the model
