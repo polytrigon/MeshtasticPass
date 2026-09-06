@@ -2912,6 +2912,16 @@ class MeshTopologyView(Container):
         )
         self._selected_node_id = ""
         self._working_set: tuple[MeshNodeState, ...] = ()
+        # The hop rings last used to paint this board, and the exact
+        # working set they were computed for. A re-render triggered by
+        # selection or resize hands set_nodes the SAME working set back
+        # and supplies no rings; reusing them keeps the app's ratcheted
+        # ladder (which remembers depths seen earlier this session, and so
+        # can differ from what this working set alone implies) rather than
+        # silently re-deriving a shallower one and reflowing the board on
+        # a mere selection change.
+        self._node_rings: dict[str, int] = {}
+        self._node_rings_source: tuple[MeshNodeState, ...] | None = None
         self._base_positions: dict[str, tuple[int, int]] = {}
         self._relay_stages: tuple[RelayStage, ...] = ()
         self._edge_node_ids: frozenset[str] = frozenset()
@@ -3132,18 +3142,27 @@ class MeshTopologyView(Container):
         # must never be treated as zero or imply any specific path depth --
         # and a STALE node still gets none either, since it has no
         # known-active route to draw stages along.
-        # Rings come from the caller when it has them, from the app's
-        # current cycle when it computed one, and otherwise are derived
-        # from THIS working set. That fallback matters: reading only app
-        # state made the board silently marker-less for any caller that
-        # did not also go through _refresh_mesh -- set_nodes was handed a
-        # working set full of hop counts and ignored it in favour of a
-        # side channel that happened to be empty. A view must not quietly
-        # render less than the data it was given.
+        # Rings come from the caller when it has them (_refresh_mesh
+        # passes its ratcheted ladder), from the previous render when this
+        # is the same working set being re-painted, and otherwise are
+        # derived from THIS working set.
+        #
+        # What must NOT happen is reading self.app._mesh_node_rings here.
+        # That dict is keyed by whatever nodes the app last refreshed, so
+        # for any caller handing set_nodes a different working set it is
+        # non-empty and entirely irrelevant: every lookup misses, every
+        # node defaults to ring 1, and the board renders with no hop
+        # markers at all -- not an error, just silently less than the data
+        # it was given. The view now answers from the working set in its
+        # hands.
         if node_rings is None:
-            node_rings = getattr(self.app, "_mesh_node_rings", None) or (
-                mesh_hop_rings_for(working_set)
+            node_rings = (
+                self._node_rings
+                if working_set is self._node_rings_source
+                else mesh_hop_rings_for(working_set)
             )
+        self._node_rings = dict(node_rings)
+        self._node_rings_source = working_set
         active_hop_counts = {
             node_id: node_rings[node_id] - 1
             for node_id in _mesh_active_hop_counts(working_set, now=now)
@@ -8956,7 +8975,13 @@ class MeshtasticPassApp(App[None]):
             column_count=MESH_LOGICAL_GRID_COLUMNS,
             min_extent=self._mesh_extent_ratchet,
         )
-        view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
+        view.set_nodes(
+            working_set,
+            base_positions,
+            theme=self._current_theme,
+            now=current_time,
+            node_rings=self._mesh_node_rings,
+        )
         # Called again here (the earlier call above only ever sees LAST
         # cycle's selected_node_id, since set_nodes -- which can fix up
         # selection, e.g. when the previously selected node just
