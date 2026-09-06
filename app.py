@@ -10,7 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from threading import Thread
 from time import monotonic, sleep, time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from rich.cells import cell_len
 from rich.color import Color
@@ -2220,9 +2220,9 @@ MESH_GRID_LABEL_MARGIN_ROWS = 1
 # one, computed smaller, or a client legitimately boosted farther out
 # by a large truthful hop count, can genuinely exceed it and need edge
 # indicators -- see item 26's tests).
-MESH_LOGICAL_GRID_ROWS = 13
+MESH_LOGICAL_GRID_ROWS = 11
 MESH_LOGICAL_GRID_COLUMNS = 21
-MESH_LOGICAL_GRID_CENTER_ROW = 7
+MESH_LOGICAL_GRID_CENTER_ROW = 6
 MESH_LOGICAL_GRID_CENTER_COLUMN = 11
 # HOP-DEPTH RINGS: a node's distance from YOU is its hop depth, so the
 # logical grid needs enough half-axis room for the deepest ring plus the
@@ -2231,18 +2231,47 @@ MESH_LOGICAL_GRID_CENTER_COLUMN = 11
 # it onto whatever the viewport actually is, so a taller logical grid
 # does not mean a taller board on screen.
 #
-# An N-hop node sits on ring N+1, which leaves rings 1..N free for its
-# own relay stages to interpolate onto (see build_relay_stages) -- the
-# same relationship the old min_radius_by_id boost was reaching for,
-# now the rule rather than a floor. Depth beyond MESH_MAX_HOP_RING - 1
-# clamps to the outermost known ring rather than growing the board
-# without bound.
-MESH_MAX_HOP_RING = 5
+# Rings are ranked over the depths actually PRESENT, never raw hop
+# counts, and a ring no depth occupies is never allocated at all -- see
+# _mesh_hop_ring_ladder. A real mesh is not evenly distributed: a board
+# whose nodes sit at 0, 4, 5 and 6 hops needs FOUR rings, not seven, and
+# spending radius on the three empty ones is what pushed every node out
+# to the edge and off the viewport. Deeper distinct depths beyond
+# MESH_MAX_HOP_RING share the outermost known ring rather than growing
+# the board without bound.
+MESH_MAX_HOP_RING = 4
 # Nodes whose hop count the radio has not reported get their own ring
 # BEYOND every known depth: "we do not know how deep this is" is a real
 # state and must not be silently mixed in among measured ones, nor
 # guessed at by defaulting it to a number.
 MESH_UNKNOWN_HOPS_RING = MESH_MAX_HOP_RING + 1
+
+
+def _mesh_hop_ring_ladder(seen_depths: Iterable[int]) -> dict[int, int]:
+    """Map each hop depth to its ring, dismissing rings nobody occupies.
+
+    Ring is the depth's RANK among the depths present, not the depth
+    itself: a board whose nodes sit at 0, 4, 5 and 6 hops gets rings
+    1, 2, 3, 4 rather than 1, 5, 6, 7 with three empty rings between.
+    Ordering -- which node is deeper than which -- is preserved exactly,
+    and that is the information the radius is there to carry. Absolute
+    depth is not discarded, it is just not what the board's geometry
+    says: the unified bottom bar still reports "HOPS 6" honestly.
+
+    Ranking this way is what lets the board CONSTRICT to the number of
+    distinct depths it actually has to express, which is the difference
+    between a node rendering on screen and rendering as an edge
+    indicator on a small viewport.
+
+    Callers pass the depths seen so far this SESSION rather than only
+    those present right now -- see MeshtasticPassApp._mesh_hop_rings.
+    Negative and None depths are not depths this app can honestly rank
+    and never appear here.
+    """
+    ladder: dict[int, int] = {}
+    for rank, depth in enumerate(sorted({d for d in seen_depths if d is not None and d >= 0})):
+        ladder[depth] = min(rank + 1, MESH_MAX_HOP_RING)
+    return ladder
 # Selected-node "visually larger" treatment: a 3-cell-wide composite
 # (small dot + role glyph + small dot) replacing the ordinary 1-cell
 # glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
@@ -2497,42 +2526,6 @@ def _mesh_active_hop_counts(
         and state.node.hops_away > 0
         and is_node_active(state.node.last_heard, now)
     }
-
-
-def _mesh_hop_rings(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
-    """Each remote node's grid ring, from hop DEPTH rather than distance.
-
-    The MESH board's radius used to come from geographic distance
-    (compressed onto a small grid), with hop count only ever raising a
-    floor. In practice most nodes report no position at all, so most of
-    them fell to one shared fallback ring at the board's edge -- which
-    put a DIRECT zero-hop neighbour exactly as far out as a three-hop
-    node and an unknown-depth one, purely because none of the three send
-    GPS. Distance from centre tracked "do we have coordinates for you",
-    not anything about the mesh.
-
-    Hop depth arrives consistently, so it is what the radius means now:
-    an N-hop node rings at N+1 (leaving rings 1..N for its own relay
-    stages -- see build_relay_stages), a direct neighbour rings at 1, and
-    a node of unknown depth takes MESH_UNKNOWN_HOPS_RING, beyond every
-    measured one. Geography is not discarded -- it still chooses each
-    node's DIRECTION (see assign_grid_slots' `ring_by_id`), which is the
-    part of it that stays truthful when only some nodes report position.
-
-    A negative hop count is treated as unknown rather than trusted: it is
-    not a depth this app can honestly place.
-    """
-    rings: dict[str, int] = {}
-    for state in working_set:
-        node = state.node
-        if node.is_local:
-            continue
-        hops = node.hops_away
-        if hops is None or hops < 0:
-            rings[node.node_id] = MESH_UNKNOWN_HOPS_RING
-        else:
-            rings[node.node_id] = min(hops + 1, MESH_MAX_HOP_RING)
-    return rings
 
 
 class MeshNodeWidget(Static):
@@ -4937,6 +4930,17 @@ class MeshtasticPassApp(App[None]):
         # bookkeeping shifted. See _refresh_mesh and mesh_topology.
         # assign_grid_slots/place_within_bounds' own docstrings.
         self._mesh_sticky_positions: dict[str, tuple[int, int, str]] = {}
+        # HOP-DEPTH RINGS: every hop depth observed this session. The ring
+        # ladder ranks over THIS, not merely the depths present right now,
+        # so it only ever grows -- the same monotonic discipline as
+        # _mesh_extent_ratchet below and for the same reason. Re-ranking on
+        # the live set would let one node appearing at a new depth push
+        # every other node outward a ring, and one departing pull them all
+        # in, which is exactly the "no new topology information, no
+        # existing node movement" invariant MESH LAYOUT STABILITY exists to
+        # protect. Cleared only alongside the sticky positions, on a total
+        # remote-population turnover.
+        self._mesh_seen_hop_depths: set[int] = set()
         self._mesh_extent_ratchet: dict[str, int] = {
             "up": 0,
             "down": 0,
@@ -8469,6 +8473,48 @@ class MeshtasticPassApp(App[None]):
             ids.update(evidence.forward)
         return tuple(sorted(ids))
 
+    def _mesh_hop_rings(self, working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
+        """Each remote node's ring, ranked over hop depths seen this session.
+
+        Radius means hop DEPTH rather than geographic distance: most nodes
+        never report a position, so distance-first placement dropped all of
+        them onto one shared fallback ring and made radius track "do we
+        have coordinates for you" instead of anything about the mesh.
+
+        The ladder ranks depths and dismisses rings nobody occupies (see
+        _mesh_hop_ring_ladder), so the board constricts to the number of
+        distinct depths it has to express. It ranks over every depth seen
+        SO FAR rather than only those currently present, so a node leaving
+        never pulls the remaining nodes inward -- the ladder grows and does
+        not collapse under them mid-session.
+
+        A node whose depth the radio has not reported takes the ring just
+        beyond the deepest one in use: "we do not know how deep this is" is
+        a real state, kept out of the measured rings without being guessed
+        at, and without reserving a ring further out than the board needs.
+        """
+        self._mesh_seen_hop_depths |= {
+            state.node.hops_away
+            for state in working_set
+            if not state.node.is_local
+            and state.node.hops_away is not None
+            and state.node.hops_away >= 0
+        }
+        ladder = _mesh_hop_ring_ladder(self._mesh_seen_hop_depths)
+        unknown_ring = min(max(ladder.values(), default=0) + 1, MESH_UNKNOWN_HOPS_RING)
+        rings: dict[str, int] = {}
+        for state in working_set:
+            node = state.node
+            if node.is_local:
+                continue
+            depth = node.hops_away
+            rings[node.node_id] = (
+                ladder.get(depth, unknown_ring)
+                if depth is not None and depth >= 0
+                else unknown_ring
+            )
+        return rings
+
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
 
@@ -8648,13 +8694,16 @@ class MeshtasticPassApp(App[None]):
         ):
             self._mesh_sticky_positions = {}
             self._mesh_extent_ratchet = {"up": 0, "down": 0, "left": 0, "right": 0}
+            # The depth ladder is layout state too: a completely different
+            # node population's depths must not keep constraining this one.
+            self._mesh_seen_hop_depths = set()
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
             # The outermost ring any node can occupy is the UNKNOWN-depth
             # one, so the board is sized to it.
             max_radius=MESH_UNKNOWN_HOPS_RING,
             min_radius_by_id=min_radius_by_id,
-            ring_by_id=_mesh_hop_rings(working_set),
+            ring_by_id=self._mesh_hop_rings(working_set),
             sticky_positions=self._mesh_sticky_positions,
         )
         # MESH LAYOUT STABILITY: remember this cycle's own positions,

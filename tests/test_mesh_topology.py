@@ -36,6 +36,7 @@ from app import (
     MESH_LOGICAL_GRID_CENTER_ROW,
     MESH_LOGICAL_GRID_COLUMNS,
     MESH_LOGICAL_GRID_ROWS,
+    MESH_MAX_HOP_RING,
     MESH_SELECTED_GLYPH_WIDTH,
     MeshCanvas,
     MeshNodeLabelWidget,
@@ -53,6 +54,7 @@ from app import (
     _mesh_select_node,
     _mesh_translated_positions,
     _render_mesh_canvas,
+    _mesh_hop_ring_ladder,
 )
 from app_settings import AppSettings
 from chat_store import DEFAULT_HISTORY_LIMIT, ChatStore
@@ -1085,6 +1087,65 @@ class MeshGridPlacementTests(unittest.TestCase):
 
 def _sticky_map(slots) -> dict:
     return {item.node.node_id.strip().lower(): (item.x, item.y, item.region) for item in slots}
+
+
+class MeshHopRingLadderTests(unittest.TestCase):
+    """Ranking depths and DISMISSING the rings nobody occupies.
+
+    A real mesh is not evenly distributed: nodes cluster at a handful of
+    depths with gaps between them. Ranking rather than using the raw hop
+    count is what lets the board constrict to the number of distinct
+    depths it actually has to express, which on a small viewport is the
+    difference between a node rendering and a node becoming an edge
+    indicator.
+    """
+
+    def test_absent_depths_get_no_ring_at_all(self) -> None:
+        """The real-hardware case: nodes at 0, 4, 5 and 6 hops need FOUR
+
+        rings, not seven. Spending radius on the three empty ones is what
+        pushed every node out to the board's edge.
+        """
+        self.assertEqual(
+            _mesh_hop_ring_ladder({0, 4, 5, 6}), {0: 1, 4: 2, 5: 3, 6: 4}
+        )
+
+    def test_contiguous_depths_rank_naturally(self) -> None:
+        self.assertEqual(_mesh_hop_ring_ladder({0, 1, 2}), {0: 1, 1: 2, 2: 3})
+
+    def test_ordering_is_always_preserved(self) -> None:
+        """Absolute depth is not what the radius says -- ORDER is. The bar
+
+        still reports the true hop count (see mesh_state.
+        format_mesh_node_bar_fields); the board only claims which node is
+        deeper than which.
+        """
+        ladder = _mesh_hop_ring_ladder({2, 9, 30, 31})
+        rings = [ladder[depth] for depth in (2, 9, 30, 31)]
+        self.assertEqual(rings, sorted(rings))
+        self.assertEqual(len(set(rings)), len(rings))
+
+    def test_more_distinct_depths_than_rings_share_the_outermost(self) -> None:
+        """The board is bounded: beyond MESH_MAX_HOP_RING distinct depths,
+
+        the deepest share a ring rather than growing the board without
+        bound and clipping everything off the viewport.
+        """
+        ladder = _mesh_hop_ring_ladder(set(range(MESH_MAX_HOP_RING + 3)))
+        self.assertEqual(max(ladder.values()), MESH_MAX_HOP_RING)
+        self.assertEqual(min(ladder.values()), 1)
+
+    def test_unrankable_depths_never_appear(self) -> None:
+        """None is "not reported" and a negative count is not a depth this
+
+        app can honestly place -- neither is ranked, and the caller gives
+        both the separate unknown ring instead (see
+        MeshtasticPassApp._mesh_hop_rings).
+        """
+        self.assertEqual(_mesh_hop_ring_ladder({0, None, -1, 3}), {0: 1, 3: 2})
+
+    def test_an_empty_mesh_has_no_ladder(self) -> None:
+        self.assertEqual(_mesh_hop_ring_ladder(set()), {})
 
 
 class AssignGridSlotsHopRingTests(unittest.TestCase):
