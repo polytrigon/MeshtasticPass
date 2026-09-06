@@ -90,6 +90,7 @@ from radio_capabilities import (
     modem_preset_choices,
     role_choices,
 )
+from serial_devices import describe_connection_target
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -491,8 +492,16 @@ class DeviceSelector(KeyboardDropdown):
     def __init__(self, device_path: str, options: tuple[str, ...]) -> None:
         super().__init__(
             "device_path",
-            "USB DEVICE",
-            (DropdownOption(path, path) for path in options),
+            # Not "USB DEVICE" any more: this list can also offer a
+            # tcp:// target for a Linux-native radio owned by
+            # meshtasticd (a HackerGadgets AIO board has no serial port
+            # at all). The setting key stays device_path for config
+            # compatibility -- see AppSettings.is_valid_device_path.
+            "RADIO",
+            (
+                DropdownOption(describe_connection_target(path), path)
+                for path in options
+            ),
             device_path,
             widget_id="device-selector",
             label_width=CONNECTION_LABEL_WIDTH,
@@ -6393,7 +6402,7 @@ class MeshtasticPassApp(App[None]):
             self._show_connection(RadioState.CONNECTING)
             self._monitor.start()
         except (OSError, ValueError) as error:
-            status.update(f"USB DEVICE NOT CHANGED — {error}")
+            status.update(f"RADIO NOT CHANGED — {error}")
 
     def _connection_nav_controls(self) -> list[Widget]:
         """The explicit, ordered CONNECTION/CONFIG up/down focus list --
