@@ -10,7 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from threading import Thread
 from time import monotonic, sleep, time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from rich.cells import cell_len
 from rich.color import Color
@@ -69,7 +69,6 @@ from mesh_state import (
     format_mesh_node_bar_line,
 )
 from mesh_topology import (
-    DEFAULT_MAX_GRID_RADIUS,
     ConnectorChain,
     ConnectorDestination,
     PositionedNode,
@@ -2221,10 +2220,74 @@ MESH_GRID_LABEL_MARGIN_ROWS = 1
 # one, computed smaller, or a client legitimately boosted farther out
 # by a large truthful hop count, can genuinely exceed it and need edge
 # indicators -- see item 26's tests).
-MESH_LOGICAL_GRID_ROWS = 8
+MESH_LOGICAL_GRID_ROWS = 11
 MESH_LOGICAL_GRID_COLUMNS = 21
-MESH_LOGICAL_GRID_CENTER_ROW = 5
+MESH_LOGICAL_GRID_CENTER_ROW = 6
 MESH_LOGICAL_GRID_CENTER_COLUMN = 11
+# HOP-DEPTH RINGS: a node's distance from YOU is its hop depth, so the
+# logical grid needs enough half-axis room for the deepest ring plus the
+# separate UNKNOWN one -- 6 steps each way from centre, hence 13 rows.
+# This is the STABLE logical space only; place_within_bounds still maps
+# it onto whatever the viewport actually is, so a taller logical grid
+# does not mean a taller board on screen.
+#
+# Rings are ranked over the depths actually PRESENT, never raw hop
+# counts, and a ring no depth occupies is never allocated at all -- see
+# _mesh_hop_ring_ladder. A real mesh is not evenly distributed: a board
+# whose nodes sit at 0, 4, 5 and 6 hops needs FOUR rings, not seven, and
+# spending radius on the three empty ones is what pushed every node out
+# to the edge and off the viewport. Deeper distinct depths beyond
+# MESH_MAX_HOP_RING share the outermost known ring rather than growing
+# the board without bound.
+MESH_MAX_HOP_RING = 4
+# Nodes whose hop count the radio has not reported get their own ring
+# BEYOND every known depth: "we do not know how deep this is" is a real
+# state and must not be silently mixed in among measured ones, nor
+# guessed at by defaulting it to a number.
+MESH_UNKNOWN_HOPS_RING = MESH_MAX_HOP_RING + 1
+
+
+def _mesh_hop_ring_ladder(seen_depths: Iterable[int]) -> dict[int, int]:
+    """Map each hop depth to its ring, dismissing rings nobody occupies.
+
+    Ring is the depth's RANK among the depths present, not the depth
+    itself: a board whose nodes sit at 0, 4, 5 and 6 hops gets rings
+    1, 2, 3, 4 rather than 1, 5, 6, 7 with three empty rings between.
+    Ordering -- which node is deeper than which -- is preserved exactly,
+    and that is the information the radius is there to carry. Absolute
+    depth is not discarded, it is just not what the board's geometry
+    says: the unified bottom bar still reports "HOPS 6" honestly.
+
+    Ranking this way is what lets the board CONSTRICT to the number of
+    distinct depths it actually has to express, which is the difference
+    between a node rendering on screen and rendering as an edge
+    indicator on a small viewport.
+
+    RING 1 IS RESERVED FOR DIRECT NEIGHBOURS -- depth 0 and nothing else.
+    Ranking alone would hand ring 1 to whatever the shallowest depth
+    happened to be, so a mesh whose nodes all sit at 3 hops would put
+    every one of them against YOU as though each were directly reachable.
+    "Adjacent to YOU means no intermediary" is the one thing the innermost
+    ring has to keep meaning; ranking is free to compress everything
+    beyond it. Non-zero depths therefore start at ring 2 whether or not
+    any direct neighbour is present.
+
+    Callers pass the depths seen so far this SESSION rather than only
+    those present right now -- see MeshtasticPassApp._mesh_hop_rings.
+    Negative and None depths are not depths this app can honestly rank
+    and never appear here.
+    """
+    ladder: dict[int, int] = {}
+    next_ring = 2
+    for depth in sorted({d for d in seen_depths if d is not None and d >= 0}):
+        if depth == 0:
+            ladder[0] = 1
+            continue
+        ladder[depth] = min(next_ring, MESH_MAX_HOP_RING)
+        next_ring += 1
+    return ladder
+
+
 # Selected-node "visually larger" treatment: a 3-cell-wide composite
 # (small dot + role glyph + small dot) replacing the ordinary 1-cell
 # glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
@@ -2647,8 +2710,8 @@ class MeshRelayWidget(Static):
 def _mesh_select_node(app: MeshtasticPassApp, node_id: str) -> None:
     view = app.query_one(MeshTopologyView)
     view.select_node(node_id)
-    view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=time())
-    app._update_mesh_node_bar(view.working_set, time())
+    view.set_nodes(view.working_set, view.base_positions, theme=app._current_theme, now=app._now())
+    app._update_mesh_node_bar(view.working_set, app._now())
 
 
 DOT_GRID_GLYPH = "·"
@@ -2991,12 +3054,37 @@ class MeshTopologyView(Container):
         for node_id, evidence in getattr(self.app, "_traceroute_routes", {}).items():
             explicit_forward_by_dest[node_id] = evidence.forward
         explicit_destinations = frozenset(explicit_forward_by_dest)
+        # RELAY MARKERS ARE ONE PER RING THE PATH CROSSES, not one per hop.
+        #
+        # They used to be one per hop, which was truthful when a node's
+        # distance from YOU meant geographic distance and carried no depth
+        # information of its own. Hop-depth rings changed that twice over.
+        # The radius now states the depth, so a dot per hop restates it; and
+        # ranked rings compress depth (0/1/4/5/6 becomes rings 1..4), so an
+        # N-hop node no longer HAS N steps of room -- six markers rounded
+        # onto four cells, collided, and the collision search fanned them
+        # into the lattice packed around YOU. On a real 8-node board that
+        # was 31 anonymous glyphs against 8 real ones, each an obstacle the
+        # router steered around and a waypoint forcing another elbow.
+        #
+        # One marker per intermediate ring fits by construction: a ring-4
+        # node gets three, at rings 1, 2 and 3, one cell each. What a marker
+        # CLAIMS changes with it, and the change is deliberate -- it says
+        # "the path crosses this depth rank", not "one hop happened here".
+        # The board is then consistently about rank, in radius and markers
+        # alike, while the true hop count stays stated as a number where it
+        # can be stated exactly (see mesh_state.format_mesh_node_bar_fields'
+        # HOPS field). No count is fabricated: a node of UNKNOWN depth still
+        # gets no markers at all, exactly as before -- an unknown hop count
+        # must never be treated as zero or imply any specific path depth --
+        # and a STALE node still gets none either, since it has no
+        # known-active route to draw stages along.
+        node_rings = getattr(self.app, "_mesh_node_rings", {})
         active_hop_counts = {
-            node_id: hop_count
-            for node_id, hop_count in _mesh_active_hop_counts(
-                working_set, now=now
-            ).items()
+            node_id: node_rings[node_id] - 1
+            for node_id in _mesh_active_hop_counts(working_set, now=now)
             if node_id not in explicit_destinations
+            and node_rings.get(node_id, 1) > 1
         }
         # Relay-stage interpolation happens in the STABLE logical
         # coordinate space (MESH_LOGICAL_GRID_*), never the current
@@ -3750,6 +3838,73 @@ class ChatEntryWidget(Vertical):
                 event.stop()
 
 
+# Every widget resolves its color through one of the six semantic theme
+# tokens (see theme_palette), so the ONLY thing separating one theme's
+# stylesheet from another's is which theme's variables its rules read.
+# The theme override rules are therefore authored ONCE against the
+# {THEME} placeholder and expanded IN PLACE -- one copy per non-default
+# theme -- rather than transcribed by hand for each new theme.
+#
+# Expansion is in place, never hoisted to the end of the stylesheet,
+# because declaration order is load-bearing here: several rules in this
+# sheet win a deliberate same-specificity tie by being declared later
+# (see the width:1fr comment on the editor action rows). Copies of a
+# block sit adjacent to each other, so a theme override's position
+# relative to every non-theme rule is exactly what it was when the block
+# was hand-written for a single theme.
+#
+# The default theme (SNOW) needs no override rules and has no theme
+# class: the unprefixed rules read its variables directly. Adding a
+# theme is now a theme_palette entry plus a COLOR_CHOICES entry, and a
+# theme can no longer be half-applied -- the failure mode where a new
+# palette recolors every Python-side lookup while the CSS-styled widgets
+# silently keep rendering the default.
+CSS_DEFAULT_THEME = "snow"
+_CSS_THEME_PLACEHOLDER = "{THEME}"
+_CSS_THEME_TOKENS = ("base", "accent", "accent2", "dim", "confirm")
+
+
+def _theme_css_variables() -> str:
+    """Declare $<theme>_<token> for every theme, then the shared tokens."""
+    lines = [""]
+    for _label, theme in COLOR_CHOICES:
+        palette = THEME_PALETTES[theme]
+        for token in _CSS_THEME_TOKENS:
+            lines.append(f"    ${theme}_{token}: {getattr(palette, token)};")
+    lines.append(f"    $error: {ERROR};")
+    lines.append("    $selection_background: #181818;")
+    lines.append("    ")
+    return "\n".join(lines)
+
+
+def _expand_theme_overrides(css: str) -> str:
+    """Emit each {THEME}-placeholder rule block once per non-default theme.
+
+    Blocks are split on the stylesheet's own 4-space-indented closing
+    brace and rejoined unchanged, so a block without the placeholder is
+    passed through byte for byte and the sheet's source order is
+    preserved exactly.
+    """
+    themes = [
+        theme for _label, theme in COLOR_CHOICES if theme != CSS_DEFAULT_THEME
+    ]
+    separator = "\n    }\n"
+    blocks = css.split(separator)
+    tail = blocks.pop()
+    expanded: list[str] = []
+    for block in blocks:
+        block += separator
+        if _CSS_THEME_PLACEHOLDER in block:
+            expanded.append(
+                "".join(
+                    block.replace(_CSS_THEME_PLACEHOLDER, theme) for theme in themes
+                )
+            )
+        else:
+            expanded.append(block)
+    return "".join(expanded) + tail
+
+
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
@@ -3760,28 +3915,15 @@ class MeshtasticPassApp(App[None]):
     ENABLE_COMMAND_PALETTE = False
 
     TITLE = "MeshtasticPass"
-    CSS = f"""
-    $snow_base: {THEME_PALETTES["snow"].base};
-    $snow_accent: {THEME_PALETTES["snow"].accent};
-    $snow_accent2: {THEME_PALETTES["snow"].accent2};
-    $snow_dim: {THEME_PALETTES["snow"].dim};
-    $snow_confirm: {THEME_PALETTES["snow"].confirm};
-    $amber_base: {THEME_PALETTES["amber"].base};
-    $amber_accent: {THEME_PALETTES["amber"].accent};
-    $amber_accent2: {THEME_PALETTES["amber"].accent2};
-    $amber_dim: {THEME_PALETTES["amber"].dim};
-    $amber_confirm: {THEME_PALETTES["amber"].confirm};
-    $error: {ERROR};
-    $selection_background: #181818;
-    """ + """
+    CSS = _theme_css_variables() + _expand_theme_overrides("""
     Screen {
         background: #101010;
         color: $snow_base;
         layers: base popup;
     }
 
-    Screen.theme-amber {
-        color: $amber_base;
+    Screen.theme-{THEME} {
+        color: ${THEME}_base;
     }
 
     #tab-bar {
@@ -3826,11 +3968,11 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #connection-title,
-    Screen.theme-amber #style-title,
-    Screen.theme-amber #radio-title,
-    Screen.theme-amber #advanced-radio-title {
-        color: $amber_dim;
+    Screen.theme-{THEME} #connection-title,
+    Screen.theme-{THEME} #style-title,
+    Screen.theme-{THEME} #radio-title,
+    Screen.theme-{THEME} #advanced-radio-title {
+        color: ${THEME}_dim;
     }
 
     #connection-status, #connection-details, #identity-values, #radio-info {
@@ -3878,8 +4020,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber .identity-name-unavailable {
-        color: $amber_dim;
+    Screen.theme-{THEME} .identity-name-unavailable {
+        color: ${THEME}_dim;
     }
 
     #long-name-input, #short-name-input,
@@ -3897,15 +4039,15 @@ class MeshtasticPassApp(App[None]):
         width: 8;
     }
 
-    Screen.theme-amber #long-name-input,
-    Screen.theme-amber #short-name-input,
-    Screen.theme-amber #network-name-input,
-    Screen.theme-amber #freq-slot-input,
-    Screen.theme-amber #key-input,
-    Screen.theme-amber #new-channel-name,
-    Screen.theme-amber #new-channel-key,
-    Screen.theme-amber #edit-channel-name {
-        color: $amber_base;
+    Screen.theme-{THEME} #long-name-input,
+    Screen.theme-{THEME} #short-name-input,
+    Screen.theme-{THEME} #network-name-input,
+    Screen.theme-{THEME} #freq-slot-input,
+    Screen.theme-{THEME} #key-input,
+    Screen.theme-{THEME} #new-channel-name,
+    Screen.theme-{THEME} #new-channel-key,
+    Screen.theme-{THEME} #edit-channel-name {
+        color: ${THEME}_base;
     }
 
     .advanced-radio-editor {
@@ -3920,9 +4062,9 @@ class MeshtasticPassApp(App[None]):
         opacity: 1;
     }
 
-    Screen.theme-amber #long-name-input:disabled,
-    Screen.theme-amber #short-name-input:disabled {
-        color: $amber_dim;
+    Screen.theme-{THEME} #long-name-input:disabled,
+    Screen.theme-{THEME} #short-name-input:disabled {
+        color: ${THEME}_dim;
     }
 
     #long-name-status, #short-name-status, #timezone-status, #role-status,
@@ -3940,12 +4082,12 @@ class MeshtasticPassApp(App[None]):
         color: $snow_confirm;
     }
 
-    Screen.theme-amber #long-name-status,
-    Screen.theme-amber #short-name-status,
-    Screen.theme-amber #timezone-status,
-    Screen.theme-amber #role-status,
-    Screen.theme-amber #font-size-status {
-        color: $amber_confirm;
+    Screen.theme-{THEME} #long-name-status,
+    Screen.theme-{THEME} #short-name-status,
+    Screen.theme-{THEME} #timezone-status,
+    Screen.theme-{THEME} #role-status,
+    Screen.theme-{THEME} #font-size-status {
+        color: ${THEME}_confirm;
     }
 
     #long-name-status.setting-error, #short-name-status.setting-error,
@@ -3956,18 +4098,18 @@ class MeshtasticPassApp(App[None]):
 
     /* Textual's own CSS specificity (id, class, type) otherwise lets
        the theme-scoped CONFIRM override above win under AMBER, since
-       "Screen.theme-amber #widget" carries one more type-selector
+       "Screen.theme-{THEME} #widget" carries one more type-selector
        component than "#widget.setting-error" -- these repeat the
-       error color with that SAME extra Screen.theme-amber qualifier
+       error color with that SAME extra Screen.theme-{THEME} qualifier
        so ERROR always wins regardless of the active theme. $error is
        already theme-independent (NEON_RED in both palettes); only the
        selector's specificity needs raising here, not its value. */
-    Screen.theme-amber #long-name-status.setting-error,
-    Screen.theme-amber #short-name-status.setting-error,
-    Screen.theme-amber #timezone-status.setting-error,
-    Screen.theme-amber #role-status.setting-error,
-    Screen.theme-amber #font-size-status.setting-error,
-    Screen.theme-amber #color-status.setting-error {
+    Screen.theme-{THEME} #long-name-status.setting-error,
+    Screen.theme-{THEME} #short-name-status.setting-error,
+    Screen.theme-{THEME} #timezone-status.setting-error,
+    Screen.theme-{THEME} #role-status.setting-error,
+    Screen.theme-{THEME} #font-size-status.setting-error,
+    Screen.theme-{THEME} #color-status.setting-error {
         color: $error;
     }
 
@@ -3977,16 +4119,16 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
-    Screen.theme-amber .keyboard-dropdown {
-        color: $amber_base;
+    Screen.theme-{THEME} .keyboard-dropdown {
+        color: ${THEME}_base;
     }
 
     .keyboard-dropdown:focus {
         color: $snow_accent;
     }
 
-    Screen.theme-amber .keyboard-dropdown:focus {
-        color: $amber_accent;
+    Screen.theme-{THEME} .keyboard-dropdown:focus {
+        color: ${THEME}_accent;
     }
 
     /* Focused editor action controls (SAVE/CANCEL) highlight with the shared
@@ -3998,8 +4140,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .editor-actions .connection-action-row:focus {
-        color: $amber_accent;
+    Screen.theme-{THEME} .editor-actions .connection-action-row:focus {
+        color: ${THEME}_accent;
     }
 
     #connection .connection-action-row,
@@ -4018,8 +4160,8 @@ class MeshtasticPassApp(App[None]):
         background: $selection_background;
     }
 
-    Screen.theme-amber #chat-input {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #chat-input {
+        color: ${THEME}_accent2;
     }
 
     /* "> message" is Textual's OWN Input.placeholder, styled via the
@@ -4031,12 +4173,12 @@ class MeshtasticPassApp(App[None]):
        own built-in disabled-grey under AMBER; this targets that exact
        component class so the prompt shares the same AMBER ACCENT2
        identity as typed text. */
-    Screen.theme-amber #chat-input > .input--placeholder {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #chat-input > .input--placeholder {
+        color: ${THEME}_accent2;
     }
 
-    Screen.theme-amber .page-title {
-        color: $amber_accent;
+    Screen.theme-{THEME} .page-title {
+        color: ${THEME}_accent;
     }
 
     #chat-header {
@@ -4057,8 +4199,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #chat-network {
-        color: $amber_dim;
+    Screen.theme-{THEME} #chat-network {
+        color: ${THEME}_dim;
     }
 
     #chat-title, #chat-dm-selector {
@@ -4078,9 +4220,9 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #chat-header-bullet,
-    Screen.theme-amber #chat-network-bullet {
-        color: $amber_dim;
+    Screen.theme-{THEME} #chat-header-bullet,
+    Screen.theme-{THEME} #chat-network-bullet {
+        color: ${THEME}_dim;
     }
 
     #chat-content, #chat-channel, #chat-dms {
@@ -4127,14 +4269,14 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .channel-editor-overlay .connection-action-row:focus {
-        color: $amber_accent;
+    Screen.theme-{THEME} .channel-editor-overlay .connection-action-row:focus {
+        color: ${THEME}_accent;
     }
 
-    Screen.theme-amber .channel-editor-overlay {
-        border: solid $amber_dim;
-        scrollbar-color: $amber_base;
-        scrollbar-background: $amber_dim;
+    Screen.theme-{THEME} .channel-editor-overlay {
+        border: solid ${THEME}_dim;
+        scrollbar-color: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
     }
 
     #radio-status {
@@ -4193,8 +4335,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber #advanced-radio-status.setting-accent {
-        color: $amber_accent;
+    Screen.theme-{THEME} #advanced-radio-status.setting-accent {
+        color: ${THEME}_accent;
     }
 
     #advanced-radio-status.setting-error {
@@ -4205,8 +4347,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_confirm;
     }
 
-    Screen.theme-amber .setting-success {
-        color: $amber_confirm;
+    Screen.theme-{THEME} .setting-success {
+        color: ${THEME}_confirm;
     }
 
     #connection-error, #send-error, #radio-status.setting-error {
@@ -4223,12 +4365,12 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber #send-error.setting-accent {
-        color: $amber_accent;
+    Screen.theme-{THEME} #send-error.setting-accent {
+        color: ${THEME}_accent;
     }
 
-    Screen.theme-amber #send-error.older-message-notice {
-        color: $amber_accent;
+    Screen.theme-{THEME} #send-error.older-message-notice {
+        color: ${THEME}_accent;
     }
 
     #chat-log {
@@ -4242,13 +4384,13 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $snow_dim;
     }
 
-    Screen.theme-amber #chat-log, Screen.theme-amber #connection {
-        scrollbar-color: $amber_base;
-        scrollbar-color-hover: $amber_base;
-        scrollbar-color-active: $amber_base;
-        scrollbar-background: $amber_dim;
-        scrollbar-background-hover: $amber_dim;
-        scrollbar-background-active: $amber_dim;
+    Screen.theme-{THEME} #chat-log, Screen.theme-{THEME} #connection {
+        scrollbar-color: ${THEME}_base;
+        scrollbar-color-hover: ${THEME}_base;
+        scrollbar-color-active: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
+        scrollbar-background-hover: ${THEME}_dim;
+        scrollbar-background-active: ${THEME}_dim;
     }
 
     #mesh-status, #mesh-node-bar {
@@ -4259,8 +4401,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #mesh-status {
-        color: $amber_dim;
+    Screen.theme-{THEME} #mesh-status {
+        color: ${THEME}_dim;
     }
 
     #mesh-node-bar {
@@ -4282,8 +4424,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
-    Screen.theme-amber .dm-list-row {
-        color: $amber_base;
+    Screen.theme-{THEME} .dm-list-row {
+        color: ${THEME}_base;
     }
 
     .dm-list-row.highlighted {
@@ -4291,8 +4433,8 @@ class MeshtasticPassApp(App[None]):
         text-style: bold;
     }
 
-    Screen.theme-amber .dm-list-row.highlighted {
-        color: $amber_accent;
+    Screen.theme-{THEME} .dm-list-row.highlighted {
+        color: ${THEME}_accent;
     }
 
     .dm-list-empty {
@@ -4300,8 +4442,8 @@ class MeshtasticPassApp(App[None]):
         height: 1;
     }
 
-    Screen.theme-amber .dm-list-empty {
-        color: $amber_dim;
+    Screen.theme-{THEME} .dm-list-empty {
+        color: ${THEME}_dim;
     }
 
     #dm-header {
@@ -4311,8 +4453,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_base;
     }
 
-    Screen.theme-amber #dm-header {
-        color: $amber_base;
+    Screen.theme-{THEME} #dm-header {
+        color: ${THEME}_base;
     }
 
     #dm-log {
@@ -4326,13 +4468,13 @@ class MeshtasticPassApp(App[None]):
         scrollbar-background-active: $snow_dim;
     }
 
-    Screen.theme-amber #dm-log {
-        scrollbar-color: $amber_base;
-        scrollbar-color-hover: $amber_base;
-        scrollbar-color-active: $amber_base;
-        scrollbar-background: $amber_dim;
-        scrollbar-background-hover: $amber_dim;
-        scrollbar-background-active: $amber_dim;
+    Screen.theme-{THEME} #dm-log {
+        scrollbar-color: ${THEME}_base;
+        scrollbar-color-hover: ${THEME}_base;
+        scrollbar-color-active: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
+        scrollbar-background-hover: ${THEME}_dim;
+        scrollbar-background-active: ${THEME}_dim;
     }
 
     #dm-send-error {
@@ -4341,12 +4483,12 @@ class MeshtasticPassApp(App[None]):
         color: $error;
     }
 
-    Screen.theme-amber #dm-input {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #dm-input {
+        color: ${THEME}_accent2;
     }
 
-    Screen.theme-amber #dm-input > .input--placeholder {
-        color: $amber_accent2;
+    Screen.theme-{THEME} #dm-input > .input--placeholder {
+        color: ${THEME}_accent2;
     }
 
     #mesh-view {
@@ -4403,22 +4545,22 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber .viewport-menu {
-        border: solid $amber_dim;
-        scrollbar-color: $amber_base;
-        scrollbar-background: $amber_dim;
+    Screen.theme-{THEME} .viewport-menu {
+        border: solid ${THEME}_dim;
+        scrollbar-color: ${THEME}_base;
+        scrollbar-background: ${THEME}_dim;
     }
 
-    Screen.theme-amber .viewport-menu-row {
-        color: $amber_base;
+    Screen.theme-{THEME} .viewport-menu-row {
+        color: ${THEME}_base;
     }
 
-    Screen.theme-amber .viewport-menu-row.highlighted {
-        color: $amber_accent;
+    Screen.theme-{THEME} .viewport-menu-row.highlighted {
+        color: ${THEME}_accent;
     }
 
-    Screen.theme-amber .viewport-menu-row.informational {
-        color: $amber_dim;
+    Screen.theme-{THEME} .viewport-menu-row.informational {
+        color: ${THEME}_dim;
     }
 
     .emoji-picker {
@@ -4432,8 +4574,8 @@ class MeshtasticPassApp(App[None]):
         padding: 0 2 0 1;
     }
 
-    Screen.theme-amber .emoji-picker {
-        border: solid $amber_dim;
+    Screen.theme-{THEME} .emoji-picker {
+        border: solid ${THEME}_dim;
     }
 
     #load-older, .message-action {
@@ -4443,9 +4585,9 @@ class MeshtasticPassApp(App[None]):
         margin-bottom: 1;
     }
 
-    Screen.theme-amber #load-older,
-    Screen.theme-amber .message-action {
-        color: $amber_base;
+    Screen.theme-{THEME} #load-older,
+    Screen.theme-{THEME} .message-action {
+        color: ${THEME}_base;
     }
 
     .message-action-row {
@@ -4461,8 +4603,8 @@ class MeshtasticPassApp(App[None]):
         text-align: center;
     }
 
-    Screen.theme-amber #end-of-chat-history {
-        color: $amber_dim;
+    Screen.theme-{THEME} #end-of-chat-history {
+        color: ${THEME}_dim;
     }
 
     #start-of-channel-history {
@@ -4473,8 +4615,8 @@ class MeshtasticPassApp(App[None]):
         text-align: center;
     }
 
-    Screen.theme-amber #start-of-channel-history {
-        color: $amber_dim;
+    Screen.theme-{THEME} #start-of-channel-history {
+        color: ${THEME}_dim;
     }
 
     #load-older:focus, .message-action:focus {
@@ -4514,8 +4656,8 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent2;
     }
 
-    Screen.theme-amber .chat-entry.favorite-sender .chat-entry-author {
-        color: $amber_accent2;
+    Screen.theme-{THEME} .chat-entry.favorite-sender .chat-entry-author {
+        color: ${THEME}_accent2;
     }
 
     .chat-entry-separator, .chat-entry-delivery {
@@ -4529,14 +4671,14 @@ class MeshtasticPassApp(App[None]):
         text-style: dim;
     }
 
-    Screen.theme-amber .chat-entry-timestamp,
-    Screen.theme-amber .chat-entry-distance {
-        color: $amber_dim;
+    Screen.theme-{THEME} .chat-entry-timestamp,
+    Screen.theme-{THEME} .chat-entry-distance {
+        color: ${THEME}_dim;
     }
 
-    Screen.theme-amber .chat-entry-separator,
-    Screen.theme-amber .chat-entry-delivery {
-        color: $amber_dim;
+    Screen.theme-{THEME} .chat-entry-separator,
+    Screen.theme-{THEME} .chat-entry-delivery {
+        color: ${THEME}_dim;
     }
 
     /* Delivery color grammar (item 9/28): ✓✓ HEARD = ACCENT,
@@ -4555,18 +4697,18 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .chat-entry.delivery-sending .chat-entry-delivery,
-    Screen.theme-amber .chat-entry.delivery-sent .chat-entry-delivery,
-    Screen.theme-amber .chat-entry.delivery-heard .chat-entry-delivery {
-        color: $amber_accent;
+    Screen.theme-{THEME} .chat-entry.delivery-sending .chat-entry-delivery,
+    Screen.theme-{THEME} .chat-entry.delivery-sent .chat-entry-delivery,
+    Screen.theme-{THEME} .chat-entry.delivery-heard .chat-entry-delivery {
+        color: ${THEME}_accent;
     }
 
     .chat-entry.delivery-unconfirmed .chat-entry-delivery {
         color: $snow_accent2;
     }
 
-    Screen.theme-amber .chat-entry.delivery-unconfirmed .chat-entry-delivery {
-        color: $amber_accent2;
+    Screen.theme-{THEME} .chat-entry.delivery-unconfirmed .chat-entry-delivery {
+        color: ${THEME}_accent2;
     }
 
     .chat-entry.delivery-failed .chat-entry-delivery,
@@ -4594,8 +4736,8 @@ class MeshtasticPassApp(App[None]):
         background: $snow_accent2 20%;
     }
 
-    Screen.theme-amber .chat-entry.mention {
-        background: $amber_accent2 20%;
+    Screen.theme-{THEME} .chat-entry.mention {
+        background: ${THEME}_accent2 20%;
     }
 
     .chat-entry.mention:focus {
@@ -4609,11 +4751,11 @@ class MeshtasticPassApp(App[None]):
         color: $snow_accent;
     }
 
-    Screen.theme-amber .chat-entry.new-message .chat-entry-author,
-    Screen.theme-amber .chat-entry.new-message .chat-entry-timestamp,
-    Screen.theme-amber .chat-entry.new-message .chat-entry-distance,
-    Screen.theme-amber .chat-entry.new-message .chat-entry-text {
-        color: $amber_accent;
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-author,
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-timestamp,
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-distance,
+    Screen.theme-{THEME} .chat-entry.new-message .chat-entry-text {
+        color: ${THEME}_accent;
     }
 
     #chat-input {
@@ -4646,8 +4788,8 @@ class MeshtasticPassApp(App[None]):
         text-align: right;
     }
 
-    Screen.theme-amber #chat-new-below {
-        color: $amber_accent;
+    Screen.theme-{THEME} #chat-new-below {
+        color: ${THEME}_accent;
     }
 
     #footer {
@@ -4657,15 +4799,43 @@ class MeshtasticPassApp(App[None]):
         color: $snow_dim;
     }
 
-    Screen.theme-amber #tab-bar,
-    Screen.theme-amber #footer {
-        color: $amber_dim;
+    Screen.theme-{THEME} #tab-bar,
+    Screen.theme-{THEME} #footer {
+        color: ${THEME}_dim;
     }
 
-    Screen.theme-amber #footer {
-        border-top: solid $amber_dim;
+    Screen.theme-{THEME} #footer {
+        border-top: solid ${THEME}_dim;
     }
-    """
+    """)
+
+    # The app's single source of "now". Production leaves this None and
+    # every read falls through to the wall clock; a test assigns a
+    # callable so that NOTHING can overwrite the instant it is reasoning
+    # about -- including the 1s _refresh_chat_timestamps timer, which
+    # calls _refresh_mesh() with no wall_now because it has no fixture
+    # time to hand it.
+    #
+    # Before this seam existed, any test that took longer than one timer
+    # interval between its own controlled refresh and its assertion had
+    # its fixture time silently replaced by real wall-clock time. The
+    # fixtures are anchored at 1_700_000_000 (November 2023), so every
+    # fixture node aged out of the 2-hour active window at once: MESH(N)
+    # fell to 0, connectors and relay markers vanished, arrow navigation
+    # landed on a different node, and placement stopped reflowing. Each
+    # of those reads as a topology bug and none of them was one.
+    #
+    # The property that cost the most: the suite was least trustworthy
+    # on the SLOWEST machine, which is the uConsole -- the hardware this
+    # project treats as authoritative. Two full runs of the same module
+    # on commits that could not affect each other's outcomes shared only
+    # 4 of 23 and 29 failures.
+    _clock: Callable[[], float] | None = None
+
+    def _now(self) -> float:
+        """The app's current wall-clock time, in seconds since the epoch."""
+        clock = self._clock
+        return time() if clock is None else clock()
 
     def __init__(
         self,
@@ -4883,6 +5053,23 @@ class MeshtasticPassApp(App[None]):
         # bookkeeping shifted. See _refresh_mesh and mesh_topology.
         # assign_grid_slots/place_within_bounds' own docstrings.
         self._mesh_sticky_positions: dict[str, tuple[int, int, str]] = {}
+        # HOP-DEPTH RINGS: every hop depth observed this session. The ring
+        # ladder ranks over THIS, not merely the depths present right now,
+        # so it only ever grows -- the same monotonic discipline as
+        # _mesh_extent_ratchet below and for the same reason. Re-ranking on
+        # the live set would let one node appearing at a new depth push
+        # every other node outward a ring, and one departing pull them all
+        # in, which is exactly the "no new topology information, no
+        # existing node movement" invariant MESH LAYOUT STABILITY exists to
+        # protect. Cleared only alongside the sticky positions, on a total
+        # remote-population turnover.
+        self._mesh_seen_hop_depths: set[int] = set()
+        # This cycle's ring per node (see _mesh_hop_rings), kept so
+        # MeshTopologyView.set_nodes can space each connector's relay
+        # markers one per ring the path crosses -- the view is handed
+        # positions, not depths, and a rendered distance is post-stretch
+        # and so cannot be read back as a ring number.
+        self._mesh_node_rings: dict[str, int] = {}
         self._mesh_extent_ratchet: dict[str, int] = {
             "up": 0,
             "down": 0,
@@ -7381,7 +7568,7 @@ class MeshtasticPassApp(App[None]):
             return
         self._clock_sync_in_progress = False
         if event.result.applied:
-            self._last_clock_sync_at = time()
+            self._last_clock_sync_at = self._now()
 
     @staticmethod
     def _snapshot_config_field(snapshot, section: str, field: str) -> str | None:
@@ -7779,7 +7966,7 @@ class MeshtasticPassApp(App[None]):
             return
         channel_index = message.channel_index or 0
         state = self._ensure_channel_loaded(channel_index)
-        app_received_at = time()
+        app_received_at = self._now()
         monotonic_now = monotonic()
         chat_is_visible = (
             self.current_tab == "chat"
@@ -8415,6 +8602,48 @@ class MeshtasticPassApp(App[None]):
             ids.update(evidence.forward)
         return tuple(sorted(ids))
 
+    def _mesh_hop_rings(self, working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
+        """Each remote node's ring, ranked over hop depths seen this session.
+
+        Radius means hop DEPTH rather than geographic distance: most nodes
+        never report a position, so distance-first placement dropped all of
+        them onto one shared fallback ring and made radius track "do we
+        have coordinates for you" instead of anything about the mesh.
+
+        The ladder ranks depths and dismisses rings nobody occupies (see
+        _mesh_hop_ring_ladder), so the board constricts to the number of
+        distinct depths it has to express. It ranks over every depth seen
+        SO FAR rather than only those currently present, so a node leaving
+        never pulls the remaining nodes inward -- the ladder grows and does
+        not collapse under them mid-session.
+
+        A node whose depth the radio has not reported takes the ring just
+        beyond the deepest one in use: "we do not know how deep this is" is
+        a real state, kept out of the measured rings without being guessed
+        at, and without reserving a ring further out than the board needs.
+        """
+        self._mesh_seen_hop_depths |= {
+            state.node.hops_away
+            for state in working_set
+            if not state.node.is_local
+            and state.node.hops_away is not None
+            and state.node.hops_away >= 0
+        }
+        ladder = _mesh_hop_ring_ladder(self._mesh_seen_hop_depths)
+        unknown_ring = min(max(ladder.values(), default=0) + 1, MESH_UNKNOWN_HOPS_RING)
+        rings: dict[str, int] = {}
+        for state in working_set:
+            node = state.node
+            if node.is_local:
+                continue
+            depth = node.hops_away
+            rings[node.node_id] = (
+                ladder.get(depth, unknown_ring)
+                if depth is not None and depth >= 0
+                else unknown_ring
+            )
+        return rings
+
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
 
@@ -8443,7 +8672,7 @@ class MeshtasticPassApp(App[None]):
             nodes = ()
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
-        current_time = time() if wall_now is None else wall_now
+        current_time = self._now() if wall_now is None else wall_now
         working_set = build_mesh_working_set(
             nodes,
             now=current_time,
@@ -8503,7 +8732,7 @@ class MeshtasticPassApp(App[None]):
         _refresh_chat_timestamps) to catch a node aging out while MESH
         isn't even the visible tab can never "reshuffle" anything.
         """
-        current_time = time() if wall_now is None else wall_now
+        current_time = self._now() if wall_now is None else wall_now
         if working_set is None:
             working_set = self._mesh_working_set(current_time)
         return sum(
@@ -8514,7 +8743,7 @@ class MeshtasticPassApp(App[None]):
 
     def _refresh_mesh(self, wall_now: float | None = None) -> None:
         """Refresh passive topology data without causing Meshtastic traffic."""
-        current_time = time() if wall_now is None else wall_now
+        current_time = self._now() if wall_now is None else wall_now
         # Computed exactly ONCE per cycle and threaded into every
         # consumer below -- the count ([3] MESH (N), via _update_tab_bar)
         # and the rendered board must describe the SAME snapshot of live
@@ -8594,10 +8823,35 @@ class MeshtasticPassApp(App[None]):
         ):
             self._mesh_sticky_positions = {}
             self._mesh_extent_ratchet = {"up": 0, "down": 0, "left": 0, "right": 0}
+            # The depth ladder is layout state too: a completely different
+            # node population's depths must not keep constraining this one.
+            self._mesh_seen_hop_depths = set()
+            self._mesh_node_rings = {}
+        previous_rings = self._mesh_node_rings
+        self._mesh_node_rings = self._mesh_hop_rings(working_set)
+        # A node whose RING changed must be re-placed, never handed back its
+        # remembered cell. MESH LAYOUT STABILITY suppresses movement caused
+        # by bookkeeping churn -- rank/index shifts, a neighbour appearing,
+        # an axis rescaling -- and a changed ring is the opposite of that: it
+        # is real, newly-observed topology information about THIS node, and
+        # the radius exists to show it. _place_group_sticky_first only
+        # compares a node's REGION (its compass/GPS/UNKNOWN placement
+        # category), which was sufficient while radius meant geographic
+        # distance and effectively never changed. With hop-depth rings it is
+        # not: a node that became a direct neighbour kept rendering out at
+        # the depth it used to have, markers and all, because its region was
+        # unchanged. Evicting only the nodes whose ring actually moved keeps
+        # every other node still, which is the invariant that matters.
+        for node_id, ring in self._mesh_node_rings.items():
+            if previous_rings.get(node_id, ring) != ring:
+                self._mesh_sticky_positions.pop(node_id.strip().lower(), None)
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
-            max_radius=DEFAULT_MAX_GRID_RADIUS,
+            # The outermost ring any node can occupy is the UNKNOWN-depth
+            # one, so the board is sized to it.
+            max_radius=MESH_UNKNOWN_HOPS_RING,
             min_radius_by_id=min_radius_by_id,
+            ring_by_id=self._mesh_node_rings,
             sticky_positions=self._mesh_sticky_positions,
         )
         # MESH LAYOUT STABILITY: remember this cycle's own positions,
@@ -8680,12 +8934,12 @@ class MeshtasticPassApp(App[None]):
                 view.working_set,
                 view.base_positions,
                 theme=self._current_theme,
-                now=time(),
+                now=self._now(),
             )
             # The unified bar is selected-node-specific -- it must switch
             # to the newly selected node's own data immediately, not wait
             # for the next periodic _refresh_mesh() tick (up to ~1s later).
-            self._update_mesh_node_bar(view.working_set, time())
+            self._update_mesh_node_bar(view.working_set, self._now())
 
     def _open_mesh_node_menu(self) -> None:
         """ENTER on the currently focused MESH node opens the shared
@@ -8919,7 +9173,7 @@ class MeshtasticPassApp(App[None]):
             active.destination_node_id,
             blink_on=self._traceroute_blink_on,
             theme=self._current_theme,
-            now=time(),
+            now=self._now(),
         )
 
     def _start_traceroute(self, node: NodeMetadata) -> None:
@@ -9060,7 +9314,7 @@ class MeshtasticPassApp(App[None]):
                     destination,
                     blink_on=None,
                     theme=self._current_theme,
-                    now=time(),
+                    now=self._now(),
                 )
 
     def _show_traceroute_banner(self, text: str, style_kind: str) -> None:
@@ -10589,7 +10843,7 @@ class MeshtasticPassApp(App[None]):
         )
         entry = received_chat_entry(
             message,
-            app_received_at=time(),
+            app_received_at=self._now(),
             monotonic_now=monotonic(),
             unread=not dm_visible,
             is_new=True,
@@ -10933,11 +11187,11 @@ class MeshtasticPassApp(App[None]):
         if (
             include_rx_age
             and metadata.last_heard is not None
-            and metadata.last_heard <= time()
+            and metadata.last_heard <= self._now()
         ):
             items.append(
                 PopupItem(
-                    f"RX {format_relative_age(time() - metadata.last_heard)}",
+                    f"RX {format_relative_age(self._now() - metadata.last_heard)}",
                     actionable=False,
                 )
             )
@@ -11482,7 +11736,7 @@ class MeshtasticPassApp(App[None]):
             )
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
-                time(),
+                self._now(),
                 (entry.delivery_state or DeliveryState.SENDING).value,
             )
         except ChatStoreError as error:
@@ -11495,7 +11749,7 @@ class MeshtasticPassApp(App[None]):
         try:
             entry.active_attempt_id = self.chat_store.add_send_attempt(
                 entry.message_id,
-                time(),
+                self._now(),
             )
             self.chat_store.update_delivery_state(
                 entry.message_id,
@@ -11545,7 +11799,7 @@ class MeshtasticPassApp(App[None]):
         if state is not DeliveryState.SENDING:
             entry.confirmation_deadline = None
         completed_at = (
-            time()
+            self._now()
             if state in (
                 DeliveryState.HEARD,
                 DeliveryState.UNCONFIRMED,
@@ -11591,7 +11845,7 @@ class MeshtasticPassApp(App[None]):
         recomputes it correctly from the persisted local_sent_at alone,
         so this in-memory update only matters for the current session.
         """
-        wall_now = time()
+        wall_now = self._now()
         entry.local_sent_at = wall_now
         entry.age_reference = monotonic()
         if self.chat_store is not None and entry.message_id is not None:

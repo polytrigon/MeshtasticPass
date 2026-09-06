@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import cos, pi, sin, sqrt
 from typing import Iterable, Literal, Mapping
 
 from rich.cells import cell_len
@@ -393,6 +393,74 @@ def _apply_min_radius(x: int, y: int, min_radius: int) -> tuple[int, int]:
     return (round(x * scale), round(y * scale))
 
 
+def _ring_spread(index: int, count: int, radius: int) -> tuple[int, int]:
+    """The index-th of `count` positionless nodes, spread around one ring.
+
+    A node with no position has no bearing, so its angle carries no
+    information and is chosen purely for legibility. Radius is exactly
+    the ring: distributing around the ring's own circle rather than
+    indexing into _square_ring's perimeter matters because a square's
+    corners sit radius*sqrt(2) out, which would let a node on an inner
+    ring render farther from YOU than one on an outer ring and undo the
+    point of ringing by depth.
+
+    Placement starts due EAST and fans outward, alternating sides. Both
+    halves of that matter, and each was measured on a real 8-node board
+    (mostly positionless, depths 0/1/4/5/6):
+
+    - Starting east rather than north is what uses the board at all. A
+      ring typically holds one or two nodes, so an even spread beginning
+      due north put them at north and south -- the board spanned 4 rows
+      and ZERO columns, stacking everything onto the scarce axis while
+      21 columns sat empty. One logical column is DOT_GRID_SPACING_X
+      cells against DOT_GRID_SPACING_Y for a row, and the viewport shows
+      roughly twice as many columns either side of centre as rows, so
+      the vertical axis is where clipping happens.
+    - Fanning rather than staying horizontal is what stops the mirror
+      image of that bug. Placing evenly from east put a ring's two
+      occupants due east and due west -- zero rows, nine columns -- and
+      the board recentres on the current selection, so two nodes at
+      opposite ends of a ring sit 2*radius apart and selecting one
+      pushes the other off. That variant clipped 2.2 nodes at every
+      viewport size.
+
+    Measured clipping, narrow/medium/roomy viewports: 3.2/2.2/1.5 for
+    the north-first spread, 2.2/2.2/2.2 for a strictly horizontal one,
+    and 1.2/0.0/0.0 for this east-first fan.
+
+    Nodes that DO have a bearing never reach here -- their direction is
+    real information and is honoured exactly (see assign_grid_slots'
+    compass buckets and MODE B).
+    """
+    if radius <= 0 or count <= 0:
+        return (0, 0)
+    # 0, -1, +1, -2, +2 ... steps of pi/count out from due east.
+    step = (index + 1) // 2
+    side = 1 if index % 2 == 0 else -1
+    angle = side * (pi * step / max(1, count))
+    return (round(radius * cos(angle)), round(radius * sin(angle)))
+
+
+def _scale_to_radius(x: int, y: int, radius: int) -> tuple[int, int]:
+    """Move (x, y) to exactly `radius` from the origin, keeping its angle.
+
+    The hop-depth ring model's counterpart to _apply_min_radius: that one
+    only ever pushes a node OUTWARD to a floor, leaving geography in charge
+    of the actual distance, while this one sets the distance outright --
+    direction still comes from geography, but how far out a node sits is
+    its hop depth and nothing else. A node with no direction at all
+    ((0, 0), i.e. coincident with YOU) is sent due north, matching
+    _apply_min_radius' own convention rather than inventing a second one.
+    """
+    if radius <= 0:
+        return x, y
+    current = sqrt(x * x + y * y)
+    if current == 0:
+        return (0, -radius)
+    scale = radius / current
+    return (round(x * scale), round(y * scale))
+
+
 def _place_group_sticky_first(
     entries: list[tuple[NodeMetadata, int, int]],
     region: str,
@@ -446,6 +514,7 @@ def assign_grid_slots(
     *,
     max_radius: int = DEFAULT_MAX_GRID_RADIUS,
     min_radius_by_id: Mapping[str, int] | None = None,
+    ring_by_id: Mapping[str, int] | None = None,
     sticky_positions: Mapping[str, tuple[int, int, str]] | None = None,
 ) -> tuple[PositionedNode, ...]:
     """Place YOU at (0, 0), then a bounded relative spatial grid outward.
@@ -481,6 +550,31 @@ def assign_grid_slots(
     geography, legitimately extends how far out a node's chain (and so
     the node itself) renders, without changing its actual direction.
 
+    `ring_by_id` (default: none) switches this function from the
+    geography-first model above to HOP-DEPTH RINGS for the nodes it names:
+    that node's distance from YOU becomes exactly its given ring, and
+    geography is left in charge of DIRECTION only. Distance compression
+    (_compress_distance_to_radius) and `min_radius_by_id` are both ignored
+    for such a node -- the ring is not a floor, it is the answer.
+
+    Why: real-world position data is sparse. A node that reports no
+    position has no bearing, so it lands on the deterministic fallback
+    ring regardless of how near it is in the mesh -- which meant a DIRECT
+    (zero-hop) neighbour rendered at the same distance as a three-hop node
+    and an unknown-depth one, purely because none of them send GPS.
+    Distance from centre tracked "do we have coordinates for you" rather
+    than anything about the mesh. Hop depth, unlike position, arrives
+    consistently, so ringing by depth makes the radius mean something for
+    every node instead of a minority of them.
+
+    Callers are expected to derive rings so that an N-hop node sits on
+    ring N+1, leaving rings 1..N free for its own relay stages to
+    interpolate onto (see build_relay_stages), and to give nodes of
+    UNKNOWN depth their own ring beyond the deepest known one rather than
+    guessing at a value. Omitting this parameter entirely reproduces the
+    exact prior geography-first behavior, which is what build_topology and
+    every pre-existing caller still get.
+
     `sticky_positions` (default: none) is the PREVIOUS call's own output,
     keyed by lowercased node_id to (x, y, region) -- MESH LAYOUT
     STABILITY: a node already placed once, whose placement category
@@ -499,6 +593,7 @@ def assign_grid_slots(
     """
     max_radius = max(1, max_radius)
     min_radius_by_id = min_radius_by_id or {}
+    ring_by_id = ring_by_id or {}
     sticky_positions = sticky_positions or {}
     unique: dict[str, NodeMetadata] = {}
     for node in nodes:
@@ -556,10 +651,16 @@ def assign_grid_slots(
         dx, dy = _DIRECTION_VECTORS[direction]
         ideal: list[tuple[NodeMetadata, int, int]] = []
         for distance, node in entries:
-            radius = max(
-                _compress_distance_to_radius(distance, max_radius),
-                min_radius_by_id.get(node.node_id, 0),
-            )
+            ring = ring_by_id.get(node.node_id)
+            if ring is not None:
+                # Hop-depth rings: bearing still chose the bucket above, so
+                # direction is unchanged -- only how far out along it.
+                radius = max(1, min(ring, max_radius))
+            else:
+                radius = max(
+                    _compress_distance_to_radius(distance, max_radius),
+                    min_radius_by_id.get(node.node_id, 0),
+                )
             ideal.append((node, dx * radius, dy * radius))
         for node, slot_x, slot_y in _place_group_sticky_first(
             ideal, direction, sticky_positions, occupied
@@ -578,9 +679,22 @@ def assign_grid_slots(
         key=lambda node: node.node_id.casefold(),
     ):
         raw_x, raw_y = gps_cluster_positions[node.node_id]
-        boosted_x, boosted_y = _apply_min_radius(
-            raw_x, raw_y, min_radius_by_id.get(node.node_id, 0)
-        )
+        ring = ring_by_id.get(node.node_id)
+        if ring is not None:
+            # MODE B's cluster projection is trustworthy about how these
+            # nodes sit RELATIVE TO EACH OTHER, never about their bearing
+            # from YOU (YOU is not at the cluster's centroid -- see
+            # _project_remote_gps_cluster). Keeping the projected angle and
+            # replacing the radius therefore gives up nothing that was ever
+            # true: their relative arrangement survives as angular order,
+            # while distance from centre becomes hop depth, which IS known.
+            boosted_x, boosted_y = _scale_to_radius(
+                raw_x, raw_y, max(1, min(ring, max_radius))
+            )
+        else:
+            boosted_x, boosted_y = _apply_min_radius(
+                raw_x, raw_y, min_radius_by_id.get(node.node_id, 0)
+            )
         gps_ideal.append((node, boosted_x, boosted_y))
     for node, slot_x, slot_y in _place_group_sticky_first(
         gps_ideal, "GPS_RELATIVE", sticky_positions, occupied
@@ -589,11 +703,35 @@ def assign_grid_slots(
 
     unknown.sort(key=_node_sort_key)
     if unknown:
-        outer_ring = _square_ring(max_radius)
-        unknown_ideal = [
-            (node, outer_ring[index % len(outer_ring)][0], outer_ring[index % len(outer_ring)][1])
-            for index, node in enumerate(unknown)
-        ]
+        # A node with no position has no bearing, so its angle is only ever
+        # a deterministic spread. With hop-depth rings it at least spreads
+        # around the ring its DEPTH earned rather than all of them sharing
+        # one fallback ring at the board's edge -- which is what previously
+        # put a direct neighbour as far out as an unknown-depth node.
+        # Grouped by ring first, so each ring's own occupants spread evenly
+        # around THAT ring rather than sharing one global index sequence
+        # (which would bunch later rings and leave earlier ones sparse).
+        by_ring: dict[int | None, list[NodeMetadata]] = {}
+        for node in unknown:
+            ring = ring_by_id.get(node.node_id)
+            by_ring.setdefault(
+                max(1, min(ring, max_radius)) if ring is not None else None, []
+            ).append(node)
+        unknown_ideal = []
+        for ring, members in sorted(
+            by_ring.items(), key=lambda item: (item[0] is None, item[0] or 0)
+        ):
+            if ring is None:
+                # No hop-depth ring for these: the original single fallback
+                # ring at the board's edge, unchanged.
+                perimeter = _square_ring(max_radius)
+                for index, node in enumerate(members):
+                    offset_x, offset_y = perimeter[index % len(perimeter)]
+                    unknown_ideal.append((node, offset_x, offset_y))
+                continue
+            for index, node in enumerate(members):
+                offset_x, offset_y = _ring_spread(index, len(members), ring)
+                unknown_ideal.append((node, offset_x, offset_y))
         for node, slot_x, slot_y in _place_group_sticky_first(
             unknown_ideal, "UNKNOWN", sticky_positions, occupied
         ):

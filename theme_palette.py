@@ -1,6 +1,6 @@
 """Central semantic colors for MeshtasticPass terminal themes.
 
-Exactly two user-selectable themes exist: SNOW and AMBER (see
+Three user-selectable themes exist: SNOW, AMBER and MATRIX (see
 app_settings.COLOR_CHOICES). Each defines six semantic tokens --
 BASE/ACCENT/ACCENT2/DIM/ERROR/CONFIRM -- and every widget consumes one
 of these tokens, never a theme-specific literal color, so switching
@@ -97,12 +97,12 @@ def _palette(
 
 # High-saturation, terminal-readable "neon" colors only -- no desaturated
 # colors, muted earth tones, dusty orange, gray-green, pastel yellow, or
-# subdued red anywhere in either palette. DIM is the only intentionally
+# subdued red anywhere in any palette. DIM is the only intentionally
 # subdued token, and it is DERIVED (see dim_base), never hand-picked.
 NEON_RED = "#FF1744"
-# ERROR is identical -- the same neon red -- in both SNOW and AMBER, so
-# it is also exposed as one theme-independent constant for CSS/markup
-# call sites that have no other reason to branch on the current theme.
+# ERROR is identical -- the same neon red -- in every theme, so it is
+# also exposed as one theme-independent constant for CSS/markup call
+# sites that have no other reason to branch on the current theme.
 ERROR = NEON_RED
 
 THEME_PALETTES = {
@@ -129,6 +129,32 @@ THEME_PALETTES = {
         base="#FF8C00",
         accent="#40C4FF",
         accent2="#FFEA00",
+        error=NEON_RED,
+        confirm="#F2F2F2",
+    ),
+    # MATRIX: a phosphor-green terminal. BASE is the CRT green the theme is
+    # named for; because DIM, the MESH dot grid and the CHAT sending
+    # animation's weak arrow are all DERIVED from BASE (see dim_base/
+    # dim_base_quarter/grid_dot), the entire ambient surface of the app --
+    # every stale, passive and background element -- goes green on its own.
+    # The theme's identity lives there, not in its accents.
+    #
+    # The accents therefore have to LEAVE the green family to stay legible
+    # against it. ACCENT is the focus/selection token and so takes the
+    # largest hue separation available (~150 deg, electric violet); a
+    # green-adjacent ACCENT would make focus the hardest thing on screen to
+    # locate, which is the one job that token has. Violet also stays clear
+    # of ERROR's neon red -- a hot magenta would have sat ~30 deg from it
+    # and read as "something went wrong" at a glance. ACCENT2 is neon cyan,
+    # distinct from both BASE and ACCENT and consistent with AMBER's own
+    # cool-blue accent. CONFIRM is bright white for AMBER's exact reason:
+    # a successful operation must read as "white" independent of the
+    # theme's hue, and aliasing it to BASE would make success
+    # indistinguishable from ordinary text.
+    "matrix": _palette(
+        base="#00FF41",
+        accent="#D400FF",
+        accent2="#00E5FF",
         error=NEON_RED,
         confirm="#F2F2F2",
     ),
