@@ -134,6 +134,23 @@ def south_of_local(miles: float) -> GeoPosition:
     return GeoPosition(-miles / _MILES_PER_DEGREE_AT_EQUATOR, 0.0)
 
 
+def _pin_clock(app: MeshtasticPassApp, wall_now: float) -> None:
+    """Pin the app's whole notion of "now" (see MeshtasticPassApp._now).
+
+    Call this before ANY assertion that depends on a fixture instant,
+    whichever door the test drives the board through -- _refresh_mesh,
+    _refresh_chat_timestamps, or MeshTopologyView.set_nodes directly.
+    Passing a fixture time to one of those entry points pins only that
+    call; the app's own 1s timer still calls _refresh_mesh() with no
+    wall_now and recomputes against the real clock, overwriting whatever
+    the test just established. Tests here use two fixture conventions --
+    the 1_700_000_000 anchor and real time.time() -- so the clock cannot
+    simply be pinned once for the module; each test pins the instant it
+    is actually reasoning about.
+    """
+    app._clock = lambda: wall_now
+
+
 def _refresh_mesh_at(app: MeshtasticPassApp, wall_now: float) -> None:
     """Refresh MESH with the app's ENTIRE notion of "now" pinned to wall_now.
 
@@ -156,7 +173,7 @@ def _refresh_mesh_at(app: MeshtasticPassApp, wall_now: float) -> None:
     that the run was slow. Use this instead of calling _refresh_mesh
     with wall_now directly.
     """
-    app._clock = lambda: wall_now
+    _pin_clock(app, wall_now)
     app._refresh_mesh(wall_now=wall_now)
 
 
@@ -4066,10 +4083,12 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
 
+            _pin_clock(app, now)
             app._refresh_chat_timestamps(wall_now=now)
             await pilot.pause()
             self.assertIn("MESH(1)", str(app.query_one("#tab-bar").render()))
 
+            _pin_clock(app, now + ACTIVE_WINDOW_SECONDS + 50)
             app._refresh_chat_timestamps(wall_now=now + ACTIVE_WINDOW_SECONDS + 50)
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
@@ -7111,6 +7130,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._fixture(you_id)
             view = app.query_one(MeshTopologyView)
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
 
@@ -7166,6 +7186,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._fixture(you_id)
             view = app.query_one(MeshTopologyView)
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
             self.assertIn("!alice001", view.edge_node_ids)
@@ -7216,8 +7237,10 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             # set -- populate it (defaulting selection to YOU) before
             # selecting ALICE, exactly as the production
             # _mesh_select_node/_move_mesh_focus call sequence does.
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             view.select_node("!alice001")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, view.base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
 
@@ -7251,6 +7274,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
             }
             view = app.query_one(MeshTopologyView)
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0)
             await pilot.pause()
 
@@ -7669,10 +7693,12 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             # set (see its own docstring), so the working set must be
             # established once first before selecting the remote node
             # and re-rendering to actually apply the recentering.
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7759,6 +7785,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             view = app.query_one(MeshTopologyView)
 
             view.select_node(you_id)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7769,6 +7796,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             }
 
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7792,6 +7820,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             canvas = view.board.query_one(MeshCanvas)
 
             def current_connectors():
+                _pin_clock(app, 1_700_000_000.0)
                 view.set_nodes(
                     working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
                 )
@@ -7821,10 +7850,12 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
             you_id = app.radio.info.node_id
             working_set, base_positions = self._fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7938,10 +7969,12 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._clipped_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -7989,6 +8022,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
             with mock.patch("app.route_chain_avoiding", side_effect=duplicating):
+                _pin_clock(app, 1_700_000_000.0)
                 view.set_nodes(
                     working_set,
                     base_positions,
@@ -8016,6 +8050,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8110,6 +8145,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
                 you_id, short_name="⛰️"
             )
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8129,10 +8165,12 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             you_id = app.radio.info.node_id
             working_set, base_positions = self._connected_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!near0003")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
@@ -8157,10 +8195,12 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
             working_set, base_positions = self._clipped_chain_fixture(you_id)
             view = app.query_one(MeshTopologyView)
             view.mark_traced("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
             view.select_node("!faroff03")
+            _pin_clock(app, 1_700_000_000.0)
             view.set_nodes(
                 working_set, base_positions, theme=app._current_theme, now=1_700_000_000.0
             )
