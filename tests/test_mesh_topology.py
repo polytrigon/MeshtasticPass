@@ -1120,10 +1120,23 @@ class MeshHopRingLadderTests(unittest.TestCase):
         format_mesh_node_bar_fields); the board only claims which node is
         deeper than which.
         """
-        ladder = _mesh_hop_ring_ladder({2, 9, 30, 31})
-        rings = [ladder[depth] for depth in (2, 9, 30, 31)]
+        ladder = _mesh_hop_ring_ladder({2, 9, 30})
+        rings = [ladder[depth] for depth in (2, 9, 30)]
         self.assertEqual(rings, sorted(rings))
         self.assertEqual(len(set(rings)), len(rings))
+
+    def test_ring_one_is_reserved_for_direct_neighbours(self) -> None:
+        """Ranking alone would hand ring 1 to whatever the shallowest depth
+
+        happened to be, so a mesh whose nodes all sit at 3 hops would put
+        every one of them against YOU as though directly reachable.
+        "Adjacent to YOU means no intermediary" is the one thing the
+        innermost ring has to keep meaning.
+        """
+        self.assertEqual(_mesh_hop_ring_ladder({3}), {3: 2})
+        self.assertEqual(_mesh_hop_ring_ladder({1, 2, 3}), {1: 2, 2: 3, 3: 4})
+        # A direct neighbour, when there is one, has ring 1 to itself.
+        self.assertEqual(_mesh_hop_ring_ladder({0, 3}), {0: 1, 3: 2})
 
     def test_more_distinct_depths_than_rings_share_the_outermost(self) -> None:
         """The board is bounded: beyond MESH_MAX_HOP_RING distinct depths,
