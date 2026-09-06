@@ -145,15 +145,22 @@ thing on this board that transmits, and only when you ask it to.
   implemented.
 - Tested on one hardware combination: ClockworkPi uConsole plus a Meshtastic
   ESP32.
-- Some tests currently fail on `main`, and they are known rather than caused by
-  your setup. Two are real defects
-  (`test_collision_routing_fallback_cannot_leave_an_orphan_marker` and
-  `test_arrow_navigation_reaches_and_recenters_on_an_off_screen_node`); the
-  rest still assert the older "one marker per hop" rule that the ring layout
-  replaced, and are being updated.
-- `test_you_and_remote_selection_yield_identical_logical_graph` is flaky. It
-  drives the board by hand while the app's own 1s refresh is running, and
-  sometimes loses that race. A re-run usually passes.
+- Some tests in `tests/test_mesh_topology.py` fail. They are known, and none of
+  them is caused by your setup. They fall into two groups.
+
+  Most still assert the old "one marker per hop" rule that the hop-ring layout
+  replaced -- markers now count RINGS crossed. Those are being updated one at a
+  time, against each fixture's own depths rather than by copying whatever the
+  code currently emits, so an expectation cannot be quietly fitted to a bug.
+
+  The rest are open questions rather than stale expectations: whether a node
+  showing the TRACE ROUTE star should still draw anonymous hop markers; why a
+  GPS update no longer reflows placement; arrow navigation landing on a
+  different node than it used to; and one traceroute label lookup that raises.
+
+- `test_you_and_remote_selection_yield_identical_logical_graph` can fail
+  intermittently. It drives the board by hand while the app's own 1s refresh is
+  running and sometimes loses that race. A re-run usually passes.
 
 ## Reporting problems
 
