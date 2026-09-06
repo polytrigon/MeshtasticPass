@@ -3038,13 +3038,30 @@ class MeshTopologyView(Container):
         for node_id, evidence in getattr(self.app, "_traceroute_routes", {}).items():
             explicit_forward_by_dest[node_id] = evidence.forward
         explicit_destinations = frozenset(explicit_forward_by_dest)
-        active_hop_counts = {
-            node_id: hop_count
-            for node_id, hop_count in _mesh_active_hop_counts(
-                working_set, now=now
-            ).items()
-            if node_id not in explicit_destinations
-        }
+        # ANONYMOUS RELAY STAGES ARE NO LONGER DRAWN. They existed to state
+        # a node's observed path DEPTH -- N hollow circles along the
+        # connector for an N-hop client -- back when a node's distance from
+        # YOU meant geographic distance and said nothing about the mesh.
+        # Hop-depth rings made that redundant: the ring a node sits on IS
+        # its depth now, so the dots restate it, and expensively. On a real
+        # 8-node board with depths of 4 to 6 that was ~34 anonymous glyphs
+        # against 8 real ones, every one of them an obstacle the connector
+        # router had to steer around and a waypoint that forced another
+        # elbow -- which is what turned a connector into a staircase and
+        # packed the cells around YOU into a lattice (every chain's first
+        # stage wants the same cell). Ranking the rings made it worse, not
+        # better: the same stage counts had to fit in less space.
+        #
+        # Feeding an empty map here is deliberately the whole change --
+        # build_relay_stages, RelayStage, MeshRelayWidget and the
+        # orphan-circle audit are all left intact and simply produce
+        # nothing, so this is one line to reverse if the board reads worse
+        # without them. IDENTIFIED relays from a successful traceroute are
+        # untouched: those are real nodes with real identities, admitted to
+        # the working set and placed as such (see mesh_state.
+        # build_mesh_working_set), and their explicit chains still route
+        # through them.
+        active_hop_counts: dict[str, int] = {}
         # Relay-stage interpolation happens in the STABLE logical
         # coordinate space (MESH_LOGICAL_GRID_*), never the current
         # viewport's dynamic row/column count -- a relay chain's
