@@ -69,7 +69,6 @@ from mesh_state import (
     format_mesh_node_bar_line,
 )
 from mesh_topology import (
-    DEFAULT_MAX_GRID_RADIUS,
     ConnectorChain,
     ConnectorDestination,
     PositionedNode,
@@ -2221,10 +2220,29 @@ MESH_GRID_LABEL_MARGIN_ROWS = 1
 # one, computed smaller, or a client legitimately boosted farther out
 # by a large truthful hop count, can genuinely exceed it and need edge
 # indicators -- see item 26's tests).
-MESH_LOGICAL_GRID_ROWS = 8
+MESH_LOGICAL_GRID_ROWS = 13
 MESH_LOGICAL_GRID_COLUMNS = 21
-MESH_LOGICAL_GRID_CENTER_ROW = 5
+MESH_LOGICAL_GRID_CENTER_ROW = 7
 MESH_LOGICAL_GRID_CENTER_COLUMN = 11
+# HOP-DEPTH RINGS: a node's distance from YOU is its hop depth, so the
+# logical grid needs enough half-axis room for the deepest ring plus the
+# separate UNKNOWN one -- 6 steps each way from centre, hence 13 rows.
+# This is the STABLE logical space only; place_within_bounds still maps
+# it onto whatever the viewport actually is, so a taller logical grid
+# does not mean a taller board on screen.
+#
+# An N-hop node sits on ring N+1, which leaves rings 1..N free for its
+# own relay stages to interpolate onto (see build_relay_stages) -- the
+# same relationship the old min_radius_by_id boost was reaching for,
+# now the rule rather than a floor. Depth beyond MESH_MAX_HOP_RING - 1
+# clamps to the outermost known ring rather than growing the board
+# without bound.
+MESH_MAX_HOP_RING = 5
+# Nodes whose hop count the radio has not reported get their own ring
+# BEYOND every known depth: "we do not know how deep this is" is a real
+# state and must not be silently mixed in among measured ones, nor
+# guessed at by defaulting it to a number.
+MESH_UNKNOWN_HOPS_RING = MESH_MAX_HOP_RING + 1
 # Selected-node "visually larger" treatment: a 3-cell-wide composite
 # (small dot + role glyph + small dot) replacing the ordinary 1-cell
 # glyph -- see MeshNodeWidget.refresh_visual for why bold alone wasn't
@@ -2479,6 +2497,42 @@ def _mesh_active_hop_counts(
         and state.node.hops_away > 0
         and is_node_active(state.node.last_heard, now)
     }
+
+
+def _mesh_hop_rings(working_set: tuple[MeshNodeState, ...]) -> dict[str, int]:
+    """Each remote node's grid ring, from hop DEPTH rather than distance.
+
+    The MESH board's radius used to come from geographic distance
+    (compressed onto a small grid), with hop count only ever raising a
+    floor. In practice most nodes report no position at all, so most of
+    them fell to one shared fallback ring at the board's edge -- which
+    put a DIRECT zero-hop neighbour exactly as far out as a three-hop
+    node and an unknown-depth one, purely because none of the three send
+    GPS. Distance from centre tracked "do we have coordinates for you",
+    not anything about the mesh.
+
+    Hop depth arrives consistently, so it is what the radius means now:
+    an N-hop node rings at N+1 (leaving rings 1..N for its own relay
+    stages -- see build_relay_stages), a direct neighbour rings at 1, and
+    a node of unknown depth takes MESH_UNKNOWN_HOPS_RING, beyond every
+    measured one. Geography is not discarded -- it still chooses each
+    node's DIRECTION (see assign_grid_slots' `ring_by_id`), which is the
+    part of it that stays truthful when only some nodes report position.
+
+    A negative hop count is treated as unknown rather than trusted: it is
+    not a depth this app can honestly place.
+    """
+    rings: dict[str, int] = {}
+    for state in working_set:
+        node = state.node
+        if node.is_local:
+            continue
+        hops = node.hops_away
+        if hops is None or hops < 0:
+            rings[node.node_id] = MESH_UNKNOWN_HOPS_RING
+        else:
+            rings[node.node_id] = min(hops + 1, MESH_MAX_HOP_RING)
+    return rings
 
 
 class MeshNodeWidget(Static):
@@ -8596,8 +8650,11 @@ class MeshtasticPassApp(App[None]):
             self._mesh_extent_ratchet = {"up": 0, "down": 0, "left": 0, "right": 0}
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
-            max_radius=DEFAULT_MAX_GRID_RADIUS,
+            # The outermost ring any node can occupy is the UNKNOWN-depth
+            # one, so the board is sized to it.
+            max_radius=MESH_UNKNOWN_HOPS_RING,
             min_radius_by_id=min_radius_by_id,
+            ring_by_id=_mesh_hop_rings(working_set),
             sticky_positions=self._mesh_sticky_positions,
         )
         # MESH LAYOUT STABILITY: remember this cycle's own positions,

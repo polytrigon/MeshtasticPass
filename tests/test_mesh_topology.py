@@ -1087,6 +1087,145 @@ def _sticky_map(slots) -> dict:
     return {item.node.node_id.strip().lower(): (item.x, item.y, item.region) for item in slots}
 
 
+class AssignGridSlotsHopRingTests(unittest.TestCase):
+    """HOP-DEPTH RINGS: radius means hop depth, geography means direction."""
+
+    def _radius(self, slots, node_id):
+        item = next(s for s in slots if s.node.node_id == node_id)
+        return round((item.x * item.x + item.y * item.y) ** 0.5)
+
+    def _slot(self, slots, node_id):
+        return next(s for s in slots if s.node.node_id == node_id)
+
+    def test_ring_sets_the_radius_outright_not_as_a_floor(self) -> None:
+        """The decisive difference from min_radius_by_id: a geographically
+
+        NEAR node that is several hops deep must ring OUT, and a distant
+        node reachable in one hop must ring IN. Under the old
+        distance-first model the near node could never move outward past
+        its compressed distance, and the far one could never come in.
+        """
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, LOCAL_GEO),
+            NodeMetadata("!near0000", "Near", "NR", 3, 1.0, False, north_of_local(0.2)),
+            NodeMetadata("!far00000", "Far", "FR", 0, 1.0, False, south_of_local(400)),
+        )
+        slots = assign_grid_slots(
+            nodes, max_radius=6, ring_by_id={"!near0000": 4, "!far00000": 1}
+        )
+        self.assertEqual(self._radius(slots, "!near0000"), 4)
+        self.assertEqual(self._radius(slots, "!far00000"), 1)
+
+    def test_bearing_still_chooses_direction(self) -> None:
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, LOCAL_GEO),
+            NodeMetadata("!n0000000", "N", "N", 1, 1.0, False, north_of_local(3)),
+            NodeMetadata("!s0000000", "S", "S", 1, 1.0, False, south_of_local(3)),
+            NodeMetadata("!e0000000", "E", "E", 1, 1.0, False, east_of_local(3)),
+            NodeMetadata("!w0000000", "W", "W", 1, 1.0, False, west_of_local(3)),
+        )
+        rings = {n.node_id: 2 for n in nodes[1:]}
+        slots = assign_grid_slots(nodes, max_radius=6, ring_by_id=rings)
+        self.assertLess(self._slot(slots, "!n0000000").y, 0)
+        self.assertGreater(self._slot(slots, "!s0000000").y, 0)
+        self.assertGreater(self._slot(slots, "!e0000000").x, 0)
+        self.assertLess(self._slot(slots, "!w0000000").x, 0)
+        # Same depth -> same ring, whatever their real distances are.
+        self.assertEqual(
+            {self._radius(slots, n.node_id) for n in nodes[1:]}, {2}
+        )
+
+    def test_positionless_nodes_land_at_their_ring_radius_not_a_corner(self) -> None:
+        """Spread around the ring's own circle, never a square perimeter:
+
+        a square's corners sit radius*sqrt(2) out, which would let a node
+        on an inner ring render farther from YOU than one on an outer
+        ring and undo the whole point of ringing by depth.
+        """
+        nodes = [NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None)]
+        rings = {}
+        for index in range(6):
+            node_id = f"!bare{index:04x}"
+            nodes.append(NodeMetadata(node_id, f"Bare{index}", None, 1, 1.0, False, None))
+            rings[node_id] = 2
+        slots = assign_grid_slots(tuple(nodes), max_radius=6, ring_by_id=rings)
+        for node_id in rings:
+            self.assertEqual(self._radius(slots, node_id), 2, node_id)
+
+    def test_deeper_ring_is_never_nearer_than_a_shallower_one(self) -> None:
+        nodes = [NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None)]
+        rings = {}
+        for ring in (1, 2, 3, 4, 5):
+            node_id = f"!ring{ring:04x}"
+            nodes.append(NodeMetadata(node_id, f"R{ring}", None, ring - 1, 1.0, False, None))
+            rings[node_id] = ring
+        slots = assign_grid_slots(tuple(nodes), max_radius=6, ring_by_id=rings)
+        radii = [self._radius(slots, f"!ring{ring:04x}") for ring in (1, 2, 3, 4, 5)]
+        self.assertEqual(radii, sorted(radii))
+        self.assertEqual(radii, [1, 2, 3, 4, 5])
+
+    def test_mode_b_keeps_relative_arrangement_at_the_hop_ring(self) -> None:
+        """YOU has no fix but several remotes do: their arrangement
+
+        relative to each other is real and survives as angular order,
+        while the radius they sit at becomes hop depth -- which, unlike
+        a bearing from YOU, is actually known.
+        """
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None),
+            NodeMetadata("!west0000", "West", "W", 1, 1.0, False, west_of_local(5)),
+            NodeMetadata("!east0000", "East", "E", 1, 1.0, False, east_of_local(5)),
+            NodeMetadata("!north000", "North", "N", 1, 1.0, False, north_of_local(5)),
+        )
+        rings = {n.node_id: 2 for n in nodes[1:]}
+        slots = assign_grid_slots(nodes, max_radius=6, ring_by_id=rings)
+        self.assertTrue(
+            all(self._slot(slots, n.node_id).region == "GPS_RELATIVE" for n in nodes[1:])
+        )
+        self.assertLess(
+            self._slot(slots, "!west0000").x, self._slot(slots, "!east0000").x
+        )
+        self.assertLess(
+            self._slot(slots, "!north000").y,
+            max(self._slot(slots, n).y for n in ("!west0000", "!east0000")),
+        )
+        self.assertEqual({self._radius(slots, n.node_id) for n in nodes[1:]}, {2})
+
+    def test_omitting_ring_by_id_reproduces_geography_first_placement(self) -> None:
+        """Every caller that predates hop rings -- build_topology included
+
+        -- must be completely unaffected.
+        """
+        nodes = (
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, LOCAL_GEO),
+            NodeMetadata("!near0000", "Near", "NR", 1, 1.0, False, north_of_local(0.5)),
+            NodeMetadata("!far00000", "Far", "FR", 1, 1.0, False, north_of_local(300)),
+        )
+        without = assign_grid_slots(nodes, max_radius=3)
+        explicit_none = assign_grid_slots(nodes, max_radius=3, ring_by_id=None)
+        self.assertEqual(without, explicit_none)
+        # Distance still orders them outward when no ring is supplied.
+        self.assertGreaterEqual(
+            self._radius(explicit_none, "!far00000"),
+            self._radius(explicit_none, "!near0000"),
+        )
+
+    def test_placement_is_independent_of_input_order(self) -> None:
+        nodes = [
+            NodeMetadata("!you00000", "You", "YOU", 0, 1.0, True, None),
+            NodeMetadata("!aaaa0000", "A", "A", 0, 1.0, False, None),
+            NodeMetadata("!bbbb0000", "B", "B", 2, 1.0, False, None),
+            NodeMetadata("!cccc0000", "C", "C", 1, 1.0, False, None),
+        ]
+        rings = {"!aaaa0000": 1, "!bbbb0000": 3, "!cccc0000": 2}
+        forward = assign_grid_slots(tuple(nodes), max_radius=6, ring_by_id=rings)
+        backward = assign_grid_slots(tuple(reversed(nodes)), max_radius=6, ring_by_id=rings)
+        self.assertEqual(
+            {s.node.node_id: (s.x, s.y) for s in forward},
+            {s.node.node_id: (s.x, s.y) for s in backward},
+        )
+
+
 class MeshLayoutStabilityStickyPositionTests(unittest.TestCase):
     """MESH LAYOUT STABILITY: assign_grid_slots(sticky_positions=...) and
 
