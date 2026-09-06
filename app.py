@@ -3038,30 +3038,38 @@ class MeshTopologyView(Container):
         for node_id, evidence in getattr(self.app, "_traceroute_routes", {}).items():
             explicit_forward_by_dest[node_id] = evidence.forward
         explicit_destinations = frozenset(explicit_forward_by_dest)
-        # ANONYMOUS RELAY STAGES ARE NO LONGER DRAWN. They existed to state
-        # a node's observed path DEPTH -- N hollow circles along the
-        # connector for an N-hop client -- back when a node's distance from
-        # YOU meant geographic distance and said nothing about the mesh.
-        # Hop-depth rings made that redundant: the ring a node sits on IS
-        # its depth now, so the dots restate it, and expensively. On a real
-        # 8-node board with depths of 4 to 6 that was ~34 anonymous glyphs
-        # against 8 real ones, every one of them an obstacle the connector
-        # router had to steer around and a waypoint that forced another
-        # elbow -- which is what turned a connector into a staircase and
-        # packed the cells around YOU into a lattice (every chain's first
-        # stage wants the same cell). Ranking the rings made it worse, not
-        # better: the same stage counts had to fit in less space.
+        # RELAY MARKERS ARE ONE PER RING THE PATH CROSSES, not one per hop.
         #
-        # Feeding an empty map here is deliberately the whole change --
-        # build_relay_stages, RelayStage, MeshRelayWidget and the
-        # orphan-circle audit are all left intact and simply produce
-        # nothing, so this is one line to reverse if the board reads worse
-        # without them. IDENTIFIED relays from a successful traceroute are
-        # untouched: those are real nodes with real identities, admitted to
-        # the working set and placed as such (see mesh_state.
-        # build_mesh_working_set), and their explicit chains still route
-        # through them.
-        active_hop_counts: dict[str, int] = {}
+        # They used to be one per hop, which was truthful when a node's
+        # distance from YOU meant geographic distance and carried no depth
+        # information of its own. Hop-depth rings changed that twice over.
+        # The radius now states the depth, so a dot per hop restates it; and
+        # ranked rings compress depth (0/1/4/5/6 becomes rings 1..4), so an
+        # N-hop node no longer HAS N steps of room -- six markers rounded
+        # onto four cells, collided, and the collision search fanned them
+        # into the lattice packed around YOU. On a real 8-node board that
+        # was 31 anonymous glyphs against 8 real ones, each an obstacle the
+        # router steered around and a waypoint forcing another elbow.
+        #
+        # One marker per intermediate ring fits by construction: a ring-4
+        # node gets three, at rings 1, 2 and 3, one cell each. What a marker
+        # CLAIMS changes with it, and the change is deliberate -- it says
+        # "the path crosses this depth rank", not "one hop happened here".
+        # The board is then consistently about rank, in radius and markers
+        # alike, while the true hop count stays stated as a number where it
+        # can be stated exactly (see mesh_state.format_mesh_node_bar_fields'
+        # HOPS field). No count is fabricated: a node of UNKNOWN depth still
+        # gets no markers at all, exactly as before -- an unknown hop count
+        # must never be treated as zero or imply any specific path depth --
+        # and a STALE node still gets none either, since it has no
+        # known-active route to draw stages along.
+        node_rings = getattr(self.app, "_mesh_node_rings", {})
+        active_hop_counts = {
+            node_id: node_rings[node_id] - 1
+            for node_id in _mesh_active_hop_counts(working_set, now=now)
+            if node_id not in explicit_destinations
+            and node_rings.get(node_id, 1) > 1
+        }
         # Relay-stage interpolation happens in the STABLE logical
         # coordinate space (MESH_LOGICAL_GRID_*), never the current
         # viewport's dynamic row/column count -- a relay chain's
@@ -4958,6 +4966,12 @@ class MeshtasticPassApp(App[None]):
         # protect. Cleared only alongside the sticky positions, on a total
         # remote-population turnover.
         self._mesh_seen_hop_depths: set[int] = set()
+        # This cycle's ring per node (see _mesh_hop_rings), kept so
+        # MeshTopologyView.set_nodes can space each connector's relay
+        # markers one per ring the path crosses -- the view is handed
+        # positions, not depths, and a rendered distance is post-stretch
+        # and so cannot be read back as a ring number.
+        self._mesh_node_rings: dict[str, int] = {}
         self._mesh_extent_ratchet: dict[str, int] = {
             "up": 0,
             "down": 0,
@@ -8714,13 +8728,14 @@ class MeshtasticPassApp(App[None]):
             # The depth ladder is layout state too: a completely different
             # node population's depths must not keep constraining this one.
             self._mesh_seen_hop_depths = set()
+        self._mesh_node_rings = self._mesh_hop_rings(working_set)
         slots = assign_grid_slots(
             tuple(state.node for state in working_set),
             # The outermost ring any node can occupy is the UNKNOWN-depth
             # one, so the board is sized to it.
             max_radius=MESH_UNKNOWN_HOPS_RING,
             min_radius_by_id=min_radius_by_id,
-            ring_by_id=self._mesh_hop_rings(working_set),
+            ring_by_id=self._mesh_node_rings,
             sticky_positions=self._mesh_sticky_positions,
         )
         # MESH LAYOUT STABILITY: remember this cycle's own positions,
