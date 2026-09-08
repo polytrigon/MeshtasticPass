@@ -4925,7 +4925,7 @@ class MeshtasticPassApp(App[None]):
         # Pi's SD card. A node whose freshest timestamp has not moved has
         # nothing new to record. In-memory only: losing it on restart
         # costs one redundant write per node, never a lost pass.
-        self._recorded_passes: dict[str, float] = {}
+        self._recorded_passes: dict[str, tuple[float, bool]] = {}
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
@@ -8663,10 +8663,22 @@ class MeshtasticPassApp(App[None]):
 
         Fed the FULL known-node tuple, not MESH's bounded working set:
         the board deliberately shows at most a handful, while PASSES is
-        the record of everyone met. These are recorded WITHOUT
-        heard_directly -- the radio knowing about a node does not mean a
-        packet from it ever reached us, and that distinction is the
-        whole point of the view (see ChatStore.record_encounter).
+        the record of everyone met.
+
+        A node at hops_away == 0 is recorded as HEARD DIRECTLY. That is
+        not an inference -- zero hops is the radio stating there is no
+        intermediary between us, which is the same fact this app already
+        reserves MESH ring 1 for. Waiting for a text message instead
+        would leave the heard/gossip split almost always empty: on a
+        real mesh you are in constant direct radio contact with your
+        neighbours (position, telemetry, nodeinfo) and receive text from
+        almost none of them. Measured on the user's own radio: 47 nodes
+        known, one of them at zero hops, and zero text messages during
+        the sample -- so the distinction the whole view rests on would
+        have shown nothing.
+
+        Any other depth is gossip: the radio knows of that node, but
+        whatever reached us came through somebody else.
 
         Never allowed to break a refresh: PASSES is a side record, and a
         storage problem must not take the MESH board down with it.
@@ -8688,7 +8700,17 @@ class MeshtasticPassApp(App[None]):
                 and last_heard > 0
                 else now
             )
-            if self._recorded_passes.get(node_id) == seen_at:
+            hops_away = getattr(node, "hops_away", None)
+            direct = (
+                isinstance(hops_away, int)
+                and not isinstance(hops_away, bool)
+                and hops_away == 0
+            )
+            # Suppression keys on directness as well as time: a node that
+            # becomes a direct neighbour without its timestamp moving is
+            # exactly the upgrade this view exists to show, and keying on
+            # the timestamp alone would skip it.
+            if self._recorded_passes.get(node_id) == (seen_at, direct):
                 continue
             try:
                 store.record_encounter(
@@ -8696,11 +8718,12 @@ class MeshtasticPassApp(App[None]):
                     seen_at=seen_at,
                     long_name=getattr(node, "long_name", None),
                     short_name=getattr(node, "short_name", None),
-                    hops_away=getattr(node, "hops_away", None),
+                    hops_away=hops_away,
+                    heard_directly=direct,
                 )
             except Exception:
                 continue
-            self._recorded_passes[node_id] = seen_at
+            self._recorded_passes[node_id] = (seen_at, direct)
 
     def _record_pass_heard(self, message: ReceivedMessage) -> None:
         """Record the sender of an arriving packet as directly HEARD.
@@ -8740,7 +8763,7 @@ class MeshtasticPassApp(App[None]):
             )
         except Exception:
             return
-        self._recorded_passes[node_id] = seen_at
+        self._recorded_passes[node_id] = (seen_at, True)
 
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
