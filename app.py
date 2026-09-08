@@ -4918,6 +4918,14 @@ class MeshtasticPassApp(App[None]):
         self._chat_mode = "channel"
         self.dm_unread_count = 0
         self.chat_store = chat_store
+        # PASSES write-suppression: node id -> the last "seen at" already
+        # written for it. The NodeDB sweep runs on every ~1s mesh refresh
+        # and a real radio knows dozens of nodes, so writing all of them
+        # every tick would be a constant stream of pointless UPDATEs on a
+        # Pi's SD card. A node whose freshest timestamp has not moved has
+        # nothing new to record. In-memory only: losing it on restart
+        # costs one redundant write per node, never a lost pass.
+        self._recorded_passes: dict[str, float] = {}
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
@@ -7949,6 +7957,10 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
+        # Before anything else: a packet from this node reached this
+        # radio, which is a PASSES encounter whatever happens to the
+        # message afterwards (see _record_pass_heard).
+        self._record_pass_heard(message)
         try:
             self._refresh_mesh()
         except Exception:
@@ -8644,6 +8656,92 @@ class MeshtasticPassApp(App[None]):
             )
         return rings
 
+    def _record_pass_encounters(
+        self, nodes: tuple[NodeMetadata, ...], *, now: float
+    ) -> None:
+        """Record every currently-known node as a PASSES entry (gossip).
+
+        Fed the FULL known-node tuple, not MESH's bounded working set:
+        the board deliberately shows at most a handful, while PASSES is
+        the record of everyone met. These are recorded WITHOUT
+        heard_directly -- the radio knowing about a node does not mean a
+        packet from it ever reached us, and that distinction is the
+        whole point of the view (see ChatStore.record_encounter).
+
+        Never allowed to break a refresh: PASSES is a side record, and a
+        storage problem must not take the MESH board down with it.
+        """
+        store = self.chat_store
+        if store is None:
+            return
+        for node in nodes:
+            if getattr(node, "is_local", False):
+                continue
+            node_id = getattr(node, "node_id", None)
+            if not isinstance(node_id, str) or not node_id.strip():
+                continue
+            last_heard = getattr(node, "last_heard", None)
+            seen_at = (
+                float(last_heard)
+                if isinstance(last_heard, (int, float))
+                and not isinstance(last_heard, bool)
+                and last_heard > 0
+                else now
+            )
+            if self._recorded_passes.get(node_id) == seen_at:
+                continue
+            try:
+                store.record_encounter(
+                    node_id,
+                    seen_at=seen_at,
+                    long_name=getattr(node, "long_name", None),
+                    short_name=getattr(node, "short_name", None),
+                    hops_away=getattr(node, "hops_away", None),
+                )
+            except Exception:
+                continue
+            self._recorded_passes[node_id] = seen_at
+
+    def _record_pass_heard(self, message: ReceivedMessage) -> None:
+        """Record the sender of an arriving packet as directly HEARD.
+
+        This is the only path that sets heard_directly, and it is the
+        honest one: a packet from this node physically reached this
+        radio. Called for every accepted message, channel or DM, before
+        any routing decision -- proximity happened regardless of where
+        the message was filed.
+
+        Deliberately NOT write-suppressed. A direct encounter is the
+        scarce, meaningful event PASSES exists to capture; it must never
+        be skipped because a gossip sighting happened to carry the same
+        timestamp.
+        """
+        store = self.chat_store
+        if store is None:
+            return
+        node_id = getattr(message, "sender_node_id", None)
+        if not isinstance(node_id, str) or not node_id.strip():
+            return
+        received_at = getattr(message, "radio_rx_at", None)
+        seen_at = (
+            float(received_at)
+            if isinstance(received_at, (int, float))
+            and not isinstance(received_at, bool)
+            and received_at > 0
+            else self._now()
+        )
+        try:
+            store.record_encounter(
+                node_id,
+                seen_at=seen_at,
+                long_name=getattr(message, "sender_long_name", None),
+                short_name=getattr(message, "sender_short_name", None),
+                heard_directly=True,
+            )
+        except Exception:
+            return
+        self._recorded_passes[node_id] = seen_at
+
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
 
@@ -8673,6 +8771,9 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = self._now() if wall_now is None else wall_now
+        # PASSES sees every node the radio knows, before MESH bounds the
+        # list down to what fits on the board.
+        self._record_pass_encounters(nodes, now=current_time)
         working_set = build_mesh_working_set(
             nodes,
             now=current_time,
