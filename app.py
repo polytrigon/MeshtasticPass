@@ -7957,10 +7957,10 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
-        # Before anything else: a packet from this node reached this
-        # radio, which is a PASSES encounter whatever happens to the
-        # message afterwards (see _record_pass_heard).
-        self._record_pass_heard(message)
+        # Before anything else: this sender is a PASSES encounter
+        # whatever happens to the message afterwards -- though not
+        # necessarily a DIRECT one (see _record_pass_from_message).
+        self._record_pass_from_message(message)
         try:
             self._refresh_mesh()
         except Exception:
@@ -8725,19 +8725,26 @@ class MeshtasticPassApp(App[None]):
                 continue
             self._recorded_passes[node_id] = (seen_at, direct)
 
-    def _record_pass_heard(self, message: ReceivedMessage) -> None:
-        """Record the sender of an arriving packet as directly HEARD.
+    def _record_pass_from_message(self, message: ReceivedMessage) -> None:
+        """Record the sender of an arriving message as a PASSES encounter.
 
-        This is the only path that sets heard_directly, and it is the
-        honest one: a packet from this node physically reached this
-        radio. Called for every accepted message, channel or DM, before
-        any routing decision -- proximity happened regardless of where
-        the message was filed.
+        NOT as a direct one. It is tempting to read "a packet from this
+        node reached us" as proximity, and that was this method's first
+        mistake: for a multi-hop message the packet that physically
+        arrived came from the LAST RELAY, not from the node that wrote
+        it. Hardware caught it -- a node six hops away was marked as
+        directly heard purely because its message got here.
 
-        Deliberately NOT write-suppressed. A direct encounter is the
-        scarce, meaningful event PASSES exists to capture; it must never
-        be skipped because a gossip sighting happened to carry the same
-        timestamp.
+        ReceivedMessage carries no hop count (see radio_service), so this
+        path genuinely cannot tell a direct arrival from a relayed one
+        and must not guess. hops_away == 0 in the NodeDB sweep is the one
+        trustworthy proximity signal, and it stays the only thing that
+        sets heard_directly.
+
+        What this path is still worth: a sender's freshest names and
+        timestamp, which may be better than anything the sweep has --
+        and it is deliberately not write-suppressed, because a message
+        arriving is a real event about a real node.
         """
         store = self.chat_store
         if store is None:
@@ -8759,11 +8766,13 @@ class MeshtasticPassApp(App[None]):
                 seen_at=seen_at,
                 long_name=getattr(message, "sender_long_name", None),
                 short_name=getattr(message, "sender_short_name", None),
-                heard_directly=True,
             )
         except Exception:
             return
-        self._recorded_passes[node_id] = (seen_at, True)
+        # Left out of the suppression map on purpose: this path never
+        # establishes directness, so it must not record a (time, direct)
+        # pair that could make the next sweep skip a real upgrade.
+        self._recorded_passes.pop(node_id, None)
 
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
