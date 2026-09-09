@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from grapheme_text import cell_len  # noqa: E402
 from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
+    PASS_COLUMNS_RESERVED,
     PASS_NAME_MAX_CELLS,
     PASS_TRUNCATION_MARKER,
     format_pass_bar,
@@ -28,18 +29,35 @@ from pass_layout import (  # noqa: E402
 )
 
 
+def viewport_showing(column_width: int, columns: int) -> int:
+    """The narrowest viewport that shows exactly `columns` columns.
+
+    Derived from the constants rather than written as a literal, so
+    changing the gutter or the reserved column does not silently turn
+    these tests into assertions about a different layout than the one
+    they were written to describe.
+    """
+    fits = columns + PASS_COLUMNS_RESERVED
+    return fits * (column_width + PASS_COLUMN_GUTTER) - PASS_COLUMN_GUTTER
+
+
 class ColumnFlowTests(unittest.TestCase):
     def test_names_flow_left_to_right_then_wrap(self) -> None:
         """MS-DOS `dir /w` order, which is what the reference screenshot
 
         shows: reading across a row is alphabetical, not down a column.
         """
-        rows = lay_out_passes(("AAA", "BBB", "CCC", "DDD", "EEE"), viewport_width=20)
+        rows = lay_out_passes(
+            ("AAA", "BBB", "CCC", "DDD", "EEE"),
+            viewport_width=viewport_showing(3, 4),
+        )
         self.assertEqual([cell.strip() for cell in rows[0]], ["AAA", "BBB", "CCC", "DDD"])
         self.assertEqual([cell.strip() for cell in rows[1]], ["EEE"])
 
     def test_the_last_row_is_short_not_padded_with_blanks(self) -> None:
-        rows = lay_out_passes(("AAA", "BBB", "CCC"), viewport_width=20)
+        rows = lay_out_passes(
+            ("AAA", "BBB", "CCC"), viewport_width=viewport_showing(3, 4)
+        )
         self.assertEqual(len(rows[-1]), 3)
 
     def test_an_empty_list_lays_out_to_nothing(self) -> None:
@@ -68,10 +86,37 @@ class ColumnWidthTests(unittest.TestCase):
         self.assertEqual(pass_column_count(("ABCDEFGH",), viewport_width=3), 1)
 
     def test_column_count_accounts_for_the_gutter(self) -> None:
-        names = ("ABCD",)  # 4 cells + 2 gutter = 6 per column, last needs no gutter
-        self.assertEqual(pass_column_count(names, viewport_width=4), 1)
-        self.assertEqual(pass_column_count(names, viewport_width=10), 2)
-        self.assertEqual(pass_column_count(names, viewport_width=16), 3)
+        """The last column needs no gutter after it."""
+        names = ("ABCD",)
+        for wanted in (1, 2, 3):
+            self.assertEqual(
+                pass_column_count(names, viewport_width=viewport_showing(4, wanted)),
+                wanted,
+            )
+
+    def test_the_rightmost_fitting_column_is_held_back(self) -> None:
+        """A board that ends in air, not against the edge of the screen.
+
+        The rightmost column has no gutter after it and nothing between
+        it and the screen edge, so it is where ink that overspills its
+        cell has nowhere to go and where a drifted row reads worst.
+        """
+        names = ("ABCD",)
+        stride = 4 + PASS_COLUMN_GUTTER
+        width = 8 * stride - PASS_COLUMN_GUTTER
+        self.assertEqual(
+            pass_column_count(names, viewport_width=width),
+            8 - PASS_COLUMNS_RESERVED,
+        )
+
+    def test_a_narrow_window_loses_names_rather_than_going_blank(self) -> None:
+        """The reserve never takes the last column.
+
+        Zero columns would render nothing and read as an empty pass list
+        rather than a window too narrow to show one.
+        """
+        for width in range(1, 12):
+            self.assertGreaterEqual(pass_column_count(("ABCD",), width), 1)
 
 
 class DisplayWidthTests(unittest.TestCase):

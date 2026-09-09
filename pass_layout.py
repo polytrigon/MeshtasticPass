@@ -29,9 +29,24 @@ from grapheme_text import cell_len, truncate_to_cells
 # long long-name must not collapse the whole board to a single column --
 # the full identity lives in the bottom bar, exactly as it does on MESH.
 PASS_NAME_MAX_CELLS = 16
-# Blank cells between columns. Two reads as a table; one reads as a
-# wrapped sentence.
-PASS_COLUMN_GUTTER = 2
+# Blank cells between columns. One reads as a wrapped sentence; two read
+# as a table but leave no room for error, and this board has error in it:
+# certain emoji glyphs are painted wider than the two cells the terminal
+# advances for them, so ink from one cell can reach into the next. Four
+# absorbs that and, on a board whose columns are now four or five cells
+# wide, is what actually separates one name from another.
+#
+# It does not FIX a glyph whose advance is wrong -- that error accumulates
+# along a row and no amount of gutter removes it -- it only stops
+# neighbouring names touching.
+PASS_COLUMN_GUTTER = 4
+
+# Columns held back from the number that would fit. The rightmost column
+# has no gutter after it and nothing between it and the edge of the
+# screen, so it is where overspilling ink has nowhere to go and where a
+# row that has drifted shows up worst. One column of names is a cheap
+# price for a board that ends in air.
+PASS_COLUMNS_RESERVED = 1
 
 # Marks a name cut short at the column cap. ASCII, and deliberately not
 # "…" (U+2026), which is East_Asian_Width=AMBIGUOUS: Rich counts it as
@@ -60,12 +75,15 @@ def pass_column_count(names: tuple[str, ...], viewport_width: int) -> int:
     A viewport too narrow for even one full column still gets one: a
     truncated name is readable, and zero columns would render nothing at
     all and look like an empty pass list rather than a narrow window.
+    The same floor applies after PASS_COLUMNS_RESERVED is taken off, so
+    a narrow window loses names rather than becoming blank.
     """
     column_width = pass_column_width(names)
     stride = column_width + PASS_COLUMN_GUTTER
     if viewport_width < column_width:
         return 1
-    return max(1, (viewport_width + PASS_COLUMN_GUTTER) // stride)
+    fits = (viewport_width + PASS_COLUMN_GUTTER) // stride
+    return max(1, fits - PASS_COLUMNS_RESERVED)
 
 
 def lay_out_passes(
