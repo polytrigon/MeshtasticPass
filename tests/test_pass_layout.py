@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import unicodedata
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,7 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from grapheme_text import cell_len  # noqa: E402
 from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
+    PASS_DISAMBIGUATOR,
     PASS_NAME_MAX_CELLS,
+    PASS_TRUNCATION_MARKER,
     disambiguate_pass_names,
     format_pass_bar,
     pass_row_offset,
@@ -131,7 +134,7 @@ class DisambiguationTests(unittest.TestCase):
             self._encounter("!e5deef81", "BIG"),
             self._encounter("!1c33b395", "BIG"),
         )
-        self.assertEqual(disambiguate_pass_names(rows), ("BIG·ef81", "BIG·b395"))
+        self.assertEqual(disambiguate_pass_names(rows), ("BIG.ef81", "BIG.b395"))
 
     def test_unique_names_are_left_alone(self) -> None:
         """Nobody pays width for a collision they do not have."""
@@ -199,6 +202,77 @@ class RowOffsetTests(unittest.TestCase):
                 f"row {row} not visible at offset {offset}",
             )
             self.assertLessEqual(offset, total - viewport)
+
+
+class AmbiguousWidthTests(unittest.TestCase):
+    """Nothing the LAYOUT adds to a cell may have a negotiable width.
+
+    East_Asian_Width=AMBIGUOUS characters -- U+00B7 MIDDLE DOT, U+2026
+    HORIZONTAL ELLIPSIS and a large family besides -- are one cell to
+    Rich and two cells to a terminal whose font or configuration treats
+    that class as wide. In flowing text the disagreement costs a column
+    at the end of a line. In a fixed-width grid it moves every column to
+    the right of it, for the whole row, and the app cannot detect that
+    it happened.
+
+    Node names come off the mesh and are taken as they are. Everything
+    the layout puts AROUND them is a choice, and this pins the choice:
+    ASCII, whose width no terminal disagrees about. The value of the
+    test is that the next person to reach for a nicer-looking separator
+    finds out here rather than on a uConsole.
+    """
+
+    def _assert_unambiguous(self, value: str) -> None:
+        for character in value:
+            width = unicodedata.east_asian_width(character)
+            self.assertNotEqual(
+                width,
+                "A",
+                f"U+{ord(character):04X} is East_Asian_Width=AMBIGUOUS",
+            )
+            self.assertTrue(
+                character.isascii(),
+                f"U+{ord(character):04X} is not ASCII",
+            )
+
+    def test_the_disambiguator_has_an_undisputed_width(self) -> None:
+        self._assert_unambiguous(PASS_DISAMBIGUATOR)
+
+    def test_the_truncation_marker_has_an_undisputed_width(self) -> None:
+        self._assert_unambiguous(PASS_TRUNCATION_MARKER)
+
+    def test_a_truncated_name_is_not_marked_with_an_ellipsis(self) -> None:
+        """truncate_to_cells defaults to "…", which is AMBIGUOUS.
+
+        The grid has to override that default, and this fails if the
+        override is ever dropped -- a regression that would only show up
+        on names long enough to be cut, which is exactly the kind of
+        rare case nobody notices going wrong.
+        """
+        rows = lay_out_passes(("X" * 40,), viewport_width=60)
+        self.assertNotIn("\u2026", rows[0][0])
+        self.assertIn(PASS_TRUNCATION_MARKER, rows[0][0])
+
+    def test_everything_the_layout_adds_to_a_cell_is_unambiguous(self) -> None:
+        """The general rule, checked against real output.
+
+        Whatever appears in a rendered cell that was NOT in the node's
+        own name got there from this module, and must be safe.
+        """
+        from chat_store import NodeEncounter
+
+        encounters = (
+            NodeEncounter("!e5deef81", None, "\U0001f43b", None, 0.0, 0.0, None, None),
+            NodeEncounter("!1c33b395", None, "\U0001f43b", None, 0.0, 0.0, None, None),
+            NodeEncounter("!aaaa1111", None, "Q" * 40, None, 0.0, 0.0, None, None),
+        )
+        supplied = set("".join(e.short_name for e in encounters))
+        names = disambiguate_pass_names(encounters)
+        for row in lay_out_passes(names, viewport_width=60):
+            for cell in row:
+                self._assert_unambiguous(
+                    "".join(c for c in cell if c not in supplied)
+                )
 
 
 class PassBarTests(unittest.TestCase):

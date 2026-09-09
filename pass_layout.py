@@ -24,6 +24,13 @@ PASS_NAME_MAX_CELLS = 16
 # wrapped sentence.
 PASS_COLUMN_GUTTER = 2
 
+# Marks a name cut short at the column cap. ASCII, and deliberately not
+# "…": see PASS_DISAMBIGUATOR below for why nothing this module ADDS to a
+# cell may be a character whose width is a terminal setting. "~" is also
+# what DOS itself used when a name would not fit, which is the layout
+# this view is imitating.
+PASS_TRUNCATION_MARKER = "~"
+
 
 def pass_column_width(names: tuple[str, ...]) -> int:
     """The cell width every column takes: the widest name, capped."""
@@ -66,7 +73,10 @@ def lay_out_passes(
     column_width = pass_column_width(names)
     columns = pass_column_count(names, viewport_width)
     cells = [
-        _pad_to_cells(truncate_to_cells(name, column_width), column_width)
+        _pad_to_cells(
+            truncate_to_cells(name, column_width, PASS_TRUNCATION_MARKER),
+            column_width,
+        )
         for name in names
     ]
     return tuple(
@@ -149,7 +159,26 @@ def _age_or_none(when, now: float, formatter):
 # When two nodes share a display name, each gets its node ID's last four
 # characters appended so the grid cannot show two cells that look like
 # the same radio.
-PASS_DISAMBIGUATOR = "\u00b7"
+#
+# ASCII, and that is not cosmetic. This was U+00B7 MIDDLE DOT, which is
+# East_Asian_Width=AMBIGUOUS: Rich counts it as one cell and a terminal
+# whose font or configuration treats ambiguous-width characters as wide
+# paints it as two. In a fixed-width grid that one cell of disagreement
+# moves every column to the right of it, for the whole row.
+#
+# It read as a display bug about EMOJI, because the names that collide
+# are the emoji ones -- a popular emoji is exactly what two strangers
+# pick independently -- so the dot only ever appeared next to an emoji.
+# The emoji were innocent: they are East_Asian_Width=WIDE, which no
+# terminal disagrees about, and an emoji name with no collision lined up
+# perfectly.
+#
+# The general rule this is an instance of: a character the LAYOUT adds to
+# a cell must have a width that is a fact rather than a setting. Names
+# come from the mesh and we take them as they are, but everything around
+# them is ours to choose, and ASCII is the only width every terminal
+# agrees on. Enforced by test_pass_layout.AmbiguousWidthTests.
+PASS_DISAMBIGUATOR = "."
 
 
 def disambiguate_pass_names(encounters) -> tuple[str, ...]:
