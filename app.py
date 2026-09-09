@@ -97,6 +97,7 @@ from pass_layout import (
     PASS_COLUMN_GUTTER,
     format_pass_bar,
     pass_column_width,
+    pass_gutter,
     lay_out_passes,
     pass_row_offset,
 )
@@ -4009,6 +4010,7 @@ class PassesView(Static):
         self._passes: tuple[NodeEncounter, ...] = ()
         self._columns = 1
         self._column_width = 1
+        self._gutter = PASS_COLUMN_GUTTER
         self._selected = 0
         # First visible row. PASSES clips to its own viewport rather
         # than using a Textual scrollbar, for the same reason MESH does:
@@ -4079,9 +4081,14 @@ class PassesView(Static):
         # advances one, and in a grid that error moves every column to
         # its right for the rest of the row -- see terminal_width.
         measure = self.app.painted_widths.width
-        rows = lay_out_passes(names, self.size.width or 60, measure)
+        width = self.size.width or 60
+        rows = lay_out_passes(names, width, measure)
         self._columns = len(rows[0]) if rows else 1
         self._column_width = pass_column_width(names, measure)
+        # Wider than PASS_COLUMN_GUTTER whenever the column count left
+        # width over: the leftover is spent on the gaps rather than
+        # banked as one margin on the right (see pass_gutter).
+        self._gutter = pass_gutter(names, width, measure)
         height = self.size.height or len(rows)
         selected_row = self._selected // max(1, self._columns)
         # No "more" marker: that a list scrolls is an assumed pattern,
@@ -4098,17 +4105,29 @@ class PassesView(Static):
                 text.append("\n")
             for column_number, cell in enumerate(row):
                 if column_number:
-                    text.append(" " * PASS_COLUMN_GUTTER)
+                    text.append(" " * self._gutter)
                 encounter = self._passes[index]
-                # ACCENT for a node that has exchanged a pass with us,
-                # BASE for everyone else. Encountering a node is the
-                # ordinary case -- it is what a mesh does all day -- so
-                # it gets the ordinary colour, and the accent is spent
-                # only on the rare thing. Hearing a node directly is
-                # deliberately NOT drawn: it is a property of radio
-                # range, not of having met someone, and colouring it
-                # made most of the board look significant.
-                color = palette.accent if encounter.has_pass else palette.base
+                # ACCENT2 for a node the user has HIGHLIGHTED -- the same
+                # token MESH paints a highlighted node with, so marking a
+                # node in one view finds it in the other. It wins over
+                # ACCENT because it is the user's own deliberate mark,
+                # and someone who highlighted a node came here to find
+                # it.
+                #
+                # ACCENT for a node that has exchanged a pass with us.
+                # BASE for everyone else: encountering a node is the
+                # ordinary case, it is what a mesh does all day, so it
+                # gets the ordinary colour and the accents are spent only
+                # on the rare things. Hearing a node directly is
+                # deliberately NOT drawn -- that is a property of radio
+                # range, not of having met someone, and colouring it made
+                # most of the board look significant.
+                if self.app.settings.is_favorite(encounter.node_id):
+                    color = palette.accent2
+                elif encounter.has_pass:
+                    color = palette.accent
+                else:
+                    color = palette.base
                 style = Style(color=color, reverse=index == self._selected)
                 text.append(cell, style=style)
                 index += 1
@@ -4133,13 +4152,23 @@ class PassesView(Static):
         if row < 0 or row >= max(1, content.height):
             return None
         return Region(
-            content.x + column * (self._column_width + PASS_COLUMN_GUTTER),
+            content.x + column * (self._column_width + self._gutter),
             content.y + row,
             self._column_width,
             1,
         )
 
     def on_key(self, event: Key) -> None:
+        if getattr(self.app, "_user_menu", None) is not None:
+            # A node menu opened from this grid is showing. Focus never
+            # actually leaves this widget while it is up (see
+            # _open_node_menu), so without this the arrows would move the
+            # selection UNDERNEATH the menu -- changing which node the
+            # menu is about, after it was opened. Returning without
+            # stopping the event lets it bubble to the app-level on_key
+            # that drives the menu's own highlight, which is the same
+            # thing CHAT's transcript and entry widgets do.
+            return
         if not self._passes:
             return
         moves = {
@@ -11924,6 +11953,11 @@ class MeshtasticPassApp(App[None]):
             if widget.entry.node_id and widget.entry.node_id.lower() == node_id.lower():
                 widget.set_favorite(self.settings.is_favorite(node_id))
         self._refresh_mesh()
+        # PASSES reads is_favorite at render time, so it needs telling
+        # that the answer changed -- including when the highlight was
+        # toggled from CHAT or MESH rather than from the grid itself.
+        for view in self.query(PassesView):
+            view.refresh()
         self._close_user_menu()
 
     def _request_node_remove(self, metadata: NodeMetadata) -> None:

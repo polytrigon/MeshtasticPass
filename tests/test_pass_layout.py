@@ -20,8 +20,10 @@ from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
     PASS_COLUMNS_RESERVED,
     PASS_NAME_MAX_CELLS,
+    PASS_MAX_COLUMN_GUTTER,
     PASS_TRUNCATION_MARKER,
     format_pass_bar,
+    pass_gutter,
     pass_row_offset,
     lay_out_passes,
     pass_column_count,
@@ -294,12 +296,13 @@ class MeasuredWidthTests(unittest.TestCase):
         """
         names = ("\U0001f43b", "ALFA", "BRVO")
         grid = lay_out_passes(names, viewport_width=60, measure=self._font_without_bear)
+        gutter = pass_gutter(names, 60, self._font_without_bear)
         row = grid[0]
         starts = []
         cursor = 0
         for cell in row:
             starts.append(cursor)
-            cursor += self._font_without_bear(cell) + PASS_COLUMN_GUTTER
+            cursor += self._font_without_bear(cell) + gutter
         strides = [b - a for a, b in zip(starts, starts[1:])]
         self.assertEqual(len(set(strides)), 1, f"uneven stride: {strides}")
 
@@ -322,9 +325,9 @@ class MeasuredWidthTests(unittest.TestCase):
             grid = lay_out_passes(
                 names, viewport_width=width, measure=self._font_without_bear
             )
+            gutter = pass_gutter(names, width, self._font_without_bear)
             widest = max(
-                sum(cell_len(cell) for cell in row)
-                + PASS_COLUMN_GUTTER * (len(row) - 1)
+                sum(cell_len(cell) for cell in row) + gutter * (len(row) - 1)
                 for row in grid
             )
             if len(grid[0]) > 1:
@@ -464,6 +467,61 @@ class PassBarTests(unittest.TestCase):
             self._encounter(pass_at=1_699_000_000.0, hops_away=0),
         ):
             self.assertIn("!e5deef81", format_pass_bar(encounter, now=1_700_000_000.0))
+
+
+class GutterDistributionTests(unittest.TestCase):
+    """Width the column count could not use is spent on the gaps.
+
+    A board of four-cell names is mostly gutter, so where the leftover
+    goes is the difference between names spread across the screen and
+    names bunched at the left of one. The COUNT is still decided at
+    PASS_COLUMN_GUTTER, so widening can only make a row fit less tightly
+    than the count assumed -- never push a column off the edge.
+    """
+
+    NAMES = tuple(f"N{index:03d}" for index in range(60))
+
+    def _drawn_width(self, viewport: int) -> int:
+        columns = pass_column_count(self.NAMES, viewport)
+        gutter = pass_gutter(self.NAMES, viewport)
+        return columns * pass_column_width(self.NAMES) + (columns - 1) * gutter
+
+    def test_the_gutter_is_never_narrower_than_the_minimum(self) -> None:
+        for viewport in range(8, 200):
+            self.assertGreaterEqual(
+                pass_gutter(self.NAMES, viewport), PASS_COLUMN_GUTTER
+            )
+
+    def test_widening_never_overflows_the_viewport(self) -> None:
+        """The property that makes this safe to do at all."""
+        for viewport in range(8, 200):
+            self.assertLessEqual(self._drawn_width(viewport), viewport)
+
+    def test_leftover_width_is_actually_spent(self) -> None:
+        """Otherwise this is just a wider constant.
+
+        At a width where the count leaves most of a column spare, the
+        drawn board must reach further right than it would at the bare
+        minimum gutter.
+        """
+        viewport = 88
+        columns = pass_column_count(self.NAMES, viewport)
+        minimum = columns * pass_column_width(self.NAMES) + (columns - 1) * PASS_COLUMN_GUTTER
+        self.assertGreater(self._drawn_width(viewport), minimum)
+
+    def test_the_gutter_is_capped(self) -> None:
+        """Past a point a row stops reading as a row.
+
+        Two names on a very wide screen should not end up at opposite
+        edges of it.
+        """
+        for viewport in range(8, 400):
+            self.assertLessEqual(
+                pass_gutter(("AB", "CD"), viewport), PASS_MAX_COLUMN_GUTTER
+            )
+
+    def test_a_single_column_has_no_gutter_to_distribute(self) -> None:
+        self.assertEqual(pass_gutter(("A" * 20,), viewport_width=10), PASS_COLUMN_GUTTER)
 
 
 if __name__ == "__main__":

@@ -316,5 +316,101 @@ class PassMenuTests(PassesHarness):
             self.assertNotEqual(view.selected.node_id, first)
 
 
+class PassHighlightTests(PassesHarness):
+    """A node highlighted anywhere is highlighted here.
+
+    HIGHLIGHT is a mark the user puts on a node, and a mark that only
+    shows up in the view you made it from is not a mark. MESH paints a
+    highlighted node in ACCENT2; so does this.
+    """
+
+    async def test_a_highlighted_node_is_drawn_in_accent2(self) -> None:
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="BRVO")
+        app = self._app()
+        app.settings.set_favorite("!aaaa0001", True)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertNotIn(palette.accent2, (palette.base, palette.accent))
+
+            by_name = _cells(view)
+            self.assertEqual(by_name["ALFA"].name, palette.accent2)
+            self.assertEqual(by_name["BRVO"].name, palette.base)
+
+    async def test_highlighting_from_the_menu_repaints_the_grid(self) -> None:
+        """The recurring failure this project watches for.
+
+        The setting changes, and the view keeps drawing the old answer
+        because nothing told it to look again. PASSES reads is_favorite
+        at render time, so it needs telling.
+        """
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            palette = THEME_PALETTES[app._current_theme]
+            self.assertEqual(_cells(view)["ALFA"].name, palette.base)
+
+            # The real production path, not a direct settings poke: the
+            # menu action is what a person actually triggers.
+            app._activate_node_action("!aaaa0001", "favorite")
+            await pilot.pause()
+
+            self.assertEqual(_cells(view)["ALFA"].name, palette.accent2)
+
+
+class PassMenuKeyTests(PassesHarness):
+    """While the menu is open, the arrows belong to the menu."""
+
+    async def test_arrows_move_the_menu_not_the_selection(self) -> None:
+        """Focus never leaves the grid while the popup is up, so without
+
+        an explicit hand-off the arrows would move the selection
+        UNDERNEATH the menu -- quietly changing which node the open menu
+        is about.
+        """
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="BRVO")
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            selected = view.selected.node_id
+
+            await pilot.press("enter")
+            await pilot.pause()
+            menu = app.query_one("#node-context-menu", ViewportMenu)
+            before = menu.highlighted_index
+
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertEqual(view.selected.node_id, selected)
+            self.assertNotEqual(menu.highlighted_index, before)
+
+    async def test_the_selection_moves_again_once_the_menu_closes(self) -> None:
+        """The hand-off is for the menu's lifetime, not permanent."""
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="BRVO")
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            selected = view.selected.node_id
+
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(len(app.query("#node-context-menu")), 0)
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertNotEqual(view.selected.node_id, selected)
+
+
 if __name__ == "__main__":
     unittest.main()

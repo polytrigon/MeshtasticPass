@@ -40,17 +40,23 @@ Measure = Callable[[str], int]
 # long long-name must not collapse the whole board to a single column --
 # the full identity lives in the bottom bar, exactly as it does on MESH.
 PASS_NAME_MAX_CELLS = 16
-# Blank cells between columns. One reads as a wrapped sentence; two read
-# as a table but leave no room for error, and this board has error in it:
-# certain emoji glyphs are painted wider than the two cells the terminal
-# advances for them, so ink from one cell can reach into the next. Four
-# absorbs that and, on a board whose columns are now four or five cells
-# wide, is what actually separates one name from another.
+# The MINIMUM blank cells between columns, and so what decides how many
+# columns fit. One reads as a wrapped sentence; two leave no room for a
+# glyph painted wider than the box it advances, which this board has.
+# Four separates one name from another on a board whose columns are four
+# or five cells wide.
 #
-# It does not FIX a glyph whose advance is wrong -- that error accumulates
-# along a row and no amount of gutter removes it -- it only stops
-# neighbouring names touching.
+# The gutter actually drawn is usually wider: see pass_gutter, which
+# spends whatever the column count left over rather than banking it as a
+# margin on the right. None of this FIXES a glyph whose advance is wrong
+# -- that error accumulates along a row and no gutter removes it (see
+# terminal_width) -- it only keeps names from crowding each other.
 PASS_COLUMN_GUTTER = 4
+
+# Ceiling on the distributed gutter. Past this the eye stops reading a
+# row as a row and starts reading each name as its own island, which is
+# the opposite of what a `dir /w` block is for.
+PASS_MAX_COLUMN_GUTTER = 8
 
 # Columns held back from the number that would fit. The rightmost column
 # has no gutter after it and nothing between it and the edge of the
@@ -99,6 +105,32 @@ def pass_column_count(
     return max(1, fits - PASS_COLUMNS_RESERVED)
 
 
+def pass_gutter(
+    names: tuple[str, ...], viewport_width: int, measure: Measure = cell_len
+) -> int:
+    """The gutter to actually draw: the minimum, widened to fill the width.
+
+    The column COUNT is decided at PASS_COLUMN_GUTTER, and whatever width
+    that leaves over is spent on the gaps rather than banked as one large
+    margin on the right. A board of four-cell names is mostly gutter
+    anyway, so this is the difference between names spread across the
+    screen and names bunched at the left of it.
+
+    Never narrower than PASS_COLUMN_GUTTER, so widening can only ever
+    make a row fit less tightly than the count assumed -- it cannot push
+    a column off the edge.
+    """
+    columns = pass_column_count(names, viewport_width, measure)
+    if columns < 2:
+        return PASS_COLUMN_GUTTER
+    column_width = pass_column_width(names, measure)
+    spare = viewport_width - columns * column_width
+    return max(
+        PASS_COLUMN_GUTTER,
+        min(PASS_MAX_COLUMN_GUTTER, spare // (columns - 1)),
+    )
+
+
 def lay_out_passes(
     names: tuple[str, ...], viewport_width: int, measure: Measure = cell_len
 ) -> tuple[tuple[str, ...], ...]:
@@ -123,13 +155,14 @@ def lay_out_passes(
         for name in names
     ]
     columns = pass_column_count(names, viewport_width, measure)
+    gutter = pass_gutter(names, viewport_width, measure)
     # Cells are padded to their MEASURED width while Rich and Textual
     # crop this text by its DECLARED one, so a row holding a glyph the
     # terminal paints narrow measures wider to them than it draws. Rather
     # than reason about how much slack a particular viewport leaves, check
     # and drop a column -- what Textual would crop is the right-hand end
     # of the last name on the row.
-    while columns > 1 and _widest_declared_row(cells, columns) > viewport_width:
+    while columns > 1 and _widest_declared_row(cells, columns, gutter) > viewport_width:
         columns -= 1
     return tuple(
         tuple(cells[start : start + columns])
@@ -137,12 +170,12 @@ def lay_out_passes(
     )
 
 
-def _widest_declared_row(cells: list[str], columns: int) -> int:
+def _widest_declared_row(cells: list[str], columns: int, gutter: int) -> int:
     """The widest row's width in the units Rich crops by (cell_len)."""
     return max(
         (
             sum(cell_len(cell) for cell in cells[start : start + columns])
-            + PASS_COLUMN_GUTTER * (len(cells[start : start + columns]) - 1)
+            + gutter * (len(cells[start : start + columns]) - 1)
             for start in range(0, len(cells), columns)
         ),
         default=0,
