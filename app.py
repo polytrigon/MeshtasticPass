@@ -5719,20 +5719,18 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
             with Vertical(id="passes", classes="tab-page"):
-                # Shown only while the radio is not ONLINE, carrying the
-                # exact same text and animation phase as CHAT's and
-                # MESH's (see _update_chat_connection_state) -- a view
-                # that stays silent while connecting reads as a view
-                # with nothing in it.
-                yield Static(
-                    id="passes-connection-status",
-                    classes="page-title",
-                    markup=False,
-                )
                 # Header mirrors CHAT's: the sort control sits exactly
                 # where [ LongFast v ] does, with the count after it, so
                 # the top-left of a people-view always answers "what am
                 # I looking at".
+                #
+                # The connecting state goes INSIDE the sort control (see
+                # _update_chat_connection_state, and ChannelSelector's
+                # identical treatment in CHAT), not into a row of its
+                # own above the header. A row of its own is a row that
+                # appears and disappears, and everything under it moves
+                # by one line each way -- on a grid of names, that is the
+                # whole board jumping every time the radio reconnects.
                 with Horizontal(id="passes-heading"):
                     yield PassSortSelector(DEFAULT_PASS_ORDER)
                     yield Static(id="passes-count", markup=False)
@@ -13149,15 +13147,34 @@ class MeshtasticPassApp(App[None]):
                 # widget -- land on the SAME neutral per-mode target
                 # C/D/ESC already use elsewhere, never a dropdown.
                 self._focus_chat_mode(self._chat_mode)
-        # DM and PASSES own their status lines the same way: written and
-        # shown here while NOT ONLINE, hidden here once ONLINE. MESH is
-        # the exception -- it is written here but hidden by
-        # _update_mesh_node_bar, because its line has a second job.
-        self_hiding = [
-            widget
-            for selector in ("#dm-connection-status", "#passes-connection-status")
-            for widget in self.query(selector)
-        ]
+        # DM owns a status line of its own: written and shown here while
+        # NOT ONLINE, hidden here once ONLINE. MESH is written here but
+        # hidden by _update_mesh_node_bar, because its line has a second
+        # job. CHAT and PASSES have no such line at all -- their status
+        # goes inside their header dropdown (below, and via
+        # ChannelSelector's own override above), which is what keeps the
+        # view from reflowing every time the radio reconnects.
+        self_hiding = list(self.query("#dm-connection-status"))
+        # PASSES puts the connecting state where CHAT does: inside the
+        # dropdown itself, replacing "[ RECENT v ]" for as long as it
+        # lasts. Nothing is added to the layout and nothing moves.
+        #
+        # The count beside it deliberately stays. CHAT hides its network
+        # name while connecting because that is a fact about a live
+        # radio; "220 NODES" is a fact about the database, just as true
+        # with no radio attached, and hiding it would suggest the list
+        # itself was unavailable.
+        for selector in self.query(PassSortSelector):
+            was_focused = selector.has_focus
+            selector.set_status_override(self._connection_status_rich_text())
+            # An overridden dropdown is disabled (see set_status_override),
+            # so focus must not be left sitting on it -- the same hazard
+            # CHAT handles a few lines above, and here it would leave the
+            # arrows doing nothing on a board that is entirely arrows.
+            if was_focused and selector.disabled:
+                views = list(self.query(PassesView))
+                if views:
+                    views[0].focus()
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:

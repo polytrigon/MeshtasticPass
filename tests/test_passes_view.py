@@ -30,6 +30,7 @@ import unittest
 from textual.widgets import Static
 
 from app import MeshtasticPassApp, PassSortSelector, PassesView
+from radio_service import RadioState
 from viewport_menu import ViewportMenu
 from app_settings import AppSettings
 from chat_store import ChatStore
@@ -489,6 +490,93 @@ class PassSortControlTests(PassesHarness):
             await pilot.press("right")
             await pilot.pause()
             self.assertNotEqual(app.query_one(PassesView).selected.node_id, selected)
+
+
+class PassConnectingStateTests(PassesHarness):
+    """Connecting must not move the board.
+
+    PASSES used to carry its own status row above the header. A row that
+    appears and disappears takes everything under it with it, one line
+    each way -- on a grid of names that is the whole board jumping every
+    time the radio reconnects. CHAT solved this long ago by putting the
+    status INSIDE its channel dropdown; this does the same.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        for index in range(12):
+            self.store.record_encounter(
+                f"!aaaa000{index:x}", seen_at=T + index, short_name=f"N{index:03d}"
+            )
+
+    async def test_the_status_replaces_the_sort_control(self) -> None:
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+
+            selector = app.query_one(PassSortSelector)
+            self.assertIn("CONNECTING", str(selector.render()).upper())
+            self.assertNotIn("RECENT", str(selector.render()).upper())
+
+    async def test_no_separate_status_row_exists(self) -> None:
+        """Its absence IS the fix, so its absence is what to assert."""
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+
+            self.assertEqual(len(app.query("#passes-connection-status")), 0)
+
+    async def test_the_grid_does_not_move_when_the_radio_comes_online(self) -> None:
+        """The actual complaint, stated as a coordinate.
+
+        Whatever the connection state, the first row of names sits on the
+        same screen line.
+        """
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            connecting_y = view.region.y
+
+            app._radio_state = RadioState.ONLINE
+            app._update_chat_connection_state()
+            await pilot.pause()
+
+            selector = app.query_one(PassSortSelector)
+            self.assertIn("RECENT", str(selector.render()).upper())
+            self.assertEqual(view.region.y, connecting_y)
+
+    async def test_the_count_stays_visible_while_connecting(self) -> None:
+        """It is a fact about the database, not about the radio.
+
+        CHAT hides its network name while connecting because that
+        describes a live radio. "12 NODES" is just as true with no radio
+        attached, and hiding it would suggest the list was unavailable.
+        """
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+
+            self.assertIn("12 NODES", self._count_text(app))
+
+    async def test_focus_is_not_stranded_on_the_disabled_control(self) -> None:
+        """An overridden dropdown is disabled, and this board is all arrows."""
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            app._radio_state = RadioState.ONLINE
+            app._update_chat_connection_state()
+            await pilot.pause()
+
+            await pilot.press("s")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, PassSortSelector)
+
+            app._radio_state = RadioState.CONNECTING
+            app._update_chat_connection_state()
+            await pilot.pause()
+
+            self.assertIsInstance(app.focused, PassesView)
 
 
 if __name__ == "__main__":
