@@ -4613,6 +4613,15 @@ class MeshtasticPassApp(App[None]):
     #passes-view {
         height: 1fr;
         width: 1fr;
+        /* A blank line above AND below the names, matching how MESH
+           breathes. MESH gets its air incidentally -- an almost-always
+           empty #mesh-status line above the board, and a board sized
+           1fr whose dot grid sits inside it rather than filling it --
+           so there is no margin rule there to copy. PASSES' grid starts
+           flush at the top of its area and ends flush at the bottom, so
+           the same breathing room has to be asked for explicitly.
+           Vertical only: the columns keep their own left edge. */
+        margin: 1 0;
     }
 
     #passes-node-bar {
