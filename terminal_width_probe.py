@@ -136,6 +136,39 @@ def graphemes_in_use(limit: int = 40) -> list[tuple[str, str]]:
     return list(seen.items())
 
 
+def names_in_use(limit: int = 40) -> list[tuple[str, str]]:
+    """Whole PASSES cell names, exactly as the grid would lay them out.
+
+    The per-grapheme table says which glyph is wrong. This says which
+    ROW drifts, which is what is actually visible on screen: a cell's
+    painted width is the stride to the next column, so any name whose
+    painted width differs from its declared width moves everything to
+    its right by that difference -- and a name whose two widths agree
+    cannot move anything, however many emoji it contains.
+
+    Uses the real disambiguated names (see disambiguate_pass_names) and
+    not the raw short names, because the suffix a collision adds is part
+    of the cell and has its own width.
+    """
+    try:
+        from chat_store import ChatStore
+        from pass_layout import disambiguate_pass_names
+    except Exception:
+        return []
+    try:
+        rows = ChatStore.open().encounters()
+    except Exception:
+        return []
+    out: list[tuple[str, str]] = []
+    for encounter, name in zip(rows, disambiguate_pass_names(rows)):
+        if name.isascii():
+            continue
+        out.append((name, encounter.node_id))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def main() -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Not a terminal. Run this IN the uConsole's terminal, not piped.")
@@ -149,12 +182,14 @@ def main() -> int:
         return 2
 
     probes = list(STANDARD_PROBES) + graphemes_in_use()
+    names = names_in_use()
     destination = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser(
         "~/terminal_width_probe.txt"
     )
 
     settings = termios.tcgetattr(sys.stdin)
     results: list[tuple[str, int, int | None, str]] = []
+    name_results: list[tuple[str, int, int | None, str]] = []
     try:
         tty.setraw(sys.stdin.fileno())
         # Anything already sitting in the input buffer (a stray keypress,
@@ -165,6 +200,10 @@ def main() -> int:
             results.append(
                 (grapheme, cell_len(grapheme), measure_painted_width(grapheme), label)
             )
+        name_results = [
+            (name, cell_len(name), measure_painted_width(name), node_id)
+            for name, node_id in names
+        ]
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
         sys.stdout.write("\r\x1b[K")
@@ -190,6 +229,27 @@ def main() -> int:
     lines.append(
         f"{divergent} of {len(results)} graphemes paint at a width Rich did not account for."
     )
+
+    if name_results:
+        lines += [
+            "",
+            "PASSES CELLS -- a name whose two widths differ moves every column",
+            "to its right on that row. One whose widths agree cannot, no matter",
+            "how many emoji it holds.",
+            "",
+            f"{'name':<24}{'rich':>5}{'painted':>9}  node",
+            "-" * 78,
+        ]
+        drifting = 0
+        for name, declared, painted, node_id in name_results:
+            shown = "no answer" if painted is None else str(painted)
+            flag = ""
+            if painted is not None and painted != declared:
+                flag = f"  <-- DRIFTS {painted - declared:+d}"
+                drifting += 1
+            lines.append(f"{name:<24}{declared:>5}{shown:>9}  {node_id}{flag}")
+        lines.append("-" * 78)
+        lines.append(f"{drifting} of {len(name_results)} names drift.")
 
     report = "\n".join(lines)
     print(report)
