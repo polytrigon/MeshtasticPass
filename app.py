@@ -4068,10 +4068,10 @@ class PassesView(Static):
         palette = THEME_PALETTES[self.app._current_theme]
         # Names exactly as their operators set them, duplicates and all.
         # Two nodes sharing one emoji DO render as two identical cells,
-        # which is the truth about this mesh; the bar under the grid and
-        # the ENTER menu are where a reader finds out which is which,
-        # and both have room to print a node ID that a 16-cell grid cell
-        # does not.
+        # which is the truth about this mesh. The bar under the grid is
+        # where a reader finds out which is which: it prints the node ID
+        # for whichever cell is highlighted, unconditionally, which a
+        # grid cell has no room to do.
         names = tuple(encounter.display_name for encounter in self._passes)
         rows = lay_out_passes(names, self.size.width or 60)
         self._columns = len(rows[0]) if rows else 1
@@ -9062,10 +9062,15 @@ class MeshtasticPassApp(App[None]):
 
         Not a shortcut straight into a DM, which is what this used to be.
         A DM is one of several things a person wants from a name on this
-        board -- highlight it, look up which node it actually is, remove
-        it -- and now that names are shown with their duplicates intact,
-        the menu is also the place that answers "which of these two is
-        this one", since it prints the node ID.
+        board -- highlight it, reply to it, remove it -- and jumping
+        straight into a conversation made the other four unreachable.
+
+        This is CHAT's menu unchanged, which means it does NOT print the
+        node ID for a remote node (see _open_node_menu: that row exists
+        only in the is_local branch). Telling two identical cells apart
+        is the bar's job, and the bar states the node ID unconditionally
+        for exactly that reason -- see format_pass_bar. Arrow onto a
+        name and it is already answered, before any menu is opened.
 
         Built the way CHAT builds its own (see open_user_menu): start
         from what is ON RECORD for this node, then overlay whatever the

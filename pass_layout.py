@@ -11,8 +11,8 @@ state, not a data problem to paper over. An earlier version appended
 each colliding node's ID tail to tell them apart, which cost every such
 cell four cells of width and still could not be read on a terminal whose
 emoji glyphs overpaint the character beside them. Identity lives where
-there is room for it instead: the bar under the grid, and the ENTER
-menu, both of which state the node ID outright.
+there is room for it instead: the bar under the grid, which states the
+node ID for the highlighted cell unconditionally (see format_pass_bar).
 
 Kept pure and free of Textual so the layout can be tested exhaustively
 -- including the emoji short names that are common on a real mesh and

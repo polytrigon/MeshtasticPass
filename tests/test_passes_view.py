@@ -197,11 +197,10 @@ class PassesViewTests(PassesHarness):
 class PassMenuTests(PassesHarness):
     """ENTER on a name opens the same node menu CHAT's sender names do.
 
-    It used to jump straight into a DM. A DM is one of several things
-    someone wants from a name here -- highlight it, find out which node
-    it actually is, remove it -- and since names are now shown with
-    their duplicates intact, the menu is also the only place that says
-    which of two identical cells this one is.
+    It used to jump straight into a DM, which made the menu's other four
+    actions unreachable from this board. Which of two identical cells you
+    are on is answered by the BAR, not the menu -- CHAT's menu prints no
+    node ID for a remote node, and this is CHAT's menu unchanged.
     """
 
     async def _open_menu(self, app, pilot) -> ViewportMenu:
@@ -224,8 +223,8 @@ class PassMenuTests(PassesHarness):
             self.assertIn("HIGHLIGHT", labels)
             self.assertIn("DIRECT MSG", labels)
 
-    async def test_the_menu_names_the_node_id_for_an_unknown_node(self) -> None:
-        """A node the radio has never heard of still opens a menu.
+    async def test_a_node_the_radio_does_not_know_still_opens_a_menu(self) -> None:
+        """The case PASSES exists for.
 
         PASSES exists to outlive the radio's own bounded NodeDB, so the
         menu is built from what is ON RECORD first and the live NodeDB
@@ -296,8 +295,9 @@ class PassMenuTests(PassesHarness):
         """No ID tail any more -- and that is deliberate.
 
         Two radios sharing an emoji look alike on the board, which is
-        the truth about this mesh. Telling them apart is the ENTER
-        menu's job, and both cells must still be selectable.
+        the truth about this mesh. Telling them apart is the BAR's job,
+        and both cells must still be separately selectable for it to
+        have anything to describe.
         """
         self.store.record_encounter("!aaaa0001", seen_at=T, short_name="\U0001f43b")
         self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="\U0001f43b")
