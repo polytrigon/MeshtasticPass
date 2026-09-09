@@ -51,6 +51,7 @@ from chat_store import (
     canonical_profile_key,
     normalize_profile_node_id,
     split_profile_key,
+    NodeEncounter,
 )
 from geo import format_distance_miles
 from host_timezone import detect_host_timezone
@@ -89,6 +90,12 @@ from radio_capabilities import (
     format_hw_model_name,
     modem_preset_choices,
     role_choices,
+)
+from pass_layout import (
+    DEFAULT_PASS_ORDER,
+    PASS_COLUMN_GUTTER,
+    format_pass_bar,
+    lay_out_passes,
 )
 from radio_service import (
     ChannelInfo,
@@ -3939,6 +3946,153 @@ def _expand_theme_overrides(css: str) -> str:
     return "".join(expanded) + tail
 
 
+PASS_ORDER_LABELS = (("ALPHA", "alpha"), ("HOPS", "hops"), ("RECENT", "recent"))
+
+
+class PassSortSelector(KeyboardDropdown):
+    """PASSES' sort control: [ RECENT v ], in CHAT's channel-selector slot.
+
+    Same primitive, same position and same grammar as CHAT's
+    [ LongFast v ] -- a view that looks like CHAT should be driven like
+    CHAT, so the one control at the top left is always "what am I
+    looking at".
+    """
+
+    def __init__(self, value: str) -> None:
+        super().__init__(
+            "pass_order",
+            "",
+            (DropdownOption(label, order) for label, order in PASS_ORDER_LABELS),
+            value,
+            widget_id="pass-sort-selector",
+            prefix="[ ",
+            suffix=" ]",
+            classes="keyboard-dropdown",
+        )
+
+
+class PassesView(Static):
+    """The PASSES directory: every node encountered, as a DOS-style block.
+
+    Rendered as ONE Static holding a single Rich Text, not one widget
+    per node. MESH mounts a widget per node and CHAT one per message,
+    and the cost of that is not hypothetical -- the 1s tick re-laying
+    out every mounted CHAT entry is exactly what made a long transcript
+    sluggish on the uConsole. A pass list is unbounded by design (it is
+    the record of everyone ever met), so it is the last place that
+    should mount a widget per row. Selection moves a style inside one
+    Text; nothing mounts, nothing unmounts, nothing re-lays out.
+    """
+
+    can_focus = True
+
+    class OpenRequested(Message):
+        """Enter on a pass: the app decides what that means (a DM)."""
+
+        def __init__(self, encounter: NodeEncounter) -> None:
+            super().__init__()
+            self.encounter = encounter
+
+    def __init__(self) -> None:
+        super().__init__(id="passes-view", markup=False)
+        self._passes: tuple[NodeEncounter, ...] = ()
+        self._columns = 1
+        self._selected = 0
+
+    @property
+    def passes(self) -> tuple[NodeEncounter, ...]:
+        return self._passes
+
+    @property
+    def selected(self) -> NodeEncounter | None:
+        if not self._passes:
+            return None
+        return self._passes[min(self._selected, len(self._passes) - 1)]
+
+    def set_passes(self, passes: tuple[NodeEncounter, ...]) -> None:
+        """Replace the list, keeping the highlight on the SAME node.
+
+        Re-sorting or a refresh must not silently move the selection to
+        whatever now occupies that index -- the highlight belongs to a
+        node, not to a position.
+        """
+        previous = self.selected
+        self._passes = passes
+        if previous is not None:
+            for index, encounter in enumerate(passes):
+                if encounter.node_id == previous.node_id:
+                    self._selected = index
+                    break
+            else:
+                self._selected = 0
+        else:
+            self._selected = 0
+        self.refresh(layout=True)
+
+    class SelectionChanged(Message):
+        """The highlight moved; the bottom bar describes a new node."""
+
+    def move_selection(self, delta_columns: int, delta_rows: int) -> None:
+        if not self._passes:
+            return
+        index = self._selected + delta_columns + delta_rows * max(1, self._columns)
+        index = max(0, min(index, len(self._passes) - 1))
+        if index == self._selected:
+            return
+        self._selected = index
+        self.refresh()
+        self.post_message(self.SelectionChanged())
+
+    def render(self) -> Text:
+        if not self._passes:
+            return Text(
+                "NO PASSES YET -- nodes appear here as the radio meets them",
+                style=Style(color=THEME_PALETTES[self.app._current_theme].dim),
+            )
+        palette = THEME_PALETTES[self.app._current_theme]
+        names = tuple(encounter.display_name for encounter in self._passes)
+        rows = lay_out_passes(names, self.size.width or 60)
+        self._columns = len(rows[0]) if rows else 1
+        text = Text(no_wrap=True)
+        index = 0
+        for row_number, row in enumerate(rows):
+            if row_number:
+                text.append("\n")
+            for column_number, cell in enumerate(row):
+                if column_number:
+                    text.append(" " * PASS_COLUMN_GUTTER)
+                encounter = self._passes[index]
+                # BASE for a node we were actually near, DIM for one the
+                # radio only knows about second-hand. This is the whole
+                # point of the view, so it is carried by the same
+                # BASE/DIM pair the rest of the app uses for
+                # present/stale rather than by a marker character.
+                color = palette.base if encounter.heard_directly else palette.dim
+                style = Style(color=color, reverse=index == self._selected)
+                text.append(cell, style=style)
+                index += 1
+        return text
+
+    def on_key(self, event: Key) -> None:
+        if not self._passes:
+            return
+        moves = {
+            "left": (-1, 0),
+            "right": (1, 0),
+            "up": (0, -1),
+            "down": (0, 1),
+        }
+        if event.key in moves:
+            self.move_selection(*moves[event.key])
+            event.stop()
+            return
+        if event.key == "enter":
+            encounter = self.selected
+            if encounter is not None:
+                self.post_message(self.OpenRequested(encounter))
+            event.stop()
+
+
 class MeshtasticPassApp(App[None]):
     """The first MeshtasticPass terminal UI shell."""
 
@@ -4429,6 +4583,41 @@ class MeshtasticPassApp(App[None]):
 
     #mesh-status, #mesh-node-bar {
         height: 1;
+    }
+
+    /* PASSES reuses MESH's and CHAT's shapes rather than introducing a
+       third: a heading row with the selector at its left, a 1fr body,
+       and one status line at the bottom. */
+    #passes-heading {
+        height: auto;
+        width: 1fr;
+    }
+
+    #pass-sort-selector {
+        width: auto;
+        height: auto;
+        min-height: 1;
+        text-style: bold;
+    }
+
+    #passes-count {
+        width: 1fr;
+        height: 1;
+        color: $snow_dim;
+    }
+
+    Screen.theme-{THEME} #passes-count {
+        color: ${THEME}_dim;
+    }
+
+    #passes-view {
+        height: 1fr;
+        width: 1fr;
+    }
+
+    #passes-node-bar {
+        height: 1;
+        width: 1fr;
     }
 
     #mesh-status {
@@ -4960,6 +5149,13 @@ class MeshtasticPassApp(App[None]):
         # nothing new to record. In-memory only: losing it on restart
         # costs one redundant write per node, never a lost pass.
         self._recorded_passes: dict[str, tuple[float, bool]] = {}
+        # Session-only: the sort a user picks is a way of looking, not a
+        # preference worth persisting until somebody asks for it.
+        self._pass_order = DEFAULT_PASS_ORDER
+        # Set whenever a pass is actually written, so the 1s tick can
+        # repaint PASSES while it is being watched WITHOUT reading the
+        # database every second for a list that usually has not changed.
+        self._passes_dirty = False
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
@@ -5348,10 +5544,17 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
             with Vertical(id="passes", classes="tab-page"):
-                # Populated in the next commit. The page exists now so
-                # the ContentSwitcher has a target for "passes": adding
-                # the key without the page would make [3] raise.
-                yield Static(id="passes-status", markup=False)
+                # Header mirrors CHAT's: the sort control sits exactly
+                # where [ LongFast v ] does, with the count after it, so
+                # the top-left of a people-view always answers "what am
+                # I looking at".
+                with Horizontal(id="passes-heading"):
+                    yield PassSortSelector(DEFAULT_PASS_ORDER)
+                    yield Static(id="passes-count", markup=False)
+                yield PassesView()
+                # One line for the highlighted pass, the same shape as
+                # MESH's node bar rather than a second grammar.
+                yield Static(id="passes-node-bar", markup=False)
             with Vertical(id="mesh", classes="tab-page"):
                 # Shown/hidden and populated by _update_chat_connection_state()
                 # with the exact same _connection_status_rich_text() CHAT's
@@ -6273,6 +6476,11 @@ class MeshtasticPassApp(App[None]):
                         dm_input.focus()
                     else:
                         self.query_one("#dm-log", ChatTranscript).focus()
+        elif tab_id == "passes":
+            self._refresh_passes()
+            # Focus the grid itself: its arrow keys are its own, unlike
+            # MESH's, which the App's on_key drives.
+            self.query_one(PassesView).focus()
         elif tab_id == "connection":
             self._refresh_device_options()
             self.query_one(DeviceSelector).focus()
@@ -6359,6 +6567,11 @@ class MeshtasticPassApp(App[None]):
 
     @on(KeyboardDropdown.Selected)
     async def dropdown_selected(self, event: KeyboardDropdown.Selected) -> None:
+        if event.setting_name == "pass_order":
+            self._pass_order = str(event.value)
+            self._refresh_passes()
+            self.query_one(PassesView).focus()
+            return
         if event.setting_name == "channel_index":
             await self._switch_channel(int(event.value))
             return
@@ -8596,6 +8809,9 @@ class MeshtasticPassApp(App[None]):
         current_time = monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
+        if self.current_tab == "passes" and self._passes_dirty:
+            self._passes_dirty = False
+            self._refresh_passes()
         self._refresh_mesh(wall_now)
 
     def _mesh_last_message_activity(self) -> dict[str, float]:
@@ -8696,6 +8912,68 @@ class MeshtasticPassApp(App[None]):
             )
         return rings
 
+    def _refresh_passes(self) -> None:
+        """Re-read the pass list and repaint PASSES.
+
+        Reads from the store rather than from any live radio state: a
+        pass is a record of having met someone, so the view must show
+        nodes the radio has since forgotten. Cheap enough to call on
+        every tab entry and every sort change -- 58 rows on the user's
+        own radio, and the ordering is a pure sort.
+        """
+        views = list(self.query(PassesView))
+        if not views:
+            return
+        view = views[0]
+        if self.chat_store is None:
+            view.set_passes(())
+        else:
+            try:
+                view.set_passes(self.chat_store.encounters(self._pass_order))
+            except ChatStoreError:
+                view.set_passes(())
+        total = len(view.passes)
+        heard = sum(1 for encounter in view.passes if encounter.heard_directly)
+        count = self.query_one("#passes-count", Static)
+        # "N PASSES - M met directly" rather than a bare total: the
+        # split is the interesting number, and stating it here saves
+        # the DIM/BASE distinction from needing a legend.
+        count.update(
+            f" \u00b7 {total} PASSES" + (f" \u00b7 {heard} MET DIRECTLY" if heard else "")
+        )
+        self._update_passes_node_bar()
+
+    def _update_passes_node_bar(self) -> None:
+        """One line describing the highlighted pass, MESH-bar shaped."""
+        bars = list(self.query("#passes-node-bar"))
+        if not bars:
+            return
+        views = list(self.query(PassesView))
+        encounter = views[0].selected if views else None
+        if encounter is None:
+            bars[0].update("")
+            return
+        bars[0].update(format_pass_bar(encounter, now=self._now()))
+
+    @on(PassesView.SelectionChanged)
+    def passes_selection_changed(self, _event: PassesView.SelectionChanged) -> None:
+        self._update_passes_node_bar()
+
+    @on(PassesView.OpenRequested)
+    def open_pass_conversation(self, event: PassesView.OpenRequested) -> None:
+        """Enter on a pass opens that node's DM -- the same public entry
+
+        point the CHAT sender menu and the MESH node menu already use,
+        so a conversation started from PASSES is not a different kind of
+        conversation.
+        """
+        encounter = event.encounter
+        self.open_dm(
+            encounter.node_id,
+            long_name=encounter.long_name,
+            short_name=encounter.short_name,
+        )
+
     def _record_pass_encounters(
         self, nodes: tuple[NodeMetadata, ...], *, now: float
     ) -> None:
@@ -8764,6 +9042,7 @@ class MeshtasticPassApp(App[None]):
             except Exception:
                 continue
             self._recorded_passes[node_id] = (seen_at, direct)
+            self._passes_dirty = True
 
     def _record_pass_from_message(self, message: ReceivedMessage) -> None:
         """Record the sender of an arriving message as a PASSES encounter.
@@ -8809,6 +9088,7 @@ class MeshtasticPassApp(App[None]):
             )
         except Exception:
             return
+        self._passes_dirty = True
         # Left out of the suppression map on purpose: this path never
         # establishes directness, so it must not record a (time, direct)
         # pair that could make the next sweep skip a real upgrade.

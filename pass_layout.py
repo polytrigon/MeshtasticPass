@@ -81,3 +81,55 @@ def _pad_to_cells(value: str, width: int) -> str:
     wide and combining characters).
     """
     return value + " " * max(0, width - cell_len(value))
+
+
+DEFAULT_PASS_ORDER = "recent"
+
+# One line describing the highlighted pass, in MESH's node-bar grammar:
+# fields separated by " - ", and a field with no data OMITTED rather
+# than printed as a placeholder (see mesh_state's own bar, which stopped
+# printing empty fields for exactly this reason -- a placeholder costs
+# the same width as real information and tells you nothing).
+PASS_BAR_SEPARATOR = " · "
+
+
+def format_pass_bar(encounter, now: float) -> str:
+    """Describe one pass on a single line.
+
+    Says HOW the node was met before anything else measurable, because
+    that is the distinction the view exists to draw and the one thing a
+    reader cannot recover from the grid alone once a cell is
+    highlighted.
+    """
+    from relative_time import format_relative_age
+
+    fields = [encounter.display_name]
+    if encounter.short_name and encounter.short_name != encounter.display_name:
+        fields.append(encounter.short_name)
+    if encounter.long_name and encounter.long_name != encounter.display_name:
+        fields.append(encounter.long_name)
+    fields.append("MET DIRECTLY" if encounter.heard_directly else "VIA MESH")
+    if encounter.hops_away is not None:
+        fields.append(f"HOPS {encounter.hops_away}")
+    first_age = _age_or_none(encounter.first_seen_at, now, format_relative_age)
+    if first_age is not None:
+        fields.append(f"FIRST {first_age}")
+    last_age = _age_or_none(encounter.last_seen_at, now, format_relative_age)
+    if last_age is not None:
+        fields.append(f"LAST {last_age}")
+    return PASS_BAR_SEPARATOR.join(fields)
+
+
+def _age_or_none(when, now: float, formatter):
+    """Format an age, or nothing at all for an impossible timestamp.
+
+    A future or malformed timestamp is not rendered as "0s" -- that
+    would state something the data does not support. The field is simply
+    absent, the same way the MESH bar omits a field it has no data for.
+    """
+    if not isinstance(when, (int, float)) or isinstance(when, bool):
+        return None
+    age = now - float(when)
+    if age < 0:
+        return None
+    return formatter(age)
