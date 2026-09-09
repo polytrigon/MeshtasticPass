@@ -174,13 +174,6 @@ def disambiguate_pass_names(encounters) -> tuple[str, ...]:
     )
 
 
-# MS-DOS printed "-- More --" when a directory ran past the screen, and
-# PASSES is a DOS directory; borrowing it is both on-theme and the
-# honest thing to show, since without it a full screen of names gives no
-# hint that the list continues.
-PASS_MORE_MARKER = "-- MORE --"
-
-
 def pass_row_offset(
     total_rows: int, viewport_rows: int, selected_row: int, offset: int
 ) -> int:

@@ -94,7 +94,6 @@ from radio_capabilities import (
 from pass_layout import (
     DEFAULT_PASS_ORDER,
     PASS_COLUMN_GUTTER,
-    PASS_MORE_MARKER,
     disambiguate_pass_names,
     format_pass_bar,
     lay_out_passes,
@@ -4068,10 +4067,9 @@ class PassesView(Static):
         self._columns = len(rows[0]) if rows else 1
         height = self.size.height or len(rows)
         selected_row = self._selected // max(1, self._columns)
-        # One row is spent on the MORE marker whenever the list runs
-        # past the fold, so the viewport is that much shorter.
-        overflows = len(rows) > height
-        visible_rows = max(1, height - 1) if overflows else height
+        # No "more" marker: that a list scrolls is an assumed pattern,
+        # and a row spent saying so is a row not spent on names.
+        visible_rows = max(1, height)
         self._row_offset = pass_row_offset(
             len(rows), visible_rows, selected_row, self._row_offset
         )
@@ -4094,13 +4092,6 @@ class PassesView(Static):
                 style = Style(color=color, reverse=index == self._selected)
                 text.append(cell, style=style)
                 index += 1
-        if overflows:
-            remaining = len(rows) - (self._row_offset + visible_rows)
-            text.append("\n")
-            text.append(
-                PASS_MORE_MARKER if remaining > 0 else " " * len(PASS_MORE_MARKER),
-                style=Style(color=palette.dim),
-            )
         return text
 
     def on_key(self, event: Key) -> None:
@@ -8992,7 +8983,7 @@ class MeshtasticPassApp(App[None]):
         # split is the interesting number, and stating it here saves
         # the DIM/BASE distinction from needing a legend.
         count.update(
-            f" \u00b7 {total} PASSES" + (f" \u00b7 {heard} MET DIRECTLY" if heard else "")
+            f" \u00b7 {total} NODES" + (f" \u00b7 {heard} MET DIRECTLY" if heard else "")
         )
         self._update_passes_node_bar()
 
