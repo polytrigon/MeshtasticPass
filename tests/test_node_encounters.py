@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from chat_store import (  # noqa: E402
     ENCOUNTER_ORDERS,
+    SCHEMA_VERSION,
     ChatStore,
     NodeEncounter,
     sort_encounters,
@@ -188,7 +189,8 @@ class SchemaUpgradeTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             self.addCleanup(connection.close)
             self.assertEqual(
-                connection.execute("SELECT version FROM schema_version").fetchone()[0], 7
+                connection.execute("SELECT version FROM schema_version").fetchone()[0],
+                SCHEMA_VERSION,
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
@@ -197,6 +199,124 @@ class SchemaUpgradeTests(unittest.TestCase):
             self.assertEqual(upgraded.encounters(), ())
             upgraded.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
             self.assertEqual(len(upgraded.encounters()), 1)
+
+    def test_a_v7_database_gains_pass_at_without_losing_its_encounters(self) -> None:
+        """v7 -> v8 is the first node_encounters migration that must ALTER.
+
+        The v6 -> v7 step got its table free from CREATE TABLE IF NOT
+        EXISTS. That same statement is a NO-OP on a v7 database, so a new
+        COLUMN needs an explicit ALTER -- and the rows already in the
+        table have to survive it, since a pass list that resets on
+        upgrade defeats the entire point of the view.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "chat.db")
+            store = ChatStore.open(path)
+            store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+
+            # Rebuild node_encounters exactly as v7 shipped it: same
+            # columns, no pass_at, carrying the row already recorded.
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE encounters_v7 (
+                    node_id TEXT PRIMARY KEY,
+                    long_name TEXT,
+                    short_name TEXT,
+                    hops_away INTEGER,
+                    first_seen_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    first_heard_at REAL,
+                    last_heard_at REAL
+                );
+                INSERT INTO encounters_v7
+                    SELECT node_id, long_name, short_name, hops_away,
+                           first_seen_at, last_seen_at, first_heard_at,
+                           last_heard_at
+                    FROM node_encounters;
+                DROP TABLE node_encounters;
+                ALTER TABLE encounters_v7 RENAME TO node_encounters;
+                UPDATE schema_version SET version = 7;
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            upgraded = ChatStore.open(path)
+
+            rows = upgraded.encounters()
+            self.assertEqual([row.short_name for row in rows], ["ALFA"])
+            self.assertIsNone(rows[0].pass_at)
+            self.assertFalse(rows[0].has_pass)
+            connection = sqlite3.connect(path)
+            self.addCleanup(connection.close)
+            self.assertEqual(
+                connection.execute("SELECT version FROM schema_version").fetchone()[0],
+                SCHEMA_VERSION,
+            )
+
+
+class ConfirmedPassTests(unittest.TestCase):
+    """pass_at: the subset of encounters that actually exchanged a pass.
+
+    Distinct from heard_directly, and deliberately harder to earn. Being
+    heard is something a radio does TO us; a pass is mutual, so nothing
+    the mesh broadcasts can ever set it on its own.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = ChatStore.open(os.path.join(directory.name, "chat.db"))
+
+    def _one(self, node_id: str) -> NodeEncounter:
+        return next(e for e in self.store.encounters() if e.node_id == node_id)
+
+    def test_an_ordinary_encounter_has_no_pass(self) -> None:
+        """The default, and for now the only case real data produces.
+
+        No pass protocol exists yet, so every row a live radio writes
+        must come back has_pass False -- the PASSES count is honestly
+        zero rather than quietly counting something else.
+        """
+        self.store.record_encounter("!aaaa0001", seen_at=T, heard_directly=True)
+        row = self._one("!aaaa0001")
+        self.assertTrue(row.heard_directly)
+        self.assertIsNone(row.pass_at)
+        self.assertFalse(row.has_pass)
+
+    def test_a_recorded_pass_round_trips(self) -> None:
+        self.store.record_encounter("!bbbb0002", seen_at=T, pass_at=T)
+        row = self._one("!bbbb0002")
+        self.assertEqual(row.pass_at, T)
+        self.assertTrue(row.has_pass)
+
+    def test_a_later_sighting_never_clears_a_pass(self) -> None:
+        """Same one-way rule the rest of the row follows.
+
+        A node that passed with us once has passed with us for ever; an
+        ordinary NodeDB sweep afterwards carries no pass_at and must not
+        be read as a retraction.
+        """
+        self.store.record_encounter("!cccc0003", seen_at=T, pass_at=T)
+        self.store.record_encounter("!cccc0003", seen_at=T + 500)
+        self.assertEqual(self._one("!cccc0003").pass_at, T)
+
+    def test_a_pass_keeps_the_earliest_time(self) -> None:
+        """pass_at answers "since when", so it only ever moves earlier."""
+        self.store.record_encounter("!dddd0004", seen_at=T, pass_at=T + 100)
+        self.store.record_encounter("!dddd0004", seen_at=T, pass_at=T + 5)
+        self.store.record_encounter("!dddd0004", seen_at=T, pass_at=T + 900)
+        self.assertEqual(self._one("!dddd0004").pass_at, T + 5)
+
+    def test_a_pass_survives_reopening_the_database(self) -> None:
+        self.store.record_encounter("!eeee0005", seen_at=T, pass_at=T)
+        self.store.record_encounter("!ffff0006", seen_at=T)
+        reopened = ChatStore.open(self.store.path)
+        self.assertEqual(
+            {e.node_id: e.has_pass for e in reopened.encounters()},
+            {"!eeee0005": True, "!ffff0006": False},
+        )
 
 
 if __name__ == "__main__":

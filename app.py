@@ -4060,7 +4060,7 @@ class PassesView(Static):
     def render(self) -> Text:
         if not self._passes:
             return Text(
-                "NO PASSES YET -- nodes appear here as the radio meets them",
+                "NO NODES YET -- they appear here as the radio encounters them",
                 style=Style(color=THEME_PALETTES[self.app._current_theme].dim),
             )
         palette = THEME_PALETTES[self.app._current_theme]
@@ -4089,12 +4089,15 @@ class PassesView(Static):
                 if column_number:
                     text.append(" " * PASS_COLUMN_GUTTER)
                 encounter = self._passes[index]
-                # BASE for a node we were actually near, DIM for one the
-                # radio only knows about second-hand. This is the whole
-                # point of the view, so it is carried by the same
-                # BASE/DIM pair the rest of the app uses for
-                # present/stale rather than by a marker character.
-                color = palette.base if encounter.heard_directly else palette.dim
+                # ACCENT for a node that has exchanged a pass with us,
+                # BASE for everyone else. Encountering a node is the
+                # ordinary case -- it is what a mesh does all day -- so
+                # it gets the ordinary colour, and the accent is spent
+                # only on the rare thing. Hearing a node directly is
+                # deliberately NOT drawn: it is a property of radio
+                # range, not of having met someone, and colouring it
+                # made most of the board look significant.
+                color = palette.accent if encounter.has_pass else palette.base
                 style = Style(color=color, reverse=index == self._selected)
                 text.append(cell, style=style)
                 index += 1
@@ -8993,14 +8996,18 @@ class MeshtasticPassApp(App[None]):
             except ChatStoreError:
                 view.set_passes(())
         total = len(view.passes)
-        heard = sum(1 for encounter in view.passes if encounter.heard_directly)
+        passes = sum(1 for encounter in view.passes if encounter.has_pass)
         count = self.query_one("#passes-count", Static)
-        # "N PASSES - M met directly" rather than a bare total: the
-        # split is the interesting number, and stating it here saves
-        # the DIM/BASE distinction from needing a legend.
-        count.update(
-            f" \u00b7 {total} NODES" + (f" \u00b7 {heard} MET DIRECTLY" if heard else "")
-        )
+        # Two different numbers, and the second is the one the app is
+        # named after. NODES is everyone the radio has ever encountered;
+        # PASSES is the subset that exchanged a pass with us, which only
+        # another MeshtasticPass install can do. The PASSES count is
+        # printed even at zero -- unlike the omit-empty-fields rule the
+        # node bar follows, "0 PASSES" out of 196 NODES is itself the
+        # information (nobody out there is running this yet), and a
+        # field that vanishes at zero would read as a field that does
+        # not exist.
+        count.update(f" \u00b7 {total} NODES \u00b7 {passes} PASSES")
         self._update_passes_node_bar()
 
     def _update_passes_node_bar(self) -> None:

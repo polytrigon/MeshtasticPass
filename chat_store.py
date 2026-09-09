@@ -10,7 +10,7 @@ from threading import RLock
 from time import time
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
 
@@ -143,12 +143,20 @@ class NodeEncounter:
     so a node met once months ago is still listed after it has aged out
     of everything else.
 
-    `first_heard_at` is the whole distinction the view draws. It is set
-    only when a packet from this node actually reached this radio --
-    proximity we observed ourselves. A node learned second-hand through
-    mesh gossip has it as None: real, worth listing, but never something
-    we were near. Deriving "heard directly" from the timestamp rather
-    than carrying a separate flag means the two can never disagree.
+    `first_heard_at` records that a packet from this node actually
+    reached this radio -- proximity we observed ourselves, as opposed to
+    a node learned second-hand through mesh gossip. Deriving "heard
+    directly" from the timestamp rather than carrying a separate flag
+    means the two can never disagree.
+
+    `pass_at` is a different and stronger claim: the moment this node
+    EXCHANGED A PASS with us, which only another MeshtasticPass install
+    can do. Hearing someone is not meeting them -- a radio broadcasts to
+    anyone in range whether or not it knows we exist -- so a pass is the
+    one field here that says something was mutual. Nothing writes it
+    yet: the exchange has no protocol, so every real row has pass_at
+    NULL and the count is honestly zero, rather than borrowing
+    `first_heard_at` and calling proximity a pass.
     """
 
     node_id: str
@@ -159,10 +167,15 @@ class NodeEncounter:
     last_seen_at: float
     first_heard_at: float | None
     last_heard_at: float | None
+    pass_at: float | None = None
 
     @property
     def heard_directly(self) -> bool:
         return self.first_heard_at is not None
+
+    @property
+    def has_pass(self) -> bool:
+        return self.pass_at is not None
 
     @property
     def display_name(self) -> str:
@@ -830,6 +843,7 @@ class ChatStore:
         short_name: str | None = None,
         hops_away: int | None = None,
         heard_directly: bool = False,
+        pass_at: float | None = None,
     ) -> None:
         """Record (or update) one PASSES entry. Idempotent and monotonic.
 
@@ -839,7 +853,9 @@ class ChatStore:
         for ever. So an encounter can be recorded from any source -- a
         NodeDB sweep, an arriving packet -- in any order, repeatedly,
         without a later gossip-only sighting downgrading what an earlier
-        direct one established.
+        direct one established. `pass_at` follows the same one-way rule
+        and keeps the EARLIEST exchange, so it answers "since when" and
+        no later sighting can move or clear it.
         """
         node_id = normalize_profile_node_id(node_id) or str(node_id).strip().lower()
         if not node_id:
@@ -852,8 +868,9 @@ class ChatStore:
                 """
                 INSERT INTO node_encounters (
                     node_id, long_name, short_name, hops_away,
-                    first_seen_at, last_seen_at, first_heard_at, last_heard_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    first_seen_at, last_seen_at, first_heard_at, last_heard_at,
+                    pass_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id) DO UPDATE SET
                     long_name = COALESCE(excluded.long_name, long_name),
                     short_name = COALESCE(excluded.short_name, short_name),
@@ -869,11 +886,16 @@ class ChatStore:
                         WHEN excluded.last_heard_at IS NULL THEN last_heard_at
                         WHEN last_heard_at IS NULL THEN excluded.last_heard_at
                         ELSE MAX(last_heard_at, excluded.last_heard_at)
+                    END,
+                    pass_at = CASE
+                        WHEN excluded.pass_at IS NULL THEN pass_at
+                        WHEN pass_at IS NULL THEN excluded.pass_at
+                        ELSE MIN(pass_at, excluded.pass_at)
                     END
                 """,
                 (
                     node_id, long_name, short_name, hops_away,
-                    seen_at, seen_at, heard_at, heard_at,
+                    seen_at, seen_at, heard_at, heard_at, pass_at,
                 ),
             )
 
@@ -883,7 +905,8 @@ class ChatStore:
             rows = connection.execute(
                 """
                 SELECT node_id, long_name, short_name, hops_away,
-                       first_seen_at, last_seen_at, first_heard_at, last_heard_at
+                       first_seen_at, last_seen_at, first_heard_at,
+                       last_heard_at, pass_at
                 FROM node_encounters
                 """
             ).fetchall()
@@ -904,6 +927,11 @@ class ChatStore:
                     last_heard_at=(
                         float(row["last_heard_at"])
                         if row["last_heard_at"] is not None
+                        else None
+                    ),
+                    pass_at=(
+                        float(row["pass_at"])
+                        if row["pass_at"] is not None
                         else None
                     ),
                 )
@@ -1385,7 +1413,8 @@ class ChatStore:
                         first_seen_at REAL NOT NULL,
                         last_seen_at REAL NOT NULL,
                         first_heard_at REAL,
-                        last_heard_at REAL
+                        last_heard_at REAL,
+                        pass_at REAL
                     );
 
                     CREATE TABLE IF NOT EXISTS send_attempts (
@@ -1496,6 +1525,25 @@ class ChatStore:
                     # from that moment. No CHAT history is touched, and a
                     # v7 database opened by older code still works -- the
                     # table is simply ignored.
+                    # v7 -> v8 adds node_encounters.pass_at (a CONFIRMED
+                    # PASS, as opposed to merely having heard the node).
+                    # Unlike the node_encounters table itself, this one
+                    # DOES need an ALTER: a v7 database already has the
+                    # table, so CREATE TABLE IF NOT EXISTS skips it and
+                    # would leave the new column missing. Existing rows
+                    # get pass_at = NULL, which is the truth -- they were
+                    # all recorded before any pass could be exchanged.
+                    if current_version <= 7:
+                        encounter_columns = {
+                            column["name"]
+                            for column in connection.execute(
+                                "PRAGMA table_info(node_encounters)"
+                            ).fetchall()
+                        }
+                        if "pass_at" not in encounter_columns:
+                            connection.execute(
+                                "ALTER TABLE node_encounters ADD COLUMN pass_at REAL"
+                            )
                     if current_version != SCHEMA_VERSION:
                         connection.execute(
                             "UPDATE schema_version SET version = ?",

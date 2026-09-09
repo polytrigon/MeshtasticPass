@@ -19,6 +19,7 @@ from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
     PASS_NAME_MAX_CELLS,
     disambiguate_pass_names,
+    format_pass_bar,
     pass_row_offset,
     lay_out_passes,
     pass_column_count,
@@ -116,10 +117,6 @@ class DisplayWidthTests(unittest.TestCase):
                     self.assertLessEqual(painted, max(width, pass_column_width(names)))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DisambiguationTests(unittest.TestCase):
     """Meshtastic short names are not unique and never were."""
 
@@ -202,3 +199,81 @@ class RowOffsetTests(unittest.TestCase):
                 f"row {row} not visible at offset {offset}",
             )
             self.assertLessEqual(offset, total - viewport)
+
+
+class PassBarTests(unittest.TestCase):
+    """The one line under the grid: identity first, then how they reached us."""
+
+    @staticmethod
+    def _encounter(**kwargs):
+        from chat_store import NodeEncounter
+
+        fields = {
+            "node_id": "!e5deef81",
+            "long_name": None,
+            "short_name": "ALFA",
+            "hops_away": None,
+            "first_seen_at": 1_700_000_000.0,
+            "last_seen_at": 1_700_000_000.0,
+            "first_heard_at": None,
+            "last_heard_at": None,
+        }
+        fields.update(kwargs)
+        return NodeEncounter(**fields)
+
+    def test_a_node_only_gossiped_about_says_via_mesh(self) -> None:
+        bar = format_pass_bar(self._encounter(), now=1_700_000_000.0)
+        self.assertIn("VIA MESH", bar)
+        self.assertNotIn("HEARD DIRECTLY", bar)
+
+    def test_a_node_we_heard_ourselves_says_heard_not_met(self) -> None:
+        """HEARD, never MET: unrelayed packets prove range, not a meeting.
+
+        MET is reserved for a pass, so the two words cannot be read as
+        the same claim by someone glancing at the bar.
+        """
+        bar = format_pass_bar(
+            self._encounter(first_heard_at=1_699_000_000.0), now=1_700_000_000.0
+        )
+        self.assertIn("HEARD DIRECTLY", bar)
+        self.assertNotIn("MET", bar)
+
+    def test_heard_directly_and_a_hop_count_coexist(self) -> None:
+        """Not a contradiction, and must not be suppressed as one.
+
+        first_heard_at is a past-tense fact that never expires; hops_away
+        is where the node is now. A node heard in the room last week and
+        five hops away today is both.
+        """
+        bar = format_pass_bar(
+            self._encounter(first_heard_at=1_699_000_000.0, hops_away=5),
+            now=1_700_000_000.0,
+        )
+        self.assertIn("HEARD DIRECTLY", bar)
+        self.assertIn("HOPS 5", bar)
+
+    def test_no_pass_field_appears_without_a_pass(self) -> None:
+        """Every real row today. An absent pass is absent, not "PASS: no"."""
+        bar = format_pass_bar(
+            self._encounter(first_heard_at=1_699_000_000.0), now=1_700_000_000.0
+        )
+        self.assertNotIn("PASS", bar)
+
+    def test_a_confirmed_pass_is_named_on_the_bar(self) -> None:
+        bar = format_pass_bar(
+            self._encounter(pass_at=1_699_000_000.0), now=1_700_000_000.0
+        )
+        self.assertIn("PASS", bar)
+
+    def test_the_node_id_is_always_printed(self) -> None:
+        """The grid can show two identical-looking cells; this cannot."""
+        for encounter in (
+            self._encounter(),
+            self._encounter(short_name=None, long_name=None),
+            self._encounter(pass_at=1_699_000_000.0, hops_away=0),
+        ):
+            self.assertIn("!e5deef81", format_pass_bar(encounter, now=1_700_000_000.0))
+
+
+if __name__ == "__main__":
+    unittest.main()

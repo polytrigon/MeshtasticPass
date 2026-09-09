@@ -96,10 +96,9 @@ PASS_BAR_SEPARATOR = " · "
 def format_pass_bar(encounter, now: float) -> str:
     """Describe one pass on a single line.
 
-    Says HOW the node was met before anything else measurable, because
-    that is the distinction the view exists to draw and the one thing a
-    reader cannot recover from the grid alone once a cell is
-    highlighted.
+    Says HOW the node reached us before anything else measurable,
+    because that is the one thing a reader cannot recover from the grid
+    alone once a cell is highlighted.
     """
     from relative_time import format_relative_age
 
@@ -112,7 +111,15 @@ def format_pass_bar(encounter, now: float) -> str:
     # cells that look identical this line is the only place a reader can
     # find out whether they are one node or two.
     fields.append(encounter.node_id)
-    fields.append("MET DIRECTLY" if encounter.heard_directly else "VIA MESH")
+    # "MET" is reserved for a pass -- a mutual exchange between two
+    # MeshtasticPass installs. What a bare radio can tell us is only
+    # whether its packets reached us unrelayed, which is a fact about
+    # range, so this field says HEARD, not MET. Printed as a past-tense
+    # fact: a node heard directly last week and five hops away today is
+    # both of those at once, not a contradiction.
+    fields.append("HEARD DIRECTLY" if encounter.heard_directly else "VIA MESH")
+    if encounter.has_pass:
+        fields.append("PASS")
     if encounter.hops_away is not None:
         fields.append(f"HOPS {encounter.hops_away}")
     first_age = _age_or_none(encounter.first_seen_at, now, format_relative_age)
