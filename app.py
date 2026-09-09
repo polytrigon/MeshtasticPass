@@ -3968,8 +3968,9 @@ class PassSortSelector(KeyboardDropdown):
             (DropdownOption(label, order) for label, order in PASS_ORDER_LABELS),
             value,
             widget_id="pass-sort-selector",
-            prefix="[ ",
-            suffix=" ]",
+            # No prefix/suffix: KeyboardDropdown already renders its own
+            # "[ value v ]" brackets, and adding a pair here produced
+            # "[  [ RECENT v ]  ]" on hardware.
             classes="keyboard-dropdown",
         )
 
@@ -4656,6 +4657,12 @@ class MeshtasticPassApp(App[None]):
     #passes-node-bar {
         height: 1;
         width: 1fr;
+        /* One line, and one line only. The bar names a node, its ID and
+           several ages, so on a narrow terminal it WILL run long -- and
+           a height-1 widget that is allowed to wrap spills a stray
+           fragment of the next line into the row instead of stopping. */
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
 
     #mesh-status {
@@ -4668,6 +4675,14 @@ class MeshtasticPassApp(App[None]):
 
     #mesh-node-bar {
         width: 1fr;
+        /* Same one-line guarantee PASSES' bar needs, and for the same
+           reason: this line carries a node's LONG NAME, which is
+           attacker-free but not width-free -- an emoji name plus GPS,
+           distance and ages runs long on a narrow terminal, and a
+           height-1 widget allowed to wrap spills a fragment of the
+           next line into the row. */
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
 
     #dm-content {
