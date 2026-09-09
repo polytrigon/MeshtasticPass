@@ -5588,6 +5588,16 @@ class MeshtasticPassApp(App[None]):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
             with Vertical(id="passes", classes="tab-page"):
+                # Shown only while the radio is not ONLINE, carrying the
+                # exact same text and animation phase as CHAT's and
+                # MESH's (see _update_chat_connection_state) -- a view
+                # that stays silent while connecting reads as a view
+                # with nothing in it.
+                yield Static(
+                    id="passes-connection-status",
+                    classes="page-title",
+                    markup=False,
+                )
                 # Header mirrors CHAT's: the sort control sits exactly
                 # where [ LongFast v ] does, with the count after it, so
                 # the top-left of a people-view always answers "what am
@@ -12908,19 +12918,27 @@ class MeshtasticPassApp(App[None]):
                 # widget -- land on the SAME neutral per-mode target
                 # C/D/ESC already use elsewhere, never a dropdown.
                 self._focus_chat_mode(self._chat_mode)
-        dm_status_widgets = list(self.query("#dm-connection-status"))
+        # DM and PASSES own their status lines the same way: written and
+        # shown here while NOT ONLINE, hidden here once ONLINE. MESH is
+        # the exception -- it is written here but hidden by
+        # _update_mesh_node_bar, because its line has a second job.
+        self_hiding = [
+            widget
+            for selector in ("#dm-connection-status", "#passes-connection-status")
+            for widget in self.query(selector)
+        ]
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:
                 widget = mesh_status_widgets[0]
                 widget.update(status_rich_text)
                 widget.display = True
-            if dm_status_widgets:
-                widget = dm_status_widgets[0]
+            for widget in self_hiding:
                 widget.update(status_rich_text)
                 widget.display = True
-        elif dm_status_widgets:
-            dm_status_widgets[0].display = False
+        else:
+            for widget in self_hiding:
+                widget.display = False
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:
