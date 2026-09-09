@@ -260,7 +260,7 @@ class ChatHotkeyTests(ChatDmMentionAppTestsBase):
             app.show_tab("chat")
             await pilot.pause()
             app.query_one("#chat-log").focus()
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
             await pilot.press("2")

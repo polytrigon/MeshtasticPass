@@ -158,6 +158,13 @@ install_flag_pair_protection()
 TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
+    # PASSES sits between CHAT and MESH deliberately: it is a view of
+    # PEOPLE, like CHAT, while MESH is a view of the network's shape.
+    # Inserting rather than appending moves MESH from [3] to [4], which
+    # is a real cost in muscle memory and in tests -- taken knowingly,
+    # because the nav should read as what the app is about rather than
+    # as the order the views happened to be built in.
+    "passes": "PASSES",
     "mesh": "MESH",
 }
 
@@ -5340,6 +5347,11 @@ class MeshtasticPassApp(App[None]):
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
+            with Vertical(id="passes", classes="tab-page"):
+                # Populated in the next commit. The page exists now so
+                # the ContentSwitcher has a target for "passes": adding
+                # the key without the page would make [3] raise.
+                yield Static(id="passes-status", markup=False)
             with Vertical(id="mesh", classes="tab-page"):
                 # Shown/hidden and populated by _update_chat_connection_state()
                 # with the exact same _connection_status_rich_text() CHAT's
@@ -5356,7 +5368,7 @@ class MeshtasticPassApp(App[None]):
                 # separate bottom-left context line and bottom-right
                 # LINK/LAST UPDATE line -- see _update_mesh_node_bar.
                 yield Static(id="mesh-node-bar", markup=False)
-        yield Static("1-3 switch tabs    F4 quit", id="footer")
+        yield Static("1-4 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -5732,7 +5744,7 @@ class MeshtasticPassApp(App[None]):
                 # state (typing them while the composer IS already
                 # focused goes through the isinstance(self.focused,
                 # Input) branch instead, unaffected by this exclusion).
-                and event.key not in ("1", "2", "3", "c", "d")
+                and event.key not in ("1", "2", "3", "4", "c", "d")
             ):
                 # Any other printable character begins composing: focus
                 # the input and insert exactly what was typed, appending
@@ -5836,7 +5848,7 @@ class MeshtasticPassApp(App[None]):
                 if (
                     event.is_printable
                     and event.character
-                    and event.key not in ("1", "2", "3", "c", "d")
+                    and event.key not in ("1", "2", "3", "4", "c", "d")
                 ):
                     dm_input = self.query_one("#dm-input", Input)
                     if not dm_input.disabled:
@@ -5893,7 +5905,8 @@ class MeshtasticPassApp(App[None]):
         tab_for_key = {
             "1": "connection",
             "2": "chat",
-            "3": "mesh",
+            "3": "passes",
+            "4": "mesh",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -12109,14 +12122,14 @@ class MeshtasticPassApp(App[None]):
                     "CTRL+P edit channel    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
-            text = "C channel    1-3 tabs    F4 quit"
+            text = "C channel    1-4 tabs    F4 quit"
         elif self.current_tab == "chat":
             text = "C channel    CTRL+D delete    ESC back    F4 quit"
         else:
             text = (
-                "1-3 tabs    F4 quit"
-                if self.current_tab == "mesh"
-                else "1-3 switch tabs    F4 quit"
+                "1-4 tabs    F4 quit"
+                if self.current_tab in ("mesh", "passes")
+                else "1-4 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 

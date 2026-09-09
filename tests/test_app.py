@@ -499,7 +499,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             # while already on CHAT (never captured as a typed digit;
             # see on_key's printable-character exclusion).
             self.assertFalse(chat_input.has_focus)
-            await pilot.press("3")
+            await pilot.press("4")
             self.assertEqual(app.current_tab, "mesh")
             await pilot.press("2")
             self.assertEqual(app.current_tab, "chat")
@@ -519,24 +519,32 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
 
             await pilot.press("escape", "1")
             self.assertEqual(app.current_tab, "connection")
-            await pilot.press("3")
+            await pilot.press("4")
             self.assertEqual(app.current_tab, "mesh")
 
         self.assertTrue(radio.is_closed)
 
-    # ---- Top-nav reorder: PROFILE hidden, CONNECTION/CHAT/MESH [1]-[3] --
+    # ---- Top nav: PROFILE hidden; CONNECTION/CHAT/PASSES/MESH [1]-[4] --
 
-    async def test_visible_top_nav_is_connection_chat_mesh_in_order(self) -> None:
+    async def test_visible_top_nav_is_connection_chat_passes_mesh_in_order(
+        self,
+    ) -> None:
         """TAB_NAMES drives both the numbering and the visible labels --
 
         assert its exact order/membership directly, the same source
         _update_tab_bar() renders from.
+
+        The order is the claim: PASSES sits between CHAT and MESH so the
+        nav groups the two views of PEOPLE before the view of the
+        NETWORK, which is why MESH is on [4] rather than [3].
         """
-        self.assertEqual(list(TAB_NAMES.keys()), ["connection", "chat", "mesh"])
+        self.assertEqual(
+            list(TAB_NAMES.keys()), ["connection", "chat", "passes", "mesh"]
+        )
         self.assertNotIn("profile", TAB_NAMES)
         self.assertNotIn("dm", TAB_NAMES)
 
-    async def test_nav_bar_renders_connection_chat_mesh_with_active_count(
+    async def test_nav_bar_renders_all_four_tabs_with_mesh_active_count(
         self,
     ) -> None:
         """The rendered tab bar, not just TAB_NAMES' dict order --
@@ -559,7 +567,12 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             tab_bar = str(app.query_one("#tab-bar", Static).render())
             self.assertIn("CONNECTION/CONFIG", tab_bar)
             self.assertIn("CHAT", tab_bar)
+            self.assertIn("PASSES", tab_bar)
             self.assertRegex(tab_bar, r"MESH\(\d+\)")
+            # PASSES carries no count: unlike MESH's ACTIVE(N), the
+            # number of people you have ever met is not a live figure
+            # the nav should be shouting.
+            self.assertNotIn("PASSES(", tab_bar)
             self.assertNotIn("CONNECTION/CONFIG(", tab_bar)
             self.assertNotIn("ACTIVE", tab_bar)
             # CONNECTION appears strictly before CHAT, which appears
@@ -567,9 +580,10 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(tab_bar.index("CONNECTION"), tab_bar.index("CHAT"))
             self.assertLess(tab_bar.index("CHAT"), tab_bar.index("MESH"))
 
-    async def test_key_1_selects_connection_key_2_selects_chat_key_3_selects_mesh(
-        self,
-    ) -> None:
+    async def test_each_digit_key_selects_its_own_tab(self) -> None:
+        """1/2/3/4 -> CONNECTION/CHAT/PASSES/MESH. Renamed from
+        ..._key_3_selects_mesh: PASSES took [3] and MESH moved to [4].
+        """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
@@ -583,7 +597,15 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.current_tab, "connection")
 
             await pilot.press("3")
+            self.assertEqual(app.current_tab, "passes")
+
+            await pilot.press("4")
             self.assertEqual(app.current_tab, "mesh")
+
+            # and back to PASSES from MESH, so [3] is not merely
+            # reachable from CONNECTION
+            await pilot.press("3")
+            self.assertEqual(app.current_tab, "passes")
 
     async def test_key_4_does_nothing_dm_is_a_chat_mode_not_a_tab(self) -> None:
         """"4" is unmapped -- DM is a MODE inside CHAT now (CHAT/DM/
@@ -629,19 +651,26 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.query_one(DMModeSelector).is_open)
             self.assertEqual(app._chat_mode, "channel")
 
-    async def test_footer_help_text_reflects_1_through_3(self) -> None:
+    async def test_footer_help_text_reflects_1_through_4(self) -> None:
+        """PASSES made the nav four tabs wide, so the footer has to say
+
+        so -- on every page, including the ones whose footer is written
+        separately (MESH and PASSES share a shorter variant).
+        """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-3", footer_text)
-            self.assertNotIn("1-4", footer_text)
+            self.assertIn("1-4", footer_text)
+            self.assertNotIn("1-3", footer_text)
 
-            await pilot.press("3")
-            await pilot.pause()
-            footer_text = str(app.query_one("#footer", Static).render())
-            self.assertIn("1-3", footer_text)
+            for key in ("3", "4"):
+                await pilot.press(key)
+                await pilot.pause()
+                footer_text = str(app.query_one("#footer", Static).render())
+                self.assertIn("1-4", footer_text)
+                self.assertNotIn("1-3", footer_text)
 
     async def test_composer_hint_matches_uppercase_hotkey_lowercase_descriptor_grammar(
         self,
@@ -6457,7 +6486,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.current_tab, "chat")
             chat_heading = str(app.query_one("#chat-title", Static).render())
 
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
             mesh_heading = str(app.query_one("#mesh-connection-status", Static).render())
@@ -6495,7 +6524,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._span_hex(chat_spans[0]), palette.base.upper())
             self.assertEqual(self._span_hex(chat_spans[-1]), palette.accent.upper())
 
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             mesh_status = app.query_one("#mesh-connection-status", Static)
             mesh_spans = mesh_status.render().spans
@@ -6523,7 +6552,7 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._span_hex(chat_spans[0]), palette.base.upper())
             self.assertEqual(self._span_hex(chat_spans[-1]), palette.error.upper())
 
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             mesh_status = app.query_one("#mesh-connection-status", Static)
             mesh_spans = mesh_status.render().spans
