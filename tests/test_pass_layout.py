@@ -18,6 +18,7 @@ from grapheme_text import cell_len  # noqa: E402
 from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
     PASS_NAME_MAX_CELLS,
+    disambiguate_pass_names,
     lay_out_passes,
     pass_column_count,
     pass_column_width,
@@ -116,3 +117,43 @@ class DisplayWidthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DisambiguationTests(unittest.TestCase):
+    """Meshtastic short names are not unique and never were."""
+
+    @staticmethod
+    def _encounter(node_id: str, short: str):
+        from chat_store import NodeEncounter
+
+        return NodeEncounter(node_id, None, short, None, 0.0, 0.0, None, None)
+
+    def test_colliding_names_gain_their_node_id_tail(self) -> None:
+        rows = (
+            self._encounter("!e5deef81", "BIG"),
+            self._encounter("!1c33b395", "BIG"),
+        )
+        self.assertEqual(disambiguate_pass_names(rows), ("BIG·ef81", "BIG·b395"))
+
+    def test_unique_names_are_left_alone(self) -> None:
+        """Nobody pays width for a collision they do not have."""
+        rows = (
+            self._encounter("!e5deef81", "ALFA"),
+            self._encounter("!1c33b395", "BRVO"),
+        )
+        self.assertEqual(disambiguate_pass_names(rows), ("ALFA", "BRVO"))
+
+    def test_three_way_collisions_all_disambiguate(self) -> None:
+        rows = tuple(
+            self._encounter(nid, "SAME") for nid in ("!aaaa1111", "!bbbb2222", "!cccc3333")
+        )
+        self.assertEqual(len(set(disambiguate_pass_names(rows))), 3)
+
+    def test_emoji_names_collide_and_survive_layout(self) -> None:
+        """The real case: two radios sharing one emoji short name."""
+        rows = (self._encounter("!e5deef81", "\U0001f43b"), self._encounter("!1c33b395", "\U0001f43b"))
+        names = disambiguate_pass_names(rows)
+        self.assertNotEqual(names[0], names[1])
+        grid = lay_out_passes(names, viewport_width=60)
+        widths = {cell_len(cell) for row in grid for cell in row}
+        self.assertEqual(len(widths), 1, f"ragged columns: {widths}")

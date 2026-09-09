@@ -104,10 +104,14 @@ def format_pass_bar(encounter, now: float) -> str:
     from relative_time import format_relative_age
 
     fields = [encounter.display_name]
-    if encounter.short_name and encounter.short_name != encounter.display_name:
-        fields.append(encounter.short_name)
     if encounter.long_name and encounter.long_name != encounter.display_name:
         fields.append(encounter.long_name)
+    # The node ID always, never conditionally. Short names collide
+    # constantly on a real mesh -- two radios sharing one emoji, or a
+    # pair running the same default name -- and when the grid shows two
+    # cells that look identical this line is the only place a reader can
+    # find out whether they are one node or two.
+    fields.append(encounter.node_id)
     fields.append("MET DIRECTLY" if encounter.heard_directly else "VIA MESH")
     if encounter.hops_away is not None:
         fields.append(f"HOPS {encounter.hops_away}")
@@ -133,3 +137,38 @@ def _age_or_none(when, now: float, formatter):
     if age < 0:
         return None
     return formatter(age)
+
+
+# When two nodes share a display name, each gets its node ID's last four
+# characters appended so the grid cannot show two cells that look like
+# the same radio.
+PASS_DISAMBIGUATOR = "\u00b7"
+
+
+def disambiguate_pass_names(encounters) -> tuple[str, ...]:
+    """Display names, made unique where two nodes share one.
+
+    Meshtastic short names are not unique and were never meant to be:
+    people pick emoji, defaults repeat, and one operator's two radios
+    routinely carry the same name. A DOS directory could assume unique
+    filenames; a pass list cannot.
+
+    Only colliding names are altered, so the common case stays clean and
+    nobody pays width for a problem they do not have. The suffix is the
+    node ID's last four characters -- the same tail Meshtastic itself
+    uses for auto-generated names, so it reads as identity rather than
+    as decoration.
+    """
+    encounters = tuple(encounters)
+    counts: dict[str, int] = {}
+    for encounter in encounters:
+        name = encounter.display_name
+        counts[name] = counts.get(name, 0) + 1
+    return tuple(
+        (
+            f"{encounter.display_name}{PASS_DISAMBIGUATOR}{encounter.node_id[-4:]}"
+            if counts[encounter.display_name] > 1
+            else encounter.display_name
+        )
+        for encounter in encounters
+    )

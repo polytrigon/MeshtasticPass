@@ -94,6 +94,7 @@ from radio_capabilities import (
 from pass_layout import (
     DEFAULT_PASS_ORDER,
     PASS_COLUMN_GUTTER,
+    disambiguate_pass_names,
     format_pass_bar,
     lay_out_passes,
 )
@@ -4050,7 +4051,11 @@ class PassesView(Static):
                 style=Style(color=THEME_PALETTES[self.app._current_theme].dim),
             )
         palette = THEME_PALETTES[self.app._current_theme]
-        names = tuple(encounter.display_name for encounter in self._passes)
+        # Colliding short names get their node ID's tail appended (see
+        # disambiguate_pass_names) -- without it two different radios
+        # sharing one emoji render as two identical cells and read as a
+        # duplicate row rather than as two nodes.
+        names = disambiguate_pass_names(self._passes)
         rows = lay_out_passes(names, self.size.width or 60)
         self._columns = len(rows[0]) if rows else 1
         text = Text(no_wrap=True)
