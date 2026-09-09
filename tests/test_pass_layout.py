@@ -251,6 +251,86 @@ class RowOffsetTests(unittest.TestCase):
             self.assertLessEqual(offset, total - viewport)
 
 
+class MeasuredWidthTests(unittest.TestCase):
+    """Laying out against what the terminal PAINTS, not what Rich declares.
+
+    This is the bug that survived four rounds of reasoning about it,
+    because it is invisible to any test that measures with the same
+    function it pads with. A terminal with no glyph for an emoji advances
+    ONE column where Rich accounted for two; the cell then paints a
+    column short and every column to its right on that row slides left,
+    cumulatively, so the last column of a nine-column board can be
+    several cells out.
+
+    `measure` defaults to cell_len, so a caller that does not supply one
+    gets exactly the old behaviour -- these tests supply one that lies
+    the way a real console font does.
+    """
+
+    @staticmethod
+    def _font_without_bear(text: str) -> int:
+        """cell_len, except this pretend font has no bear glyph."""
+        bear = "\U0001f43b"
+        return cell_len(text) - text.count(bear)
+
+    def test_a_narrow_painted_glyph_gets_extra_padding(self) -> None:
+        """The fix, stated as arithmetic.
+
+        Every cell must advance the SAME number of columns. The bear cell
+        is one short by Rich's reckoning, so it earns one more space.
+        """
+        names = ("\U0001f43b", "ALFA")
+        grid = lay_out_passes(names, viewport_width=60, measure=self._font_without_bear)
+        painted = {self._font_without_bear(cell) for row in grid for cell in row}
+        self.assertEqual(len(painted), 1, f"ragged columns: {painted}")
+
+    def test_the_column_after_a_narrow_glyph_lands_where_it_should(self) -> None:
+        """What a person actually sees: the NEXT name's position.
+
+        Measured off a photograph of the real board, the cell after the
+        offending glyph sat 1.1 cells left of its column, and so did
+        every cell after that one -- the error accumulates, which is why
+        a wider gutter could never have fixed it.
+        """
+        names = ("\U0001f43b", "ALFA", "BRVO")
+        grid = lay_out_passes(names, viewport_width=60, measure=self._font_without_bear)
+        row = grid[0]
+        starts = []
+        cursor = 0
+        for cell in row:
+            starts.append(cursor)
+            cursor += self._font_without_bear(cell) + PASS_COLUMN_GUTTER
+        strides = [b - a for a, b in zip(starts, starts[1:])]
+        self.assertEqual(len(set(strides)), 1, f"uneven stride: {strides}")
+
+    def test_declaring_no_measurements_changes_nothing(self) -> None:
+        """The default path, which every test and non-tty run takes."""
+        names = ("\U0001f43b", "ALFA", "BRVO")
+        self.assertEqual(
+            lay_out_passes(names, viewport_width=60),
+            lay_out_passes(names, viewport_width=60, measure=cell_len),
+        )
+
+    def test_a_row_never_grows_past_the_viewport(self) -> None:
+        """Padding in measured cells makes a row measure WIDER to Rich.
+
+        Textual crops by cell_len, so an over-wide row would lose the
+        right-hand end of its last name. A column is dropped instead.
+        """
+        names = tuple("\U0001f43b" for _ in range(12))
+        for width in range(10, 80):
+            grid = lay_out_passes(
+                names, viewport_width=width, measure=self._font_without_bear
+            )
+            widest = max(
+                sum(cell_len(cell) for cell in row)
+                + PASS_COLUMN_GUTTER * (len(row) - 1)
+                for row in grid
+            )
+            if len(grid[0]) > 1:
+                self.assertLessEqual(widest, width, f"overflowed at {width}")
+
+
 class AmbiguousWidthTests(unittest.TestCase):
     """Nothing the LAYOUT adds to a cell may have a negotiable width.
 

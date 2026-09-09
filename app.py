@@ -100,6 +100,7 @@ from pass_layout import (
     lay_out_passes,
     pass_row_offset,
 )
+from terminal_width import PaintedWidths, measure_terminal
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -4073,9 +4074,14 @@ class PassesView(Static):
         # for whichever cell is highlighted, unconditionally, which a
         # grid cell has no room to do.
         names = tuple(encounter.display_name for encounter in self._passes)
-        rows = lay_out_passes(names, self.size.width or 60)
+        # MEASURED widths, not declared ones. On a terminal with no glyph
+        # for an emoji, Rich accounts for two columns and the terminal
+        # advances one, and in a grid that error moves every column to
+        # its right for the rest of the row -- see terminal_width.
+        measure = self.app.painted_widths.width
+        rows = lay_out_passes(names, self.size.width or 60, measure)
         self._columns = len(rows[0]) if rows else 1
-        self._column_width = pass_column_width(names)
+        self._column_width = pass_column_width(names, measure)
         height = self.size.height or len(rows)
         selected_row = self._selected // max(1, self._columns)
         # No "more" marker: that a list scrolls is an assumed pattern,
@@ -5149,10 +5155,16 @@ class MeshtasticPassApp(App[None]):
         settings: AppSettings | None = None,
         terminal_cursor: TerminalCursor | None = None,
         chat_store: ChatStore | None = None,
+        painted_widths: PaintedWidths | None = None,
         history_error: str = "",
     ) -> None:
         super().__init__()
         self.radio = radio
+        # What this terminal really paints (see terminal_width). The
+        # empty default behaves exactly like cell_len, so every test and
+        # every non-tty run gets the declared widths it always got, and
+        # only a real startup that successfully measured differs.
+        self.painted_widths = painted_widths or PaintedWidths()
         self.settings = settings or AppSettings.load()
         self._current_theme = self.settings.color
         self.current_tab = "connection"
@@ -13244,6 +13256,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _names_to_measure(chat_store: ChatStore | None) -> tuple[str, ...]:
+    """The display names startup should measure the terminal against.
+
+    PASSES holds every node ever met, so its names are both the widest
+    variety of emoji the app will be asked to draw and the only place
+    where a mis-measured one corrupts a grid. Returns nothing rather than
+    raising if the store cannot be read -- an unmeasured terminal is a
+    cosmetic problem, and refusing to start over it would not be.
+    """
+    if chat_store is None:
+        return ()
+    try:
+        return tuple(encounter.display_name for encounter in chat_store.encounters())
+    except Exception:
+        return ()
+
+
 def main() -> int:
     args = parse_args()
     settings = AppSettings.load()
@@ -13264,10 +13293,18 @@ def main() -> int:
     except ChatStoreError as error:
         chat_store = None
         history_error = str(error)
+    # Measure the terminal BEFORE Textual takes the screen -- it needs to
+    # print characters and read the cursor position back, which is not
+    # possible once a Textual app owns stdin. Measured against the names
+    # about to be displayed, so the cost is bounded by what is actually
+    # on the board. Never raises; a terminal that will not answer yields
+    # no measurements and everything below behaves as it always has.
+    painted_widths = measure_terminal(_names_to_measure(chat_store))
     app = MeshtasticPassApp(
         radio,
         settings,
         chat_store=chat_store,
+        painted_widths=painted_widths,
         history_error=history_error,
     )
     try:

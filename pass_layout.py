@@ -21,7 +21,18 @@ are the usual cause of a column drifting out of alignment.
 
 from __future__ import annotations
 
-from grapheme_text import cell_len, truncate_to_cells
+from typing import Callable
+
+from grapheme_text import cell_len, grapheme_clusters
+
+
+# How wide a piece of text is. Defaults to cell_len -- the width Unicode
+# DECLARES -- everywhere, so every caller that does not care behaves
+# exactly as it always has. The app passes a MEASURED width instead (see
+# terminal_width.PaintedWidths), because a terminal with no glyph for an
+# emoji advances one column where Rich accounted for two, and in a grid
+# that error moves every column to its right for the rest of the row.
+Measure = Callable[[str], int]
 
 
 # A pass cell is the node's display name and nothing else, so the widest
@@ -63,13 +74,15 @@ PASS_COLUMNS_RESERVED = 1
 PASS_TRUNCATION_MARKER = "~"
 
 
-def pass_column_width(names: tuple[str, ...]) -> int:
+def pass_column_width(names: tuple[str, ...], measure: Measure = cell_len) -> int:
     """The cell width every column takes: the widest name, capped."""
-    widest = max((cell_len(name) for name in names), default=0)
+    widest = max((measure(name) for name in names), default=0)
     return max(1, min(widest, PASS_NAME_MAX_CELLS))
 
 
-def pass_column_count(names: tuple[str, ...], viewport_width: int) -> int:
+def pass_column_count(
+    names: tuple[str, ...], viewport_width: int, measure: Measure = cell_len
+) -> int:
     """How many columns fit, never fewer than one.
 
     A viewport too narrow for even one full column still gets one: a
@@ -78,7 +91,7 @@ def pass_column_count(names: tuple[str, ...], viewport_width: int) -> int:
     The same floor applies after PASS_COLUMNS_RESERVED is taken off, so
     a narrow window loses names rather than becoming blank.
     """
-    column_width = pass_column_width(names)
+    column_width = pass_column_width(names, measure)
     stride = column_width + PASS_COLUMN_GUTTER
     if viewport_width < column_width:
         return 1
@@ -87,7 +100,7 @@ def pass_column_count(names: tuple[str, ...], viewport_width: int) -> int:
 
 
 def lay_out_passes(
-    names: tuple[str, ...], viewport_width: int
+    names: tuple[str, ...], viewport_width: int, measure: Measure = cell_len
 ) -> tuple[tuple[str, ...], ...]:
     """Flow `names` into padded rows, left to right then wrapping.
 
@@ -104,27 +117,69 @@ def lay_out_passes(
     """
     if not names:
         return ()
-    column_width = pass_column_width(names)
-    columns = pass_column_count(names, viewport_width)
+    column_width = pass_column_width(names, measure)
     cells = [
-        _pad_to_cells(
-            truncate_to_cells(name, column_width, PASS_TRUNCATION_MARKER),
-            column_width,
-        )
+        _pad_to_cells(_truncate(name, column_width, measure), column_width, measure)
         for name in names
     ]
+    columns = pass_column_count(names, viewport_width, measure)
+    # Cells are padded to their MEASURED width while Rich and Textual
+    # crop this text by its DECLARED one, so a row holding a glyph the
+    # terminal paints narrow measures wider to them than it draws. Rather
+    # than reason about how much slack a particular viewport leaves, check
+    # and drop a column -- what Textual would crop is the right-hand end
+    # of the last name on the row.
+    while columns > 1 and _widest_declared_row(cells, columns) > viewport_width:
+        columns -= 1
     return tuple(
         tuple(cells[start : start + columns])
         for start in range(0, len(cells), columns)
     )
 
 
-def _pad_to_cells(value: str, width: int) -> str:
-    """Right-pad to `width` DISPLAY cells (never len(), which lies about
+def _widest_declared_row(cells: list[str], columns: int) -> int:
+    """The widest row's width in the units Rich crops by (cell_len)."""
+    return max(
+        (
+            sum(cell_len(cell) for cell in cells[start : start + columns])
+            + PASS_COLUMN_GUTTER * (len(cells[start : start + columns]) - 1)
+            for start in range(0, len(cells), columns)
+        ),
+        default=0,
+    )
 
-    wide and combining characters).
+
+def _truncate(value: str, width: int, measure: Measure) -> str:
+    """Grapheme-safe truncate to at most `width` cells, as MEASURED.
+
+    Same job as grapheme_text.truncate_to_cells, in the same units as
+    the padding beside it. A name capped by declared width could still
+    paint short and leave its cell under-filled, which is the drift this
+    module exists to prevent, only smaller.
     """
-    return value + " " * max(0, width - cell_len(value))
+    if measure(value) <= width:
+        return value
+    marker_width = measure(PASS_TRUNCATION_MARKER)
+    if width <= marker_width:
+        return PASS_TRUNCATION_MARKER[:width]
+    visible = ""
+    for cluster in grapheme_clusters(value):
+        if measure(f"{visible}{cluster}{PASS_TRUNCATION_MARKER}") > width:
+            break
+        visible += cluster
+    return f"{visible}{PASS_TRUNCATION_MARKER}"
+
+
+def _pad_to_cells(value: str, width: int, measure: Measure = cell_len) -> str:
+    """Right-pad so the terminal advances `width` columns.
+
+    Three different widths are in play and only one of them keeps a
+    column of names lined up: len() lies about wide characters, cell_len
+    tells the truth about what Unicode DECLARES, and `measure` says what
+    the font in front of the user actually draws. The padding is spaces,
+    which every terminal agrees are one column, so the arithmetic holds.
+    """
+    return value + " " * max(0, width - measure(value))
 
 
 DEFAULT_PASS_ORDER = "recent"
