@@ -2950,6 +2950,65 @@ class MeshTopologyView(Container):
         """
         return self._edge_node_ids & {state.node.node_id for state in self._working_set}
 
+    def _lay_out_board(self) -> tuple[int, int, int, int, int, int]:
+        """Size and centre the board block, and report its geometry.
+
+        Returns (rows, columns, center_row, center_column, board width,
+        board height). Shared by set_nodes and render_empty_grid so the
+        dot grid can never come out at different dimensions, or in a
+        different place, depending on which of them drew it.
+
+        Horizontally centres the whole board as one rigid block inside
+        the available MESH region -- a board-level offset, not a per-node
+        one, so it can never desync node-to-grid coordinates. Before this
+        view has ever been laid out, self.size is 0x0 and there is
+        nothing to centre against; callers check self.size.width and
+        re-run once the next refresh has resolved it, rather than leaving
+        the board visibly left-anchored.
+        """
+        row_count, column_count, center_row, center_column = (
+            self.current_grid_dimensions()
+        )
+        board_width = column_count * DOT_GRID_SPACING_X
+        board_height = row_count * DOT_GRID_SPACING_Y
+        board = self.board
+        board.styles.width = board_width
+        board.styles.height = board_height
+        if self.size.width:
+            board.styles.offset = (max(0, (self.size.width - board_width) // 2), 0)
+        return (
+            row_count,
+            column_count,
+            center_row,
+            center_column,
+            board_width,
+            board_height,
+        )
+
+    def render_empty_grid(self, theme: str) -> None:
+        """Draw the bare dot grid, with nothing on it.
+
+        For the stretch before the radio is ONLINE and any working set
+        has ever arrived. MESH genuinely has nothing to say about
+        topology yet -- but the grid is not topology. It is the board
+        those nodes will land on, and an empty rectangle reads as a
+        broken view where an empty board reads as a waiting one.
+
+        A no-op once a working set exists. Stale topology deliberately
+        stays visible across a reconnect (see _refresh_mesh), and
+        painting a bare grid over it would throw away useful data on a
+        connection-state change alone.
+        """
+        if self._working_set:
+            return
+        *_, board_width, board_height = self._lay_out_board()
+        if not self.size.width:
+            self.app.call_after_refresh(lambda: self.render_empty_grid(theme))
+            return
+        self.board.query_one(MeshCanvas).render_scene(
+            board_width, board_height, (), theme
+        )
+
     def current_grid_dimensions(self) -> tuple[int, int, int, int]:
         """(rows, columns, center_row, center_column) for the visible
 
@@ -3016,23 +3075,15 @@ class MeshTopologyView(Container):
         """
         self._last_now = now
         board = self.board
-        row_count, column_count, center_row, center_column = (
-            self.current_grid_dimensions()
-        )
-        board_width = column_count * DOT_GRID_SPACING_X
-        board_height = row_count * DOT_GRID_SPACING_Y
-        board.styles.width = board_width
-        board.styles.height = board_height
-        # Horizontally center the whole board as one rigid block inside the
-        # available MESH region -- a board-level offset, not a per-node one,
-        # so it can never desync node-to-grid coordinates. On the very first
-        # render (before this view has ever been laid out), self.size is
-        # not resolved yet (0x0); re-run once after the next refresh, when
-        # it is, rather than leaving the board visibly left-anchored.
-        view_width = self.size.width
-        if view_width:
-            board.styles.offset = (max(0, (view_width - board_width) // 2), 0)
-        else:
+        (
+            row_count,
+            column_count,
+            center_row,
+            center_column,
+            board_width,
+            board_height,
+        ) = self._lay_out_board()
+        if not self.size.width:
             self.app.call_after_refresh(
                 lambda: self.set_nodes(working_set, base_positions, theme=theme, now=now)
             )
@@ -6234,6 +6285,33 @@ class MeshtasticPassApp(App[None]):
                     event.stop()
                 return
 
+        if self.current_tab == "passes":
+            # S opens the sort control, exactly as C opens CHAT's channel
+            # selector and D its DM selector. The grid owns the arrow
+            # keys -- they move the selection through several hundred
+            # names -- so there is no spare direction to reach a header
+            # control with, and this app's answer to that has always been
+            # an uppercase letter hotkey named in the footer.
+            if event.key.lower() == "s":
+                selector = self.query_one(PassSortSelector)
+                selector.focus()
+                selector.open_menu()
+                event.stop()
+                return
+            # Leaving the sort control without choosing anything. Picking
+            # an order already hands focus back (see dropdown_selected);
+            # this is the other path, so ESC out of a closed dropdown
+            # cannot strand the keyboard on a control whose arrows do
+            # nothing.
+            if (
+                isinstance(self.focused, PassSortSelector)
+                and not self.focused.is_open
+                and event.key in ("escape", "down")
+            ):
+                self.query_one(PassesView).focus()
+                event.stop()
+                return
+
         # PROFILE is intentionally absent: hidden from the visible top
         # nav (see TAB_NAMES), so no digit key may reach it. DM is
         # likewise absent here -- it is a MODE inside CHAT now (see
@@ -9406,6 +9484,15 @@ class MeshtasticPassApp(App[None]):
             # wording like the old "RADIO DISCONNECTED" either -- that
             # was exactly the kind of independent reinterpretation this
             # is meant to eliminate.
+            #
+            # The one thing that IS drawn here: the bare dot grid, when
+            # there is no stale topology to preserve because none has
+            # ever arrived. On a first connect the board would otherwise
+            # be a blank rectangle for the whole handshake, which reads
+            # as a broken view rather than a waiting one. render_empty_grid
+            # is itself a no-op once a working set exists, so a reconnect
+            # keeps showing what it was showing.
+            views[0].render_empty_grid(self._current_theme)
             return
         view = views[0]
         status = statuses[0]
@@ -12599,10 +12686,14 @@ class MeshtasticPassApp(App[None]):
             text = "C channel    1-4 tabs    F4 quit"
         elif self.current_tab == "chat":
             text = "C channel    CTRL+D delete    ESC back    F4 quit"
+        elif self.current_tab == "passes":
+            # S is the only way to reach the sort control, so the footer
+            # is the only place a person finds out it exists.
+            text = "S sort    1-4 tabs    F4 quit"
         else:
             text = (
                 "1-4 tabs    F4 quit"
-                if self.current_tab in ("mesh", "passes")
+                if self.current_tab == "mesh"
                 else "1-4 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)

@@ -29,7 +29,7 @@ import unittest
 
 from textual.widgets import Static
 
-from app import MeshtasticPassApp, PassesView
+from app import MeshtasticPassApp, PassSortSelector, PassesView
 from viewport_menu import ViewportMenu
 from app_settings import AppSettings
 from chat_store import ChatStore
@@ -410,6 +410,85 @@ class PassMenuKeyTests(PassesHarness):
             await pilot.press("right")
             await pilot.pause()
             self.assertNotEqual(view.selected.node_id, selected)
+
+
+class PassSortControlTests(PassesHarness):
+    """Reaching the sort control at all.
+
+    The grid owns the arrow keys -- they move a selection through several
+    hundred names -- so there is no spare direction to walk up to a
+    header control with. This app's answer has always been an uppercase
+    letter hotkey named in the footer, the way C reaches CHAT's channel
+    selector, and PASSES shipped without one: the dropdown was on screen
+    and unreachable.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="BRVO")
+
+    async def test_s_opens_the_sort_control(self) -> None:
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            self.assertIsInstance(app.focused, PassesView)
+
+            await pilot.press("s")
+            await pilot.pause()
+
+            selector = app.query_one(PassSortSelector)
+            self.assertIs(app.focused, selector)
+            self.assertTrue(selector.is_open)
+
+    async def test_the_footer_says_so(self) -> None:
+        """A hotkey nobody can discover is not a way in."""
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+
+            footer = str(app.query_one("#footer", Static).render())
+            self.assertIn("S sort", footer)
+
+    async def test_choosing_an_order_re_sorts_and_returns_focus(self) -> None:
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            before = [encounter.short_name for encounter in app.query_one(PassesView).passes]
+
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("down", "enter")
+            await pilot.pause()
+
+            self.assertIsInstance(app.focused, PassesView)
+            after = [encounter.short_name for encounter in app.query_one(PassesView).passes]
+            self.assertCountEqual(before, after)
+
+    async def test_escape_does_not_strand_the_keyboard(self) -> None:
+        """Leaving without choosing.
+
+        A closed dropdown ignores the arrows, so focus parked on it after
+        ESC would leave the keyboard doing nothing at all until the user
+        guessed at a tab switch.
+        """
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app.query_one(PassSortSelector).is_open)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, PassesView)
+
+            selected = app.query_one(PassesView).selected.node_id
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertNotEqual(app.query_one(PassesView).selected.node_id, selected)
 
 
 if __name__ == "__main__":
