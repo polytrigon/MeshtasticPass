@@ -19,6 +19,7 @@ from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
     PASS_NAME_MAX_CELLS,
     disambiguate_pass_names,
+    pass_row_offset,
     lay_out_passes,
     pass_column_count,
     pass_column_width,
@@ -157,3 +158,47 @@ class DisambiguationTests(unittest.TestCase):
         grid = lay_out_passes(names, viewport_width=60)
         widths = {cell_len(cell) for row in grid for cell in row}
         self.assertEqual(len(widths), 1, f"ragged columns: {widths}")
+
+
+class RowOffsetTests(unittest.TestCase):
+    """Scrolling the pass grid: minimal movement, never overscrolling."""
+
+    def test_a_selection_already_visible_does_not_scroll(self) -> None:
+        self.assertEqual(pass_row_offset(20, 5, 2, 0), 0)
+        self.assertEqual(pass_row_offset(20, 5, 7, 5), 5)
+
+    def test_stepping_past_the_fold_moves_by_one_row(self) -> None:
+        """Not a recentre. Every cell looks like every other cell here,
+
+        so a list that jumps the selection to the middle of the screen
+        makes it hard to keep your place.
+        """
+        self.assertEqual(pass_row_offset(20, 5, 5, 0), 1)
+
+    def test_moving_above_the_window_scrolls_up_to_it(self) -> None:
+        self.assertEqual(pass_row_offset(20, 5, 3, 5), 3)
+
+    def test_the_last_row_cannot_scroll_past_the_end(self) -> None:
+        """The bottom of the list is the bottom of the list -- never a
+
+        screen of empty space below it.
+        """
+        self.assertEqual(pass_row_offset(20, 5, 19, 10), 15)
+
+    def test_a_list_shorter_than_the_viewport_never_scrolls(self) -> None:
+        self.assertEqual(pass_row_offset(3, 10, 2, 0), 0)
+
+    def test_degenerate_sizes_are_survivable(self) -> None:
+        """Called during layout, when the widget may not have a size."""
+        self.assertEqual(pass_row_offset(20, 0, 5, 3), 0)
+        self.assertEqual(pass_row_offset(0, 5, 0, 0), 0)
+
+    def test_walking_the_whole_list_keeps_the_selection_visible(self) -> None:
+        total, viewport, offset = 37, 6, 0
+        for row in range(total):
+            offset = pass_row_offset(total, viewport, row, offset)
+            self.assertTrue(
+                offset <= row < offset + viewport,
+                f"row {row} not visible at offset {offset}",
+            )
+            self.assertLessEqual(offset, total - viewport)

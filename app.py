@@ -94,9 +94,11 @@ from radio_capabilities import (
 from pass_layout import (
     DEFAULT_PASS_ORDER,
     PASS_COLUMN_GUTTER,
+    PASS_MORE_MARKER,
     disambiguate_pass_names,
     format_pass_bar,
     lay_out_passes,
+    pass_row_offset,
 )
 from radio_service import (
     ChannelInfo,
@@ -3999,6 +4001,11 @@ class PassesView(Static):
         self._passes: tuple[NodeEncounter, ...] = ()
         self._columns = 1
         self._selected = 0
+        # First visible row. PASSES clips to its own viewport rather
+        # than using a Textual scrollbar, for the same reason MESH does:
+        # the whole view is one rendered Text, so scrolling is a slice,
+        # not a container full of widgets to move.
+        self._row_offset = 0
 
     @property
     def passes(self) -> tuple[NodeEncounter, ...]:
@@ -4058,9 +4065,19 @@ class PassesView(Static):
         names = disambiguate_pass_names(self._passes)
         rows = lay_out_passes(names, self.size.width or 60)
         self._columns = len(rows[0]) if rows else 1
+        height = self.size.height or len(rows)
+        selected_row = self._selected // max(1, self._columns)
+        # One row is spent on the MORE marker whenever the list runs
+        # past the fold, so the viewport is that much shorter.
+        overflows = len(rows) > height
+        visible_rows = max(1, height - 1) if overflows else height
+        self._row_offset = pass_row_offset(
+            len(rows), visible_rows, selected_row, self._row_offset
+        )
+        window = rows[self._row_offset : self._row_offset + visible_rows]
         text = Text(no_wrap=True)
-        index = 0
-        for row_number, row in enumerate(rows):
+        index = self._row_offset * max(1, self._columns)
+        for row_number, row in enumerate(window):
             if row_number:
                 text.append("\n")
             for column_number, cell in enumerate(row):
@@ -4076,6 +4093,13 @@ class PassesView(Static):
                 style = Style(color=color, reverse=index == self._selected)
                 text.append(cell, style=style)
                 index += 1
+        if overflows:
+            remaining = len(rows) - (self._row_offset + visible_rows)
+            text.append("\n")
+            text.append(
+                PASS_MORE_MARKER if remaining > 0 else " " * len(PASS_MORE_MARKER),
+                style=Style(color=palette.dim),
+            )
         return text
 
     def on_key(self, event: Key) -> None:

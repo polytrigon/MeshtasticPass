@@ -172,3 +172,35 @@ def disambiguate_pass_names(encounters) -> tuple[str, ...]:
         )
         for encounter in encounters
     )
+
+
+# MS-DOS printed "-- More --" when a directory ran past the screen, and
+# PASSES is a DOS directory; borrowing it is both on-theme and the
+# honest thing to show, since without it a full screen of names gives no
+# hint that the list continues.
+PASS_MORE_MARKER = "-- MORE --"
+
+
+def pass_row_offset(
+    total_rows: int, viewport_rows: int, selected_row: int, offset: int
+) -> int:
+    """The smallest scroll that keeps `selected_row` visible.
+
+    Deliberately minimal rather than recentering: moving down one row
+    should move the list by one row, not jump the selection to the
+    middle of the screen. A list that re-centres under the cursor makes
+    it hard to keep your place, which matters more here than elsewhere
+    because every cell looks like every other cell.
+
+    Clamped so the last screenful cannot scroll past the end into empty
+    space -- the bottom of the list is the bottom of the list.
+    """
+    if viewport_rows <= 0 or total_rows <= 0:
+        return 0
+    highest = max(0, total_rows - viewport_rows)
+    offset = max(0, min(offset, highest))
+    if selected_row < offset:
+        return selected_row
+    if selected_row >= offset + viewport_rows:
+        return min(selected_row - viewport_rows + 1, highest)
+    return offset
