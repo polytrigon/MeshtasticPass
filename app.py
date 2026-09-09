@@ -3692,8 +3692,14 @@ class ChatEntryWidget(Vertical):
         self.mention = mention and not entry.outgoing and entry.dm_node_id is None
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
+        # The timestamp text currently painted, so the 1s tick can skip
+        # the layout-invalidating update when nothing changed (see
+        # refresh_timestamp). Seeded below with the label's own initial
+        # text, so the very first tick is already a no-op.
+        initial_timestamp = self._timestamp_text(initial_now)
+        self._timestamp_rendered: str = initial_timestamp
         self.timestamp_label = Static(
-            self._timestamp_text(initial_now),
+            initial_timestamp,
             classes="chat-entry-timestamp",
             markup=False,
         )
@@ -3779,8 +3785,29 @@ class ChatEntryWidget(Vertical):
         self.refresh_delivery_state(1)
 
     def refresh_timestamp(self, now: float) -> None:
-        """Update only the existing timestamp child for this entry."""
-        self.timestamp_label.update(self._timestamp_text(now))
+        """Update the timestamp child, but ONLY when its text changed.
+
+        The shared 1s CHAT tick calls this on every mounted entry, and
+        Static.update() ends in refresh(layout=True) -- a LAYOUT
+        invalidation, not merely a repaint. Without this guard the
+        transcript re-laid itself out once per second per mounted
+        message, which is what made moving around a long CHAT feel
+        sluggish on the uConsole: arrow keys competed with a layout
+        storm.
+
+        Almost all of that work was rewriting a string that had not
+        changed. format_relative_age quantises: a message an hour old
+        reads the same for a whole minute, and an older one for far
+        longer, so at any given tick only the handful of genuinely
+        recent entries have anything new to say. Comparing first turns
+        an O(mounted entries) layout pass into an O(entries that
+        actually changed) one, and the common case is zero.
+        """
+        text = self._timestamp_text(now)
+        if text == self._timestamp_rendered:
+            return
+        self._timestamp_rendered = text
+        self.timestamp_label.update(text)
 
     def _timestamp_text(self, now: float) -> str:
         age = format_relative_age(now - self.entry.age_reference)
