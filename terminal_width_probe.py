@@ -146,13 +146,11 @@ def names_in_use(limit: int = 40) -> list[tuple[str, str]]:
     its right by that difference -- and a name whose two widths agree
     cannot move anything, however many emoji it contains.
 
-    Uses the real disambiguated names (see disambiguate_pass_names) and
-    not the raw short names, because the suffix a collision adds is part
-    of the cell and has its own width.
+    Uses display_name, which is exactly what a cell holds -- short name,
+    then long name, then the node ID.
     """
     try:
         from chat_store import ChatStore
-        from pass_layout import disambiguate_pass_names
     except Exception:
         return []
     try:
@@ -160,7 +158,8 @@ def names_in_use(limit: int = 40) -> list[tuple[str, str]]:
     except Exception:
         return []
     out: list[tuple[str, str]] = []
-    for encounter, name in zip(rows, disambiguate_pass_names(rows)):
+    for encounter in rows:
+        name = encounter.display_name
         if name.isascii():
             continue
         out.append((name, encounter.node_id))

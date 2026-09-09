@@ -27,6 +27,7 @@ from textual.containers import (
     VerticalScroll,
 )
 from textual.events import Blur, Click, Focus, Key
+from textual.geometry import Region
 from textual.message import Message
 from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
@@ -94,8 +95,8 @@ from radio_capabilities import (
 from pass_layout import (
     DEFAULT_PASS_ORDER,
     PASS_COLUMN_GUTTER,
-    disambiguate_pass_names,
     format_pass_bar,
+    pass_column_width,
     lay_out_passes,
     pass_row_offset,
 )
@@ -4006,6 +4007,7 @@ class PassesView(Static):
         super().__init__(id="passes-view", markup=False)
         self._passes: tuple[NodeEncounter, ...] = ()
         self._columns = 1
+        self._column_width = 1
         self._selected = 0
         # First visible row. PASSES clips to its own viewport rather
         # than using a Textual scrollbar, for the same reason MESH does:
@@ -4064,13 +4066,16 @@ class PassesView(Static):
                 style=Style(color=THEME_PALETTES[self.app._current_theme].dim),
             )
         palette = THEME_PALETTES[self.app._current_theme]
-        # Colliding short names get their node ID's tail appended (see
-        # disambiguate_pass_names) -- without it two different radios
-        # sharing one emoji render as two identical cells and read as a
-        # duplicate row rather than as two nodes.
-        names = disambiguate_pass_names(self._passes)
+        # Names exactly as their operators set them, duplicates and all.
+        # Two nodes sharing one emoji DO render as two identical cells,
+        # which is the truth about this mesh; the bar under the grid and
+        # the ENTER menu are where a reader finds out which is which,
+        # and both have room to print a node ID that a 16-cell grid cell
+        # does not.
+        names = tuple(encounter.display_name for encounter in self._passes)
         rows = lay_out_passes(names, self.size.width or 60)
         self._columns = len(rows[0]) if rows else 1
+        self._column_width = pass_column_width(names)
         height = self.size.height or len(rows)
         selected_row = self._selected // max(1, self._columns)
         # No "more" marker: that a list scrolls is an assumed pattern,
@@ -4102,6 +4107,31 @@ class PassesView(Static):
                 text.append(cell, style=style)
                 index += 1
         return text
+
+    def selected_region(self) -> Region | None:
+        """Where the highlighted cell sits on screen, for menu placement.
+
+        The whole grid is one widget, so there is no per-cell widget to
+        anchor a popup to the way MESH anchors to a node's own glyph.
+        The coordinates are recomputed here from the same three numbers
+        the last render used -- column count, column width and scroll
+        offset -- rather than stored during render, so a menu opened
+        before the first paint gets None instead of a stale position.
+        """
+        if not self._passes:
+            return None
+        columns = max(1, self._columns)
+        row = self._selected // columns - self._row_offset
+        column = self._selected % columns
+        content = self.content_region
+        if row < 0 or row >= max(1, content.height):
+            return None
+        return Region(
+            content.x + column * (self._column_width + PASS_COLUMN_GUTTER),
+            content.y + row,
+            self._column_width,
+            1,
+        )
 
     def on_key(self, event: Key) -> None:
         if not self._passes:
@@ -9027,18 +9057,54 @@ class MeshtasticPassApp(App[None]):
         self._update_passes_node_bar()
 
     @on(PassesView.OpenRequested)
-    def open_pass_conversation(self, event: PassesView.OpenRequested) -> None:
-        """Enter on a pass opens that node's DM -- the same public entry
+    def open_pass_menu(self, event: PassesView.OpenRequested) -> None:
+        """ENTER on a pass opens the SAME node menu CHAT's sender names do.
 
-        point the CHAT sender menu and the MESH node menu already use,
-        so a conversation started from PASSES is not a different kind of
-        conversation.
+        Not a shortcut straight into a DM, which is what this used to be.
+        A DM is one of several things a person wants from a name on this
+        board -- highlight it, look up which node it actually is, remove
+        it -- and now that names are shown with their duplicates intact,
+        the menu is also the place that answers "which of these two is
+        this one", since it prints the node ID.
+
+        Built the way CHAT builds its own (see open_user_menu): start
+        from what is ON RECORD for this node, then overlay whatever the
+        live NodeDB currently says. The order matters in that direction
+        -- PASSES exists to outlive the radio's own bounded NodeDB, so a
+        node the radio has since forgotten still opens a menu with the
+        name it was met under, rather than an empty one.
         """
         encounter = event.encounter
-        self.open_dm(
+        metadata = NodeMetadata(
             encounter.node_id,
-            long_name=encounter.long_name,
-            short_name=encounter.short_name,
+            encounter.long_name,
+            encounter.short_name,
+            encounter.hops_away,
+        )
+        getter = getattr(self.radio, "get_node_metadata", None)
+        if callable(getter):
+            try:
+                current = getter(encounter.node_id)
+            except Exception:
+                current = None
+            if isinstance(current, NodeMetadata):
+                metadata = NodeMetadata(
+                    encounter.node_id,
+                    metadata.long_name or current.long_name,
+                    metadata.short_name or current.short_name,
+                    # Hops from the LIVE radio when it has them: the
+                    # recorded value is where the node was when we last
+                    # met it, which can be months stale.
+                    current.hops_away
+                    if current.hops_away is not None
+                    else metadata.hops_away,
+                    current.last_heard,
+                    current.is_local,
+                    is_unmessagable=current.is_unmessagable,
+                )
+        view = self.query_one(PassesView)
+        self._open_node_menu(
+            metadata, view, None, anchor=view.selected_region()
         )
 
     def _record_pass_encounters(
@@ -11660,6 +11726,7 @@ class MeshtasticPassApp(App[None]):
         allow_reply: bool = True,
         allow_dm: bool = True,
         allow_traceroute: bool = False,
+        anchor: Region | None = None,
     ) -> None:
         """Open the shared CHAT/MESH node-details menu.
 
@@ -11677,6 +11744,15 @@ class MeshtasticPassApp(App[None]):
         says it cannot receive messages (metadata.is_unmessagable --
         see RadioService/NodeMetadata). Never offered for YOU (the
         is_local branch below has no actionable rows at all).
+
+        anchor overrides where the popup is placed, for a caller whose
+        selection is not its own widget. CHAT and MESH both anchor to a
+        real mounted widget -- a sender name, a node glyph -- and pass
+        nothing here. PASSES draws its entire grid as one widget, so
+        `origin` is the whole board and anchoring to it would put the
+        menu at the board's edge rather than beside the highlighted
+        name; it passes the selected cell's region instead. `origin`
+        still governs focus restoration either way.
 
         allow_traceroute defaults to False; TRACE ROUTE (Part C) is
         explicit, user-triggered RF traffic offered ONLY from MESH's own
@@ -11761,7 +11837,7 @@ class MeshtasticPassApp(App[None]):
         )
         width = max(cell_len(item.label) for item in items) + 4
         self.screen.mount(menu)
-        menu.place(origin.region, self.screen.region, width)
+        menu.place(origin.region if anchor is None else anchor, self.screen.region, width)
 
     def _activate_menu_item(self, metadata: NodeMetadata, action: str) -> None:
         """Dispatch a node-context-menu action -- REPLY needs the node's

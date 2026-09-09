@@ -30,6 +30,7 @@ import unittest
 from textual.widgets import Static
 
 from app import MeshtasticPassApp, PassesView
+from viewport_menu import ViewportMenu
 from app_settings import AppSettings
 from chat_store import ChatStore
 from simulated_radio_service import SimulatedRadioService
@@ -54,7 +55,9 @@ def _cells(view: PassesView) -> dict[str, object]:
     }
 
 
-class PassesViewTests(unittest.IsolatedAsyncioTestCase):
+class PassesHarness(unittest.IsolatedAsyncioTestCase):
+    """Shared setup only -- no tests, so nothing here runs twice."""
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -81,6 +84,10 @@ class PassesViewTests(unittest.IsolatedAsyncioTestCase):
 
     def _count_text(self, app: MeshtasticPassApp) -> str:
         return str(app.query_one("#passes-count", Static).render())
+
+
+class PassesViewTests(PassesHarness):
+    """The header's two numbers, and the grid's one colour."""
 
     # ---- the two numbers ---------------------------------------------
 
@@ -185,6 +192,128 @@ class PassesViewTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(by_name["BRVO"].name, palette.accent)
             for name in ("ALFA", "CHRL"):
                 self.assertEqual(by_name[name].name, palette.base)
+
+
+class PassMenuTests(PassesHarness):
+    """ENTER on a name opens the same node menu CHAT's sender names do.
+
+    It used to jump straight into a DM. A DM is one of several things
+    someone wants from a name here -- highlight it, find out which node
+    it actually is, remove it -- and since names are now shown with
+    their duplicates intact, the menu is also the only place that says
+    which of two identical cells this one is.
+    """
+
+    async def _open_menu(self, app, pilot) -> ViewportMenu:
+        await self._open_passes(pilot)
+        await pilot.press("enter")
+        await pilot.pause()
+        return app.query_one("#node-context-menu", ViewportMenu)
+
+    async def test_enter_opens_the_node_menu_rather_than_a_dm(self) -> None:
+        self.store.record_encounter(
+            "!aaaa0001", seen_at=T, short_name="ALFA", long_name="Alfa Trail"
+        )
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            menu = await self._open_menu(app, pilot)
+
+            labels = [item.label for item in menu.items]
+            self.assertIn("Alfa Trail", labels)
+            self.assertIn("ALFA", labels)
+            self.assertIn("HIGHLIGHT", labels)
+            self.assertIn("DIRECT MSG", labels)
+
+    async def test_the_menu_names_the_node_id_for_an_unknown_node(self) -> None:
+        """A node the radio has never heard of still opens a menu.
+
+        PASSES exists to outlive the radio's own bounded NodeDB, so the
+        menu is built from what is ON RECORD first and the live NodeDB
+        only overlays it. This radio is not even online, which is the
+        strongest version of that case.
+        """
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            menu = await self._open_menu(app, pilot)
+
+            self.assertIn("ALFA", [item.label for item in menu.items])
+            self.assertTrue(
+                any(item.value for item in menu.items),
+                "an offline node still needs actionable rows",
+            )
+
+    async def test_the_menu_opens_against_the_highlighted_node(self) -> None:
+        """Not simply the first one. Arrow, then ENTER.
+
+        The whole grid is one widget, so the selection is an index this
+        code keeps rather than focus landing on a per-cell widget -- the
+        kind of thing that silently opens a menu for the wrong row.
+        """
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="ALFA")
+        self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="BRVO")
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            first = view.selected.short_name
+            await pilot.press("right")
+            await pilot.pause()
+            moved = view.selected.short_name
+            self.assertNotEqual(first, moved)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            menu = app.query_one("#node-context-menu", ViewportMenu)
+            labels = [item.label for item in menu.items]
+            self.assertIn(moved, labels)
+            self.assertNotIn(first, labels)
+
+    async def test_the_menu_is_placed_beside_the_cell_not_the_board(self) -> None:
+        """PASSES has no per-cell widget to anchor to, so it computes one.
+
+        Anchoring to the PassesView itself would put the popup at the
+        edge of the whole grid, which is nowhere near the name that was
+        selected.
+        """
+        for index in range(6):
+            self.store.record_encounter(
+                f"!aaaa000{index}", seen_at=T + index, short_name=f"N{index:03d}"
+            )
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+            await pilot.press("right", "right")
+            await pilot.pause()
+
+            region = view.selected_region()
+            self.assertIsNotNone(region)
+            self.assertGreater(region.x, view.content_region.x)
+            self.assertEqual(region.height, 1)
+
+    async def test_duplicate_names_render_as_two_identical_cells(self) -> None:
+        """No ID tail any more -- and that is deliberate.
+
+        Two radios sharing an emoji look alike on the board, which is
+        the truth about this mesh. Telling them apart is the ENTER
+        menu's job, and both cells must still be selectable.
+        """
+        self.store.record_encounter("!aaaa0001", seen_at=T, short_name="\U0001f43b")
+        self.store.record_encounter("!bbbb0002", seen_at=T + 10, short_name="\U0001f43b")
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            view = app.query_one(PassesView)
+
+            text = view.render()
+            self.assertNotIn("aaaa", text.plain)
+            self.assertNotIn("bbbb", text.plain)
+            self.assertEqual(len(view.passes), 2)
+            first = view.selected.node_id
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertNotEqual(view.selected.node_id, first)
 
 
 if __name__ == "__main__":

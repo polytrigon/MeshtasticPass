@@ -5,6 +5,15 @@ style block: names flow LEFT TO RIGHT and then wrap to the next row,
 which is what makes a long list scannable in a fixed-width terminal
 without a scrollbar per column.
 
+Names are shown exactly as their operators set them, INCLUDING when two
+nodes share one -- a mesh full of duplicate short names is the normal
+state, not a data problem to paper over. An earlier version appended
+each colliding node's ID tail to tell them apart, which cost every such
+cell four cells of width and still could not be read on a terminal whose
+emoji glyphs overpaint the character beside them. Identity lives where
+there is room for it instead: the bar under the grid, and the ENTER
+menu, both of which state the node ID outright.
+
 Kept pure and free of Textual so the layout can be tested exhaustively
 -- including the emoji short names that are common on a real mesh and
 are the usual cause of a column drifting out of alignment.
@@ -25,10 +34,17 @@ PASS_NAME_MAX_CELLS = 16
 PASS_COLUMN_GUTTER = 2
 
 # Marks a name cut short at the column cap. ASCII, and deliberately not
-# "…": see PASS_DISAMBIGUATOR below for why nothing this module ADDS to a
-# cell may be a character whose width is a terminal setting. "~" is also
-# what DOS itself used when a name would not fit, which is the layout
-# this view is imitating.
+# "…" (U+2026), which is East_Asian_Width=AMBIGUOUS: Rich counts it as
+# one cell and a terminal whose font treats that class as wide paints it
+# as two, which in a fixed-width grid moves every column to its right.
+#
+# The general rule: node names come off the mesh and are taken as they
+# are, but a character the LAYOUT adds to a cell must have a width that
+# is a fact rather than a setting, and ASCII is the only width every
+# terminal agrees on. Enforced by test_pass_layout.AmbiguousWidthTests.
+#
+# "~" is also what DOS itself used for a name that would not fit, and
+# this view is imitating DOS.
 PASS_TRUNCATION_MARKER = "~"
 
 
@@ -154,60 +170,6 @@ def _age_or_none(when, now: float, formatter):
     if age < 0:
         return None
     return formatter(age)
-
-
-# When two nodes share a display name, each gets its node ID's last four
-# characters appended so the grid cannot show two cells that look like
-# the same radio.
-#
-# ASCII, and that is not cosmetic. This was U+00B7 MIDDLE DOT, which is
-# East_Asian_Width=AMBIGUOUS: Rich counts it as one cell and a terminal
-# whose font or configuration treats ambiguous-width characters as wide
-# paints it as two. In a fixed-width grid that one cell of disagreement
-# moves every column to the right of it, for the whole row.
-#
-# It read as a display bug about EMOJI, because the names that collide
-# are the emoji ones -- a popular emoji is exactly what two strangers
-# pick independently -- so the dot only ever appeared next to an emoji.
-# The emoji were innocent: they are East_Asian_Width=WIDE, which no
-# terminal disagrees about, and an emoji name with no collision lined up
-# perfectly.
-#
-# The general rule this is an instance of: a character the LAYOUT adds to
-# a cell must have a width that is a fact rather than a setting. Names
-# come from the mesh and we take them as they are, but everything around
-# them is ours to choose, and ASCII is the only width every terminal
-# agrees on. Enforced by test_pass_layout.AmbiguousWidthTests.
-PASS_DISAMBIGUATOR = "."
-
-
-def disambiguate_pass_names(encounters) -> tuple[str, ...]:
-    """Display names, made unique where two nodes share one.
-
-    Meshtastic short names are not unique and were never meant to be:
-    people pick emoji, defaults repeat, and one operator's two radios
-    routinely carry the same name. A DOS directory could assume unique
-    filenames; a pass list cannot.
-
-    Only colliding names are altered, so the common case stays clean and
-    nobody pays width for a problem they do not have. The suffix is the
-    node ID's last four characters -- the same tail Meshtastic itself
-    uses for auto-generated names, so it reads as identity rather than
-    as decoration.
-    """
-    encounters = tuple(encounters)
-    counts: dict[str, int] = {}
-    for encounter in encounters:
-        name = encounter.display_name
-        counts[name] = counts.get(name, 0) + 1
-    return tuple(
-        (
-            f"{encounter.display_name}{PASS_DISAMBIGUATOR}{encounter.node_id[-4:]}"
-            if counts[encounter.display_name] > 1
-            else encounter.display_name
-        )
-        for encounter in encounters
-    )
 
 
 def pass_row_offset(

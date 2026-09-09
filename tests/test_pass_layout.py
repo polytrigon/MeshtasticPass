@@ -18,10 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from grapheme_text import cell_len  # noqa: E402
 from pass_layout import (  # noqa: E402
     PASS_COLUMN_GUTTER,
-    PASS_DISAMBIGUATOR,
     PASS_NAME_MAX_CELLS,
     PASS_TRUNCATION_MARKER,
-    disambiguate_pass_names,
     format_pass_bar,
     pass_row_offset,
     lay_out_passes,
@@ -120,44 +118,48 @@ class DisplayWidthTests(unittest.TestCase):
                     self.assertLessEqual(painted, max(width, pass_column_width(names)))
 
 
-class DisambiguationTests(unittest.TestCase):
-    """Meshtastic short names are not unique and never were."""
+class DuplicateNameTests(unittest.TestCase):
+    """Meshtastic short names are not unique and never were.
 
-    @staticmethod
-    def _encounter(node_id: str, short: str):
-        from chat_store import NodeEncounter
+    They are shown anyway. A version of this view appended each
+    colliding node's ID tail so no two cells could look alike; it cost
+    four cells of width on every such name, and on a terminal whose
+    emoji glyphs overpaint the character beside them the separator was
+    not even visible. Identity moved to the bar and the ENTER menu,
+    which have room to print a node ID. What the grid owes the reader is
+    that duplicates still LAY OUT correctly -- two identical names must
+    occupy two cells of equal width, not collapse or drift.
+    """
 
-        return NodeEncounter(node_id, None, short, None, 0.0, 0.0, None, None)
+    def test_identical_names_produce_identical_cells(self) -> None:
+        grid = lay_out_passes(("BIG", "BIG", "ALFA"), viewport_width=60)
+        self.assertEqual(grid[0][0], grid[0][1])
 
-    def test_colliding_names_gain_their_node_id_tail(self) -> None:
-        rows = (
-            self._encounter("!e5deef81", "BIG"),
-            self._encounter("!1c33b395", "BIG"),
-        )
-        self.assertEqual(disambiguate_pass_names(rows), ("BIG.ef81", "BIG.b395"))
+    def test_duplicates_are_not_collapsed(self) -> None:
+        """Three radios called SAME are three rows, not one.
 
-    def test_unique_names_are_left_alone(self) -> None:
-        """Nobody pays width for a collision they do not have."""
-        rows = (
-            self._encounter("!e5deef81", "ALFA"),
-            self._encounter("!1c33b395", "BRVO"),
-        )
-        self.assertEqual(disambiguate_pass_names(rows), ("ALFA", "BRVO"))
+        The list is a record of nodes, and a node is not a name.
+        """
+        grid = lay_out_passes(("SAME", "SAME", "SAME"), viewport_width=60)
+        self.assertEqual(sum(len(row) for row in grid), 3)
 
-    def test_three_way_collisions_all_disambiguate(self) -> None:
-        rows = tuple(
-            self._encounter(nid, "SAME") for nid in ("!aaaa1111", "!bbbb2222", "!cccc3333")
-        )
-        self.assertEqual(len(set(disambiguate_pass_names(rows))), 3)
-
-    def test_emoji_names_collide_and_survive_layout(self) -> None:
+    def test_duplicate_emoji_names_keep_equal_width_cells(self) -> None:
         """The real case: two radios sharing one emoji short name."""
-        rows = (self._encounter("!e5deef81", "\U0001f43b"), self._encounter("!1c33b395", "\U0001f43b"))
-        names = disambiguate_pass_names(rows)
-        self.assertNotEqual(names[0], names[1])
+        names = ("\U0001f43b", "\U0001f43b", "ALFA")
         grid = lay_out_passes(names, viewport_width=60)
         widths = {cell_len(cell) for row in grid for cell in row}
         self.assertEqual(len(widths), 1, f"ragged columns: {widths}")
+
+    def test_a_bare_emoji_name_costs_no_more_width_than_it_is(self) -> None:
+        """What removing the ID tail bought.
+
+        A board of emoji names now sets its column from the emoji, not
+        from the emoji plus a five-character suffix, which is several
+        more columns of names on an 80-column screen.
+        """
+        self.assertEqual(
+            pass_column_width(("\U0001f43b", "\U0001f43b")), 2
+        )
 
 
 class RowOffsetTests(unittest.TestCase):
@@ -235,9 +237,6 @@ class AmbiguousWidthTests(unittest.TestCase):
                 f"U+{ord(character):04X} is not ASCII",
             )
 
-    def test_the_disambiguator_has_an_undisputed_width(self) -> None:
-        self._assert_unambiguous(PASS_DISAMBIGUATOR)
-
     def test_the_truncation_marker_has_an_undisputed_width(self) -> None:
         self._assert_unambiguous(PASS_TRUNCATION_MARKER)
 
@@ -259,15 +258,8 @@ class AmbiguousWidthTests(unittest.TestCase):
         Whatever appears in a rendered cell that was NOT in the node's
         own name got there from this module, and must be safe.
         """
-        from chat_store import NodeEncounter
-
-        encounters = (
-            NodeEncounter("!e5deef81", None, "\U0001f43b", None, 0.0, 0.0, None, None),
-            NodeEncounter("!1c33b395", None, "\U0001f43b", None, 0.0, 0.0, None, None),
-            NodeEncounter("!aaaa1111", None, "Q" * 40, None, 0.0, 0.0, None, None),
-        )
-        supplied = set("".join(e.short_name for e in encounters))
-        names = disambiguate_pass_names(encounters)
+        names = ("\U0001f43b", "\U0001f43b", "Q" * 40)
+        supplied = set("".join(names))
         for row in lay_out_passes(names, viewport_width=60):
             for cell in row:
                 self._assert_unambiguous(
