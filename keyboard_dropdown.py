@@ -46,6 +46,7 @@ class KeyboardDropdown(Static):
         prefix: str = "",
         suffix: str = "",
         label_width: int | None = None,
+        marker_gutter: bool = True,
         classes: str = "keyboard-dropdown",
     ) -> None:
         super().__init__(id=widget_id, classes=classes, markup=False)
@@ -54,6 +55,18 @@ class KeyboardDropdown(Static):
         self.prefix = prefix
         self.suffix = suffix
         self.label_width = label_width
+        # Two leading cells reserved for the ">" focus marker. Every
+        # dropdown that sits in a LABELLED column wants them: the label
+        # column is what it aligns to, and reserving the space stops the
+        # text jumping sideways as focus moves.
+        #
+        # A dropdown that is the FIRST thing on its line has nothing to
+        # align to but the page edge, and those two cells indent it past
+        # every other view's first column. Such a caller can turn the
+        # gutter off, because focus is already unambiguous without the
+        # marker -- .keyboard-dropdown:focus recolours the whole control
+        # to ACCENT, so nothing is lost but the indent.
+        self.marker_gutter = marker_gutter
         self.options = tuple(options)
         self.value = value
         self.is_open = False
@@ -211,11 +224,16 @@ class KeyboardDropdown(Static):
         if self._status_override is not None:
             self.update(self._status_override)
             return
-        marker = ">" if (self.has_focus if focused is None else focused) else " "
+        is_focused = self.has_focus if focused is None else focused
+        marker = ">" if is_focused else " "
         label = f"{self.prefix}{self.label}"
         if self.label_width is not None:
             label = f"{label:<{self.label_width}}"
-        if label:
+        if not self.marker_gutter:
+            heading = f"[ {self.selected_label} ▾ ]"
+            if label:
+                heading = f"{label} {heading}"
+        elif label:
             heading = f"{marker} {label} [ {self.selected_label} ▾ ]"
         else:
             # An empty label (e.g. ChannelSelector, which drops the

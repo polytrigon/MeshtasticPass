@@ -3970,6 +3970,12 @@ class PassSortSelector(KeyboardDropdown):
             # No prefix/suffix: KeyboardDropdown already renders its own
             # "[ value v ]" brackets, and adding a pair here produced
             # "[  [ RECENT v ]  ]" on hardware.
+            #
+            # No marker gutter either: this control is the first thing
+            # on its line, so those two reserved cells indented it past
+            # where CHAT's network name starts. CHAT's own dropdowns
+            # keep the gutter -- they follow a label and align to it.
+            marker_gutter=False,
             classes="keyboard-dropdown",
         )
 
