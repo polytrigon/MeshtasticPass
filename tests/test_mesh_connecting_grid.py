@@ -16,7 +16,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from app import DOT_GRID_GLYPH, MeshCanvas, MeshTopologyView, MeshtasticPassApp
+from app import (
+    DOT_GRID_GLYPH,
+    DOT_GRID_SPACING_X,
+    DOT_GRID_SPACING_Y,
+    MeshCanvas,
+    MeshTopologyView,
+    MeshtasticPassApp,
+)
 from app_settings import AppSettings
 from simulated_radio_service import SimulatedRadioService
 
@@ -92,6 +99,72 @@ class MeshConnectingGridTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(self._canvas_text(app), populated)
+
+
+class BoardEdgeTests(unittest.IsolatedAsyncioTestCase):
+    """The board ends ON the last dot, not one grid step past it.
+
+    Sizing it column_count * spacing appended a whole empty step: three
+    blank columns on the right and a blank row at the bottom, belonging
+    to a dot that is never drawn. Centring then divided only what was
+    LEFT, so the whole extra step landed on the right and the grid read
+    as pushed off-centre.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        self.settings = AppSettings.load(
+            config_path=root / "meshtasticpass" / "config.json",
+            profile_path=root / "terminal.conf",
+        )
+
+    def _app(self) -> MeshtasticPassApp:
+        return MeshtasticPassApp(
+            SimulatedRadioService(connect_delay=60, message_interval=0), self.settings
+        )
+
+    async def test_the_last_dot_is_the_last_column_of_the_board(self) -> None:
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            rows, columns, _, _ = view.current_grid_dimensions()
+
+            lines = str(app.query_one(MeshCanvas).render()).split("\n")
+            self.assertEqual(len(lines), (rows - 1) * DOT_GRID_SPACING_Y + 1)
+            self.assertEqual(
+                len(lines[0]), (columns - 1) * DOT_GRID_SPACING_X + 1
+            )
+            # No trailing blank: the row ends on ink.
+            self.assertTrue(lines[0].endswith(DOT_GRID_GLYPH))
+            self.assertTrue(lines[-1].endswith(DOT_GRID_GLYPH))
+
+    async def test_the_gaps_either_side_are_within_one_cell(self) -> None:
+        """The actual complaint: it looked pushed left.
+
+        They cannot be exactly equal -- an odd column count on an even
+        viewport leaves one cell over -- but they must not differ by a
+        whole grid step.
+        """
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            await pilot.press("4")
+            await pilot.pause()
+            await pilot.pause()
+            view = app.query_one(MeshTopologyView)
+            board = view.board
+
+            left = board.region.x - view.region.x
+            right = (view.region.x + view.region.width) - (
+                board.region.x + board.region.width
+            )
+            self.assertLessEqual(abs(left - right), 1, f"left {left}, right {right}")
 
 
 if __name__ == "__main__":

@@ -2969,8 +2969,25 @@ class MeshTopologyView(Container):
         row_count, column_count, center_row, center_column = (
             self.current_grid_dimensions()
         )
-        board_width = column_count * DOT_GRID_SPACING_X
-        board_height = row_count * DOT_GRID_SPACING_Y
+        # The board ends ON the last dot, not one grid STEP past it.
+        #
+        # Dots sit at (column - 1) * DOT_GRID_SPACING_X (see
+        # _mesh_grid_pixel), so the rightmost one is at
+        # (column_count - 1) * spacing and the board needs exactly one
+        # cell more than that. Sizing it column_count * spacing instead
+        # appended a full empty step -- three blank columns on the right
+        # and one blank row at the bottom that belonged to a dot that
+        # was never drawn. Centring then split the REMAINING space
+        # evenly, so those three cells landed entirely on the right: at
+        # 90 columns the gaps read 3 left, 6 right. They now read 4 and
+        # 5.
+        #
+        # Node and label coordinates come from _mesh_grid_pixel and
+        # never from these two numbers, so nothing moves relative to the
+        # grid -- only the container's own edges, and the canvas that
+        # fills it.
+        board_width = (column_count - 1) * DOT_GRID_SPACING_X + 1
+        board_height = (row_count - 1) * DOT_GRID_SPACING_Y + 1
         board = self.board
         board.styles.width = board_width
         board.styles.height = board_height
