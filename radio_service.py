@@ -51,9 +51,26 @@ MAX_CONNECT_ARRIVALS = 256
 # where that handshake stalls.
 CONNECT_TIMEOUT_SECONDS = 30.0
 
+# What the FIRST attempt of a connect sequence gets instead.
+#
+# Measured on real hardware (handshake tracing, 13:06): attempt one ran
+# the full 33s and received exactly ONE node_info -- no config, no
+# config_complete. Attempt two, six seconds later on the same port,
+# pulled 95 node_info plus 10 config, 16 moduleConfig, 8 channel,
+# metadata and my_info in THREE SECONDS. Waiting two minutes between
+# runs changed nothing, so it is not settle time; the first open after
+# process start simply does not take, and want_config_id goes nowhere.
+#
+# So the first attempt is not slow, it is dead, and the only question is
+# how long we stare at it before trying the one that works. 8s turns a
+# ~40s startup into ~12s, and shrinks the window in which a doomed
+# attempt can consume the radio's queue. If it ever IS merely slow, the
+# cost is one wasted 8s and every later attempt still gets the full 30.
+FIRST_CONNECT_TIMEOUT_SECONDS = 8.0
 
-@functools.lru_cache(maxsize=4)
-def _traced_interface(interface_class: type) -> type:
+
+@functools.lru_cache(maxsize=8)
+def _traced_interface(interface_class: type, timeout: float) -> type:
     """`interface_class` with handshake tracing (and the timeout above).
 
     A subclass overriding one default argument, rather than patching the
@@ -63,7 +80,9 @@ def _traced_interface(interface_class: type) -> type:
     """
 
     class TracedInterface(interface_class):  # type: ignore[valid-type,misc]
-        def _waitConnected(self, timeout: float = CONNECT_TIMEOUT_SECONDS):
+        def _waitConnected(self, _timeout: float = 0.0):
+            # The SDK calls this with no argument; the value that
+            # matters is the one this class was built for.
             return super()._waitConnected(timeout)
 
         def _handleFromRadio(self, fromRadioBytes):
@@ -760,6 +779,9 @@ class RadioService:
         # constructor, before self._interface can possibly be assigned.
         self._connect_in_progress = False
         self._connect_arrivals: list[tuple[Any, Any]] = []
+        # See _connect_timeout(): the first open after a close is the
+        # one that reliably does not take.
+        self._connected_since_open = False
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -820,6 +842,7 @@ class RadioService:
             # from, so stale V3 settings can never leak into a V4's own
             # snapshot (see item 8: capability comes from what the SDK
             # actually reports here, never from device_path).
+            self._connected_since_open = True
             self._connection_generation += 1
             self._rebuild_config_snapshot()
             return info
@@ -2323,6 +2346,12 @@ class RadioService:
         # successful connect() always re-establishes both fresh from
         # that NEW radio's own reported identity.
         self._activity_local_node_id = None
+        # The next open is a FIRST open again, and the first open after a
+        # close is the one that reliably does not take (see
+        # FIRST_CONNECT_TIMEOUT_SECONDS). Forgetting this here would make
+        # every reconnect after the first spend 30s on an attempt that
+        # receives nothing.
+        self._connected_since_open = False
         self._direct_observations.clear()
         self._link_observations.clear()
         if self._interface is not None:
@@ -2354,16 +2383,17 @@ class RadioService:
         from pubsub import pub
 
         kind, location, port = parse_connection_target(self.device_path)
+        timeout = self._connect_timeout()
         self._subscribe_to_events(pub)
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
 
-            return _traced_interface(TCPInterface)(
+            return _traced_interface(TCPInterface, timeout)(
                 hostname=location, portNumber=port
             )
         from meshtastic.serial_interface import SerialInterface
 
-        return _traced_interface(SerialInterface)(devPath=location)
+        return _traced_interface(SerialInterface, timeout)(devPath=location)
 
     def _subscribe_to_events(self, pub: Any) -> None:
         if self._pub is not None:
@@ -2631,6 +2661,17 @@ class RadioService:
         self._connect_arrivals = []
         if dropped and rx_debug_enabled():
             rx_debug_log(f"CONNECT discarding {dropped} held packet(s)")
+
+    def _connect_timeout(self) -> float:
+        """How long to wait for THIS attempt's initial download.
+
+        Short for the first attempt after a close, full-length after one
+        has succeeded -- see FIRST_CONNECT_TIMEOUT_SECONDS for the
+        measurement behind that.
+        """
+        if self._connected_since_open:
+            return CONNECT_TIMEOUT_SECONDS
+        return FIRST_CONNECT_TIMEOUT_SECONDS
 
     def _drain_connect_arrivals(self) -> None:
         """Replay packets held while the interface was being constructed.

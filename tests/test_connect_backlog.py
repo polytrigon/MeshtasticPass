@@ -30,6 +30,8 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from radio_service import (  # noqa: E402
+    CONNECT_TIMEOUT_SECONDS,
+    FIRST_CONNECT_TIMEOUT_SECONDS,
     MAX_CONNECT_ARRIVALS,
     RadioService,
 )
@@ -290,6 +292,74 @@ class ConnectWindowTests(unittest.TestCase):
         self._connect_delivering([banked_packet("second connect")])
 
         self.assertEqual([m.text for m in self.received], ["second connect"])
+
+
+class FirstAttemptTimeoutTests(unittest.TestCase):
+    """The first open after a close is the one that does not take.
+
+    Measured: attempt one ran 33s and received a single node_info;
+    attempt two pulled 95 node_info and the whole config in three
+    seconds, and a two-minute wait between runs changed nothing. So the
+    first attempt is dead rather than slow, and staring at it for 30s
+    only widens the window in which it can consume the radio's queue.
+    """
+
+    def setUp(self) -> None:
+        self.service = RadioService("/dev/ttyUSB0")
+
+    def test_the_first_attempt_fails_fast(self) -> None:
+        self.assertEqual(
+            self.service._connect_timeout(), FIRST_CONNECT_TIMEOUT_SECONDS
+        )
+
+    def test_the_short_timeout_is_shorter(self) -> None:
+        """Guards the constants against being edited into nonsense."""
+        self.assertLess(FIRST_CONNECT_TIMEOUT_SECONDS, CONNECT_TIMEOUT_SECONDS)
+        self.assertGreater(FIRST_CONNECT_TIMEOUT_SECONDS, 0)
+
+    def test_later_attempts_get_the_full_timeout(self) -> None:
+        """Once a connect has worked, a slow one is worth waiting for."""
+        opened = make_interface()
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(self.service, "_open_interface", return_value=opened),
+        ):
+            self.service.connect()
+
+        self.assertEqual(self.service._connect_timeout(), CONNECT_TIMEOUT_SECONDS)
+
+    def test_closing_makes_the_next_open_a_first_open_again(self) -> None:
+        """Otherwise every reconnect after the first wastes 30s.
+
+        A reconnect opens the port afresh, so it hits exactly the same
+        dead first attempt as process start does.
+        """
+        opened = make_interface()
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(self.service, "_open_interface", return_value=opened),
+        ):
+            self.service.connect()
+        self.service.close()
+
+        self.assertEqual(
+            self.service._connect_timeout(), FIRST_CONNECT_TIMEOUT_SECONDS
+        )
+
+    def test_a_failed_connect_does_not_promote_the_timeout(self) -> None:
+        """Nothing succeeded, so the next attempt is still a first one."""
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(
+                self.service, "_open_interface", side_effect=OSError("timed out")
+            ),
+        ):
+            with self.assertRaises(Exception):
+                self.service.connect()
+
+        self.assertEqual(
+            self.service._connect_timeout(), FIRST_CONNECT_TIMEOUT_SECONDS
+        )
 
 
 if __name__ == "__main__":
