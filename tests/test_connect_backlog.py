@@ -30,6 +30,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from radio_service import (  # noqa: E402
+    RadioState,
     CONNECT_TIMEOUT_SECONDS,
     FIRST_CONNECT_TIMEOUT_SECONDS,
     MAX_CONNECT_ARRIVALS,
@@ -360,6 +361,94 @@ class FirstAttemptTimeoutTests(unittest.TestCase):
         self.assertEqual(
             self.service._connect_timeout(), FIRST_CONNECT_TIMEOUT_SECONDS
         )
+
+
+class HeldDeliveryOrderingTests(unittest.TestCase):
+    """Held packets must not be delivered before the app is ready.
+
+    The app binds its CHAT history profile while handling the ONLINE
+    event. Every read is narrowed by `AND profile_key = ?`, so a
+    message persisted before that binding lands with profile_key NULL
+    and is preserved-but-hidden forever.
+
+    Seen in the field exactly once, which is what these tests exist to
+    prevent recurring: id 2034 was stored in the same second as LINK
+    online and never appeared, while id 2035 arrived two seconds later
+    and rendered normally.
+    """
+
+    def setUp(self) -> None:
+        self.service = RadioService("/dev/ttyUSB0")
+        self.received = []
+        self.service.add_message_handler(self.received.append)
+        self.interface = make_interface()
+
+    def _open_holding(self):
+        def open_interface():
+            self.service._on_text_received(
+                packet=banked_packet("banked"), interface=self.interface
+            )
+            return self.interface
+
+        return open_interface
+
+    def test_defer_held_keeps_them_queued(self) -> None:
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(
+                self.service, "_open_interface", side_effect=self._open_holding()
+            ),
+        ):
+            self.service.connect(defer_held=True)
+
+        self.assertEqual(self.received, [], "held until the caller says when")
+        self.assertEqual(len(self.service._connect_arrivals), 1)
+
+    def test_connect_without_the_flag_still_delivers(self) -> None:
+        """Direct callers (tools, tests) keep the simple behaviour."""
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(
+                self.service, "_open_interface", side_effect=self._open_holding()
+            ),
+        ):
+            self.service.connect()
+
+        self.assertEqual([m.text for m in self.received], ["banked"])
+
+    def test_connection_events_delivers_only_after_online_is_handled(self) -> None:
+        """The ordering that actually matters.
+
+        A generator resumes on the consumer's NEXT iteration, so nothing
+        placed after the ONLINE yield can run until the consumer has
+        finished handling it -- which for the app is where the profile
+        gets bound.
+        """
+        from threading import Event as ThreadEvent
+
+        stopped = ThreadEvent()
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(
+                self.service, "_open_interface", side_effect=self._open_holding()
+            ),
+        ):
+            events = self.service.connection_events(
+                retry_delay=0, stop_event=stopped, poll_interval=0.001
+            )
+            self.assertEqual(next(events).state, RadioState.CONNECTING)
+            self.assertEqual(next(events).state, RadioState.ONLINE)
+
+            # Standing exactly where the app binds its profile.
+            self.assertEqual(
+                self.received, [], "delivered before the consumer could bind"
+            )
+
+            stopped.set()
+            for _ in events:
+                pass
+
+        self.assertEqual([m.text for m in self.received], ["banked"])
 
 
 if __name__ == "__main__":

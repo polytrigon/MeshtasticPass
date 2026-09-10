@@ -783,8 +783,20 @@ class RadioService:
         # one that reliably does not take.
         self._connected_since_open = False
 
-    def connect(self) -> RadioInfo:
-        """Connect, wait for the SDK's initial sync, and return local node info."""
+    def connect(self, *, defer_held: bool = False) -> RadioInfo:
+        """Connect, wait for the SDK's initial sync, and return local node info.
+
+        `defer_held` leaves packets caught during the connect window
+        (see _on_text_received) queued instead of delivering them before
+        returning. connection_events() uses it because delivering them
+        here is TOO EARLY: the app binds its CHAT history profile while
+        handling the ONLINE event, so a message replayed before that
+        lands with profile_key NULL and every later read -- narrowed by
+        `AND profile_key = ?` -- hides it. Observed exactly once in the
+        field: id 2034 stored in the same second as LINK online and
+        invisible ever after, while id 2035 arrived two seconds later
+        and was fine.
+        """
         self._connection_lost.clear()
         self._check_device()
 
@@ -825,7 +837,8 @@ class RadioService:
                 self._interface = self._open_interface()
             finally:
                 self._connect_in_progress = False
-            self._drain_connect_arrivals()
+            if not defer_held:
+                self._drain_connect_arrivals()
             info = self._read_radio_info()
             if (
                 self._activity_local_node_id is not None
@@ -912,7 +925,7 @@ class RadioService:
                 yield RadioEvent(RadioState.CONNECTING)
 
                 try:
-                    info = self.connect()
+                    info = self.connect(defer_held=True)
                 except RadioConnectionError as error:
                     if rx_debug_enabled():
                         rx_debug_log(f"LINK failed reason={error}")
@@ -924,6 +937,13 @@ class RadioService:
                             f"short={info.short_name} nodes={info.known_nodes}"
                         )
                     yield RadioEvent(RadioState.ONLINE, info=info)
+                    # A generator resumes only on the consumer's NEXT
+                    # iteration, so by here the ONLINE event has been
+                    # fully handled -- for the app that means the CHAT
+                    # history profile and channel list are bound, which
+                    # is what a replayed packet needs to be persisted
+                    # somewhere the reads can still see it.
+                    self._drain_connect_arrivals()
 
                     while not stopped.is_set():
                         if self._connection_lost.wait(poll_interval):
