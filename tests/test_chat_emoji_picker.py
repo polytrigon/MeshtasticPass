@@ -524,35 +524,39 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(EMOJI_PICKER_PADDING_CELLS - 2, worst_case_shortfall)
 
     async def test_picker_content_width_uses_rendered_cell_width_not_len(self) -> None:
-        """❤️ is 5 Python characters (heart, U+FE0F variation selector
+        """Sized in terminal cells, never in Python characters.
 
-        counts as 1 char) but renders as 2 terminal cells -- the width
-        calculation must use cell_len, never len().
+        The discriminating case is the SINGLE-CHARACTER wide emoji, of
+        which nearly every choice is one: len() calls "😀" one, the
+        terminal draws it as two, and a len()-based box would clip a
+        column off every item. Comparing the WIDEST choice cannot show
+        this -- "❤️" happens to be 2 characters AND 2 cells, so both
+        methods agree on the maximum while disagreeing about almost
+        every individual item.
         """
-        # A WINDOW's worth, not the whole set: the strip scrolls, so the
-        # box is sized for what is on screen at once plus its two scroll
-        # markers.
         visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
-        widest_len = max(len(emoji) for emoji in EMOJI_PICKER_CHOICES)
-        widest_cells = max(cell_len(emoji) for emoji in EMOJI_PICKER_CHOICES)
-        naive_len_total = (
-            EMOJI_PICKER_MARKER_CELLS + visible * (1 + widest_len + 1) + (visible - 1)
-        )
         correct_total = (
-            EMOJI_PICKER_MARKER_CELLS + visible * (1 + widest_cells + 1) + (visible - 1)
+            EMOJI_PICKER_MARKER_CELLS
+            + visible * emoji_picker_item_width()
+            + (visible - 1)
         )
         self.assertEqual(emoji_picker_content_width(), correct_total)
         self.assertEqual(
             emoji_picker_total_width(),
             correct_total + EMOJI_PICKER_BORDER_CELLS + EMOJI_PICKER_PADDING_CELLS,
         )
-        # Every emoji here is a single Python character except ❤️ (heart
-        # + variation selector, 2 characters) but ALL of them are wide
-        # (2-cell) glyphs -- a naive len()-based sum undercounts the 12
-        # single-character ones, so it comes out narrower than the
-        # correct, cell-width-based total. Using len() here would size
-        # the picker wrongly and clip content.
-        self.assertNotEqual(naive_len_total, correct_total)
+
+        single_character = [
+            emoji for emoji in EMOJI_PICKER_CHOICES if len(emoji) == 1
+        ]
+        self.assertTrue(
+            single_character, "the case this test exists for has been removed"
+        )
+        for emoji in single_character:
+            self.assertEqual(len(emoji), 1)
+            self.assertEqual(cell_len(emoji), 2)
+        naive_item_width = 1 + max(len(emoji) for emoji in single_character) + 1
+        self.assertLess(naive_item_width, emoji_picker_item_width())
 
     async def test_picker_width_deterministic_across_repeated_opens(self) -> None:
         app = self.make_app()
