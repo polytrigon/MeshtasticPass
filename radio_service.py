@@ -33,24 +33,28 @@ MAX_CONNECT_ARRIVALS = 256
 
 # How long to let the radio finish its initial node-DB download.
 #
-# The SDK's serial path waits 30s (stream_interface.connect ->
-# _waitConnected(); BLE asks for 60 explicitly, so 30 is a default
-# nobody chose for this case). On a CM4 with a 34-node database the
-# first attempt times out at ~33s while the device is mid-replay, and
-# the retry then succeeds in about 3 -- because the first attempt
-# already drained the radio. Everything banked while the app was closed
-# dies in that gap.
+# 30.0 is the SDK's own serial default (stream_interface.connect() ->
+# _waitConnected(); BLE asks for 60). Kept deliberately.
 #
-# Carrying held packets across a failed attempt (see connect()) makes
-# that survivable; this makes it rare. A connect that is genuinely going
-# to fail still fails, just later -- and the reconnect loop was already
-# willing to spend 33s on the attempt plus a retry delay.
-CONNECT_TIMEOUT_SECONDS = 90.0
+# DO NOT RAISE THIS AGAIN WITHOUT NEW EVIDENCE. Raising it to 90 looked
+# obvious -- the first attempt was dying at ~33s and the retry then
+# succeeded in 3, so the handshake "must" be slow. It is not slow, it is
+# STUCK: at 90s the attempts still failed, three in a row at 94/92/92s,
+# and the fourth succeeded in 6. config_complete simply never arrives on
+# a failing attempt, so waiting longer only turns a 40-second connect
+# into four and a half minutes.
+#
+# What the failures actually cost is the backlog: the device appears to
+# send config_complete and move on to draining its queue while our
+# client never registers it, so a failed attempt consumes messages that
+# are then gone. _handleFromRadio tracing (below) exists to find out
+# where that handshake stalls.
+CONNECT_TIMEOUT_SECONDS = 30.0
 
 
 @functools.lru_cache(maxsize=4)
-def _patient_interface(interface_class: type) -> type:
-    """`interface_class` with a longer initial-download timeout.
+def _traced_interface(interface_class: type) -> type:
+    """`interface_class` with handshake tracing (and the timeout above).
 
     A subclass overriding one default argument, rather than patching the
     SDK's class or reimplementing StreamInterface.connect()'s handshake
@@ -58,13 +62,55 @@ def _patient_interface(interface_class: type) -> type:
     reader thread, _startConfig -- across SDK upgrades).
     """
 
-    class PatientInterface(interface_class):  # type: ignore[valid-type,misc]
+    class TracedInterface(interface_class):  # type: ignore[valid-type,misc]
         def _waitConnected(self, timeout: float = CONNECT_TIMEOUT_SECONDS):
             return super()._waitConnected(timeout)
 
-    PatientInterface.__name__ = f"Patient{interface_class.__name__}"
-    PatientInterface.__qualname__ = PatientInterface.__name__
-    return PatientInterface
+        def _handleFromRadio(self, fromRadioBytes):
+            # The one choke point for EVERYTHING the device sends, config
+            # replay included -- none of which reaches pubsub, so the
+            # [RX] packet trace cannot see a handshake at all. That blind
+            # spot is why a stuck connect looks identical to a quiet one.
+            if rx_debug_enabled():
+                self._trace_from_radio(fromRadioBytes)
+            return super()._handleFromRadio(fromRadioBytes)
+
+        def _trace_from_radio(self, raw: bytes) -> None:
+            """Name each FromRadio variant, in order, with a running count.
+
+            Parses a second time rather than hooking the SDK's own parse:
+            this is opt-in diagnostic code and must not alter what the
+            real path sees, even by leaving a half-consumed buffer
+            behind. Never raises -- a broken trace must not break a
+            connect.
+            """
+            try:
+                from meshtastic.protobuf import mesh_pb2
+
+                message = mesh_pb2.FromRadio()
+                message.ParseFromString(raw)
+                variant = message.WhichOneof("payload_variant") or "unset"
+            except Exception:
+                rx_debug_log(f"HANDSHAKE unparsable bytes={len(raw)}")
+                return
+            counts = getattr(self, "_handshake_counts", None)
+            if counts is None:
+                counts = {}
+                self._handshake_counts = counts
+            counts[variant] = counts.get(variant, 0) + 1
+            if variant == "config_complete_id":
+                # The moment the device stops replaying config and starts
+                # draining its queue. If this line never appears, the
+                # handshake died mid-replay and the tally says how far it
+                # got.
+                tally = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                rx_debug_log(f"HANDSHAKE config_complete_id AFTER {tally}")
+            else:
+                rx_debug_log(f"HANDSHAKE {variant} #{counts[variant]}")
+
+    TracedInterface.__name__ = f"Traced{interface_class.__name__}"
+    TracedInterface.__qualname__ = TracedInterface.__name__
+    return TracedInterface
 RX_DEBUG_FILE_ENV_VAR = "MESHTASTICPASS_RX_DEBUG_FILE"
 
 
@@ -2312,12 +2358,12 @@ class RadioService:
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
 
-            return _patient_interface(TCPInterface)(
+            return _traced_interface(TCPInterface)(
                 hostname=location, portNumber=port
             )
         from meshtastic.serial_interface import SerialInterface
 
-        return _patient_interface(SerialInterface)(devPath=location)
+        return _traced_interface(SerialInterface)(devPath=location)
 
     def _subscribe_to_events(self, pub: Any) -> None:
         if self._pub is not None:
