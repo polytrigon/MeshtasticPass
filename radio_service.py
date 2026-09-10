@@ -22,6 +22,13 @@ from serial_devices import (
 
 
 RX_DEBUG_ENV_VAR = "MESHTASTICPASS_RX_DEBUG"
+
+# Upper bound on packets held during the connect window
+# (_on_text_received). The firmware's own queue for a disconnected
+# client is MAX_RX_TOPHONE -- 8, 16 or 32 depending on the board -- so
+# this cannot legitimately be reached by a backlog drain; it exists only
+# so a pathological connect can never grow this list without limit.
+MAX_CONNECT_ARRIVALS = 256
 RX_DEBUG_FILE_ENV_VAR = "MESHTASTICPASS_RX_DEBUG_FILE"
 
 
@@ -666,6 +673,11 @@ class RadioService:
         # is the only reader and always reflects the CURRENT connection.
         self._connection_generation = 0
         self._config_snapshot: RadioConfigurationSnapshot | None = None
+        # See _on_text_received / _drain_connect_arrivals: packets the
+        # radio delivers while connect() is still blocked inside the SDK
+        # constructor, before self._interface can possibly be assigned.
+        self._connect_in_progress = False
+        self._connect_arrivals: list[tuple[Any, Any]] = []
 
     def connect(self) -> RadioInfo:
         """Connect, wait for the SDK's initial sync, and return local node info."""
@@ -673,7 +685,33 @@ class RadioService:
         self._check_device()
 
         try:
-            self._interface = self._open_interface()
+            # THE BANKED-MESSAGE WINDOW.
+            #
+            # _open_interface() subscribes to meshtastic.receive.text and
+            # only THEN constructs the SDK interface, which blocks until
+            # config_complete_id. The firmware answers that by entering
+            # STATE_SEND_PACKETS and draining everything it queued for us
+            # while no client was attached (MeshService::toPhoneQueue) --
+            # on the SDK's reader thread, while this thread is still
+            # inside the constructor. Those packets therefore arrive
+            # BEFORE the assignment below can run, so _on_text_received
+            # sees a self._interface that is still None (first connect)
+            # or still the previous object (reconnect), and its
+            # stale-interface guard throws away the entire backlog.
+            #
+            # Whether that guard wins is a pure race, which is why this
+            # was intermittent for weeks and then total. Rather than
+            # weaken the guard -- it exists to reject a genuinely dead
+            # interface, which matters -- close the window: hold
+            # arrivals that cannot yet be judged, then replay them once
+            # the identity they must be judged against exists.
+            self._connect_in_progress = True
+            self._connect_arrivals = []
+            try:
+                self._interface = self._open_interface()
+            finally:
+                self._connect_in_progress = False
+            self._drain_connect_arrivals()
             info = self._read_radio_info()
             if (
                 self._activity_local_node_id is not None
@@ -2424,6 +2462,26 @@ class RadioService:
     ) -> None:
         debug = rx_debug_enabled()
         if interface is not None and interface is not self._interface:
+            if self._connect_in_progress:
+                # Mid-connect: self._interface is not assigned yet, so
+                # "is it ours?" has no answer to compare against. This is
+                # exactly when the radio replays its banked queue, so
+                # discarding here loses precisely the messages the user
+                # was away for. Hold it; connect() replays it against the
+                # real interface a moment later.
+                if len(self._connect_arrivals) < MAX_CONNECT_ARRIVALS:
+                    self._connect_arrivals.append((packet, interface))
+                    if debug:
+                        rx_debug_log(
+                            f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
+                            "held reason=connect_in_progress"
+                        )
+                elif debug:
+                    rx_debug_log(
+                        f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
+                        "dropped reason=connect_backlog_full"
+                    )
+                return
             if debug:
                 rx_debug_log(
                     f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
@@ -2455,6 +2513,28 @@ class RadioService:
             except Exception:
                 # One consumer should not stop radio packet processing.
                 pass
+
+    def _drain_connect_arrivals(self) -> None:
+        """Replay packets held while the interface was being constructed.
+
+        Called immediately after self._interface is assigned, so every
+        held packet is now judged by the ordinary rule in
+        _on_text_received: one belonging to the interface we just opened
+        is delivered normally, and one from any other (a leftover from a
+        previous connection that lost the race) is discarded exactly as
+        it would have been.
+
+        The list is swapped out before iterating: the SDK reader thread
+        can still be appending, and re-entering _on_text_received must
+        not walk a list that is being mutated underneath it.
+        """
+        held, self._connect_arrivals = self._connect_arrivals, []
+        if not held:
+            return
+        if rx_debug_enabled():
+            rx_debug_log(f"CONNECT replaying {len(held)} held packet(s)")
+        for packet, interface in held:
+            self._on_text_received(packet=packet, interface=interface)
 
     def _record_direct_observation(
         self,
