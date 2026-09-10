@@ -212,6 +212,10 @@ SIMULATED_MESSAGES = (
 class SimulatedRadioService:
     """Behaves like RadioService while producing deterministic fake events."""
 
+    # These nodes do not exist (see SIMULATED_NODES). Nothing may write
+    # them anywhere that outlives the process -- see RadioService.
+    is_simulated = True
+
     def __init__(
         self,
         device_path: str = SIMULATED_DEVICE_PATHS[0],

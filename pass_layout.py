@@ -40,6 +40,22 @@ Measure = Callable[[str], int]
 # long long-name must not collapse the whole board to a single column --
 # the full identity lives in the bottom bar, exactly as it does on MESH.
 PASS_NAME_MAX_CELLS = 16
+
+# The share of names a column is sized to fit whole. The rest are
+# truncated (see PASS_TRUNCATION_MARKER) and read in full from the bar.
+#
+# Sizing to the WIDEST name instead lets one outlier set the stride for
+# the entire board: a node with no short name falls back to its long
+# name, and a single 13-cell "No Short Name" turned a thirteen-column
+# board into a four-column one with enormous gaps. That is the wrong
+# trade in a directory -- people come here to scan the list, not to read
+# its one longest entry, and the bar under the grid already gives that
+# entry in full the moment it is highlighted.
+#
+# Only bites once there are enough names for a distribution to mean
+# anything: below roughly twenty, the quantile IS the maximum and every
+# name still fits whole.
+PASS_NAME_TYPICAL_QUANTILE = 0.9
 # The MINIMUM blank cells between columns, and so what decides how many
 # columns fit. One reads as a wrapped sentence; two leave no room for a
 # glyph painted wider than the box it advances, which this board has.
@@ -81,9 +97,23 @@ PASS_TRUNCATION_MARKER = "~"
 
 
 def pass_column_width(names: tuple[str, ...], measure: Measure = cell_len) -> int:
-    """The cell width every column takes: the widest name, capped."""
-    widest = max((measure(name) for name in names), default=0)
-    return max(1, min(widest, PASS_NAME_MAX_CELLS))
+    """The width every column takes: what MOST names need, capped.
+
+    Sized to PASS_NAME_TYPICAL_QUANTILE of the names rather than to the
+    widest one, so a single long name cannot set the stride for the
+    whole board (see that constant). Names above it are truncated, and
+    the bar reads them out in full.
+
+    Measured in columns the terminal really advances rather than in the
+    width Unicode declares (see terminal_width), because this number's
+    whole job is to be the stride between two things a person sees side
+    by side.
+    """
+    widths = sorted(measure(name) for name in names)
+    if not widths:
+        return 1
+    index = min(len(widths) - 1, int(len(widths) * PASS_NAME_TYPICAL_QUANTILE))
+    return max(1, min(widths[index], PASS_NAME_MAX_CELLS))
 
 
 def pass_column_count(

@@ -579,6 +579,16 @@ def validate_send_request(
 class RadioService:
     """Owns the connection between the app and a Meshtastic radio."""
 
+    # Whether this service's nodes are inventions. False here, and for
+    # every service that talks to real hardware; SimulatedRadioService
+    # overrides it. Read by anything that would otherwise PERSIST what a
+    # radio reports -- most of all PASSES, whose whole premise is that a
+    # row is the record of having actually met someone. A fabricated
+    # node written there is indistinguishable from a real one for ever
+    # after, because the record is meant to outlive the radio that made
+    # it.
+    is_simulated = False
+
     _MAX_PENDING_SENDS = 200
     # How close a subsequent packet's own rxTime must land to the host
     # epoch we asked the radio to adopt (see sync_clock) to count as

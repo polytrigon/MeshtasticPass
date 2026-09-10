@@ -9272,9 +9272,17 @@ class MeshtasticPassApp(App[None]):
 
         Never allowed to break a refresh: PASSES is a side record, and a
         storage problem must not take the MESH board down with it.
+
+        Records NOTHING from a simulated radio. Its nodes are inventions
+        (see SIMULATED_NODES), and a pass list is the one place in this
+        app where a row outlives the radio that made it -- so a fake one
+        written here is indistinguishable from a real encounter for ever
+        after. One --simulate run used to leave eight invented people in
+        the real list permanently, one of them a 13-cell "No Short Name"
+        that set the column width for the entire board.
         """
         store = self.chat_store
-        if store is None:
+        if store is None or getattr(self.radio, "is_simulated", False):
             return
         for node in nodes:
             if getattr(node, "is_local", False):
@@ -9336,9 +9344,13 @@ class MeshtasticPassApp(App[None]):
         timestamp, which may be better than anything the sweep has --
         and it is deliberately not write-suppressed, because a message
         arriving is a real event about a real node.
+
+        Unless the radio is simulated, in which case the sender is an
+        invention too and nothing here may reach the store -- the same
+        rule, and for the same reason, as _record_pass_encounters.
         """
         store = self.chat_store
-        if store is None:
+        if store is None or getattr(self.radio, "is_simulated", False):
             return
         node_id = getattr(message, "sender_node_id", None)
         if not isinstance(node_id, str) or not node_id.strip():

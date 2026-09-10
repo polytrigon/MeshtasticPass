@@ -29,8 +29,10 @@ import unittest
 
 from textual.widgets import Static
 
+from types import SimpleNamespace
+
 from app import MeshtasticPassApp, PassSortSelector, PassesView
-from radio_service import RadioState
+from radio_service import NodeMetadata, RadioState
 from viewport_menu import ViewportMenu
 from app_settings import AppSettings
 from chat_store import ChatStore
@@ -577,6 +579,62 @@ class PassConnectingStateTests(PassesHarness):
             await pilot.pause()
 
             self.assertIsInstance(app.focused, PassesView)
+
+
+class SimulatedRadioTests(PassesHarness):
+    """A simulated radio must never write to the pass list.
+
+    Found on real hardware: eight invented people sitting permanently in
+    the user's own board, one of them a 13-cell "No Short Name" that
+    took a thirteen-column grid down to four. PASSES is the one place in
+    this app where a row deliberately outlives the radio that wrote it,
+    so a fabricated row there is indistinguishable from a real encounter
+    for ever after -- there is no later moment at which it becomes
+    obviously wrong.
+    """
+
+    async def test_a_simulated_sweep_records_nothing(self) -> None:
+        app = self._app()
+        self.assertTrue(app.radio.is_simulated)
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            for _ in range(30):
+                await pilot.pause()
+
+            self.assertEqual(self.store.encounters(), ())
+
+    async def test_a_real_radio_still_records(self) -> None:
+        """The guard must be about SIMULATION, not about sweeps.
+
+        A test double that never claims to be simulated has to keep
+        working, or this quietly turns off PASSES for everyone.
+        """
+        app = self._app()
+        app.radio.is_simulated = False
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._record_pass_encounters(
+                (NodeMetadata("!aaaa0001", "Alfa Trail", "ALFA", 0),), now=T
+            )
+
+            recorded = self.store.encounters()
+            self.assertEqual([row.node_id for row in recorded], ["!aaaa0001"])
+
+    async def test_an_arriving_simulated_message_records_nothing(self) -> None:
+        """The other write path into the store, guarded the same way."""
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await pilot.pause()
+            app._record_pass_from_message(
+                SimpleNamespace(
+                    sender_node_id="!bbbb0002",
+                    sender_long_name="Bob Basecamp",
+                    sender_short_name="BOB",
+                    radio_rx_at=T,
+                )
+            )
+
+            self.assertEqual(self.store.encounters(), ())
 
 
 if __name__ == "__main__":

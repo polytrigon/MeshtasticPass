@@ -80,6 +80,37 @@ class ColumnWidthTests(unittest.TestCase):
             pass_column_width(("A", "B" * 80)), PASS_NAME_MAX_CELLS
         )
 
+    def test_one_long_name_among_many_does_not_set_the_column(self) -> None:
+        """The real regression, from real data.
+
+        A node with no short name falls back to its long name. One
+        13-cell "No Short Name" among two hundred four-cell ones took a
+        thirteen-column board down to four, with enormous gaps -- the
+        whole directory paying width for a single entry nobody was
+        looking at.
+        """
+        names = tuple(f"N{index:03d}" for index in range(200)) + ("No Short Name",)
+        self.assertEqual(pass_column_width(names), 4)
+
+    def test_the_outlier_is_truncated_rather_than_dropped(self) -> None:
+        """It still has to be findable. Narrower, marked, not missing."""
+        names = tuple(f"N{index:03d}" for index in range(200)) + ("No Short Name",)
+        grid = lay_out_passes(names, viewport_width=108)
+        cells = [cell for row in grid for cell in row]
+        self.assertEqual(len(cells), len(names))
+        self.assertTrue(
+            any(cell.startswith("No") and PASS_TRUNCATION_MARKER in cell for cell in cells),
+            "the long name should be present and marked as cut",
+        )
+
+    def test_a_small_board_still_shows_every_name_whole(self) -> None:
+        """Below a distribution, the quantile IS the maximum.
+
+        Three names is not a population, and truncating one of three to
+        suit the other two would be arithmetic for its own sake.
+        """
+        self.assertEqual(pass_column_width(("AB", "CD", "EFGHIJ")), 6)
+
     def test_a_viewport_narrower_than_one_column_still_gets_one(self) -> None:
         """Zero columns would render nothing and read as an empty pass
 
