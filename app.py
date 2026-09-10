@@ -58,7 +58,6 @@ from geo import format_distance_miles
 from host_timezone import detect_host_timezone
 from grapheme_text import (
     install_flag_pair_protection,
-    terminal_safe_text,
     truncate_to_cells,
 )
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
@@ -4091,16 +4090,15 @@ class ChatEntryWidget(Vertical):
         # or its width -- see ChatEntryWidget.on_focus/on_blur, which
         # only ever update the separate, fixed-width selection_marker.
         #
-        # terminal_safe_text() additionally substitutes keycap-digit
-        # emoji (e.g. a boxed/keycap-style "5") with the equivalent
-        # single-codepoint circled digit -- see grapheme_text.py for
-        # why that specific sequence's Rich/Textual-accounted width can
-        # disagree with what a plain terminal font actually paints.
-        # Display-only: self.entry.text itself, chat_store persistence,
-        # the outgoing RF payload, and @mention matching all still use
-        # the original, untouched text.
+        # The text renders EXACTLY as received. A keycap emoji used to
+        # be swapped here for a circled digit, because Rich accounted it
+        # 2 cells and a bare terminal font might paint 1. The startup
+        # terminal measurement (terminal_width.py) fixes that at the
+        # source now, and the substitution was actively wrong -- it
+        # showed the wrong glyph for every keycap on a mesh where people
+        # count off with them.
         self.message_label = Static(
-            terminal_safe_text(self.entry.text),
+            self.entry.text,
             classes="chat-entry-text",
             markup=False,
         )
@@ -9111,12 +9109,22 @@ class MeshtasticPassApp(App[None]):
             chat_inputs[0].value = state.draft
             chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
-        await transcript.remove_children()
+        # Raised BEFORE the first await, not after it. remove_children()
+        # yields to the event loop, and a message arriving in that gap
+        # runs _insert_chat_widget against a transcript this method has
+        # just emptied and is about to refill -- which mounted a second
+        # LoadOlderControl and killed the app with DuplicateIds, on the
+        # very reconnect where a backlog was being delivered. Cleared in
+        # a finally so a failed rebuild cannot wedge the flag on and
+        # silently stop every later arrival from rendering.
         self._transcript_rebuilding = True
-        widgets = self._initial_chat_widgets(channel_index, state)
-        if widgets:
-            await transcript.mount(*widgets)
-        self._transcript_rebuilding = False
+        try:
+            await transcript.remove_children()
+            widgets = self._initial_chat_widgets(channel_index, state)
+            if widgets:
+                await transcript.mount(*widgets)
+        finally:
+            self._transcript_rebuilding = False
         if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_unread_messages_viewed()
             self._recount_unread()
@@ -9212,6 +9220,13 @@ class MeshtasticPassApp(App[None]):
         *,
         older: bool,
     ) -> None:
+        if self._transcript_rebuilding:
+            # A rebuild is mid-flight and renders the whole transcript
+            # from state.entries, which already contains this entry
+            # (it was appended, and persisted, before we got here).
+            # Mounting it separately would duplicate it -- and race the
+            # rebuild's own widgets for the singleton control IDs.
+            return
         transcript = self.query_one("#chat-log", ChatTranscript)
         # The empty-channel marker (StartOfChannelHistoryMarker) is only
         # ever mounted when a channel has zero entries -- the first real

@@ -34,7 +34,6 @@ from grapheme_text import (
     COMBINING_ENCLOSING_KEYCAP,
     grapheme_clusters,
     install_flag_pair_protection,
-    terminal_safe_text,
     truncate_to_cells,
 )
 
@@ -168,9 +167,10 @@ class FlagPairSeveringIsARealBugWithoutTheFixTests(unittest.TestCase):
 
 
 class KeycapDigitWidthDisagreementIsRealTests(unittest.TestCase):
-    """Proves the premise behind terminal_safe_text(): a fully-qualified
+    """The width disagreement that made keycaps a problem at all.
 
-    keycap-digit sequence is measured by Rich (and so by Textual's
+    A fully-qualified keycap-digit sequence is measured by Rich (and so
+    by Textual's
     Strip, the same code path every wrap/height/virtual-size
     calculation resolves cell counts from) as one 2-cell-wide unit, via
     a "VARIATION SELECTOR-16 promotes the preceding narrow character to
@@ -179,7 +179,11 @@ class KeycapDigitWidthDisagreementIsRealTests(unittest.TestCase):
     inconsistency -- cell_len() is self-consistent -- it is a
     disagreement between that accounted width and what an arbitrary
     target terminal actually paints, which is exactly why a
-    text-level substitution (not a wrap-boundary trick) is required.
+    text-level substitution (not a wrap-boundary trick) was once
+    required. It no longer is: the app measures its own terminal at
+    startup and corrects Rich to match (terminal_width.py), so these
+    numbers are kept as a record of WHY that machinery exists, not as
+    the justification for a substitution that has since been removed.
     """
 
     def test_qualified_keycap_is_two_cells_via_variation_selector_bump(self) -> None:
@@ -201,73 +205,6 @@ class KeycapDigitWidthDisagreementIsRealTests(unittest.TestCase):
 
     def test_bare_enclosing_keycap_mark_is_zero_width(self) -> None:
         self.assertEqual(cell_len(COMBINING_ENCLOSING_KEYCAP), 0)
-
-
-class TerminalSafeTextTests(unittest.TestCase):
-    def test_qualified_keycap_becomes_circled_digit(self) -> None:
-        for digit, circled in zip("0123456789", "⓪①②③④⑤⑥⑦⑧⑨"):
-            with self.subTest(digit=digit):
-                keycap = digit + "️" + COMBINING_ENCLOSING_KEYCAP
-                self.assertEqual(terminal_safe_text(keycap), circled)
-
-    def test_unqualified_keycap_also_becomes_circled_digit(self) -> None:
-        keycap = "7" + COMBINING_ENCLOSING_KEYCAP
-        self.assertEqual(terminal_safe_text(keycap), "⑦")
-
-    def test_circled_digit_is_one_cell_wide(self) -> None:
-        self.assertEqual(cell_len(terminal_safe_text("5️" + COMBINING_ENCLOSING_KEYCAP)), 1)
-
-    def test_surrounding_text_is_preserved(self) -> None:
-        keycap = "5️" + COMBINING_ENCLOSING_KEYCAP
-        text = f"reach floor {keycap} please"
-        self.assertEqual(terminal_safe_text(text), "reach floor ⑤ please")
-
-    def test_repeated_keycaps_all_substituted(self) -> None:
-        keycap = "5️" + COMBINING_ENCLOSING_KEYCAP
-        text = keycap * 3
-        self.assertEqual(terminal_safe_text(text), "⑤⑤⑤")
-
-    def test_plain_text_untouched(self) -> None:
-        text = "hello there, this is a normal message with a 5 in it"
-        self.assertEqual(terminal_safe_text(text), text)
-
-    def test_bare_digit_without_keycap_mark_untouched(self) -> None:
-        self.assertEqual(terminal_safe_text("just the number 5 alone"), "just the number 5 alone")
-
-    def test_bare_enclosing_mark_without_digit_untouched(self) -> None:
-        text = "stray mark " + COMBINING_ENCLOSING_KEYCAP + " alone"
-        self.assertEqual(terminal_safe_text(text), text)
-
-    def test_unrelated_emoji_untouched(self) -> None:
-        for text in ("🇺🇸🇬🇧 team", "👨‍👩‍👧‍👦 family", "👋🏽 wave", "❤️ heart", "🍕 pizza"):
-            with self.subTest(text=text):
-                self.assertEqual(terminal_safe_text(text), text)
-
-    def test_keycap_alongside_ordinary_emoji_only_keycap_substituted(self) -> None:
-        keycap = "5️" + COMBINING_ENCLOSING_KEYCAP
-        text = f"🍕 order {keycap} for table 🎉"
-        self.assertEqual(terminal_safe_text(text), "🍕 order ⑤ for table 🎉")
-
-    def test_hash_and_asterisk_keycaps_left_untouched(self) -> None:
-        """Out of scope: the reported bug is digit keycaps, and neither
-
-        "#" nor "*" has a matching single-codepoint circled glyph to
-        substitute.
-        """
-        for base in ("#", "*"):
-            keycap = base + "️" + COMBINING_ENCLOSING_KEYCAP
-            with self.subTest(base=base):
-                self.assertEqual(terminal_safe_text(keycap), keycap)
-
-    def test_does_not_mutate_input_string(self) -> None:
-        keycap = "5️" + COMBINING_ENCLOSING_KEYCAP
-        original = str(keycap)
-        terminal_safe_text(keycap)
-        self.assertEqual(keycap, original)
-
-    def test_fast_path_returns_identical_object_when_no_keycap_present(self) -> None:
-        text = "plain text with no combining marks"
-        self.assertIs(terminal_safe_text(text), text)
 
 
 class EnclosingMarkTests(unittest.TestCase):

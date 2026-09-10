@@ -23,7 +23,7 @@ import unittest
 from textual.widgets import Input, Static
 
 from chat_store import ChatStore
-from grapheme_text import COMBINING_ENCLOSING_KEYCAP, terminal_safe_text
+from grapheme_text import COMBINING_ENCLOSING_KEYCAP
 from app import ChatEntryWidget, ChatTranscript, MeshtasticPassApp, ThinScrollBarRender
 from app_settings import AppSettings
 from simulated_radio_service import SIMULATED_MESSAGES, SimulatedRadioService
@@ -235,14 +235,13 @@ class KeycapDigitScrollbarSafetyTests(unittest.IsolatedAsyncioTestCase):
     width can disagree with what an arbitrary target terminal actually
     paints, corrupting the wrap point, this entry's height, and
     everything laid out after it (the scrollbar). The fix substitutes
-    it, at the display boundary only, with the single-codepoint circled
-    digit of the same number (see grapheme_text.terminal_safe_text) --
-    an ordinary character with no presentation-selector interaction, so
-    accounted and actual width can never disagree. This class proves
-    that substitution is real (stored text is untouched, only the
-    rendered label changes), applied in both CHANNEL and DM, and that
-    it does not disturb transcript/scrollbar geometry the way the raw
-    sequence would.
+    it USED to be substituted at the display boundary with a circled
+    digit. That is gone: the app measures its own terminal at startup
+    and corrects Rich to match (terminal_width.py), so the disagreement
+    is fixed at the source and a keycap now renders as the keycap the
+    sender actually typed. This class proves the text reaches the
+    screen VERBATIM, in both CHANNEL and DM, without disturbing
+    transcript or scrollbar geometry.
     """
 
     def setUp(self) -> None:
@@ -285,11 +284,10 @@ class KeycapDigitScrollbarSafetyTests(unittest.IsolatedAsyncioTestCase):
         from rich.cells import cell_len
 
         self.assertEqual(cell_len(KEYCAP_FIVE), 2)
-        self.assertEqual(cell_len(terminal_safe_text(KEYCAP_FIVE)), 1)
 
     # ---- Renders with the substituted glyph, original text untouched ----
 
-    async def _assert_renders_substituted(self, text: str) -> None:
+    async def _assert_renders_verbatim(self, text: str) -> None:
         app = MeshtasticPassApp(self.radio(), self.settings)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
@@ -301,10 +299,10 @@ class KeycapDigitScrollbarSafetyTests(unittest.IsolatedAsyncioTestCase):
             # keeps the exact original sequence untouched.
             self.assertEqual(widget.entry.text, text)
 
-            # Only the rendered label is display-safe.
+            # And the label renders it unchanged -- no substitution.
             rendered = str(widget.message_label.render())
-            self.assertEqual(rendered, terminal_safe_text(text))
-            self.assertNotIn(COMBINING_ENCLOSING_KEYCAP, rendered)
+            self.assertEqual(rendered, text)
+            self.assertIn(COMBINING_ENCLOSING_KEYCAP, rendered)
 
             widget.focus()
             await pilot.pause()
@@ -313,16 +311,16 @@ class KeycapDigitScrollbarSafetyTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
     async def test_keycap_at_start_of_message(self) -> None:
-        await self._assert_renders_substituted(KEYCAP_AT_START_TEXT)
+        await self._assert_renders_verbatim(KEYCAP_AT_START_TEXT)
 
     async def test_keycap_near_wrap_boundary(self) -> None:
-        await self._assert_renders_substituted(KEYCAP_AT_WRAP_BOUNDARY_TEXT)
+        await self._assert_renders_verbatim(KEYCAP_AT_WRAP_BOUNDARY_TEXT)
 
     async def test_repeated_keycaps(self) -> None:
-        await self._assert_renders_substituted(REPEATED_KEYCAP_TEXT)
+        await self._assert_renders_verbatim(REPEATED_KEYCAP_TEXT)
 
     async def test_keycap_alongside_ordinary_emoji(self) -> None:
-        await self._assert_renders_substituted(KEYCAP_WITH_ORDINARY_EMOJI_TEXT)
+        await self._assert_renders_verbatim(KEYCAP_WITH_ORDINARY_EMOJI_TEXT)
 
     # ---- Transcript/scrollbar geometry stability, vs. plain-text control -
 
@@ -398,8 +396,8 @@ class KeycapDigitScrollbarSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(widget.entry.text, KEYCAP_AT_START_TEXT)
             rendered = str(widget.message_label.render())
-            self.assertEqual(rendered, terminal_safe_text(KEYCAP_AT_START_TEXT))
-            self.assertNotIn(COMBINING_ENCLOSING_KEYCAP, rendered)
+            self.assertEqual(rendered, KEYCAP_AT_START_TEXT)
+            self.assertIn(COMBINING_ENCLOSING_KEYCAP, rendered)
 
             dm_transcript = app.query_one("#dm-log", ChatTranscript)
             self.assertIs(dm_transcript.vertical_scrollbar.renderer, ThinScrollBarRender)
