@@ -100,6 +100,7 @@ from pass_layout import (
     pass_gutter,
     lay_out_passes,
     pass_row_offset,
+    scroll_window_offset,
 )
 from serial_devices import describe_connection_target
 from terminal_width import (
@@ -1586,20 +1587,49 @@ class DMModeSelector(KeyboardDropdown):
 # Centralized here for easy future expansion; nothing else in this
 # module hardcodes this list or its length.
 EMOJI_PICKER_CHOICES: tuple[str, ...] = (
-    "😀",
-    "😂",
-    "❤️",
-    "👍",
-    "👎",
-    "😭",
-    "😮",
-    "😡",
-    "🎉",
-    "🔥",
-    "👋",
-    "✨",
-    "📡",
+    # Reactions first: the ones a reply is most often just an
+    # acknowledgement of, so the common case needs no scrolling.
+    "\U0001f44d",  # thumbs up
+    "\U0001f44e",  # thumbs down
+    "\u2764\ufe0f",  # red heart
+    "\U0001f602",  # tears of joy
+    "\U0001f600",  # grinning
+    "\U0001f605",  # sweat smile
+    "\U0001f914",  # thinking
+    "\U0001f62e",  # open mouth
+    "\U0001f62d",  # sobbing
+    "\U0001f621",  # angry
+    "\U0001f60e",  # sunglasses
+    "\U0001f440",  # eyes
+    "\U0001f64f",  # folded hands
+    # Then the ones this app is actually for: mesh, movement, weather,
+    # and the handful of statuses people send each other in the field.
+    "\U0001f44b",  # waving hand
+    "\U0001f389",  # party popper
+    "\U0001f525",  # fire
+    "\u2728",  # sparkles
+    "\U0001f4e1",  # satellite antenna
+    "\U0001f9ed",  # compass
+    "\U0001f5fa",  # world map
+    "\U0001f3d5",  # camping
+    "\U0001f97e",  # hiking boot
+    "\U0001f50b",  # battery
+    "\u2600\ufe0f",  # sun
+    "\U0001f327",  # rain
+    "\U0001f319",  # crescent moon
+    "\u26a0\ufe0f",  # warning
+    "\u2705",  # check mark
+    "\u274c",  # cross mark
 )
+
+# How many choices are on screen at once. The strip scrolls rather than
+# growing, because it is an overlay above the composer and a row wide
+# enough for thirty emoji would not fit a uConsole -- and a picker you
+# have to read left to right is slower than one you can take in.
+#
+# Thirteen keeps the box exactly the width it has always been, so adding
+# choices changed what is reachable without changing what is seen.
+EMOJI_PICKER_VISIBLE = 13
 # Must match the ".emoji-picker { height: ... }" CSS rule below.
 EMOJI_PICKER_HEIGHT = 3
 # What the ".emoji-picker" CSS rule below actually costs in columns:
@@ -1640,20 +1670,40 @@ EMOJI_PICKER_BORDER_CELLS = 2
 EMOJI_PICKER_PADDING_CELLS = 3
 
 
+# One cell each side for the "more this way" markers. ASCII, always
+# present (a space when there is nothing further), so the box width and
+# every item's position stay put as the strip scrolls.
+EMOJI_PICKER_MARKER_CELLS = 2
+
+
+def emoji_picker_item_width() -> int:
+    """Cells one choice occupies: bracket, widest emoji, bracket.
+
+    Every item is padded to the WIDEST choice rather than to its own
+    width, so the strip does not jitter as it scrolls and the box can be
+    sized once. Same rule as the PASSES grid, for the same reason: a row
+    of cells that each measure themselves is a row that moves.
+    """
+    widest = max((cell_len(emoji) for emoji in EMOJI_PICKER_CHOICES), default=2)
+    return 1 + widest + 1
+
+
 def emoji_picker_content_width() -> int:
     """Exact rendered terminal-cell width of the picker's emoji row.
 
-    Never len(text): each item is a 1-cell bracket/space, the emoji's
-    own RENDERED cell width (cell_len -- a wide emoji is 2 cells even
-    when, like an intact heart+variation-selector sequence, it is more
-    than one Python character), and a closing 1-cell bracket/space,
-    plus a 1-cell separator between items. Derived from
-    EMOJI_PICKER_CHOICES itself, so the picker never needs a manual
-    width update if the set changes.
+    Never len(text): a wide emoji is 2 cells even when, like an intact
+    heart+variation-selector sequence, it is more than one Python
+    character. Sized for a full WINDOW plus the two scroll markers, so
+    the box is the same width wherever the strip is scrolled to and
+    whatever the choices are.
     """
-    per_item_width = sum(1 + cell_len(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES)
-    separator_width = max(0, len(EMOJI_PICKER_CHOICES) - 1)
-    return per_item_width + separator_width
+    visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+    items = visible * emoji_picker_item_width()
+    separators = max(0, visible - 1)
+    return EMOJI_PICKER_MARKER_CELLS + items + separators
+
+
+
 
 
 def emoji_picker_total_width() -> int:
@@ -1684,6 +1734,10 @@ class EmojiPicker(Static):
     def __init__(self) -> None:
         super().__init__(classes="emoji-picker", markup=False)
         self.highlighted_index = 0
+        # First visible choice. The strip scrolls rather than growing,
+        # so this is what LEFT/RIGHT move once the highlight reaches an
+        # edge (see move_highlight).
+        self._scroll_offset = 0
         default_palette = THEME_PALETTES["snow"]
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
@@ -1697,8 +1751,15 @@ class EmojiPicker(Static):
         self._render_picker()
 
     def move_highlight(self, direction: int) -> None:
+        """Move one choice, wrapping, scrolling the window if needed."""
         self.highlighted_index = (self.highlighted_index + direction) % len(
             EMOJI_PICKER_CHOICES
+        )
+        self._scroll_offset = scroll_window_offset(
+            len(EMOJI_PICKER_CHOICES),
+            EMOJI_PICKER_VISIBLE,
+            self.highlighted_index,
+            self._scroll_offset,
         )
         self._render_picker()
 
@@ -1707,14 +1768,29 @@ class EmojiPicker(Static):
         return EMOJI_PICKER_CHOICES[self.highlighted_index]
 
     def _render_picker(self) -> None:
+        visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+        start = self._scroll_offset
+        window = EMOJI_PICKER_CHOICES[start : start + visible]
+        widest = emoji_picker_item_width() - 2
         text = Text()
-        for index, emoji in enumerate(EMOJI_PICKER_CHOICES):
-            if index:
+        # Markers are drawn whether or not there is more, as a space --
+        # a strip that changes width when it scrolls would move every
+        # emoji under the user's fingers.
+        text.append("<" if start else " ", style=self._base_color)
+        for offset, emoji in enumerate(window):
+            if offset:
                 text.append(" ", style=self._base_color)
+            index = start + offset
             selected = index == self.highlighted_index
             text.append("[" if selected else " ", style=self._base_color)
-            text.append(emoji, style=self._accent_color if selected else self._base_color)
+            text.append(
+                emoji, style=self._accent_color if selected else self._base_color
+            )
+            # Pad to the widest choice so the columns hold still.
+            text.append(" " * max(0, widest - cell_len(emoji)), style=self._base_color)
             text.append("]" if selected else " ", style=self._base_color)
+        more = start + visible < len(EMOJI_PICKER_CHOICES)
+        text.append(">" if more else " ", style=self._base_color)
         self.update(text)
 
 

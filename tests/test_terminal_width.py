@@ -16,16 +16,22 @@ are what a scripted terminal exercises here.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from grapheme_text import cell_len  # noqa: E402
 from terminal_width import (  # noqa: E402
     PaintedWidths,
+    cache_path,
     distinct_graphemes,
+    load_cached_widths,
+    save_cached_widths,
     install_terminal_widths,
     measure_painted_widths,
     measure_terminal,
@@ -334,6 +340,91 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.cells.cell_len(f"{BEAR} hello"), 8)
         install_terminal_widths(plan_corrections(PaintedWidths({BEAR: 1})))
         self.assertEqual(self.cells.cell_len(f"{BEAR} hello"), 7)
+
+
+class CacheTests(unittest.TestCase):
+    """Measurements are remembered between launches.
+
+    Probing has to PAINT each glyph to find out how wide it is, so a
+    board full of emoji names visibly flickered on every start.
+    Remembering makes that a first-run cost, and a newly met node costs
+    only its own new glyphs.
+
+    Every test here redirects XDG_DATA_HOME. Writing to the real cache
+    from a test run would poison the widths the app uses afterwards.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = directory.name
+        environment = patch.dict(os.environ, {"XDG_DATA_HOME": self.home})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_a_measurement_survives_a_round_trip(self) -> None:
+        save_cached_widths({BEAR: 1, CORN: 2})
+        self.assertEqual(load_cached_widths(), {BEAR: 1, CORN: 2})
+
+    def test_the_cache_lives_beside_the_chat_database(self) -> None:
+        """A fact about the hardware, not a preference.
+
+        It must not travel with a copied config, and it must not sit in
+        the settings file where a user editing preferences would meet
+        it.
+        """
+        self.assertTrue(str(cache_path()).startswith(self.home))
+        self.assertEqual(cache_path().name, "terminal_widths.json")
+
+    def test_a_cached_width_is_used_without_touching_the_terminal(self) -> None:
+        """The whole point: a second launch does not re-probe.
+
+        There is no tty in a test run, so a measurement appearing here
+        can only have come from the file.
+        """
+        save_cached_widths({BEAR: 1})
+        widths = measure_terminal((f"{BEAR} hello",))
+        self.assertEqual(widths.corrections, {BEAR: 1})
+
+    def test_use_cache_false_ignores_what_was_remembered(self) -> None:
+        """What the probe tool passes, so it reports the terminal rather
+
+        than repeating a possibly stale answer -- the case that matters
+        after someone changes their font.
+        """
+        save_cached_widths({BEAR: 1})
+        self.assertFalse(measure_terminal((BEAR,), use_cache=False))
+
+    def test_measurements_are_kept_per_terminal(self) -> None:
+        """TERM is a proxy, but a different TERM is certainly a
+
+        different terminal, and inheriting widths across one would be
+        worse than measuring again.
+        """
+        with patch.dict(os.environ, {"TERM": "linux"}):
+            save_cached_widths({BEAR: 1})
+        with patch.dict(os.environ, {"TERM": "xterm-ghostty"}):
+            self.assertEqual(load_cached_widths(), {})
+        with patch.dict(os.environ, {"TERM": "linux"}):
+            self.assertEqual(load_cached_widths(), {BEAR: 1})
+
+    def test_a_corrupt_cache_is_ignored_rather_than_fatal(self) -> None:
+        """It is an optimisation. Losing it costs a flicker, not a start."""
+        path = cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json at all", encoding="utf-8")
+        self.assertEqual(load_cached_widths(), {})
+        save_cached_widths({BEAR: 1})
+        self.assertEqual(load_cached_widths(), {BEAR: 1})
+
+    def test_a_nonsense_cached_width_is_discarded(self) -> None:
+        path = cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({os.environ.get("TERM", "?"): {BEAR: -4, CORN: "wide"}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(load_cached_widths(), {})
 
 
 if __name__ == "__main__":

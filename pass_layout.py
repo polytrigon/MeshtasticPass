@@ -308,7 +308,7 @@ def _age_or_none(when, now: float, formatter):
     return formatter(age)
 
 
-def pass_row_offset(
+def scroll_window_offset(
     total_rows: int, viewport_rows: int, selected_row: int, offset: int
 ) -> int:
     """The smallest scroll that keeps `selected_row` visible.
@@ -331,3 +331,10 @@ def pass_row_offset(
     if selected_row >= offset + viewport_rows:
         return min(selected_row - viewport_rows + 1, highest)
     return offset
+
+
+# The PASSES grid's own name for it, kept because that is what the view
+# and its tests call. The rule is not grid-specific -- the CHAT emoji
+# picker scrolls its strip by exactly the same one -- so the general
+# name is the implementation and this is the alias.
+pass_row_offset = scroll_window_offset

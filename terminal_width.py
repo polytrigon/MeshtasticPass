@@ -29,6 +29,7 @@ PaintedWidths then reports exactly what cell_len does.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping
 
@@ -79,6 +80,15 @@ class PaintedWidths:
             measured = self._measured.get(cluster)
             total += cell_len(cluster) if measured is None else measured
         return total
+
+    @property
+    def measured(self) -> dict[str, int]:
+        """Everything measured, agreements included.
+
+        `corrections` is the interesting subset; this is what a cache
+        should keep, so an agreeing glyph is not re-probed every launch.
+        """
+        return dict(self._measured)
 
     @property
     def corrections(self) -> dict[str, int]:
@@ -164,8 +174,77 @@ def _column_from_report(reply: str) -> int | None:
         return None
 
 
-def measure_terminal(names: Iterable[str]) -> PaintedWidths:
+def cache_path() -> "Path":
+    """Where measurements are remembered between launches.
+
+    Beside the CHAT database rather than in the settings file: this is a
+    fact about the hardware, not a preference the user chose, and it
+    should not travel if a config is copied to another machine.
+    """
+    from pathlib import Path
+
+    data_home = os.environ.get("XDG_DATA_HOME")
+    root = Path(data_home).expanduser() if data_home else Path.home() / ".local/share"
+    return root / "meshtasticpass" / "terminal_widths.json"
+
+
+def _terminal_key() -> str:
+    return os.environ.get("TERM", "?")
+
+
+def load_cached_widths() -> dict[str, int]:
+    """Previously measured widths for this TERM, or nothing.
+
+    Keyed by TERM, which is a proxy rather than a guarantee: the same
+    TERM with a different FONT has different glyph coverage. Deleting
+    this file, or running terminal_width_probe.py, re-measures.
+    """
+    import json
+
+    try:
+        with open(cache_path(), encoding="utf-8") as handle:
+            stored = json.load(handle)
+        widths = stored.get(_terminal_key(), {})
+        return {
+            grapheme: width
+            for grapheme, width in widths.items()
+            if isinstance(width, int) and width >= 0
+        }
+    except Exception:
+        return {}
+
+
+def save_cached_widths(widths: Mapping[str, int]) -> None:
+    """Remember measurements for this TERM. Best effort, never raises."""
+    import json
+
+    try:
+        path = cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except Exception:
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored[_terminal_key()] = dict(widths)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(stored, handle, ensure_ascii=False, indent=1, sort_keys=True)
+    except Exception:
+        return
+
+
+def measure_terminal(
+    names: Iterable[str], *, use_cache: bool = True
+) -> PaintedWidths:
     """Measure this process's real terminal, or return the empty result.
+
+    Measures only what is NOT already known for this terminal. Probing
+    paints each glyph on the screen for as long as the reply takes, so a
+    board of emoji names visibly flickered on every launch; remembering
+    the answers makes that a first-run cost, and a new node name costs
+    only its own new glyphs.
 
     Every failure path lands on an empty PaintedWidths, which behaves
     exactly like cell_len -- so a caller can call this at startup and use
@@ -174,14 +253,20 @@ def measure_terminal(names: Iterable[str]) -> PaintedWidths:
     graphemes = distinct_graphemes(names)
     if not graphemes:
         return PaintedWidths()
-    try:
-        return PaintedWidths(_measure_on_tty(graphemes))
-    except Exception:
-        return PaintedWidths()
+    known = load_cached_widths() if use_cache else {}
+    missing = tuple(g for g in graphemes if g not in known)
+    if missing:
+        try:
+            fresh = _measure_on_tty(missing)
+        except Exception:
+            fresh = {}
+        if fresh:
+            known = {**known, **fresh}
+            save_cached_widths(known)
+    return PaintedWidths({g: known[g] for g in graphemes if g in known})
 
 
 def _measure_on_tty(graphemes: tuple[str, ...]) -> dict[str, int]:
-    import os
     import select
     import sys
     import termios
@@ -210,10 +295,13 @@ def _measure_on_tty(graphemes: tuple[str, ...]) -> dict[str, int]:
         return reply[reply.rfind("\x1b[") + 2 :] if "\x1b[" in reply else reply
 
     saved = termios.tcgetattr(stdin)
-    # Hidden throughout: this paints real characters on the user's shell
-    # line for a few milliseconds before Textual takes the screen, and a
-    # cursor jumping around them is the part that would be noticed.
-    write("\x1b[?25l")
+    # On the ALTERNATE SCREEN, with the cursor hidden. Probing has to
+    # paint each glyph to find out how wide it is, and doing that on the
+    # user's own shell line meant watching a stream of emoji flicker
+    # past on every launch. The alternate screen is discarded on exit
+    # and the shell scrollback is restored untouched -- and Textual is
+    # about to switch to it anyway, so there is nothing to see.
+    write("\x1b[?1049h\x1b[?25l")
     try:
         tty.setraw(stdin.fileno())
         # A stray keypress still in the buffer would be read as part of
@@ -222,7 +310,7 @@ def _measure_on_tty(graphemes: tuple[str, ...]) -> dict[str, int]:
         return measure_painted_widths(graphemes, write=write, read_reply=read_reply)
     finally:
         termios.tcsetattr(stdin, termios.TCSADRAIN, saved)
-        write("\r\x1b[K\x1b[?25h")
+        write("\r\x1b[K\x1b[?1049l\x1b[?25h")
 
 
 @dataclass(frozen=True)
