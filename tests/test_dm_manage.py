@@ -23,6 +23,7 @@ from app import (
     _mesh_select_node,
     canonical_entered_node_id,
 )
+from app import EMOJI_PICKER_CHOICES
 from app_settings import AppSettings
 from chat_store import ChatStore
 from mesh_state import MeshNodeState
@@ -529,9 +530,12 @@ class EmojiMenuContextTests(DmManageAppTestsBase):
             # Selecting the highlighted emoji inserts into the DM composer.
             await pilot.press("enter")
             await pilot.pause()
-            # Selecting the highlighted emoji inserts into the DM composer at
-            # the cursor (end): "hi ;)" + the first emoji choice, "😀".
-            self.assertEqual(dm_input.value, "hi ;)😀")
+            # Selecting the highlighted emoji inserts into the DM composer
+            # at the cursor (end). Which emoji that is comes from
+            # EMOJI_PICKER_CHOICES rather than a literal: the ORDER of
+            # that tuple is a product decision, and this test is about
+            # which COMPOSER gets edited.
+            self.assertEqual(dm_input.value, f"hi ;){EMOJI_PICKER_CHOICES[0]}")
             # The channel composer must NOT have been edited.
             self.assertEqual(app.query_one("#chat-input").value, "")
 
