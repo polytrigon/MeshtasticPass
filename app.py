@@ -8756,6 +8756,10 @@ class MeshtasticPassApp(App[None]):
             # item 3) already decided this; route it to its own DM
             # conversation, never mingled into channel history merely
             # because packet.channel happens to be present (item 12).
+            if rx_debug_enabled():
+                rx_debug_log(
+                    f"ROUTE dm node={message.sender_node_id} reason=is_direct"
+                )
             self._accept_received_dm(message)
             return
         channel_index = message.channel_index or 0
@@ -11949,6 +11953,17 @@ class MeshtasticPassApp(App[None]):
         )
         self._assign_arrival_order(entry)
         inserted = self._persist_incoming(entry)
+        if rx_debug_enabled():
+            if entry.message_id is not None:
+                rx_debug_log(
+                    f"DM STORE id={entry.message_id} node={node_id} "
+                    + ("inserted" if inserted else "duplicate, ignored")
+                )
+            else:
+                rx_debug_log(
+                    f"DM STORE not persisted node={node_id} "
+                    "reason=no_chat_store_attached"
+                )
         if not inserted:
             return
         state.entries.append(entry)

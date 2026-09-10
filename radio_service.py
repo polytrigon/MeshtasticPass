@@ -22,6 +22,7 @@ from serial_devices import (
 
 
 RX_DEBUG_ENV_VAR = "MESHTASTICPASS_RX_DEBUG"
+RX_DEBUG_FILE_ENV_VAR = "MESHTASTICPASS_RX_DEBUG_FILE"
 
 
 def rx_debug_enabled() -> bool:
@@ -41,13 +42,35 @@ def rx_debug_enabled() -> bool:
 
 
 def rx_debug_log(line: str) -> None:
-    """Print one concise receive-pipeline diagnostic line.
+    """Record one concise receive-pipeline diagnostic line.
 
     Deliberately plain print() (not logging.*): this is a lightweight,
     opt-in terminal trace meant to run for hours in a normal foreground
     session on the uConsole, not a structured log file.
+
+    print() alone is invisible under the TUI, though. Textual owns the
+    terminal and redirects stdout, so the one session whose decisions we
+    most need to read -- the real app, deciding whether an arriving
+    packet is new or a duplicate -- is exactly the one that cannot show
+    them. Naming a path in MESHTASTICPASS_RX_DEBUG_FILE appends the same
+    lines there too, which is what lets the running app testify about
+    itself.
+
+    The file is opened per line and never held: the trace has to survive
+    a kill -9 mid-session, and an unwritable path must never be able to
+    take the radio down with it.
     """
-    print(f"[RX] {line}", flush=True)
+    entry = f"[RX] {line}"
+    print(entry, flush=True)
+    path = os.environ.get(RX_DEBUG_FILE_ENV_VAR, "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as sink:
+            sink.write(f"{time.strftime('%H:%M:%S')} {entry}\n")
+    except OSError:
+        # A diagnostic that can break the app is worse than no diagnostic.
+        pass
 
 
 def _canonical_node_number(number: Any) -> int | None:
