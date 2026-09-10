@@ -607,17 +607,18 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("3")
             self.assertEqual(app.current_tab, "passes")
 
-    async def test_key_4_does_nothing_dm_is_a_chat_mode_not_a_tab(self) -> None:
-        """"4" is unmapped -- DM is a MODE inside CHAT now (CHAT/DM/
+    async def test_no_digit_key_reaches_dm_or_profile(self) -> None:
+        """DM is a MODE inside CHAT (CHAT/DM/MENTION UX Part A), reached
 
-        MENTION UX Part A), reached via "2" + the D hotkey or the
-        header's DM(N) selector, never its own digit key. Unmapped
-        exactly like any other ordinary character, "4" pressed from
-        CHAT's neutral state simply begins composing (types itself)
-        rather than switching anything -- it is NOT excluded from the
-        printable-character fallback the way "1"/"2"/"3"/"c"/"d" are.
-        PROFILE remains hidden/unreachable via any digit key too,
-        unchanged.
+        via "2" plus the D hotkey or the header's DM(N) selector, never
+        its own digit key. PROFILE is hidden from the nav entirely.
+        Neither is behind ANY digit.
+
+        This was written as "4 does nothing" and asserted that "4"
+        TYPED ITSELF into the composer, being unmapped. PASSES took [3]
+        and moved MESH to [4], so the unmapped digit is now "5" -- the
+        printable-character fallback is still the point, just no longer
+        demonstrated by that particular key.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
@@ -625,10 +626,6 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
 
-            # No digit reaches DM or PROFILE. "4" is MESH since PASSES
-            # took [3]; what this test is about is that neither of those
-            # two is behind ANY digit, not which view a given digit
-            # happens to open.
             for key in ("1", "2", "3", "4", "5"):
                 await pilot.press(key)
                 await pilot.pause()
@@ -639,9 +636,16 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
             self.assertEqual(app._chat_mode, "channel")
-            self.assertEqual(app._chat_mode, "channel")
+
+            # An UNMAPPED digit is an ordinary printable character: from
+            # CHAT's neutral state it begins composing rather than
+            # switching anything, unlike "1"-"4"/"c"/"d".
             chat_input = app.query_one("#chat-input", Input)
-            self.assertEqual(chat_input.value, "4")
+            chat_input.value = ""
+            await pilot.press("5")
+            await pilot.pause()
+            self.assertEqual(app.current_tab, "chat")
+            self.assertEqual(chat_input.value, "5")
 
             await pilot.press("escape")
             await pilot.pause()
