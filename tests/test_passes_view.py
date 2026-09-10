@@ -88,6 +88,19 @@ class PassesHarness(unittest.IsolatedAsyncioTestCase):
     def _count_text(self, app: MeshtasticPassApp) -> str:
         return str(app.query_one("#passes-count", Static).render())
 
+    @staticmethod
+    async def _go_online(app: MeshtasticPassApp, pilot) -> None:
+        """Reach the ONLINE state without waiting on a radio.
+
+        The harness radio deliberately never connects (see _app), which
+        is the right default -- most of what PASSES does is meant to
+        work without one. Anything testing a control that the
+        connection state GATES has to get there on purpose.
+        """
+        app._radio_state = RadioState.ONLINE
+        app._update_chat_connection_state()
+        await pilot.pause()
+
 
 class PassesViewTests(PassesHarness):
     """The header's two numbers, and the grid's one colour."""
@@ -435,6 +448,7 @@ class PassSortControlTests(PassesHarness):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
+            await self._go_online(app, pilot)
             self.assertIsInstance(app.focused, PassesView)
 
             await pilot.press("s")
@@ -443,6 +457,27 @@ class PassSortControlTests(PassesHarness):
             selector = app.query_one(PassSortSelector)
             self.assertIs(app.focused, selector)
             self.assertTrue(selector.is_open)
+
+    async def test_s_does_nothing_while_the_radio_is_connecting(self) -> None:
+        """Deliberate, and consistent with every other dropdown.
+
+        The sort control shows the connection state while the radio is
+        coming up, and set_status_override makes a control it takes over
+        inert. Sorting waits for the radio like everything else rather
+        than being a special case -- and the wait is a handshake, not a
+        session.
+        """
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            selector = app.query_one(PassSortSelector)
+            self.assertTrue(selector.disabled)
+
+            await pilot.press("s")
+            await pilot.pause()
+
+            self.assertFalse(selector.is_open)
+            self.assertIsInstance(app.focused, PassesView)
 
     async def test_the_footer_says_so(self) -> None:
         """A hotkey nobody can discover is not a way in."""
@@ -457,6 +492,7 @@ class PassSortControlTests(PassesHarness):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
+            await self._go_online(app, pilot)
             before = [encounter.short_name for encounter in app.query_one(PassesView).passes]
 
             await pilot.press("s")
@@ -478,6 +514,7 @@ class PassSortControlTests(PassesHarness):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
+            await self._go_online(app, pilot)
             await pilot.press("s")
             await pilot.pause()
             await pilot.press("escape")
@@ -540,9 +577,7 @@ class PassConnectingStateTests(PassesHarness):
             view = app.query_one(PassesView)
             connecting_y = view.region.y
 
-            app._radio_state = RadioState.ONLINE
-            app._update_chat_connection_state()
-            await pilot.pause()
+            await self._go_online(app, pilot)
 
             selector = app.query_one(PassSortSelector)
             self.assertIn("RECENT", str(selector.render()).upper())
@@ -561,28 +596,26 @@ class PassConnectingStateTests(PassesHarness):
 
             self.assertIn("12 NODES", self._count_text(app))
 
-    async def test_sorting_still_works_while_the_radio_is_connecting(self) -> None:
-        """The control shows the connection state; it is not ABOUT it.
+    async def test_focus_is_not_stranded_on_the_disabled_control(self) -> None:
+        """An overridden dropdown is inert, and this board is all arrows.
 
-        set_status_override normally disables the control it takes over,
-        which is right for CHAT's channel selector -- a channel cannot
-        be picked without a radio. Sorting a list held on disk can, and
-        PASSES is explicitly the view that stays valid with no radio
-        attached. Borrowing this control to avoid a reflow must not cost
-        a working feature for the length of a handshake.
+        Focus left sitting on it would leave the keyboard with nothing
+        to do until the user guessed at a tab switch.
         """
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
-            selector = app.query_one(PassSortSelector)
-            self.assertIn("CONNECTING", str(selector.render()).upper())
-            self.assertFalse(selector.disabled)
+            await self._go_online(app, pilot)
 
             await pilot.press("s")
             await pilot.pause()
+            self.assertIsInstance(app.focused, PassSortSelector)
 
-            self.assertIs(app.focused, selector)
-            self.assertTrue(selector.is_open)
+            app._radio_state = RadioState.CONNECTING
+            app._update_chat_connection_state()
+            await pilot.pause()
+
+            self.assertIsInstance(app.focused, PassesView)
 
 
 class SimulatedRadioTests(PassesHarness):
