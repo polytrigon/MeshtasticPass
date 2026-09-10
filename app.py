@@ -2207,6 +2207,19 @@ CIRCLE_STROKED_LARGE = "○"
 # mesh_topology.py for the pure grid geometry (assign_grid_slots(),
 # place_within_bounds(), project_to_viewport(), directional_target(),
 # build_relay_stages(), route_chain()) reused here.
+# How far past the mounted-window target an UNREAD message may keep the
+# window growing before it is trimmed anyway.
+#
+# The protection exists so a message cannot scroll out of the mounted
+# window before anyone has seen it. Without a ceiling it is unbounded:
+# nothing is read while nobody is looking, so an unattended radio mounts
+# a widget per arriving message all night and the 1s timer walks every
+# one of them by morning. Past this many extra entries the oldest go,
+# read or not -- their text is in chat_store, scrolling up brings them
+# back, and CHAT(N) counts them regardless (see
+# ChannelChatState.unread_count).
+MOUNTED_CHAT_UNREAD_CEILING = 100
+
 MESH_GRID_MIN_ROWS = 5
 MESH_GRID_MIN_COLUMNS = 9
 # A node's label renders one terminal row ABOVE its glyph (see
@@ -8970,28 +8983,48 @@ class MeshtasticPassApp(App[None]):
         )
 
     def _trim_mounted_chat_window(self, transcript: ChatTranscript) -> None:
-        """Bound the mounted window without hiding NEW/unread messages."""
+        """Bound the mounted window, preferring not to hide NEW/unread.
+
+        Two thresholds, because the old single one had no upper bound at
+        all. Up to _mounted_chat_target the window trims only messages
+        that have been READ; past MOUNTED_CHAT_UNREAD_CEILING it trims
+        whatever is oldest, unread included.
+
+        The unbounded version is what made a machine left running
+        overnight go sluggish, and only when it was left UNATTENDED --
+        which is the detail that identifies it. Every arriving message
+        is unread until somebody looks, so with nobody looking the loop
+        hit an unread entry on its first iteration, broke, and mounted
+        another widget. By morning the transcript held every message of
+        the night, and the 1s timer walked all of them.
+
+        Trimming an unread message loses nothing. The text is in
+        chat_store, the entry comes back by scrolling up, and the unread
+        COUNT lives on ChannelChatState.unread_count -- a plain counter
+        incremented on arrival, never derived from what happens to be
+        mounted -- so CHAT(N) still reports every one of them.
+
+        A message with no message_id is never trimmed at any size: it is
+        not in the store yet, so the mounted widget is the only copy
+        that exists.
+        """
         trimmed = False
+        ceiling = self._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING
+        # One pass over the mounted widgets, not one pass per removal --
+        # coming back to a night of messages trims hundreds at once, and
+        # re-querying inside the loop made that quadratic exactly when
+        # the app was already struggling.
+        widgets = {
+            id(widget.entry): widget for widget in self.query(ChatEntryWidget)
+        }
         while len(self.chat_history) > self._mounted_chat_target:
             oldest = self.chat_history[0]
-            removable_index = (
-                0
-                if oldest.message_id is not None
-                and not oldest.is_new
-                and not oldest.unread
-                else None
-            )
-            if removable_index is None:
+            if oldest.message_id is None:
                 break
-            removed = self.chat_history.pop(removable_index)
-            widget = next(
-                (
-                    candidate
-                    for candidate in self.query(ChatEntryWidget)
-                    if candidate.entry is removed
-                ),
-                None,
-            )
+            if (oldest.is_new or oldest.unread) and len(self.chat_history) <= ceiling:
+                break
+            removed = self.chat_history.pop(0)
+            widget = widgets.pop(id(removed), None)
             if widget is not None:
                 widget.remove()
             trimmed = True
