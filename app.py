@@ -5464,6 +5464,25 @@ class MeshtasticPassApp(App[None]):
         clock = self._clock
         return time() if clock is None else clock()
 
+    # The MONOTONIC counterpart of _clock. Two clocks, two seams: a
+    # displayed message age is measured against monotonic() -- see
+    # ChatEntry.age_reference, which is deliberately not wall time so a
+    # clock correction cannot make a message look older or newer than
+    # it is -- while everything MESH and PASSES reason about is wall
+    # time. Pinning one does nothing for the other.
+    #
+    # The 1s timer calls _refresh_chat_timestamps() with no argument,
+    # so it recomputes against the real monotonic clock -- which on a
+    # Linux box is UPTIME. A test that set a fixture age_reference and
+    # then paused got the machine's uptime instead: two days six hours,
+    # on a uConsole left running overnight.
+    _monotonic_clock: Callable[[], float] | None = None
+
+    def _monotonic(self) -> float:
+        """The app's current monotonic time, for measuring elapsed age."""
+        clock = self._monotonic_clock
+        return monotonic() if clock is None else clock()
+
     def __init__(
         self,
         radio: object,
@@ -9271,7 +9290,7 @@ class MeshtasticPassApp(App[None]):
         now: float | None = None,
         wall_now: float | None = None,
     ) -> None:
-        current_time = monotonic() if now is None else now
+        current_time = self._monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
         if self.current_tab == "passes" and self._passes_dirty:
@@ -12841,7 +12860,7 @@ class MeshtasticPassApp(App[None]):
         """
         wall_now = self._now()
         entry.local_sent_at = wall_now
-        entry.age_reference = monotonic()
+        entry.age_reference = self._monotonic()
         if self.chat_store is not None and entry.message_id is not None:
             try:
                 self.chat_store.update_message_chronology(entry.message_id, wall_now)
