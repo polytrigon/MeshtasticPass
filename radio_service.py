@@ -68,21 +68,6 @@ CONNECT_TIMEOUT_SECONDS = 30.0
 # cost is one wasted 8s and every later attempt still gets the full 30.
 FIRST_CONNECT_TIMEOUT_SECONDS = 8.0
 
-# How long to wait for an answer before asking the device again.
-#
-# Attempt one receives ONE unsolicited node_info and then nothing: the
-# port is open and the device is transmitting, it simply never answers
-# want_config_id. That is the signature of the request write being lost
-# on a freshly opened CDC endpoint, not of an unwilling device -- so the
-# repair is to ask again rather than to give up faster.
-#
-# MeshInterface._startConfig() is safe to repeat: it clears myInfo,
-# nodes and nodesByNum and sends a fresh want_config_id with a new
-# configId, so a re-ask discards any partial replay and starts clean.
-# A successful replay takes ~3s, so 3.0 is long enough that a merely
-# slow device is not interrupted mid-download.
-CONFIG_REQUEST_INTERVAL_SECONDS = 3.0
-
 
 @functools.lru_cache(maxsize=8)
 def _traced_interface(interface_class: type, timeout: float) -> type:
@@ -96,38 +81,9 @@ def _traced_interface(interface_class: type, timeout: float) -> type:
 
     class TracedInterface(interface_class):  # type: ignore[valid-type,misc]
         def _waitConnected(self, _timeout: float = 0.0):
-            """Wait for the initial download, re-asking if unanswered.
-
-            The SDK calls this with no argument and waits once; the
-            budget that matters is the one this class was built for.
-            Within it, ask again every CONFIG_REQUEST_INTERVAL_SECONDS
-            rather than staring at a request the device never received.
-
-            Only a TIMEOUT is retried. If the device reported a real
-            failure, `self.failure` is set and re-asking would just bury
-            it, so that propagates on the first raise.
-            """
-            deadline = time.monotonic() + timeout
-            asks = 1
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    remaining = 0.001
-                try:
-                    return super()._waitConnected(
-                        min(CONFIG_REQUEST_INTERVAL_SECONDS, remaining)
-                    )
-                except Exception:
-                    if getattr(self, "failure", None) is not None:
-                        raise
-                    if time.monotonic() >= deadline:
-                        raise
-                asks += 1
-                if rx_debug_enabled():
-                    rx_debug_log(
-                        f"HANDSHAKE want_config_id unanswered, re-asking (#{asks})"
-                    )
-                self._startConfig()
+            # The SDK calls this with no argument; the value that
+            # matters is the one this class was built for.
+            return super()._waitConnected(timeout)
 
         def _handleFromRadio(self, fromRadioBytes):
             # The one choke point for EVERYTHING the device sends, config
