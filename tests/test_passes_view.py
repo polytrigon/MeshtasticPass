@@ -99,6 +99,10 @@ class PassesHarness(unittest.IsolatedAsyncioTestCase):
         """
         app._radio_state = RadioState.ONLINE
         app._update_chat_connection_state()
+        # Twice: the sort control was DISABLED a moment ago, and a
+        # widget only re-enters the focus chain once the refresh that
+        # re-enabled it has actually been applied.
+        await pilot.pause()
         await pilot.pause()
 
 
