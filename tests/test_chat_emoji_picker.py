@@ -12,16 +12,21 @@ from textual.widgets import Input, Static
 
 from rich.cells import cell_len
 
+from pass_layout import scroll_window_step
+
 from app import (
     EMOJI_PICKER_BORDER_CELLS,
     EMOJI_PICKER_CHOICES,
+    EMOJI_PICKER_MARKER_CELLS,
     EMOJI_PICKER_PADDING_CELLS,
+    EMOJI_PICKER_VISIBLE,
     ChatEntryWidget,
     ChatTranscript,
     ColorSelector,
     EmojiPicker,
     MeshtasticPassApp,
     emoji_picker_content_width,
+    emoji_picker_item_width,
     emoji_picker_total_width,
 )
 from app_settings import AppSettings
@@ -48,26 +53,24 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
     def make_app(self) -> MeshtasticPassApp:
         return MeshtasticPassApp(self.radio(), self.settings)
 
-    async def test_exactly_thirteen_emoji_in_order(self) -> None:
-        self.assertEqual(len(EMOJI_PICKER_CHOICES), 13)
+    async def test_the_reactions_come_first_and_the_set_is_unique(self) -> None:
+        """Order is the feature; the exact list is not.
+
+        The first EMOJI_PICKER_VISIBLE choices are what a person sees
+        without scrolling, so the plain reactions live there and the
+        field/mesh set sits behind them. Pinning the whole tuple made
+        adding a choice a test edit rather than a decision, so this pins
+        the property instead.
+        """
+        self.assertGreaterEqual(len(EMOJI_PICKER_CHOICES), EMOJI_PICKER_VISIBLE)
         self.assertEqual(
-            EMOJI_PICKER_CHOICES,
-            (
-                "😀",
-                "😂",
-                "❤️",
-                "👍",
-                "👎",
-                "😭",
-                "😮",
-                "😡",
-                "🎉",
-                "🔥",
-                "👋",
-                "✨",
-                "📡",
-            ),
+            len(set(EMOJI_PICKER_CHOICES)),
+            len(EMOJI_PICKER_CHOICES),
+            "a duplicate choice is two ways to pick the same thing",
         )
+        without_scrolling = EMOJI_PICKER_CHOICES[:EMOJI_PICKER_VISIBLE]
+        for reaction in ("👍", "👎", "❤️", "😂", "😭"):
+            self.assertIn(reaction, without_scrolling)
 
     async def test_final_set_swaps_and_additions(self) -> None:
         self.assertNotIn("😢", EMOJI_PICKER_CHOICES)
@@ -161,7 +164,11 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             chat_input.focus()
             await pilot.press("ctrl+e")
             picker = app._emoji_picker
-            await pilot.press("right", "right", "right")  # 👍 at index 3
+            # Walk to the wanted emoji rather than assuming where it
+            # sits: the order of EMOJI_PICKER_CHOICES is a product
+            # decision, not something this test is about.
+            for _ in range(EMOJI_PICKER_CHOICES.index("👍")):
+                await pilot.press("right")
             selected = picker.selected_emoji
             self.assertEqual(selected, "👍")
 
@@ -483,10 +490,22 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             base_width = unicodedata.east_asian_width(emoji[0])
             return cell_len(emoji) if base_width in ("W", "F") else 1
 
+        # Over the WIDEST window, since the strip scrolls and the box is
+        # sized once for all of them.
+        visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+        # MIN over the windows, not max: the worst case is the window
+        # that PAINTS NARROWEST against the width the box was sized to,
+        # because that is the shortfall the padding has to absorb. Max
+        # picks the window with no ambiguous glyph in it at all, which
+        # is the best case wearing the wrong name.
         optimistic_total = emoji_picker_content_width()
-        worst_case_total = sum(
-            1 + worst_case_width(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES
-        ) + max(0, len(EMOJI_PICKER_CHOICES) - 1)
+        worst_case_total = EMOJI_PICKER_MARKER_CELLS + min(
+            sum(
+                1 + worst_case_width(emoji) + 1
+                for emoji in EMOJI_PICKER_CHOICES[start : start + visible]
+            )
+            for start in range(len(EMOJI_PICKER_CHOICES) - visible + 1)
+        ) + (visible - 1)
         worst_case_shortfall = optimistic_total - worst_case_total
 
         # Sanity check on the premise itself: EMOJI_PICKER_CHOICES must
@@ -505,29 +524,39 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(EMOJI_PICKER_PADDING_CELLS - 2, worst_case_shortfall)
 
     async def test_picker_content_width_uses_rendered_cell_width_not_len(self) -> None:
-        """❤️ is 5 Python characters (heart, U+FE0F variation selector
+        """Sized in terminal cells, never in Python characters.
 
-        counts as 1 char) but renders as 2 terminal cells -- the width
-        calculation must use cell_len, never len().
+        The discriminating case is the SINGLE-CHARACTER wide emoji, of
+        which nearly every choice is one: len() calls "😀" one, the
+        terminal draws it as two, and a len()-based box would clip a
+        column off every item. Comparing the WIDEST choice cannot show
+        this -- "❤️" happens to be 2 characters AND 2 cells, so both
+        methods agree on the maximum while disagreeing about almost
+        every individual item.
         """
-        naive_len_total = sum(1 + len(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES) + (
-            len(EMOJI_PICKER_CHOICES) - 1
-        )
-        correct_total = sum(1 + cell_len(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES) + (
-            len(EMOJI_PICKER_CHOICES) - 1
+        visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+        correct_total = (
+            EMOJI_PICKER_MARKER_CELLS
+            + visible * emoji_picker_item_width()
+            + (visible - 1)
         )
         self.assertEqual(emoji_picker_content_width(), correct_total)
         self.assertEqual(
             emoji_picker_total_width(),
             correct_total + EMOJI_PICKER_BORDER_CELLS + EMOJI_PICKER_PADDING_CELLS,
         )
-        # Every emoji here is a single Python character except ❤️ (heart
-        # + variation selector, 2 characters) but ALL of them are wide
-        # (2-cell) glyphs -- a naive len()-based sum undercounts the 12
-        # single-character ones, so it comes out narrower than the
-        # correct, cell-width-based total. Using len() here would size
-        # the picker too small and clip content.
-        self.assertLess(naive_len_total, correct_total)
+
+        single_character = [
+            emoji for emoji in EMOJI_PICKER_CHOICES if len(emoji) == 1
+        ]
+        self.assertTrue(
+            single_character, "the case this test exists for has been removed"
+        )
+        for emoji in single_character:
+            self.assertEqual(len(emoji), 1)
+            self.assertEqual(cell_len(emoji), 2)
+        naive_item_width = 1 + max(len(emoji) for emoji in single_character) + 1
+        self.assertLess(naive_item_width, emoji_picker_item_width())
 
     async def test_picker_width_deterministic_across_repeated_opens(self) -> None:
         app = self.make_app()
@@ -673,6 +702,128 @@ class EmojiPickerTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(radio.sent_messages, ())
+
+
+class ScrollingStripTests(unittest.TestCase):
+    """The strip scrolls; it does not grow.
+
+    It is an overlay above the composer, so a row wide enough for every
+    choice would not fit a uConsole -- and a picker you have to read
+    left to right is slower than one you can take in. LEFT/RIGHT move
+    the highlight and the window follows it.
+
+    Tested against scroll_window_step rather than against an EmojiPicker:
+    a Textual widget cannot be constructed outside a running app, so a
+    rule living inside one can only be exercised by standing up a whole
+    app. The rule is what these tests are about.
+    """
+
+    TOTAL = len(EMOJI_PICKER_CHOICES)
+    VISIBLE = EMOJI_PICKER_VISIBLE
+
+    def _walk(self, steps: int, direction: int = 1):
+        index, offset = 0, 0
+        for _ in range(steps):
+            index, offset = scroll_window_step(
+                self.TOTAL, self.VISIBLE, index, offset, direction
+            )
+        return index, offset
+
+    def test_the_first_screenful_needs_no_scrolling(self) -> None:
+        _, offset = self._walk(self.VISIBLE - 1)
+        self.assertEqual(offset, 0)
+
+    def test_moving_past_the_edge_scrolls_by_one(self) -> None:
+        """Minimal movement, not a jump to the middle.
+
+        A strip that re-centres under the cursor makes it hard to keep
+        your place, and every cell here looks like every other cell.
+        """
+        _, offset = self._walk(self.VISIBLE)
+        self.assertEqual(offset, 1)
+
+    def test_the_window_never_runs_past_the_end(self) -> None:
+        for steps in range(self.TOTAL * 2):
+            _, offset = self._walk(steps)
+            self.assertLessEqual(offset + self.VISIBLE, max(self.TOTAL, self.VISIBLE))
+            self.assertGreaterEqual(offset, 0)
+
+    def test_wrapping_round_returns_to_the_start(self) -> None:
+        """RIGHT off the end still wraps, as it always has."""
+        index, offset = self._walk(self.TOTAL)
+        self.assertEqual(index, 0)
+        self.assertEqual(offset, 0)
+
+    def test_left_from_the_start_reaches_the_last_choice(self) -> None:
+        index, offset = self._walk(1, direction=-1)
+        self.assertEqual(index, self.TOTAL - 1)
+        self.assertLessEqual(offset + self.VISIBLE, self.TOTAL)
+
+    def test_every_choice_is_reachable(self) -> None:
+        seen = {0}
+        index, offset = 0, 0
+        for _ in range(self.TOTAL - 1):
+            index, offset = scroll_window_step(
+                self.TOTAL, self.VISIBLE, index, offset, 1
+            )
+            seen.add(index)
+        self.assertEqual(seen, set(range(self.TOTAL)))
+
+    def test_the_highlight_is_always_inside_the_window(self) -> None:
+        """The property the whole thing exists for."""
+        index, offset = 0, 0
+        for direction in (1, 1, 1, -1, 1, -1, -1):
+            for _ in range(self.TOTAL):
+                index, offset = scroll_window_step(
+                    self.TOTAL, self.VISIBLE, index, offset, direction
+                )
+                self.assertTrue(
+                    offset <= index < offset + self.VISIBLE,
+                    f"highlight {index} outside window {offset}..{offset + self.VISIBLE - 1}",
+                )
+
+
+class StripWidthTests(unittest.TestCase):
+    """The box is one width, wherever the strip is scrolled to.
+
+    Sizing it to the visible content would make it breathe as the
+    window moved, and every emoji would shift under the user's fingers.
+    """
+
+    def test_the_width_does_not_depend_on_the_number_of_choices(self) -> None:
+        visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+        expected = (
+            EMOJI_PICKER_MARKER_CELLS
+            + visible * emoji_picker_item_width()
+            + (visible - 1)
+        )
+        self.assertEqual(emoji_picker_content_width(), expected)
+
+    def test_every_choice_is_two_cells_wide(self) -> None:
+        """A requirement, not an observation.
+
+        Many pictographs are Emoji but NOT Emoji_Presentation -- world
+        map, camping, cloud-with-rain, satellite -- and default to a
+        narrow text glyph. One of those among two-cell colour emoji
+        reads as a mistake, and it is invisible when picking from a
+        chart. This fails here rather than on somebody's screen.
+        """
+        for emoji in EMOJI_PICKER_CHOICES:
+            self.assertEqual(
+                cell_len(emoji),
+                2,
+                f"{emoji!r} ({' '.join(f'U+{ord(c):04X}' for c in emoji)}) "
+                "is not 2 cells -- pick an Emoji_Presentation character",
+            )
+
+    def test_every_item_is_the_width_of_the_widest_choice(self) -> None:
+        """Including "❤️", whose base character is Narrow.
+
+        Padding each item to the widest keeps the columns still even
+        when one choice measures differently from the rest.
+        """
+        widest = max(cell_len(emoji) for emoji in EMOJI_PICKER_CHOICES)
+        self.assertEqual(emoji_picker_item_width(), widest + 2)
 
 
 if __name__ == "__main__":

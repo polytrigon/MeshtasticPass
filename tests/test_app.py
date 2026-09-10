@@ -607,40 +607,45 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("3")
             self.assertEqual(app.current_tab, "passes")
 
-    async def test_key_4_does_nothing_dm_is_a_chat_mode_not_a_tab(self) -> None:
-        """"4" is unmapped -- DM is a MODE inside CHAT now (CHAT/DM/
+    async def test_no_digit_key_reaches_dm_or_profile(self) -> None:
+        """DM is a MODE inside CHAT (CHAT/DM/MENTION UX Part A), reached
 
-        MENTION UX Part A), reached via "2" + the D hotkey or the
-        header's DM(N) selector, never its own digit key. Unmapped
-        exactly like any other ordinary character, "4" pressed from
-        CHAT's neutral state simply begins composing (types itself)
-        rather than switching anything -- it is NOT excluded from the
-        printable-character fallback the way "1"/"2"/"3"/"c"/"d" are.
-        PROFILE remains hidden/unreachable via any digit key too,
-        unchanged.
+        via "2" plus the D hotkey or the header's DM(N) selector, never
+        its own digit key. PROFILE is hidden from the nav entirely.
+        Neither is behind ANY digit.
+
+        This was written as "4 does nothing" and asserted that "4"
+        TYPED ITSELF into the composer, being unmapped. PASSES took [3]
+        and moved MESH to [4], so the unmapped digit is now "5" -- the
+        printable-character fallback is still the point, just no longer
+        demonstrated by that particular key.
         """
         radio = SimulatedRadioService(connect_delay=0, message_interval=0)
         app = MeshtasticPassApp(radio, self.settings)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
-            await pilot.press("4")
-            await pilot.pause()
-            self.assertEqual(app.current_tab, "connection")
-            self.assertNotEqual(app.current_tab, "dm")
-            self.assertNotEqual(app.current_tab, "profile")
+
+            for key in ("1", "2", "3", "4", "5"):
+                await pilot.press(key)
+                await pilot.pause()
+                self.assertNotEqual(app.current_tab, "dm")
+                self.assertNotEqual(app.current_tab, "profile")
 
             await pilot.press("2")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
             self.assertEqual(app._chat_mode, "channel")
 
-            await pilot.press("4")
+            # An UNMAPPED digit is an ordinary printable character: from
+            # CHAT's neutral state it begins composing rather than
+            # switching anything, unlike "1"-"4"/"c"/"d".
+            chat_input = app.query_one("#chat-input", Input)
+            chat_input.value = ""
+            await pilot.press("5")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            self.assertEqual(app._chat_mode, "channel")
-            chat_input = app.query_one("#chat-input", Input)
-            self.assertEqual(chat_input.value, "4")
+            self.assertEqual(chat_input.value, "5")
 
             await pilot.press("escape")
             await pilot.pause()
@@ -3465,6 +3470,13 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 (1_001.0, "RX 9s"),
                 (1_002.0, "RX 10s"),
             ):
+                # Pin the MONOTONIC clock, which is what a displayed
+                # age is measured against (see ChatEntry.age_reference).
+                # The 1s timer calls _refresh_chat_timestamps() with no
+                # argument and recomputes against the real one -- which
+                # on Linux is UPTIME, so a pause here showed the
+                # machine's two-day uptime instead of the fixture.
+                app._monotonic_clock = lambda now=now: now
                 app._refresh_chat_timestamps(now)
                 await pilot.pause()
                 self.assertEqual(
@@ -3473,7 +3485,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIs(list(app.query(ChatEntryWidget))[0], original_widget)
 
-            app._refresh_chat_timestamps(incoming_entry.age_reference + 63 * 60)
+            later = incoming_entry.age_reference + 63 * 60
+            app._monotonic_clock = lambda: later
+            app._refresh_chat_timestamps(later)
             await pilot.pause()
             incoming_timestamp = widgets[0].query_one(
                 ".chat-entry-timestamp", Static
@@ -6484,11 +6498,19 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("2")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            chat_heading = str(app.query_one("#chat-title", Static).render())
-
             await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
+
+            # Read BOTH after the same refresh. The status text carries
+            # an animated dot count that advances on its own ~0.45s
+            # timer, so reading CHAT's before the tab switch and MESH's
+            # after compared two different animation frames and failed
+            # with "RETRYING..." != "RETRYING." -- the two widgets
+            # agreeing was never in question, only the instant each was
+            # read at. Both widgets stay mounted, so both can be read
+            # at once.
+            chat_heading = str(app.query_one("#chat-title", Static).render())
             mesh_heading = str(app.query_one("#mesh-connection-status", Static).render())
 
             self.assertEqual(chat_heading, mesh_heading)

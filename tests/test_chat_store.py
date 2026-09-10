@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from chat_store import (
+    SCHEMA_VERSION,
     DEFAULT_HISTORY_LIMIT,
     ChatStore,
     ChatStoreError,
@@ -180,7 +181,7 @@ class ChatStoreTests(unittest.TestCase):
             "SELECT version FROM schema_version"
         ).fetchone()[0]
 
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertIsNone(messages[0].local_node_id)
         self.assertEqual([message.text for message in messages], ["preserved"])
         self.assertIsNone(messages[0].origin_sent_at)
@@ -1063,7 +1064,7 @@ class DirectMessagePersistenceTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v2 preserved"])
         self.assertIsNone(messages[0].dm_node_id)
@@ -1142,7 +1143,7 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
         messages = reopened.load_recent()
         self.assertEqual([m.text for m in messages], ["v3 preserved"])
         self.assertIsNone(messages[0].channel_key)
@@ -1217,7 +1218,7 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         version = reopened._connection.execute(
             "SELECT version FROM schema_version"
         ).fetchone()[0]
-        self.assertEqual(version, 6)
+        self.assertEqual(version, SCHEMA_VERSION)
         # local_node_id column now exists.
         columns = {
             column["name"]
@@ -1256,13 +1257,17 @@ class ChannelKeyIsolationTests(unittest.TestCase):
         self.addCleanup(second.close)
         self.assertEqual(
             second._connection.execute("SELECT version FROM schema_version").fetchone()[0],
-            6,
+            SCHEMA_VERSION,
         )
+        # Exactly ONE row, and it is the current version: the point of
+        # this assertion is that repeated opens do not ACCUMULATE
+        # version rows, which is a real corruption a literal number
+        # would keep testing for only until the next schema bump.
         versions = {
             row["version"]
             for row in second._connection.execute("SELECT version FROM schema_version").fetchall()
         }
-        self.assertEqual(versions, {6})
+        self.assertEqual(versions, {SCHEMA_VERSION})
         remaining = second._connection.execute(
             "SELECT text FROM messages ORDER BY id"
         ).fetchall()

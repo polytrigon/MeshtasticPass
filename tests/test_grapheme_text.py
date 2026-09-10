@@ -35,6 +35,7 @@ from grapheme_text import (
     grapheme_clusters,
     install_flag_pair_protection,
     terminal_safe_text,
+    truncate_to_cells,
 )
 
 
@@ -267,6 +268,40 @@ class TerminalSafeTextTests(unittest.TestCase):
     def test_fast_path_returns_identical_object_when_no_keycap_present(self) -> None:
         text = "plain text with no combining marks"
         self.assertIs(terminal_safe_text(text), text)
+
+
+class EnclosingMarkTests(unittest.TestCase):
+    """A keycap emoji is ONE grapheme, all three codepoints of it.
+
+    U+20E3 COMBINING ENCLOSING KEYCAP is Unicode category Me with a
+    canonical combining class of ZERO, so a test based on
+    unicodedata.combining() alone reported it as a standalone grapheme
+    and split "5\ufe0f\u20e3" in two. That is precisely the severed
+    cluster this module exists to prevent -- truncation could cut a
+    keycap in half, and nothing could measure the sequence as a unit.
+    """
+
+    def test_a_keycap_is_one_cluster(self) -> None:
+        self.assertEqual(grapheme_clusters("5\ufe0f\u20e3"), ("5\ufe0f\u20e3",))
+
+    def test_every_keycap_digit_survives(self) -> None:
+        for digit in "0123456789":
+            sequence = f"{digit}\ufe0f\u20e3"
+            self.assertEqual(grapheme_clusters(sequence), (sequence,))
+
+    def test_a_keycap_is_never_truncated_apart(self) -> None:
+        """The consequence, not just the classification."""
+        for width in range(1, 6):
+            truncated = truncate_to_cells("5\ufe0f\u20e3abc", width)
+            self.assertNotIn(
+                "\u20e3",
+                truncated.replace("5\ufe0f\u20e3", ""),
+                f"orphaned enclosing mark at width {width}: {truncated!r}",
+            )
+
+    def test_an_enclosing_mark_still_attaches_after_other_text(self) -> None:
+        clusters = grapheme_clusters("ab5\ufe0f\u20e3")
+        self.assertEqual(clusters, ("a", "b", "5\ufe0f\u20e3"))
 
 
 if __name__ == "__main__":

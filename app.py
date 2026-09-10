@@ -100,9 +100,15 @@ from pass_layout import (
     pass_gutter,
     lay_out_passes,
     pass_row_offset,
+    scroll_window_step,
 )
 from serial_devices import describe_connection_target
-from terminal_width import PaintedWidths, measure_terminal
+from terminal_width import (
+    PaintedWidths,
+    install_terminal_widths,
+    measure_terminal,
+    plan_corrections,
+)
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -1581,20 +1587,79 @@ class DMModeSelector(KeyboardDropdown):
 # Centralized here for easy future expansion; nothing else in this
 # module hardcodes this list or its length.
 EMOJI_PICKER_CHOICES: tuple[str, ...] = (
-    "😀",
-    "😂",
-    "❤️",
-    "👍",
-    "👎",
-    "😭",
-    "😮",
-    "😡",
-    "🎉",
-    "🔥",
-    "👋",
-    "✨",
-    "📡",
+    # Reactions first: the ones a reply is most often just an
+    # acknowledgement of, so the common case needs no scrolling.
+    "\U0001f44d",  # thumbs up
+    "\U0001f44e",  # thumbs down
+    "\u2764\ufe0f",  # red heart
+    "\U0001f602",  # tears of joy
+    "\U0001f600",  # grinning
+    "\U0001f605",  # sweat smile
+    "\U0001f914",  # thinking
+    "\U0001f62e",  # open mouth
+    "\U0001f62d",  # sobbing
+    "\U0001f621",  # angry
+    "\U0001f60e",  # sunglasses
+    "\U0001f440",  # eyes
+    "\U0001f64f",  # folded hands
+    # Then the ones this app is actually for: mesh, movement, weather,
+    # and the handful of statuses people send each other in the field.
+    "\U0001f44b",  # waving hand
+    "\U0001f389",  # party popper
+    "\U0001f525",  # fire
+    "\u2728",  # sparkles
+    "\U0001f4e1",  # satellite antenna
+    "\U0001f9ed",  # compass
+    "\U0001f30d",  # globe
+    "\u26fa",  # tent
+    "\U0001f97e",  # hiking boot
+    "\U0001f526",  # flashlight
+    "\U0001f50b",  # battery
+    "\U0001f31e",  # sun with face
+    "\U0001f308",  # rainbow
+    "\U0001f319",  # crescent moon
+    "\u2757",  # exclamation
+    "\u2705",  # check mark
+    "\u274c",  # cross mark
 )
+
+# How many choices are on screen at once. The strip scrolls rather than
+# growing, because it is an overlay above the composer and a row wide
+# enough for thirty emoji would not fit a uConsole -- and a picker you
+# have to read left to right is slower than one you can take in.
+#
+# Thirteen keeps the box exactly the width it has always been, so adding
+# choices changed what is reachable without changing what is seen.
+EMOJI_PICKER_VISIBLE = 13
+
+# Every choice above is 2 terminal cells, and that is a REQUIREMENT, not
+# an observation. Many pictographs are Emoji but not Emoji_Presentation
+# -- U+1F5FA WORLD MAP, U+1F3D5 CAMPING, U+1F327 CLOUD WITH RAIN, U+1F6F0
+# SATELLITE -- and default to a NARROW text glyph unless a variation
+# selector is appended. Three of those were in the first draft of this
+# set and would have rendered as one-cell monochrome oddities among
+# two-cell colour emoji.
+#
+# Appending U+FE0F would widen them, at the cost of making each one a
+# variation-selector sequence, whose width a terminal may decline to
+# promote (see terminal_width). Picking an Emoji_Presentation character
+# instead costs nothing and has no such failure mode -- so the globe,
+# the tent, the flashlight and the rainbow, rather than the map, the
+# campsite, the satellite and the rain cloud.
+#
+# test_chat_emoji_picker pins this: a new choice that is not two cells
+# wide fails there rather than on somebody's screen.
+#
+# For the same reason there is exactly ONE variation-selector sequence
+# here, the heart. A VS16 sequence's width is a PROMOTION a terminal may
+# decline (see terminal_width), and the picker's one cell of spare
+# right-hand padding absorbs exactly one such shortfall per visible
+# window. Two of them in one window -- which a sun and a warning sign
+# duly produced -- overruns it. Emoji_Presentation characters have no
+# such failure mode, so the sun-with-face and the exclamation mark
+# stand in for them, and the heart stays because it is the one people
+# reach for. Widening the padding instead would cost a column on every
+# theme to insure against a case that is avoidable outright.
 # Must match the ".emoji-picker { height: ... }" CSS rule below.
 EMOJI_PICKER_HEIGHT = 3
 # What the ".emoji-picker" CSS rule below actually costs in columns:
@@ -1635,20 +1700,40 @@ EMOJI_PICKER_BORDER_CELLS = 2
 EMOJI_PICKER_PADDING_CELLS = 3
 
 
+# One cell each side for the "more this way" markers. ASCII, always
+# present (a space when there is nothing further), so the box width and
+# every item's position stay put as the strip scrolls.
+EMOJI_PICKER_MARKER_CELLS = 2
+
+
+def emoji_picker_item_width() -> int:
+    """Cells one choice occupies: bracket, widest emoji, bracket.
+
+    Every item is padded to the WIDEST choice rather than to its own
+    width, so the strip does not jitter as it scrolls and the box can be
+    sized once. Same rule as the PASSES grid, for the same reason: a row
+    of cells that each measure themselves is a row that moves.
+    """
+    widest = max((cell_len(emoji) for emoji in EMOJI_PICKER_CHOICES), default=2)
+    return 1 + widest + 1
+
+
 def emoji_picker_content_width() -> int:
     """Exact rendered terminal-cell width of the picker's emoji row.
 
-    Never len(text): each item is a 1-cell bracket/space, the emoji's
-    own RENDERED cell width (cell_len -- a wide emoji is 2 cells even
-    when, like an intact heart+variation-selector sequence, it is more
-    than one Python character), and a closing 1-cell bracket/space,
-    plus a 1-cell separator between items. Derived from
-    EMOJI_PICKER_CHOICES itself, so the picker never needs a manual
-    width update if the set changes.
+    Never len(text): a wide emoji is 2 cells even when, like an intact
+    heart+variation-selector sequence, it is more than one Python
+    character. Sized for a full WINDOW plus the two scroll markers, so
+    the box is the same width wherever the strip is scrolled to and
+    whatever the choices are.
     """
-    per_item_width = sum(1 + cell_len(emoji) + 1 for emoji in EMOJI_PICKER_CHOICES)
-    separator_width = max(0, len(EMOJI_PICKER_CHOICES) - 1)
-    return per_item_width + separator_width
+    visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+    items = visible * emoji_picker_item_width()
+    separators = max(0, visible - 1)
+    return EMOJI_PICKER_MARKER_CELLS + items + separators
+
+
+
 
 
 def emoji_picker_total_width() -> int:
@@ -1679,6 +1764,10 @@ class EmojiPicker(Static):
     def __init__(self) -> None:
         super().__init__(classes="emoji-picker", markup=False)
         self.highlighted_index = 0
+        # First visible choice. The strip scrolls rather than growing,
+        # so this is what LEFT/RIGHT move once the highlight reaches an
+        # edge (see move_highlight).
+        self._scroll_offset = 0
         default_palette = THEME_PALETTES["snow"]
         self._base_color = default_palette.base
         self._accent_color = default_palette.accent
@@ -1692,8 +1781,17 @@ class EmojiPicker(Static):
         self._render_picker()
 
     def move_highlight(self, direction: int) -> None:
-        self.highlighted_index = (self.highlighted_index + direction) % len(
-            EMOJI_PICKER_CHOICES
+        """Move one choice, wrapping, scrolling the window if needed.
+
+        The rule itself is scroll_window_step, kept pure so it can be
+        tested without standing up an app -- see its docstring.
+        """
+        self.highlighted_index, self._scroll_offset = scroll_window_step(
+            len(EMOJI_PICKER_CHOICES),
+            EMOJI_PICKER_VISIBLE,
+            self.highlighted_index,
+            self._scroll_offset,
+            direction,
         )
         self._render_picker()
 
@@ -1702,14 +1800,29 @@ class EmojiPicker(Static):
         return EMOJI_PICKER_CHOICES[self.highlighted_index]
 
     def _render_picker(self) -> None:
+        visible = min(EMOJI_PICKER_VISIBLE, len(EMOJI_PICKER_CHOICES))
+        start = self._scroll_offset
+        window = EMOJI_PICKER_CHOICES[start : start + visible]
+        widest = emoji_picker_item_width() - 2
         text = Text()
-        for index, emoji in enumerate(EMOJI_PICKER_CHOICES):
-            if index:
+        # Markers are drawn whether or not there is more, as a space --
+        # a strip that changes width when it scrolls would move every
+        # emoji under the user's fingers.
+        text.append("<" if start else " ", style=self._base_color)
+        for offset, emoji in enumerate(window):
+            if offset:
                 text.append(" ", style=self._base_color)
+            index = start + offset
             selected = index == self.highlighted_index
             text.append("[" if selected else " ", style=self._base_color)
-            text.append(emoji, style=self._accent_color if selected else self._base_color)
+            text.append(
+                emoji, style=self._accent_color if selected else self._base_color
+            )
+            # Pad to the widest choice so the columns hold still.
+            text.append(" " * max(0, widest - cell_len(emoji)), style=self._base_color)
             text.append("]" if selected else " ", style=self._base_color)
+        more = start + visible < len(EMOJI_PICKER_CHOICES)
+        text.append(">" if more else " ", style=self._base_color)
         self.update(text)
 
 
@@ -5350,6 +5463,25 @@ class MeshtasticPassApp(App[None]):
         """The app's current wall-clock time, in seconds since the epoch."""
         clock = self._clock
         return time() if clock is None else clock()
+
+    # The MONOTONIC counterpart of _clock. Two clocks, two seams: a
+    # displayed message age is measured against monotonic() -- see
+    # ChatEntry.age_reference, which is deliberately not wall time so a
+    # clock correction cannot make a message look older or newer than
+    # it is -- while everything MESH and PASSES reason about is wall
+    # time. Pinning one does nothing for the other.
+    #
+    # The 1s timer calls _refresh_chat_timestamps() with no argument,
+    # so it recomputes against the real monotonic clock -- which on a
+    # Linux box is UPTIME. A test that set a fixture age_reference and
+    # then paused got the machine's uptime instead: two days six hours,
+    # on a uConsole left running overnight.
+    _monotonic_clock: Callable[[], float] | None = None
+
+    def _monotonic(self) -> float:
+        """The app's current monotonic time, for measuring elapsed age."""
+        clock = self._monotonic_clock
+        return monotonic() if clock is None else clock()
 
     def __init__(
         self,
@@ -9158,7 +9290,7 @@ class MeshtasticPassApp(App[None]):
         now: float | None = None,
         wall_now: float | None = None,
     ) -> None:
-        current_time = monotonic() if now is None else now
+        current_time = self._monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
         if self.current_tab == "passes" and self._passes_dirty:
@@ -12728,7 +12860,7 @@ class MeshtasticPassApp(App[None]):
         """
         wall_now = self._now()
         entry.local_sent_at = wall_now
-        entry.age_reference = monotonic()
+        entry.age_reference = self._monotonic()
         if self.chat_store is not None and entry.message_id is not None:
             try:
                 self.chat_store.update_message_chronology(entry.message_id, wall_now)
@@ -13317,9 +13449,12 @@ class MeshtasticPassApp(App[None]):
             was_focused = selector.has_focus
             selector.set_status_override(self._connection_status_rich_text())
             # An overridden dropdown is disabled (see set_status_override),
-            # so focus must not be left sitting on it -- the same hazard
-            # CHAT handles a few lines above, and here it would leave the
-            # arrows doing nothing on a board that is entirely arrows.
+            # so sorting is unavailable until the radio is up -- the same
+            # as every other dropdown in the app, and deliberate. Focus
+            # must not be left sitting on it: the same hazard CHAT
+            # handles a few lines above, and worse here, because a board
+            # navigated entirely by arrow keys has nothing left to do if
+            # the keyboard is stranded on an inert control.
             if was_focused and selector.disabled:
                 views = list(self.query(PassesView))
                 if views:
@@ -13547,21 +13682,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _names_to_measure(chat_store: ChatStore | None) -> tuple[str, ...]:
-    """The display names startup should measure the terminal against.
+def _text_to_measure(chat_store: ChatStore | None) -> tuple[str, ...]:
+    """Everything startup should measure this terminal against.
 
-    PASSES holds every node ever met, so its names are both the widest
-    variety of emoji the app will be asked to draw and the only place
-    where a mis-measured one corrupts a grid. Returns nothing rather than
-    raising if the store cannot be read -- an unmeasured terminal is a
-    cosmetic problem, and refusing to start over it would not be.
+    In priority order, because the measurement is budgeted (see
+    terminal_width.MEASUREMENT_LIMIT) and a board of several hundred
+    nodes could otherwise spend all of it before reaching anything else:
+
+    1. The emoji picker's own choices. A fixed set, always displayed,
+       and one of them ("\u2764\ufe0f") is the reason the picker carries a
+       spare column of padding.
+    2. Recent CHAT text. This is the scrollbar case: Textual computes
+       wrap points and the transcript's virtual size from cell_len, so a
+       glyph in a MESSAGE that paints at an unexpected width corrupts
+       the scrollbar, not just the message.
+    3. PASSES display names -- every node ever met, and the widest
+       variety of emoji the app will be asked to draw.
+
+    Returns what it can rather than raising: an unmeasured terminal is a
+    cosmetic problem, and refusing to start over one would not be.
     """
+    text: list[str] = list(EMOJI_PICKER_CHOICES)
     if chat_store is None:
-        return ()
+        return tuple(text)
     try:
-        return tuple(encounter.display_name for encounter in chat_store.encounters())
+        text.extend(message.text for message in chat_store.load_recent(0, limit=200))
     except Exception:
-        return ()
+        pass
+    try:
+        text.extend(
+            encounter.display_name for encounter in chat_store.encounters()
+        )
+    except Exception:
+        pass
+    return tuple(text)
 
 
 def main() -> int:
@@ -13590,7 +13744,14 @@ def main() -> int:
     # about to be displayed, so the cost is bounded by what is actually
     # on the board. Never raises; a terminal that will not answer yields
     # no measurements and everything below behaves as it always has.
-    painted_widths = measure_terminal(_names_to_measure(chat_store))
+    painted_widths = measure_terminal(_text_to_measure(chat_store))
+    # Correct RICH itself, not only this app's own layout code. Every
+    # wrap point, virtual size and scrollbar position Textual computes
+    # comes from rich.cells.cell_len, so a glyph the terminal paints at
+    # an unexpected width corrupts all of them -- which is what the CHAT
+    # scrollbar has been doing. Must happen before the app renders
+    # anything, and is a no-op when nothing was measured.
+    install_terminal_widths(plan_corrections(painted_widths))
     app = MeshtasticPassApp(
         radio,
         settings,

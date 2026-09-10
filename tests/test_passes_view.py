@@ -27,6 +27,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from rich.color import Color
 from textual.widgets import Static
 
 from types import SimpleNamespace
@@ -41,6 +42,18 @@ from theme_palette import THEME_PALETTES
 
 
 T = 1_700_000_000.0
+
+
+def _painted(token: str) -> Color:
+    """A palette token as the Color a rendered span actually carries.
+
+    Never compare a span's colour NAME to a palette string: Rich
+    normalises "#B84DFF" to "#b84dff", so the spellings differ while the
+    colours are identical -- which is a test failing over how a value
+    was typed. Parsing both sides compares the colour itself, and keeps
+    working if a palette ever uses a named colour instead of hex.
+    """
+    return Color.parse(token)
 
 
 def _cells(view: PassesView) -> dict[str, object]:
@@ -87,6 +100,19 @@ class PassesHarness(unittest.IsolatedAsyncioTestCase):
 
     def _count_text(self, app: MeshtasticPassApp) -> str:
         return str(app.query_one("#passes-count", Static).render())
+
+    @staticmethod
+    async def _go_online(app: MeshtasticPassApp, pilot) -> None:
+        """Reach the ONLINE state without waiting on a radio.
+
+        The harness radio deliberately never connects (see _app), which
+        is the right default -- most of what PASSES does is meant to
+        work without one. Anything testing a control that the
+        connection state GATES has to get there on purpose.
+        """
+        app._radio_state = RadioState.ONLINE
+        app._update_chat_connection_state()
+        await pilot.pause()
 
 
 class PassesViewTests(PassesHarness):
@@ -192,9 +218,9 @@ class PassesViewTests(PassesHarness):
 
             by_name = _cells(view)
             self.assertEqual(set(by_name), {"ALFA", "BRVO", "CHRL"})
-            self.assertEqual(by_name["BRVO"].name, palette.accent)
+            self.assertEqual(by_name["BRVO"], _painted(palette.accent))
             for name in ("ALFA", "CHRL"):
-                self.assertEqual(by_name[name].name, palette.base)
+                self.assertEqual(by_name[name], _painted(palette.base))
 
 
 class PassMenuTests(PassesHarness):
@@ -339,8 +365,8 @@ class PassHighlightTests(PassesHarness):
             self.assertNotIn(palette.accent2, (palette.base, palette.accent))
 
             by_name = _cells(view)
-            self.assertEqual(by_name["ALFA"].name, palette.accent2)
-            self.assertEqual(by_name["BRVO"].name, palette.base)
+            self.assertEqual(by_name["ALFA"], _painted(palette.accent2))
+            self.assertEqual(by_name["BRVO"], _painted(palette.base))
 
     async def test_highlighting_from_the_menu_repaints_the_grid(self) -> None:
         """The recurring failure this project watches for.
@@ -355,14 +381,14 @@ class PassHighlightTests(PassesHarness):
             await self._open_passes(pilot)
             view = app.query_one(PassesView)
             palette = THEME_PALETTES[app._current_theme]
-            self.assertEqual(_cells(view)["ALFA"].name, palette.base)
+            self.assertEqual(_cells(view)["ALFA"], _painted(palette.base))
 
             # The real production path, not a direct settings poke: the
             # menu action is what a person actually triggers.
             app._activate_node_action("!aaaa0001", "favorite")
             await pilot.pause()
 
-            self.assertEqual(_cells(view)["ALFA"].name, palette.accent2)
+            self.assertEqual(_cells(view)["ALFA"], _painted(palette.accent2))
 
 
 class PassMenuKeyTests(PassesHarness):
@@ -435,6 +461,7 @@ class PassSortControlTests(PassesHarness):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
+            await self._go_online(app, pilot)
             self.assertIsInstance(app.focused, PassesView)
 
             await pilot.press("s")
@@ -443,6 +470,27 @@ class PassSortControlTests(PassesHarness):
             selector = app.query_one(PassSortSelector)
             self.assertIs(app.focused, selector)
             self.assertTrue(selector.is_open)
+
+    async def test_s_does_nothing_while_the_radio_is_connecting(self) -> None:
+        """Deliberate, and consistent with every other dropdown.
+
+        The sort control shows the connection state while the radio is
+        coming up, and set_status_override makes a control it takes over
+        inert. Sorting waits for the radio like everything else rather
+        than being a special case -- and the wait is a handshake, not a
+        session.
+        """
+        app = self._app()
+        async with app.run_test(size=(90, 28)) as pilot:
+            await self._open_passes(pilot)
+            selector = app.query_one(PassSortSelector)
+            self.assertTrue(selector.disabled)
+
+            await pilot.press("s")
+            await pilot.pause()
+
+            self.assertFalse(selector.is_open)
+            self.assertIsInstance(app.focused, PassesView)
 
     async def test_the_footer_says_so(self) -> None:
         """A hotkey nobody can discover is not a way in."""
@@ -457,6 +505,7 @@ class PassSortControlTests(PassesHarness):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
+            await self._go_online(app, pilot)
             before = [encounter.short_name for encounter in app.query_one(PassesView).passes]
 
             await pilot.press("s")
@@ -478,6 +527,7 @@ class PassSortControlTests(PassesHarness):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
+            await self._go_online(app, pilot)
             await pilot.press("s")
             await pilot.pause()
             await pilot.press("escape")
@@ -540,9 +590,7 @@ class PassConnectingStateTests(PassesHarness):
             view = app.query_one(PassesView)
             connecting_y = view.region.y
 
-            app._radio_state = RadioState.ONLINE
-            app._update_chat_connection_state()
-            await pilot.pause()
+            await self._go_online(app, pilot)
 
             selector = app.query_one(PassSortSelector)
             self.assertIn("RECENT", str(selector.render()).upper())
@@ -562,13 +610,15 @@ class PassConnectingStateTests(PassesHarness):
             self.assertIn("12 NODES", self._count_text(app))
 
     async def test_focus_is_not_stranded_on_the_disabled_control(self) -> None:
-        """An overridden dropdown is disabled, and this board is all arrows."""
+        """An overridden dropdown is inert, and this board is all arrows.
+
+        Focus left sitting on it would leave the keyboard with nothing
+        to do until the user guessed at a tab switch.
+        """
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await self._open_passes(pilot)
-            app._radio_state = RadioState.ONLINE
-            app._update_chat_connection_state()
-            await pilot.pause()
+            await self._go_online(app, pilot)
 
             await pilot.press("s")
             await pilot.pause()

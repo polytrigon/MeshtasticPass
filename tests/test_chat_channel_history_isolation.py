@@ -22,7 +22,7 @@ from app import (
     StartOfChannelHistoryMarker,
 )
 from app_settings import AppSettings
-from chat_store import ChatStore
+from chat_store import SCHEMA_VERSION, ChatStore
 from radio_service import ChannelInfo, RadioState, ReceivedMessage
 from simulated_radio_service import (
     SIMULATED_LOCAL_NODE_ID,
@@ -973,7 +973,7 @@ class MigrationLiveIngestTests(unittest.IsolatedAsyncioTestCase):
         store = ChatStore.open(self.chat_db_path)
         self.assertEqual(
             store._connection.execute("SELECT version FROM schema_version").fetchone()[0],
-            6,
+            SCHEMA_VERSION,
         )
         # legacy rows preserved but hidden after binding a real radio.
         store.set_local_profile("!aaaaaaaa", "SIM")

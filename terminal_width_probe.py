@@ -13,7 +13,11 @@ how an earlier round of this concluded, wrongly, that nothing was
 diverging at all.
 
 Usage:
-    python3 terminal_width_probe.py [output-file]
+    .venv/bin/python terminal_width_probe.py [output-file]
+
+Run it from the virtual environment, not system Python -- it needs the
+same rich this app runs against, and a bare `python3` typically has no
+rich at all.
 
 Prints a table and writes the same table to `output-file` (default
 ~/terminal_width_probe.txt) so it can be read back over SSH.
@@ -103,9 +107,16 @@ def main() -> int:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     try:
         from grapheme_text import cell_len
-        from terminal_width import measure_terminal
+        from terminal_width import (
+            load_cached_widths,
+            measure_terminal,
+            save_cached_widths,
+        )
     except Exception:
-        print("Run this from the MeshtasticPass checkout.")
+        print(
+            "Could not import rich. Run this with .venv/bin/python from the "
+            "MeshtasticPass checkout, not system python3."
+        )
         return 2
 
     names = names_in_use()
@@ -115,7 +126,11 @@ def main() -> int:
     subjects = [grapheme for grapheme, _ in STANDARD_PROBES] + [
         name for name, _ in names
     ]
-    widths = measure_terminal(subjects)
+    # use_cache=False: this exists to REPORT what the terminal does, so
+    # it must ask the terminal rather than repeat what was remembered
+    # from a previous launch -- and a refreshed cache is exactly what
+    # someone wants after changing their font.
+    widths = measure_terminal(subjects, use_cache=False)
 
     def measured(text: str) -> int | None:
         painted = widths.width(text)
@@ -144,6 +159,7 @@ def main() -> int:
             [(name, cell_len(name), measured(name), node_id) for name, node_id in names],
             label_width=24,
         )
+    save_cached_widths({**load_cached_widths(), **widths.measured})
     corrections = widths.corrections
     lines += ["", f"Corrections the app will apply on this terminal: {len(corrections)}"]
     for grapheme, painted in corrections.items():
