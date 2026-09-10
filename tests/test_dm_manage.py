@@ -17,13 +17,13 @@ from textual.widgets import Static
 from app import (
     DMModeSelector,
     MeshtasticPassApp,
+    EMOJI_PICKER_CHOICES,
     NEW_DM_ACTION_VALUE,
     MeshNodeLabelWidget,
     MeshTopologyView,
     _mesh_select_node,
     canonical_entered_node_id,
 )
-from app import EMOJI_PICKER_CHOICES
 from app_settings import AppSettings
 from chat_store import ChatStore
 from mesh_state import MeshNodeState
