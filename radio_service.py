@@ -68,6 +68,43 @@ CONNECT_TIMEOUT_SECONDS = 30.0
 # cost is one wasted 8s and every later attempt still gets the full 30.
 FIRST_CONNECT_TIMEOUT_SECONDS = 8.0
 
+# Whether to ask the radio for its whole node database during the
+# handshake. Default: NO.
+#
+# The node replay is what makes the handshake unreliable. Measured
+# across ten attempts, max node_info received before the attempt ended:
+#
+#   FAILED:  55, 9, 53, 0, 65, 106, 100
+#   ONLINE:  13, 24, 98
+#
+# No relationship between how far the replay gets and whether it
+# completes -- attempt 2 failed at 9 and attempt 3 succeeded at 13, one
+# attempt failed having received ZERO, and two successful connects ended
+# after only 13 and 24 nodes. The device sends an arbitrary prefix of its
+# database each time and often never signals the end, so a connect either
+# finishes in ~3s or never finishes at all (confirmed at 8s, 30s and 90s
+# budgets). Nothing on this side can make that state machine terminate.
+#
+# noNodes=True sends NODELESS_WANT_CONFIG_ID, so the device skips the
+# node DB entirely and config_complete arrives almost immediately -- the
+# erratic part of the handshake simply does not happen. Nodes still
+# arrive afterwards as ordinary NODEINFO_APP packets.
+#
+# The trade: MESH starts empty and fills in. PASSES is unaffected (it
+# reads node_encounters from chat.db, not the live interface). And the
+# node DB was already a coin flip -- connects reporting nodes=13 and
+# nodes=24 were happening before this change.
+#
+# Set MESHTASTICPASS_NODE_DB_AT_CONNECT=1 to restore the old behaviour
+# without a rebuild, for comparing the two on real hardware.
+NODE_DB_AT_CONNECT_ENV_VAR = "MESHTASTICPASS_NODE_DB_AT_CONNECT"
+
+
+def node_db_at_connect_enabled() -> bool:
+    """Whether the handshake should include the radio's node database."""
+    value = os.environ.get(NODE_DB_AT_CONNECT_ENV_VAR, "").strip().lower()
+    return value not in ("", "0", "false")
+
 
 @functools.lru_cache(maxsize=8)
 def _traced_interface(interface_class: type, timeout: float) -> type:
@@ -2404,16 +2441,25 @@ class RadioService:
 
         kind, location, port = parse_connection_target(self.device_path)
         timeout = self._connect_timeout()
+        # See NODE_DB_AT_CONNECT_ENV_VAR: skipping the node replay is
+        # what makes the handshake complete reliably.
+        no_nodes = not node_db_at_connect_enabled()
+        if rx_debug_enabled():
+            rx_debug_log(
+                f"LINK opening node_db={'yes' if not no_nodes else 'skipped'}"
+            )
         self._subscribe_to_events(pub)
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
 
             return _traced_interface(TCPInterface, timeout)(
-                hostname=location, portNumber=port
+                hostname=location, portNumber=port, noNodes=no_nodes
             )
         from meshtastic.serial_interface import SerialInterface
 
-        return _traced_interface(SerialInterface, timeout)(devPath=location)
+        return _traced_interface(SerialInterface, timeout)(
+            devPath=location, noNodes=no_nodes
+        )
 
     def _subscribe_to_events(self, pub: Any) -> None:
         if self._pub is not None:

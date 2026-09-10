@@ -30,6 +30,8 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from radio_service import (  # noqa: E402
+    NODE_DB_AT_CONNECT_ENV_VAR,
+    node_db_at_connect_enabled,
     RadioState,
     CONNECT_TIMEOUT_SECONDS,
     FIRST_CONNECT_TIMEOUT_SECONDS,
@@ -449,6 +451,52 @@ class HeldDeliveryOrderingTests(unittest.TestCase):
                 pass
 
         self.assertEqual([m.text for m in self.received], ["banked"])
+
+
+class NodeDbAtConnectTests(unittest.TestCase):
+    """Whether the handshake asks for the radio's node database.
+
+    It should not, by default. The node replay is the unreliable part:
+    across ten measured attempts the max node_info received was
+    55/9/53/0/65/106/100 for failures and 13/24/98 for successes -- no
+    relationship between how far it gets and whether it completes, one
+    failure at zero, and two successes ending after 13 and 24 nodes.
+    A connect either finishes in ~3s or never finishes, at any timeout.
+
+    The env var exists so the two behaviours can be compared on real
+    hardware without a rebuild.
+    """
+
+    def setUp(self) -> None:
+        self.previous = os.environ.get(NODE_DB_AT_CONNECT_ENV_VAR)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        if self.previous is None:
+            os.environ.pop(NODE_DB_AT_CONNECT_ENV_VAR, None)
+        else:
+            os.environ[NODE_DB_AT_CONNECT_ENV_VAR] = self.previous
+
+    def _set(self, value):
+        if value is None:
+            os.environ.pop(NODE_DB_AT_CONNECT_ENV_VAR, None)
+        else:
+            os.environ[NODE_DB_AT_CONNECT_ENV_VAR] = value
+
+    def test_the_node_db_is_skipped_by_default(self) -> None:
+        self._set(None)
+        self.assertFalse(node_db_at_connect_enabled())
+
+    def test_the_old_behaviour_can_be_restored(self) -> None:
+        self._set("1")
+        self.assertTrue(node_db_at_connect_enabled())
+
+    def test_falsey_values_do_not_reenable_it(self) -> None:
+        """`=0` and `=` must mean off, not "the variable is present"."""
+        for value in ("", "  ", "0", "false", "FALSE"):
+            with self.subTest(value=repr(value)):
+                self._set(value)
+                self.assertFalse(node_db_at_connect_enabled())
 
 
 if __name__ == "__main__":
