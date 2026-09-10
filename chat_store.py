@@ -10,7 +10,7 @@ from threading import RLock
 from time import time
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 DEFAULT_HISTORY_LIMIT = 100
 OLDER_HISTORY_PAGE_SIZE = 50
 
@@ -132,6 +132,97 @@ class StoredSendAttempt:
     started_at: float
     completed_at: float | None
     error: str | None
+
+
+@dataclass(frozen=True)
+class NodeEncounter:
+    """One node this radio has encountered, and how.
+
+    PASSES is a passport, not a live view: a row here outlives the
+    radio's own bounded NodeDB and the MESH board's bounded working set,
+    so a node met once months ago is still listed after it has aged out
+    of everything else.
+
+    `first_heard_at` records that a packet from this node actually
+    reached this radio -- proximity we observed ourselves, as opposed to
+    a node learned second-hand through mesh gossip. Deriving "heard
+    directly" from the timestamp rather than carrying a separate flag
+    means the two can never disagree.
+
+    `pass_at` is a different and stronger claim: the moment this node
+    EXCHANGED A PASS with us, which only another MeshtasticPass install
+    can do. Hearing someone is not meeting them -- a radio broadcasts to
+    anyone in range whether or not it knows we exist -- so a pass is the
+    one field here that says something was mutual. Nothing writes it
+    yet: the exchange has no protocol, so every real row has pass_at
+    NULL and the count is honestly zero, rather than borrowing
+    `first_heard_at` and calling proximity a pass.
+    """
+
+    node_id: str
+    long_name: str | None
+    short_name: str | None
+    hops_away: int | None
+    first_seen_at: float
+    last_seen_at: float
+    first_heard_at: float | None
+    last_heard_at: float | None
+    pass_at: float | None = None
+
+    @property
+    def heard_directly(self) -> bool:
+        return self.first_heard_at is not None
+
+    @property
+    def has_pass(self) -> bool:
+        return self.pass_at is not None
+
+    @property
+    def display_name(self) -> str:
+        """Short name, then long name, then the node ID -- never empty."""
+        for candidate in (self.short_name, self.long_name):
+            if candidate and candidate.strip():
+                return candidate.strip()
+        return self.node_id
+
+
+ENCOUNTER_ORDERS = ("alpha", "hops", "recent")
+
+
+def sort_encounters(
+    encounters: "tuple[NodeEncounter, ...]", order: str
+) -> "tuple[NodeEncounter, ...]":
+    """Order a pass list. Pure, so the ordering is testable without a database.
+
+    Every order is TOTAL: node_id breaks each tie, so the list can never
+    reshuffle between two renders of unchanged data -- the same stability
+    rule the MESH board follows.
+
+    "hops" puts unknown depth last rather than treating it as zero. An
+    unknown hop count is not a small one, and sorting it to the front
+    would put the least-known nodes where the closest ones belong.
+    """
+    if order not in ENCOUNTER_ORDERS:
+        raise ValueError(f"Unknown pass order: {order!r}")
+    if order == "alpha":
+        return tuple(
+            sorted(encounters, key=lambda e: (e.display_name.lower(), e.node_id))
+        )
+    if order == "hops":
+        return tuple(
+            sorted(
+                encounters,
+                key=lambda e: (
+                    e.hops_away is None,
+                    e.hops_away if e.hops_away is not None else 0,
+                    e.display_name.lower(),
+                    e.node_id,
+                ),
+            )
+        )
+    return tuple(
+        sorted(encounters, key=lambda e: (-e.last_seen_at, e.display_name.lower(), e.node_id))
+    )
 
 
 def default_chat_db_path() -> Path:
@@ -743,6 +834,112 @@ class ChatStore:
     ) -> list[StoredMessage]:
         return list(self.load_recent_page(channel_index, limit).messages)
 
+    def record_encounter(
+        self,
+        node_id: str,
+        *,
+        seen_at: float,
+        long_name: str | None = None,
+        short_name: str | None = None,
+        hops_away: int | None = None,
+        heard_directly: bool = False,
+        pass_at: float | None = None,
+    ) -> None:
+        """Record (or update) one PASSES entry. Idempotent and monotonic.
+
+        Never forgets: a name already on record is kept when this sighting
+        carries none, first_seen_at only moves earlier, last_seen_at only
+        moves later, and a node heard directly once stays heard directly
+        for ever. So an encounter can be recorded from any source -- a
+        NodeDB sweep, an arriving packet -- in any order, repeatedly,
+        without a later gossip-only sighting downgrading what an earlier
+        direct one established. `pass_at` follows the same one-way rule
+        and keeps the EARLIEST exchange, so it answers "since when" and
+        no later sighting can move or clear it.
+        """
+        node_id = normalize_profile_node_id(node_id) or str(node_id).strip().lower()
+        if not node_id:
+            raise ChatStoreError("A pass entry needs a node ID.")
+        long_name = long_name.strip() if isinstance(long_name, str) and long_name.strip() else None
+        short_name = short_name.strip() if isinstance(short_name, str) and short_name.strip() else None
+        heard_at = seen_at if heard_directly else None
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO node_encounters (
+                    node_id, long_name, short_name, hops_away,
+                    first_seen_at, last_seen_at, first_heard_at, last_heard_at,
+                    pass_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    long_name = COALESCE(excluded.long_name, long_name),
+                    short_name = COALESCE(excluded.short_name, short_name),
+                    hops_away = COALESCE(excluded.hops_away, hops_away),
+                    first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+                    last_seen_at = MAX(last_seen_at, excluded.last_seen_at),
+                    first_heard_at = CASE
+                        WHEN excluded.first_heard_at IS NULL THEN first_heard_at
+                        WHEN first_heard_at IS NULL THEN excluded.first_heard_at
+                        ELSE MIN(first_heard_at, excluded.first_heard_at)
+                    END,
+                    last_heard_at = CASE
+                        WHEN excluded.last_heard_at IS NULL THEN last_heard_at
+                        WHEN last_heard_at IS NULL THEN excluded.last_heard_at
+                        ELSE MAX(last_heard_at, excluded.last_heard_at)
+                    END,
+                    pass_at = CASE
+                        WHEN excluded.pass_at IS NULL THEN pass_at
+                        WHEN pass_at IS NULL THEN excluded.pass_at
+                        ELSE MIN(pass_at, excluded.pass_at)
+                    END
+                """,
+                (
+                    node_id, long_name, short_name, hops_away,
+                    seen_at, seen_at, heard_at, heard_at, pass_at,
+                ),
+            )
+
+    def encounters(self, order: str = "recent") -> tuple[NodeEncounter, ...]:
+        """Every pass on record, ordered (see sort_encounters)."""
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT node_id, long_name, short_name, hops_away,
+                       first_seen_at, last_seen_at, first_heard_at,
+                       last_heard_at, pass_at
+                FROM node_encounters
+                """
+            ).fetchall()
+        return sort_encounters(
+            tuple(
+                NodeEncounter(
+                    node_id=row["node_id"],
+                    long_name=row["long_name"],
+                    short_name=row["short_name"],
+                    hops_away=row["hops_away"],
+                    first_seen_at=float(row["first_seen_at"]),
+                    last_seen_at=float(row["last_seen_at"]),
+                    first_heard_at=(
+                        float(row["first_heard_at"])
+                        if row["first_heard_at"] is not None
+                        else None
+                    ),
+                    last_heard_at=(
+                        float(row["last_heard_at"])
+                        if row["last_heard_at"] is not None
+                        else None
+                    ),
+                    pass_at=(
+                        float(row["pass_at"])
+                        if row["pass_at"] is not None
+                        else None
+                    ),
+                )
+                for row in rows
+            ),
+            order,
+        )
+
     def load_recent_page(
         self,
         channel_index: int = 0,
@@ -1208,6 +1405,18 @@ class ChatStore:
                         updated_at REAL NOT NULL
                     );
 
+                    CREATE TABLE IF NOT EXISTS node_encounters (
+                        node_id TEXT PRIMARY KEY,
+                        long_name TEXT,
+                        short_name TEXT,
+                        hops_away INTEGER,
+                        first_seen_at REAL NOT NULL,
+                        last_seen_at REAL NOT NULL,
+                        first_heard_at REAL,
+                        last_heard_at REAL,
+                        pass_at REAL
+                    );
+
                     CREATE TABLE IF NOT EXISTS send_attempts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -1308,6 +1517,33 @@ class ChatStore:
                         connection.execute(
                             "ALTER TABLE messages ADD COLUMN profile_key TEXT"
                         )
+                    # v6 -> v7 adds the node_encounters TABLE (PASSES).
+                    # Unlike every migration above it, there is nothing to
+                    # ALTER: CREATE TABLE IF NOT EXISTS in the script above
+                    # runs on existing databases too, so an older database
+                    # gains the empty table on open and starts recording
+                    # from that moment. No CHAT history is touched, and a
+                    # v7 database opened by older code still works -- the
+                    # table is simply ignored.
+                    # v7 -> v8 adds node_encounters.pass_at (a CONFIRMED
+                    # PASS, as opposed to merely having heard the node).
+                    # Unlike the node_encounters table itself, this one
+                    # DOES need an ALTER: a v7 database already has the
+                    # table, so CREATE TABLE IF NOT EXISTS skips it and
+                    # would leave the new column missing. Existing rows
+                    # get pass_at = NULL, which is the truth -- they were
+                    # all recorded before any pass could be exchanged.
+                    if current_version <= 7:
+                        encounter_columns = {
+                            column["name"]
+                            for column in connection.execute(
+                                "PRAGMA table_info(node_encounters)"
+                            ).fetchall()
+                        }
+                        if "pass_at" not in encounter_columns:
+                            connection.execute(
+                                "ALTER TABLE node_encounters ADD COLUMN pass_at REAL"
+                            )
                     if current_version != SCHEMA_VERSION:
                         connection.execute(
                             "UPDATE schema_version SET version = ?",

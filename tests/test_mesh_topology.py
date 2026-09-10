@@ -2515,7 +2515,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -2647,7 +2647,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             mounted_ids = {entry.node_id for entry in app.chat_history if entry.node_id}
             self.assertNotIn("!a11ce001", mounted_ids)
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             _refresh_mesh_at(app, now)
             await pilot.pause()
@@ -2751,7 +2751,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     radio_rx_at=very_old,
                 )
             )
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             _refresh_mesh_at(app, 1_700_000_000.0)
             await pilot.pause()
@@ -3324,7 +3324,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.current_tab, "chat")
             self.assertEqual(app.focused.id, "chat-log")
 
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
             self.assertIsNone(app.focused)
@@ -4044,7 +4044,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             app._show_connection(RadioState.OFFLINE, message="lost")
             await pilot.pause()
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
 
@@ -4072,7 +4072,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 if app._radio_state is RadioState.ONLINE:
                     break
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app._radio_state, RadioState.ONLINE)
 
@@ -4775,7 +4775,7 @@ class MeshRealDataAppTests(unittest.IsolatedAsyncioTestCase):
                     radio_rx_at=very_old,
                 )
             )
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             _refresh_mesh_at(app, 1_700_000_000.0)
             await pilot.pause()
@@ -4862,7 +4862,7 @@ class MeshNodeDbFirstLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -5083,7 +5083,7 @@ class MeshActiveConnectivityTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -5472,7 +5472,7 @@ class MeshGeographicModeTransitionTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -5745,7 +5745,7 @@ class MeshUnknownHopsConnectorTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -6333,7 +6333,7 @@ class MeshNodeBarConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -7313,7 +7313,7 @@ class MeshOffScreenEdgeIndicatorTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -7711,7 +7711,7 @@ class MeshBoundaryContinuationIndicatorTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -7872,7 +7872,7 @@ class MeshSelectedRelayChainSpuriousConnectorTests(unittest.IsolatedAsyncioTestC
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -8132,7 +8132,7 @@ class MeshOrphanRelayMarkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -8584,7 +8584,7 @@ class MeshResponsiveResizeAndFocusPersistenceTests(unittest.IsolatedAsyncioTestC
         app = self._make_app()
         async with app.run_test(size=(60, 14)) as pilot:
             await pilot.pause()
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             now = 1_700_000_000.0
             you_id = app.radio.info.node_id
@@ -8654,7 +8654,7 @@ class MeshNodeMenuTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -8901,7 +8901,7 @@ class MeshFocusAndNavigationAuditTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -8970,7 +8970,7 @@ class MeshFocusAndNavigationAuditTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("2")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            await pilot.press("3")
+            await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
             self.assertEqual(view.selected_node_id, target_id)
@@ -9025,7 +9025,7 @@ class MeshDistanceUnitsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -9219,7 +9219,7 @@ class MeshRadioSwapIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -9475,7 +9475,7 @@ class MeshTopologyYouLabelRenderTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 
@@ -9643,7 +9643,7 @@ class MeshTracerouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_mesh(self, pilot) -> None:
         await pilot.pause()
-        await pilot.press("3")
+        await pilot.press("4")
         await pilot.pause()
         await pilot.pause()
 

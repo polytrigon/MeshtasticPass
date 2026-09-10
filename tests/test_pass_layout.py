@@ -1,0 +1,559 @@
+"""PASSES column layout: the DOS `dir /w` flow, measured in display cells.
+
+The failure this file exists to prevent is a column that drifts out of
+alignment because a name was measured with len() instead of its terminal
+width -- which on a real mesh happens the moment somebody sets their
+short name to an emoji.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import unicodedata
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from grapheme_text import cell_len  # noqa: E402
+from pass_layout import (  # noqa: E402
+    PASS_COLUMN_GUTTER,
+    PASS_COLUMNS_RESERVED,
+    PASS_NAME_MAX_CELLS,
+    PASS_MAX_COLUMN_GUTTER,
+    PASS_TRUNCATION_MARKER,
+    format_pass_bar,
+    pass_gutter,
+    pass_row_offset,
+    lay_out_passes,
+    pass_column_count,
+    pass_column_width,
+)
+
+
+def viewport_showing(column_width: int, columns: int) -> int:
+    """The narrowest viewport that shows exactly `columns` columns.
+
+    Derived from the constants rather than written as a literal, so
+    changing the gutter or the reserved column does not silently turn
+    these tests into assertions about a different layout than the one
+    they were written to describe.
+    """
+    fits = columns + PASS_COLUMNS_RESERVED
+    return fits * (column_width + PASS_COLUMN_GUTTER) - PASS_COLUMN_GUTTER
+
+
+class ColumnFlowTests(unittest.TestCase):
+    def test_names_flow_left_to_right_then_wrap(self) -> None:
+        """MS-DOS `dir /w` order, which is what the reference screenshot
+
+        shows: reading across a row is alphabetical, not down a column.
+        """
+        rows = lay_out_passes(
+            ("AAA", "BBB", "CCC", "DDD", "EEE"),
+            viewport_width=viewport_showing(3, 4),
+        )
+        self.assertEqual([cell.strip() for cell in rows[0]], ["AAA", "BBB", "CCC", "DDD"])
+        self.assertEqual([cell.strip() for cell in rows[1]], ["EEE"])
+
+    def test_the_last_row_is_short_not_padded_with_blanks(self) -> None:
+        rows = lay_out_passes(
+            ("AAA", "BBB", "CCC"), viewport_width=viewport_showing(3, 4)
+        )
+        self.assertEqual(len(rows[-1]), 3)
+
+    def test_an_empty_list_lays_out_to_nothing(self) -> None:
+        self.assertEqual(lay_out_passes((), viewport_width=60), ())
+
+
+class ColumnWidthTests(unittest.TestCase):
+    def test_the_widest_name_sets_the_column(self) -> None:
+        self.assertEqual(pass_column_width(("AB", "ABCDE", "A")), 5)
+
+    def test_one_very_long_name_cannot_collapse_the_board(self) -> None:
+        """Without the cap, a single long long-name would take the whole
+
+        width and leave one column -- the full identity belongs in the
+        bottom bar, as it does on MESH.
+        """
+        self.assertEqual(
+            pass_column_width(("A", "B" * 80)), PASS_NAME_MAX_CELLS
+        )
+
+    def test_one_long_name_among_many_does_not_set_the_column(self) -> None:
+        """The real regression, from real data.
+
+        A node with no short name falls back to its long name. One
+        13-cell "No Short Name" among two hundred four-cell ones took a
+        thirteen-column board down to four, with enormous gaps -- the
+        whole directory paying width for a single entry nobody was
+        looking at.
+        """
+        names = tuple(f"N{index:03d}" for index in range(200)) + ("No Short Name",)
+        self.assertEqual(pass_column_width(names), 4)
+
+    def test_the_outlier_is_truncated_rather_than_dropped(self) -> None:
+        """It still has to be findable. Narrower, marked, not missing."""
+        names = tuple(f"N{index:03d}" for index in range(200)) + ("No Short Name",)
+        grid = lay_out_passes(names, viewport_width=108)
+        cells = [cell for row in grid for cell in row]
+        self.assertEqual(len(cells), len(names))
+        self.assertTrue(
+            any(cell.startswith("No") and PASS_TRUNCATION_MARKER in cell for cell in cells),
+            "the long name should be present and marked as cut",
+        )
+
+    def test_a_small_board_still_shows_every_name_whole(self) -> None:
+        """Below a distribution, the quantile IS the maximum.
+
+        Three names is not a population, and truncating one of three to
+        suit the other two would be arithmetic for its own sake.
+        """
+        self.assertEqual(pass_column_width(("AB", "CD", "EFGHIJ")), 6)
+
+    def test_a_viewport_narrower_than_one_column_still_gets_one(self) -> None:
+        """Zero columns would render nothing and read as an empty pass
+
+        list rather than a narrow window.
+        """
+        self.assertEqual(pass_column_count(("ABCDEFGH",), viewport_width=3), 1)
+
+    def test_column_count_accounts_for_the_gutter(self) -> None:
+        """The last column needs no gutter after it."""
+        names = ("ABCD",)
+        for wanted in (1, 2, 3):
+            self.assertEqual(
+                pass_column_count(names, viewport_width=viewport_showing(4, wanted)),
+                wanted,
+            )
+
+    def test_the_rightmost_fitting_column_is_held_back(self) -> None:
+        """A board that ends in air, not against the edge of the screen.
+
+        The rightmost column has no gutter after it and nothing between
+        it and the screen edge, so it is where ink that overspills its
+        cell has nowhere to go and where a drifted row reads worst.
+        """
+        names = ("ABCD",)
+        stride = 4 + PASS_COLUMN_GUTTER
+        width = 8 * stride - PASS_COLUMN_GUTTER
+        self.assertEqual(
+            pass_column_count(names, viewport_width=width),
+            8 - PASS_COLUMNS_RESERVED,
+        )
+
+    def test_a_narrow_window_loses_names_rather_than_going_blank(self) -> None:
+        """The reserve never takes the last column.
+
+        Zero columns would render nothing and read as an empty pass list
+        rather than a window too narrow to show one.
+        """
+        for width in range(1, 12):
+            self.assertGreaterEqual(pass_column_count(("ABCD",), width), 1)
+
+
+class DisplayWidthTests(unittest.TestCase):
+    """Every cell must be equal in TERMINAL width, not in len()."""
+
+    def test_emoji_names_produce_equal_width_cells(self) -> None:
+        names = ("ALFA", "🐍", "👍🏽", "🇺🇸", "BRAVO")
+        rows = lay_out_passes(names, viewport_width=60)
+        widths = {cell_len(cell) for row in rows for cell in row}
+        self.assertEqual(len(widths), 1, f"ragged columns: {widths}")
+
+    def test_a_wide_glyph_is_not_padded_as_if_it_were_narrow(self) -> None:
+        """The specific bug: len('🐍') is 1, cell_len is 2. Padding by
+
+        len() would make that column one cell too wide and shunt every
+        column to its right.
+        """
+        rows = lay_out_passes(("🐍", "AB"), viewport_width=60)
+        self.assertEqual(cell_len(rows[0][0]), cell_len(rows[0][1]))
+
+    def test_an_over_long_name_is_truncated_not_left_to_overflow(self) -> None:
+        rows = lay_out_passes(("A" * 40, "BB"), viewport_width=60)
+        self.assertEqual(cell_len(rows[0][0]), PASS_NAME_MAX_CELLS)
+
+    def test_truncation_never_severs_a_grapheme_cluster(self) -> None:
+        """A severed ZWJ sequence or flag half renders unpredictably wide
+
+        and corrupts whatever is drawn to its right (see grapheme_text).
+        """
+        for name in ("👨‍👩‍👧‍👦" * 6, "🇺🇸" * 12, "👍🏽" * 12, "é" * 30):
+            with self.subTest(name=name[:8]):
+                rows = lay_out_passes((name,), viewport_width=60)
+                self.assertLessEqual(cell_len(rows[0][0]), PASS_NAME_MAX_CELLS)
+
+    def test_every_row_fits_the_viewport_it_was_laid_out_for(self) -> None:
+        names = tuple(f"NODE{n:02d}" for n in range(37))
+        for width in range(8, 121, 7):
+            with self.subTest(width=width):
+                rows = lay_out_passes(names, width)
+                for row in rows:
+                    painted = sum(cell_len(cell) for cell in row) + PASS_COLUMN_GUTTER * (
+                        len(row) - 1
+                    )
+                    self.assertLessEqual(painted, max(width, pass_column_width(names)))
+
+
+class DuplicateNameTests(unittest.TestCase):
+    """Meshtastic short names are not unique and never were.
+
+    They are shown anyway. A version of this view appended each
+    colliding node's ID tail so no two cells could look alike; it cost
+    four cells of width on every such name, and on a terminal whose
+    emoji glyphs overpaint the character beside them the separator was
+    not even visible. Identity moved to the bar and the ENTER menu,
+    which have room to print a node ID. What the grid owes the reader is
+    that duplicates still LAY OUT correctly -- two identical names must
+    occupy two cells of equal width, not collapse or drift.
+    """
+
+    def test_identical_names_produce_identical_cells(self) -> None:
+        grid = lay_out_passes(("BIG", "BIG", "ALFA"), viewport_width=60)
+        self.assertEqual(grid[0][0], grid[0][1])
+
+    def test_duplicates_are_not_collapsed(self) -> None:
+        """Three radios called SAME are three rows, not one.
+
+        The list is a record of nodes, and a node is not a name.
+        """
+        grid = lay_out_passes(("SAME", "SAME", "SAME"), viewport_width=60)
+        self.assertEqual(sum(len(row) for row in grid), 3)
+
+    def test_duplicate_emoji_names_keep_equal_width_cells(self) -> None:
+        """The real case: two radios sharing one emoji short name."""
+        names = ("\U0001f43b", "\U0001f43b", "ALFA")
+        grid = lay_out_passes(names, viewport_width=60)
+        widths = {cell_len(cell) for row in grid for cell in row}
+        self.assertEqual(len(widths), 1, f"ragged columns: {widths}")
+
+    def test_a_bare_emoji_name_costs_no_more_width_than_it_is(self) -> None:
+        """What removing the ID tail bought.
+
+        A board of emoji names now sets its column from the emoji, not
+        from the emoji plus a five-character suffix, which is several
+        more columns of names on an 80-column screen.
+        """
+        self.assertEqual(
+            pass_column_width(("\U0001f43b", "\U0001f43b")), 2
+        )
+
+
+class RowOffsetTests(unittest.TestCase):
+    """Scrolling the pass grid: minimal movement, never overscrolling."""
+
+    def test_a_selection_already_visible_does_not_scroll(self) -> None:
+        self.assertEqual(pass_row_offset(20, 5, 2, 0), 0)
+        self.assertEqual(pass_row_offset(20, 5, 7, 5), 5)
+
+    def test_stepping_past_the_fold_moves_by_one_row(self) -> None:
+        """Not a recentre. Every cell looks like every other cell here,
+
+        so a list that jumps the selection to the middle of the screen
+        makes it hard to keep your place.
+        """
+        self.assertEqual(pass_row_offset(20, 5, 5, 0), 1)
+
+    def test_moving_above_the_window_scrolls_up_to_it(self) -> None:
+        self.assertEqual(pass_row_offset(20, 5, 3, 5), 3)
+
+    def test_the_last_row_cannot_scroll_past_the_end(self) -> None:
+        """The bottom of the list is the bottom of the list -- never a
+
+        screen of empty space below it.
+        """
+        self.assertEqual(pass_row_offset(20, 5, 19, 10), 15)
+
+    def test_a_list_shorter_than_the_viewport_never_scrolls(self) -> None:
+        self.assertEqual(pass_row_offset(3, 10, 2, 0), 0)
+
+    def test_degenerate_sizes_are_survivable(self) -> None:
+        """Called during layout, when the widget may not have a size."""
+        self.assertEqual(pass_row_offset(20, 0, 5, 3), 0)
+        self.assertEqual(pass_row_offset(0, 5, 0, 0), 0)
+
+    def test_walking_the_whole_list_keeps_the_selection_visible(self) -> None:
+        total, viewport, offset = 37, 6, 0
+        for row in range(total):
+            offset = pass_row_offset(total, viewport, row, offset)
+            self.assertTrue(
+                offset <= row < offset + viewport,
+                f"row {row} not visible at offset {offset}",
+            )
+            self.assertLessEqual(offset, total - viewport)
+
+
+class MeasuredWidthTests(unittest.TestCase):
+    """Laying out against what the terminal PAINTS, not what Rich declares.
+
+    This is the bug that survived four rounds of reasoning about it,
+    because it is invisible to any test that measures with the same
+    function it pads with. A terminal with no glyph for an emoji advances
+    ONE column where Rich accounted for two; the cell then paints a
+    column short and every column to its right on that row slides left,
+    cumulatively, so the last column of a nine-column board can be
+    several cells out.
+
+    `measure` defaults to cell_len, so a caller that does not supply one
+    gets exactly the old behaviour -- these tests supply one that lies
+    the way a real console font does.
+    """
+
+    @staticmethod
+    def _font_without_bear(text: str) -> int:
+        """cell_len, except this pretend font has no bear glyph."""
+        bear = "\U0001f43b"
+        return cell_len(text) - text.count(bear)
+
+    def test_a_narrow_painted_glyph_gets_extra_padding(self) -> None:
+        """The fix, stated as arithmetic.
+
+        Every cell must advance the SAME number of columns. The bear cell
+        is one short by Rich's reckoning, so it earns one more space.
+        """
+        names = ("\U0001f43b", "ALFA")
+        grid = lay_out_passes(names, viewport_width=60, measure=self._font_without_bear)
+        painted = {self._font_without_bear(cell) for row in grid for cell in row}
+        self.assertEqual(len(painted), 1, f"ragged columns: {painted}")
+
+    def test_the_column_after_a_narrow_glyph_lands_where_it_should(self) -> None:
+        """What a person actually sees: the NEXT name's position.
+
+        Measured off a photograph of the real board, the cell after the
+        offending glyph sat 1.1 cells left of its column, and so did
+        every cell after that one -- the error accumulates, which is why
+        a wider gutter could never have fixed it.
+        """
+        names = ("\U0001f43b", "ALFA", "BRVO")
+        grid = lay_out_passes(names, viewport_width=60, measure=self._font_without_bear)
+        gutter = pass_gutter(names, 60, self._font_without_bear)
+        row = grid[0]
+        starts = []
+        cursor = 0
+        for cell in row:
+            starts.append(cursor)
+            cursor += self._font_without_bear(cell) + gutter
+        strides = [b - a for a, b in zip(starts, starts[1:])]
+        self.assertEqual(len(set(strides)), 1, f"uneven stride: {strides}")
+
+    def test_declaring_no_measurements_changes_nothing(self) -> None:
+        """The default path, which every test and non-tty run takes."""
+        names = ("\U0001f43b", "ALFA", "BRVO")
+        self.assertEqual(
+            lay_out_passes(names, viewport_width=60),
+            lay_out_passes(names, viewport_width=60, measure=cell_len),
+        )
+
+    def test_a_row_never_grows_past_the_viewport(self) -> None:
+        """Padding in measured cells makes a row measure WIDER to Rich.
+
+        Textual crops by cell_len, so an over-wide row would lose the
+        right-hand end of its last name. A column is dropped instead.
+        """
+        names = tuple("\U0001f43b" for _ in range(12))
+        for width in range(10, 80):
+            grid = lay_out_passes(
+                names, viewport_width=width, measure=self._font_without_bear
+            )
+            gutter = pass_gutter(names, width, self._font_without_bear)
+            widest = max(
+                sum(cell_len(cell) for cell in row) + gutter * (len(row) - 1)
+                for row in grid
+            )
+            if len(grid[0]) > 1:
+                self.assertLessEqual(widest, width, f"overflowed at {width}")
+
+
+class AmbiguousWidthTests(unittest.TestCase):
+    """Nothing the LAYOUT adds to a cell may have a negotiable width.
+
+    East_Asian_Width=AMBIGUOUS characters -- U+00B7 MIDDLE DOT, U+2026
+    HORIZONTAL ELLIPSIS and a large family besides -- are one cell to
+    Rich and two cells to a terminal whose font or configuration treats
+    that class as wide. In flowing text the disagreement costs a column
+    at the end of a line. In a fixed-width grid it moves every column to
+    the right of it, for the whole row, and the app cannot detect that
+    it happened.
+
+    Node names come off the mesh and are taken as they are. Everything
+    the layout puts AROUND them is a choice, and this pins the choice:
+    ASCII, whose width no terminal disagrees about. The value of the
+    test is that the next person to reach for a nicer-looking separator
+    finds out here rather than on a uConsole.
+    """
+
+    def _assert_unambiguous(self, value: str) -> None:
+        for character in value:
+            width = unicodedata.east_asian_width(character)
+            self.assertNotEqual(
+                width,
+                "A",
+                f"U+{ord(character):04X} is East_Asian_Width=AMBIGUOUS",
+            )
+            self.assertTrue(
+                character.isascii(),
+                f"U+{ord(character):04X} is not ASCII",
+            )
+
+    def test_the_truncation_marker_has_an_undisputed_width(self) -> None:
+        self._assert_unambiguous(PASS_TRUNCATION_MARKER)
+
+    def test_a_truncated_name_is_not_marked_with_an_ellipsis(self) -> None:
+        """truncate_to_cells defaults to "…", which is AMBIGUOUS.
+
+        The grid has to override that default, and this fails if the
+        override is ever dropped -- a regression that would only show up
+        on names long enough to be cut, which is exactly the kind of
+        rare case nobody notices going wrong.
+        """
+        rows = lay_out_passes(("X" * 40,), viewport_width=60)
+        self.assertNotIn("\u2026", rows[0][0])
+        self.assertIn(PASS_TRUNCATION_MARKER, rows[0][0])
+
+    def test_everything_the_layout_adds_to_a_cell_is_unambiguous(self) -> None:
+        """The general rule, checked against real output.
+
+        Whatever appears in a rendered cell that was NOT in the node's
+        own name got there from this module, and must be safe.
+        """
+        names = ("\U0001f43b", "\U0001f43b", "Q" * 40)
+        supplied = set("".join(names))
+        for row in lay_out_passes(names, viewport_width=60):
+            for cell in row:
+                self._assert_unambiguous(
+                    "".join(c for c in cell if c not in supplied)
+                )
+
+
+class PassBarTests(unittest.TestCase):
+    """The one line under the grid: identity first, then how they reached us."""
+
+    @staticmethod
+    def _encounter(**kwargs):
+        from chat_store import NodeEncounter
+
+        fields = {
+            "node_id": "!e5deef81",
+            "long_name": None,
+            "short_name": "ALFA",
+            "hops_away": None,
+            "first_seen_at": 1_700_000_000.0,
+            "last_seen_at": 1_700_000_000.0,
+            "first_heard_at": None,
+            "last_heard_at": None,
+        }
+        fields.update(kwargs)
+        return NodeEncounter(**fields)
+
+    def test_a_node_only_gossiped_about_says_via_mesh(self) -> None:
+        bar = format_pass_bar(self._encounter(), now=1_700_000_000.0)
+        self.assertIn("VIA MESH", bar)
+        self.assertNotIn("HEARD DIRECTLY", bar)
+
+    def test_a_node_we_heard_ourselves_says_heard_not_met(self) -> None:
+        """HEARD, never MET: unrelayed packets prove range, not a meeting.
+
+        MET is reserved for a pass, so the two words cannot be read as
+        the same claim by someone glancing at the bar.
+        """
+        bar = format_pass_bar(
+            self._encounter(first_heard_at=1_699_000_000.0), now=1_700_000_000.0
+        )
+        self.assertIn("HEARD DIRECTLY", bar)
+        self.assertNotIn("MET", bar)
+
+    def test_heard_directly_and_a_hop_count_coexist(self) -> None:
+        """Not a contradiction, and must not be suppressed as one.
+
+        first_heard_at is a past-tense fact that never expires; hops_away
+        is where the node is now. A node heard in the room last week and
+        five hops away today is both.
+        """
+        bar = format_pass_bar(
+            self._encounter(first_heard_at=1_699_000_000.0, hops_away=5),
+            now=1_700_000_000.0,
+        )
+        self.assertIn("HEARD DIRECTLY", bar)
+        self.assertIn("HOPS 5", bar)
+
+    def test_no_pass_field_appears_without_a_pass(self) -> None:
+        """Every real row today. An absent pass is absent, not "PASS: no"."""
+        bar = format_pass_bar(
+            self._encounter(first_heard_at=1_699_000_000.0), now=1_700_000_000.0
+        )
+        self.assertNotIn("PASS", bar)
+
+    def test_a_confirmed_pass_is_named_on_the_bar(self) -> None:
+        bar = format_pass_bar(
+            self._encounter(pass_at=1_699_000_000.0), now=1_700_000_000.0
+        )
+        self.assertIn("PASS", bar)
+
+    def test_the_node_id_is_always_printed(self) -> None:
+        """The grid can show two identical-looking cells; this cannot."""
+        for encounter in (
+            self._encounter(),
+            self._encounter(short_name=None, long_name=None),
+            self._encounter(pass_at=1_699_000_000.0, hops_away=0),
+        ):
+            self.assertIn("!e5deef81", format_pass_bar(encounter, now=1_700_000_000.0))
+
+
+class GutterDistributionTests(unittest.TestCase):
+    """Width the column count could not use is spent on the gaps.
+
+    A board of four-cell names is mostly gutter, so where the leftover
+    goes is the difference between names spread across the screen and
+    names bunched at the left of one. The COUNT is still decided at
+    PASS_COLUMN_GUTTER, so widening can only make a row fit less tightly
+    than the count assumed -- never push a column off the edge.
+    """
+
+    NAMES = tuple(f"N{index:03d}" for index in range(60))
+
+    def _drawn_width(self, viewport: int) -> int:
+        columns = pass_column_count(self.NAMES, viewport)
+        gutter = pass_gutter(self.NAMES, viewport)
+        return columns * pass_column_width(self.NAMES) + (columns - 1) * gutter
+
+    def test_the_gutter_is_never_narrower_than_the_minimum(self) -> None:
+        for viewport in range(8, 200):
+            self.assertGreaterEqual(
+                pass_gutter(self.NAMES, viewport), PASS_COLUMN_GUTTER
+            )
+
+    def test_widening_never_overflows_the_viewport(self) -> None:
+        """The property that makes this safe to do at all."""
+        for viewport in range(8, 200):
+            self.assertLessEqual(self._drawn_width(viewport), viewport)
+
+    def test_leftover_width_is_actually_spent(self) -> None:
+        """Otherwise this is just a wider constant.
+
+        At a width where the count leaves most of a column spare, the
+        drawn board must reach further right than it would at the bare
+        minimum gutter.
+        """
+        viewport = 88
+        columns = pass_column_count(self.NAMES, viewport)
+        minimum = columns * pass_column_width(self.NAMES) + (columns - 1) * PASS_COLUMN_GUTTER
+        self.assertGreater(self._drawn_width(viewport), minimum)
+
+    def test_the_gutter_is_capped(self) -> None:
+        """Past a point a row stops reading as a row.
+
+        Two names on a very wide screen should not end up at opposite
+        edges of it.
+        """
+        for viewport in range(8, 400):
+            self.assertLessEqual(
+                pass_gutter(("AB", "CD"), viewport), PASS_MAX_COLUMN_GUTTER
+            )
+
+    def test_a_single_column_has_no_gutter_to_distribute(self) -> None:
+        self.assertEqual(pass_gutter(("A" * 20,), viewport_width=10), PASS_COLUMN_GUTTER)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -88,11 +88,13 @@ Everything is keyboard-driven. There is no mouse requirement anywhere.
 
 | Key | Does |
 | --- | --- |
-| `1` `2` `3` | CONNECTION/CONFIG, CHAT, MESH |
-| `C` | Channel dropdown (outside the input) |
+| `1` `2` `3` `4` | CONNECTION/CONFIG, CHAT, PASSES, MESH |
+| `C` | Channel dropdown (in CHAT, outside the input) |
+| `S` | Sort order (in PASSES) |
 | `Escape` | Leave the composer and navigate the transcript |
 | `Up` / `Down` | Move one message or control at a time |
 | `Right` | Jump to the newest message |
+| `Enter` | Open the menu for the node under the cursor |
 | `F4` | Quit from anywhere |
 
 Note that `q` is ordinary text, not a quit key -- you can type it in a message
@@ -109,6 +111,25 @@ UI scale).
 
 **CHAT** is the currently selected broadcast channel, with persistent history,
 per-message delivery state, and unread tracking. History survives restarts.
+
+**PASSES** is every node this radio has ever encountered, laid out like an
+MS-DOS `dir /w` listing. It is a record rather than a live view: a node stays
+listed long after it has aged out of the radio's own node database and off the
+MESH board, and the list is just as valid with no radio attached. Sort it by
+name, hop count or recency with `S`; `Enter` on a name opens the same node menu
+CHAT's sender names do.
+
+Duplicate names are shown as duplicates, because a mesh full of repeated short
+names is the normal state and two radios sharing one emoji really are two
+radios. The bar under the grid names the node ID of whichever cell is
+highlighted, which is what tells them apart.
+
+The header reads `N NODES · M PASSES`. NODES is everyone encountered; PASSES is
+the subset that has exchanged a pass with you, which only another
+MeshtasticPass install can do. That number is zero today and will stay zero
+until the exchange exists -- it is deliberately not a rename of "nodes I have
+heard directly", which is a fact about radio range rather than about having met
+anyone.
 
 **MESH** is a passive, YOU-centred board of the nodes around you. It never
 transmits to build itself -- everything on it comes from the radio's own node
@@ -143,9 +164,20 @@ thing on this board that transmits, and only when you ask it to.
    arrive late, and whether history is intact after a restart.
 4. **The MESH board with more than a handful of nodes.** It has mostly been seen
    with about eight, and layout is where I expect problems.
-5. **Anything that looks visually wrong** -- misaligned labels, colours that
-   don't match the rest of the UI, text that overflows. Emoji in node names are a
-   known source of this.
+5. **PASSES with a few hundred nodes.** Column layout, scrolling, and whether
+   the sort orders do what you expect.
+6. **Anything that looks visually wrong** -- misaligned labels, colours that
+   don't match the rest of the UI, text that overflows.
+
+   Emoji in node names were the long-standing source of this, and the cause is
+   now understood: a terminal with no glyph for an emoji falls back to a text
+   font and advances ONE column where the layout accounted for two, so
+   everything after it on that line slides. The app measures your terminal at
+   startup and corrects for it. If a grid still looks misaligned, run
+   `python3 terminal_width_probe.py` **in the uConsole's own terminal, not over
+   SSH** -- over SSH it measures the machine you connected from -- and include
+   the output in the report. It names the exact glyphs your font disagrees
+   about.
 
 ## Known limitations
 

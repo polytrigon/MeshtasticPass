@@ -71,18 +71,28 @@ def grapheme_clusters(value: str) -> tuple[str, ...]:
     return tuple(clusters)
 
 
-def truncate_to_cells(value: str, width: int) -> str:
-    """Grapheme-safe truncate-with-ellipsis to at most `width` display cells."""
+def truncate_to_cells(value: str, width: int, marker: str = "…") -> str:
+    """Grapheme-safe truncate-with-marker to at most `width` display cells.
+
+    `marker` exists for callers laying text into a FIXED-WIDTH GRID. The
+    default "…" is East_Asian_Width=AMBIGUOUS: Rich counts it as one
+    cell, and a terminal configured (or fonted) to treat ambiguous-width
+    characters as wide paints it as two. In flowing text that costs a
+    column at the end of a line and nobody notices. In a grid it moves
+    every column to its right. Such callers pass an ASCII marker, whose
+    width no terminal disagrees about.
+    """
     if cell_len(value) <= width:
         return value
-    if width <= 1:
-        return "…"[:width]
+    marker_width = cell_len(marker)
+    if width <= marker_width:
+        return marker[:width]
     visible = ""
     for cluster in grapheme_clusters(value):
-        if cell_len(f"{visible}{cluster}…") > width:
+        if cell_len(f"{visible}{cluster}{marker}") > width:
             break
         visible += cluster
-    return f"{visible}…"
+    return f"{visible}{marker}"
 
 
 def _merge_regional_indicator_spans(

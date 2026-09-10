@@ -27,6 +27,7 @@ from textual.containers import (
     VerticalScroll,
 )
 from textual.events import Blur, Click, Focus, Key
+from textual.geometry import Region
 from textual.message import Message
 from textual.scrollbar import ScrollBarRender
 from textual.timer import Timer
@@ -51,6 +52,7 @@ from chat_store import (
     canonical_profile_key,
     normalize_profile_node_id,
     split_profile_key,
+    NodeEncounter,
 )
 from geo import format_distance_miles
 from host_timezone import detect_host_timezone
@@ -90,7 +92,17 @@ from radio_capabilities import (
     modem_preset_choices,
     role_choices,
 )
+from pass_layout import (
+    DEFAULT_PASS_ORDER,
+    PASS_COLUMN_GUTTER,
+    format_pass_bar,
+    pass_column_width,
+    pass_gutter,
+    lay_out_passes,
+    pass_row_offset,
+)
 from serial_devices import describe_connection_target
+from terminal_width import PaintedWidths, measure_terminal
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -159,6 +171,13 @@ install_flag_pair_protection()
 TAB_NAMES = {
     "connection": "CONNECTION/CONFIG",
     "chat": "CHAT",
+    # PASSES sits between CHAT and MESH deliberately: it is a view of
+    # PEOPLE, like CHAT, while MESH is a view of the network's shape.
+    # Inserting rather than appending moves MESH from [3] to [4], which
+    # is a real cost in muscle memory and in tests -- taken knowingly,
+    # because the nav should read as what the app is about rather than
+    # as the order the views happened to be built in.
+    "passes": "PASSES",
     "mesh": "MESH",
 }
 
@@ -2197,6 +2216,19 @@ CIRCLE_STROKED_LARGE = "○"
 # mesh_topology.py for the pure grid geometry (assign_grid_slots(),
 # place_within_bounds(), project_to_viewport(), directional_target(),
 # build_relay_stages(), route_chain()) reused here.
+# How far past the mounted-window target an UNREAD message may keep the
+# window growing before it is trimmed anyway.
+#
+# The protection exists so a message cannot scroll out of the mounted
+# window before anyone has seen it. Without a ceiling it is unbounded:
+# nothing is read while nobody is looking, so an unattended radio mounts
+# a widget per arriving message all night and the 1s timer walks every
+# one of them by morning. Past this many extra entries the oldest go,
+# read or not -- their text is in chat_store, scrolling up brings them
+# back, and CHAT(N) counts them regardless (see
+# ChannelChatState.unread_count).
+MOUNTED_CHAT_UNREAD_CEILING = 100
+
 MESH_GRID_MIN_ROWS = 5
 MESH_GRID_MIN_COLUMNS = 9
 # A node's label renders one terminal row ABOVE its glyph (see
@@ -3002,6 +3034,82 @@ class MeshTopologyView(Container):
         """
         return self._edge_node_ids & {state.node.node_id for state in self._working_set}
 
+    def _lay_out_board(self) -> tuple[int, int, int, int, int, int]:
+        """Size and centre the board block, and report its geometry.
+
+        Returns (rows, columns, center_row, center_column, board width,
+        board height). Shared by set_nodes and render_empty_grid so the
+        dot grid can never come out at different dimensions, or in a
+        different place, depending on which of them drew it.
+
+        Horizontally centres the whole board as one rigid block inside
+        the available MESH region -- a board-level offset, not a per-node
+        one, so it can never desync node-to-grid coordinates. Before this
+        view has ever been laid out, self.size is 0x0 and there is
+        nothing to centre against; callers check self.size.width and
+        re-run once the next refresh has resolved it, rather than leaving
+        the board visibly left-anchored.
+        """
+        row_count, column_count, center_row, center_column = (
+            self.current_grid_dimensions()
+        )
+        # The board ends ON the last dot, not one grid STEP past it.
+        #
+        # Dots sit at (column - 1) * DOT_GRID_SPACING_X (see
+        # _mesh_grid_pixel), so the rightmost one is at
+        # (column_count - 1) * spacing and the board needs exactly one
+        # cell more than that. Sizing it column_count * spacing instead
+        # appended a full empty step -- three blank columns on the right
+        # and one blank row at the bottom that belonged to a dot that
+        # was never drawn. Centring then split the REMAINING space
+        # evenly, so those three cells landed entirely on the right: at
+        # 90 columns the gaps read 3 left, 6 right. They now read 4 and
+        # 5.
+        #
+        # Node and label coordinates come from _mesh_grid_pixel and
+        # never from these two numbers, so nothing moves relative to the
+        # grid -- only the container's own edges, and the canvas that
+        # fills it.
+        board_width = (column_count - 1) * DOT_GRID_SPACING_X + 1
+        board_height = (row_count - 1) * DOT_GRID_SPACING_Y + 1
+        board = self.board
+        board.styles.width = board_width
+        board.styles.height = board_height
+        if self.size.width:
+            board.styles.offset = (max(0, (self.size.width - board_width) // 2), 0)
+        return (
+            row_count,
+            column_count,
+            center_row,
+            center_column,
+            board_width,
+            board_height,
+        )
+
+    def render_empty_grid(self, theme: str) -> None:
+        """Draw the bare dot grid, with nothing on it.
+
+        For the stretch before the radio is ONLINE and any working set
+        has ever arrived. MESH genuinely has nothing to say about
+        topology yet -- but the grid is not topology. It is the board
+        those nodes will land on, and an empty rectangle reads as a
+        broken view where an empty board reads as a waiting one.
+
+        A no-op once a working set exists. Stale topology deliberately
+        stays visible across a reconnect (see _refresh_mesh), and
+        painting a bare grid over it would throw away useful data on a
+        connection-state change alone.
+        """
+        if self._working_set:
+            return
+        *_, board_width, board_height = self._lay_out_board()
+        if not self.size.width:
+            self.app.call_after_refresh(lambda: self.render_empty_grid(theme))
+            return
+        self.board.query_one(MeshCanvas).render_scene(
+            board_width, board_height, (), theme
+        )
+
     def current_grid_dimensions(self) -> tuple[int, int, int, int]:
         """(rows, columns, center_row, center_column) for the visible
 
@@ -3069,23 +3177,15 @@ class MeshTopologyView(Container):
         """
         self._last_now = now
         board = self.board
-        row_count, column_count, center_row, center_column = (
-            self.current_grid_dimensions()
-        )
-        board_width = column_count * DOT_GRID_SPACING_X
-        board_height = row_count * DOT_GRID_SPACING_Y
-        board.styles.width = board_width
-        board.styles.height = board_height
-        # Horizontally center the whole board as one rigid block inside the
-        # available MESH region -- a board-level offset, not a per-node one,
-        # so it can never desync node-to-grid coordinates. On the very first
-        # render (before this view has ever been laid out), self.size is
-        # not resolved yet (0x0); re-run once after the next refresh, when
-        # it is, rather than leaving the board visibly left-anchored.
-        view_width = self.size.width
-        if view_width:
-            board.styles.offset = (max(0, (view_width - board_width) // 2), 0)
-        else:
+        (
+            row_count,
+            column_count,
+            center_row,
+            center_column,
+            board_width,
+            board_height,
+        ) = self._lay_out_board()
+        if not self.size.width:
             self.app.call_after_refresh(
                 lambda: self.set_nodes(working_set, base_positions, theme=theme, now=now)
             )
@@ -3784,8 +3884,14 @@ class ChatEntryWidget(Vertical):
         self.mention = mention and not entry.outgoing and entry.dm_node_id is None
         initial_now = monotonic() if now is None else now
         is_new = self.entry.is_new and not self.entry.outgoing
+        # The timestamp text currently painted, so the 1s tick can skip
+        # the layout-invalidating update when nothing changed (see
+        # refresh_timestamp). Seeded below with the label's own initial
+        # text, so the very first tick is already a no-op.
+        initial_timestamp = self._timestamp_text(initial_now)
+        self._timestamp_rendered: str = initial_timestamp
         self.timestamp_label = Static(
-            self._timestamp_text(initial_now),
+            initial_timestamp,
             classes="chat-entry-timestamp",
             markup=False,
         )
@@ -3871,8 +3977,29 @@ class ChatEntryWidget(Vertical):
         self.refresh_delivery_state(1)
 
     def refresh_timestamp(self, now: float) -> None:
-        """Update only the existing timestamp child for this entry."""
-        self.timestamp_label.update(self._timestamp_text(now))
+        """Update the timestamp child, but ONLY when its text changed.
+
+        The shared 1s CHAT tick calls this on every mounted entry, and
+        Static.update() ends in refresh(layout=True) -- a LAYOUT
+        invalidation, not merely a repaint. Without this guard the
+        transcript re-laid itself out once per second per mounted
+        message, which is what made moving around a long CHAT feel
+        sluggish on the uConsole: arrow keys competed with a layout
+        storm.
+
+        Almost all of that work was rewriting a string that had not
+        changed. format_relative_age quantises: a message an hour old
+        reads the same for a whole minute, and an older one for far
+        longer, so at any given tick only the handful of genuinely
+        recent entries have anything new to say. Comparing first turns
+        an O(mounted entries) layout pass into an O(entries that
+        actually changed) one, and the common case is zero.
+        """
+        text = self._timestamp_text(now)
+        if text == self._timestamp_rendered:
+            return
+        self._timestamp_rendered = text
+        self.timestamp_label.update(text)
 
     def _timestamp_text(self, now: float) -> str:
         age = format_relative_age(now - self.entry.age_reference)
@@ -3995,6 +4122,243 @@ def _expand_theme_overrides(css: str) -> str:
         else:
             expanded.append(block)
     return "".join(expanded) + tail
+
+
+PASS_ORDER_LABELS = (("ALPHA", "alpha"), ("HOPS", "hops"), ("RECENT", "recent"))
+
+
+class PassSortSelector(KeyboardDropdown):
+    """PASSES' sort control: [ RECENT v ], in CHAT's channel-selector slot.
+
+    Same primitive, same position and same grammar as CHAT's
+    [ LongFast v ] -- a view that looks like CHAT should be driven like
+    CHAT, so the one control at the top left is always "what am I
+    looking at".
+    """
+
+    def __init__(self, value: str) -> None:
+        super().__init__(
+            "pass_order",
+            "",
+            (DropdownOption(label, order) for label, order in PASS_ORDER_LABELS),
+            value,
+            widget_id="pass-sort-selector",
+            # No prefix/suffix: KeyboardDropdown already renders its own
+            # "[ value v ]" brackets, and adding a pair here produced
+            # "[  [ RECENT v ]  ]" on hardware.
+            #
+            # No marker gutter either: this control is the first thing
+            # on its line, so those two reserved cells indented it past
+            # where CHAT's network name starts. CHAT's own dropdowns
+            # keep the gutter -- they follow a label and align to it.
+            marker_gutter=False,
+            classes="keyboard-dropdown",
+        )
+
+
+class PassesView(Static):
+    """The PASSES directory: every node encountered, as a DOS-style block.
+
+    Rendered as ONE Static holding a single Rich Text, not one widget
+    per node. MESH mounts a widget per node and CHAT one per message,
+    and the cost of that is not hypothetical -- the 1s tick re-laying
+    out every mounted CHAT entry is exactly what made a long transcript
+    sluggish on the uConsole. A pass list is unbounded by design (it is
+    the record of everyone ever met), so it is the last place that
+    should mount a widget per row. Selection moves a style inside one
+    Text; nothing mounts, nothing unmounts, nothing re-lays out.
+    """
+
+    can_focus = True
+
+    class OpenRequested(Message):
+        """Enter on a pass: the app decides what that means (a DM)."""
+
+        def __init__(self, encounter: NodeEncounter) -> None:
+            super().__init__()
+            self.encounter = encounter
+
+    def __init__(self) -> None:
+        super().__init__(id="passes-view", markup=False)
+        self._passes: tuple[NodeEncounter, ...] = ()
+        self._columns = 1
+        self._column_width = 1
+        self._gutter = PASS_COLUMN_GUTTER
+        self._selected = 0
+        # First visible row. PASSES clips to its own viewport rather
+        # than using a Textual scrollbar, for the same reason MESH does:
+        # the whole view is one rendered Text, so scrolling is a slice,
+        # not a container full of widgets to move.
+        self._row_offset = 0
+
+    @property
+    def passes(self) -> tuple[NodeEncounter, ...]:
+        return self._passes
+
+    @property
+    def selected(self) -> NodeEncounter | None:
+        if not self._passes:
+            return None
+        return self._passes[min(self._selected, len(self._passes) - 1)]
+
+    def set_passes(self, passes: tuple[NodeEncounter, ...]) -> None:
+        """Replace the list, keeping the highlight on the SAME node.
+
+        Re-sorting or a refresh must not silently move the selection to
+        whatever now occupies that index -- the highlight belongs to a
+        node, not to a position.
+        """
+        previous = self.selected
+        self._passes = passes
+        if previous is not None:
+            for index, encounter in enumerate(passes):
+                if encounter.node_id == previous.node_id:
+                    self._selected = index
+                    break
+            else:
+                self._selected = 0
+        else:
+            self._selected = 0
+        self.refresh(layout=True)
+
+    class SelectionChanged(Message):
+        """The highlight moved; the bottom bar describes a new node."""
+
+    def move_selection(self, delta_columns: int, delta_rows: int) -> None:
+        if not self._passes:
+            return
+        index = self._selected + delta_columns + delta_rows * max(1, self._columns)
+        index = max(0, min(index, len(self._passes) - 1))
+        if index == self._selected:
+            return
+        self._selected = index
+        self.refresh()
+        self.post_message(self.SelectionChanged())
+
+    def render(self) -> Text:
+        if not self._passes:
+            return Text(
+                "NO NODES YET -- they appear here as the radio encounters them",
+                style=Style(color=THEME_PALETTES[self.app._current_theme].dim),
+            )
+        palette = THEME_PALETTES[self.app._current_theme]
+        # Names exactly as their operators set them, duplicates and all.
+        # Two nodes sharing one emoji DO render as two identical cells,
+        # which is the truth about this mesh. The bar under the grid is
+        # where a reader finds out which is which: it prints the node ID
+        # for whichever cell is highlighted, unconditionally, which a
+        # grid cell has no room to do.
+        names = tuple(encounter.display_name for encounter in self._passes)
+        # MEASURED widths, not declared ones. On a terminal with no glyph
+        # for an emoji, Rich accounts for two columns and the terminal
+        # advances one, and in a grid that error moves every column to
+        # its right for the rest of the row -- see terminal_width.
+        measure = self.app.painted_widths.width
+        width = self.size.width or 60
+        rows = lay_out_passes(names, width, measure)
+        self._columns = len(rows[0]) if rows else 1
+        self._column_width = pass_column_width(names, measure)
+        # Wider than PASS_COLUMN_GUTTER whenever the column count left
+        # width over: the leftover is spent on the gaps rather than
+        # banked as one margin on the right (see pass_gutter).
+        self._gutter = pass_gutter(names, width, measure)
+        height = self.size.height or len(rows)
+        selected_row = self._selected // max(1, self._columns)
+        # No "more" marker: that a list scrolls is an assumed pattern,
+        # and a row spent saying so is a row not spent on names.
+        visible_rows = max(1, height)
+        self._row_offset = pass_row_offset(
+            len(rows), visible_rows, selected_row, self._row_offset
+        )
+        window = rows[self._row_offset : self._row_offset + visible_rows]
+        text = Text(no_wrap=True)
+        index = self._row_offset * max(1, self._columns)
+        for row_number, row in enumerate(window):
+            if row_number:
+                text.append("\n")
+            for column_number, cell in enumerate(row):
+                if column_number:
+                    text.append(" " * self._gutter)
+                encounter = self._passes[index]
+                # ACCENT2 for a node the user has HIGHLIGHTED -- the same
+                # token MESH paints a highlighted node with, so marking a
+                # node in one view finds it in the other. It wins over
+                # ACCENT because it is the user's own deliberate mark,
+                # and someone who highlighted a node came here to find
+                # it.
+                #
+                # ACCENT for a node that has exchanged a pass with us.
+                # BASE for everyone else: encountering a node is the
+                # ordinary case, it is what a mesh does all day, so it
+                # gets the ordinary colour and the accents are spent only
+                # on the rare things. Hearing a node directly is
+                # deliberately NOT drawn -- that is a property of radio
+                # range, not of having met someone, and colouring it made
+                # most of the board look significant.
+                if self.app.settings.is_favorite(encounter.node_id):
+                    color = palette.accent2
+                elif encounter.has_pass:
+                    color = palette.accent
+                else:
+                    color = palette.base
+                style = Style(color=color, reverse=index == self._selected)
+                text.append(cell, style=style)
+                index += 1
+        return text
+
+    def selected_region(self) -> Region | None:
+        """Where the highlighted cell sits on screen, for menu placement.
+
+        The whole grid is one widget, so there is no per-cell widget to
+        anchor a popup to the way MESH anchors to a node's own glyph.
+        The coordinates are recomputed here from the same three numbers
+        the last render used -- column count, column width and scroll
+        offset -- rather than stored during render, so a menu opened
+        before the first paint gets None instead of a stale position.
+        """
+        if not self._passes:
+            return None
+        columns = max(1, self._columns)
+        row = self._selected // columns - self._row_offset
+        column = self._selected % columns
+        content = self.content_region
+        if row < 0 or row >= max(1, content.height):
+            return None
+        return Region(
+            content.x + column * (self._column_width + self._gutter),
+            content.y + row,
+            self._column_width,
+            1,
+        )
+
+    def on_key(self, event: Key) -> None:
+        if getattr(self.app, "_user_menu", None) is not None:
+            # A node menu opened from this grid is showing. Focus never
+            # actually leaves this widget while it is up (see
+            # _open_node_menu), so without this the arrows would move the
+            # selection UNDERNEATH the menu -- changing which node the
+            # menu is about, after it was opened. Returning without
+            # stopping the event lets it bubble to the app-level on_key
+            # that drives the menu's own highlight, which is the same
+            # thing CHAT's transcript and entry widgets do.
+            return
+        if not self._passes:
+            return
+        moves = {
+            "left": (-1, 0),
+            "right": (1, 0),
+            "up": (0, -1),
+            "down": (0, 1),
+        }
+        if event.key in moves:
+            self.move_selection(*moves[event.key])
+            event.stop()
+            return
+        if event.key == "enter":
+            encounter = self.selected
+            if encounter is not None:
+                self.post_message(self.OpenRequested(encounter))
+            event.stop()
 
 
 class MeshtasticPassApp(App[None]):
@@ -4489,6 +4853,56 @@ class MeshtasticPassApp(App[None]):
         height: 1;
     }
 
+    /* PASSES reuses MESH's and CHAT's shapes rather than introducing a
+       third: a heading row with the selector at its left, a 1fr body,
+       and one status line at the bottom. */
+    #passes-heading {
+        height: auto;
+        width: 1fr;
+    }
+
+    #pass-sort-selector {
+        width: auto;
+        height: auto;
+        min-height: 1;
+        text-style: bold;
+    }
+
+    #passes-count {
+        width: 1fr;
+        height: 1;
+        color: $snow_dim;
+    }
+
+    Screen.theme-{THEME} #passes-count {
+        color: ${THEME}_dim;
+    }
+
+    #passes-view {
+        height: 1fr;
+        width: 1fr;
+        /* A blank line above AND below the names, matching how MESH
+           breathes. MESH gets its air incidentally -- an almost-always
+           empty #mesh-status line above the board, and a board sized
+           1fr whose dot grid sits inside it rather than filling it --
+           so there is no margin rule there to copy. PASSES' grid starts
+           flush at the top of its area and ends flush at the bottom, so
+           the same breathing room has to be asked for explicitly.
+           Vertical only: the columns keep their own left edge. */
+        margin: 1 0;
+    }
+
+    #passes-node-bar {
+        height: 1;
+        width: 1fr;
+        /* One line, and one line only. The bar names a node, its ID and
+           several ages, so on a narrow terminal it WILL run long -- and
+           a height-1 widget that is allowed to wrap spills a stray
+           fragment of the next line into the row instead of stopping. */
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+
     #mesh-status {
         color: $snow_dim;
     }
@@ -4499,6 +4913,14 @@ class MeshtasticPassApp(App[None]):
 
     #mesh-node-bar {
         width: 1fr;
+        /* Same one-line guarantee PASSES' bar needs, and for the same
+           reason: this line carries a node's LONG NAME, which is
+           attacker-free but not width-free -- an emoji name plus GPS,
+           distance and ages runs long on a narrow terminal, and a
+           height-1 widget allowed to wrap spills a fragment of the
+           next line into the row. */
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
 
     #dm-content {
@@ -4935,10 +5357,16 @@ class MeshtasticPassApp(App[None]):
         settings: AppSettings | None = None,
         terminal_cursor: TerminalCursor | None = None,
         chat_store: ChatStore | None = None,
+        painted_widths: PaintedWidths | None = None,
         history_error: str = "",
     ) -> None:
         super().__init__()
         self.radio = radio
+        # What this terminal really paints (see terminal_width). The
+        # empty default behaves exactly like cell_len, so every test and
+        # every non-tty run gets the declared widths it always got, and
+        # only a real startup that successfully measured differs.
+        self.painted_widths = painted_widths or PaintedWidths()
         self.settings = settings or AppSettings.load()
         self._current_theme = self.settings.color
         self.current_tab = "connection"
@@ -5010,6 +5438,21 @@ class MeshtasticPassApp(App[None]):
         self._chat_mode = "channel"
         self.dm_unread_count = 0
         self.chat_store = chat_store
+        # PASSES write-suppression: node id -> the last "seen at" already
+        # written for it. The NodeDB sweep runs on every ~1s mesh refresh
+        # and a real radio knows dozens of nodes, so writing all of them
+        # every tick would be a constant stream of pointless UPDATEs on a
+        # Pi's SD card. A node whose freshest timestamp has not moved has
+        # nothing new to record. In-memory only: losing it on restart
+        # costs one redundant write per node, never a lost pass.
+        self._recorded_passes: dict[str, tuple[float, bool]] = {}
+        # Session-only: the sort a user picks is a way of looking, not a
+        # preference worth persisting until somebody asks for it.
+        self._pass_order = DEFAULT_PASS_ORDER
+        # Set whenever a pass is actually written, so the 1s tick can
+        # repaint PASSES while it is being watched WITHOUT reading the
+        # database every second for a list that usually has not changed.
+        self._passes_dirty = False
         self._history_error = history_error
         self._radio_state = RadioState.CONNECTING
         self._radio_info: RadioInfo | None = None
@@ -5397,6 +5840,26 @@ class MeshtasticPassApp(App[None]):
             with Vertical(id="profile", classes="tab-page"):
                 yield Static("> PROFILE", classes="page-title")
                 yield Static("Coming in a future milestone.")
+            with Vertical(id="passes", classes="tab-page"):
+                # Header mirrors CHAT's: the sort control sits exactly
+                # where [ LongFast v ] does, with the count after it, so
+                # the top-left of a people-view always answers "what am
+                # I looking at".
+                #
+                # The connecting state goes INSIDE the sort control (see
+                # _update_chat_connection_state, and ChannelSelector's
+                # identical treatment in CHAT), not into a row of its
+                # own above the header. A row of its own is a row that
+                # appears and disappears, and everything under it moves
+                # by one line each way -- on a grid of names, that is the
+                # whole board jumping every time the radio reconnects.
+                with Horizontal(id="passes-heading"):
+                    yield PassSortSelector(DEFAULT_PASS_ORDER)
+                    yield Static(id="passes-count", markup=False)
+                yield PassesView()
+                # One line for the highlighted pass, the same shape as
+                # MESH's node bar rather than a second grammar.
+                yield Static(id="passes-node-bar", markup=False)
             with Vertical(id="mesh", classes="tab-page"):
                 # Shown/hidden and populated by _update_chat_connection_state()
                 # with the exact same _connection_status_rich_text() CHAT's
@@ -5413,7 +5876,7 @@ class MeshtasticPassApp(App[None]):
                 # separate bottom-left context line and bottom-right
                 # LINK/LAST UPDATE line -- see _update_mesh_node_bar.
                 yield Static(id="mesh-node-bar", markup=False)
-        yield Static("1-3 switch tabs    F4 quit", id="footer")
+        yield Static("1-4 switch tabs    F4 quit", id="footer")
 
     def on_mount(self) -> None:
         self._terminal_cursor.hide()
@@ -5789,7 +6252,7 @@ class MeshtasticPassApp(App[None]):
                 # state (typing them while the composer IS already
                 # focused goes through the isinstance(self.focused,
                 # Input) branch instead, unaffected by this exclusion).
-                and event.key not in ("1", "2", "3", "c", "d")
+                and event.key not in ("1", "2", "3", "4", "c", "d")
             ):
                 # Any other printable character begins composing: focus
                 # the input and insert exactly what was typed, appending
@@ -5893,7 +6356,7 @@ class MeshtasticPassApp(App[None]):
                 if (
                     event.is_printable
                     and event.character
-                    and event.key not in ("1", "2", "3", "c", "d")
+                    and event.key not in ("1", "2", "3", "4", "c", "d")
                 ):
                     dm_input = self.query_one("#dm-input", Input)
                     if not dm_input.disabled:
@@ -5942,6 +6405,33 @@ class MeshtasticPassApp(App[None]):
                     event.stop()
                 return
 
+        if self.current_tab == "passes":
+            # S opens the sort control, exactly as C opens CHAT's channel
+            # selector and D its DM selector. The grid owns the arrow
+            # keys -- they move the selection through several hundred
+            # names -- so there is no spare direction to reach a header
+            # control with, and this app's answer to that has always been
+            # an uppercase letter hotkey named in the footer.
+            if event.key.lower() == "s":
+                selector = self.query_one(PassSortSelector)
+                selector.focus()
+                selector.open_menu()
+                event.stop()
+                return
+            # Leaving the sort control without choosing anything. Picking
+            # an order already hands focus back (see dropdown_selected);
+            # this is the other path, so ESC out of a closed dropdown
+            # cannot strand the keyboard on a control whose arrows do
+            # nothing.
+            if (
+                isinstance(self.focused, PassSortSelector)
+                and not self.focused.is_open
+                and event.key in ("escape", "down")
+            ):
+                self.query_one(PassesView).focus()
+                event.stop()
+                return
+
         # PROFILE is intentionally absent: hidden from the visible top
         # nav (see TAB_NAMES), so no digit key may reach it. DM is
         # likewise absent here -- it is a MODE inside CHAT now (see
@@ -5950,7 +6440,8 @@ class MeshtasticPassApp(App[None]):
         tab_for_key = {
             "1": "connection",
             "2": "chat",
-            "3": "mesh",
+            "3": "passes",
+            "4": "mesh",
         }
         if event.key in tab_for_key:
             self.show_tab(tab_for_key[event.key])
@@ -6317,6 +6808,11 @@ class MeshtasticPassApp(App[None]):
                         dm_input.focus()
                     else:
                         self.query_one("#dm-log", ChatTranscript).focus()
+        elif tab_id == "passes":
+            self._refresh_passes()
+            # Focus the grid itself: its arrow keys are its own, unlike
+            # MESH's, which the App's on_key drives.
+            self.query_one(PassesView).focus()
         elif tab_id == "connection":
             self._refresh_device_options()
             self.query_one(DeviceSelector).focus()
@@ -6403,6 +6899,11 @@ class MeshtasticPassApp(App[None]):
 
     @on(KeyboardDropdown.Selected)
     async def dropdown_selected(self, event: KeyboardDropdown.Selected) -> None:
+        if event.setting_name == "pass_order":
+            self._pass_order = str(event.value)
+            self._refresh_passes()
+            self.query_one(PassesView).focus()
+            return
         if event.setting_name == "channel_index":
             await self._switch_channel(int(event.value))
             return
@@ -8041,6 +8542,10 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
+        # Before anything else: this sender is a PASSES encounter
+        # whatever happens to the message afterwards -- though not
+        # necessarily a DIRECT one (see _record_pass_from_message).
+        self._record_pass_from_message(message)
         try:
             self._refresh_mesh()
         except Exception:
@@ -8570,28 +9075,48 @@ class MeshtasticPassApp(App[None]):
         )
 
     def _trim_mounted_chat_window(self, transcript: ChatTranscript) -> None:
-        """Bound the mounted window without hiding NEW/unread messages."""
+        """Bound the mounted window, preferring not to hide NEW/unread.
+
+        Two thresholds, because the old single one had no upper bound at
+        all. Up to _mounted_chat_target the window trims only messages
+        that have been READ; past MOUNTED_CHAT_UNREAD_CEILING it trims
+        whatever is oldest, unread included.
+
+        The unbounded version is what made a machine left running
+        overnight go sluggish, and only when it was left UNATTENDED --
+        which is the detail that identifies it. Every arriving message
+        is unread until somebody looks, so with nobody looking the loop
+        hit an unread entry on its first iteration, broke, and mounted
+        another widget. By morning the transcript held every message of
+        the night, and the 1s timer walked all of them.
+
+        Trimming an unread message loses nothing. The text is in
+        chat_store, the entry comes back by scrolling up, and the unread
+        COUNT lives on ChannelChatState.unread_count -- a plain counter
+        incremented on arrival, never derived from what happens to be
+        mounted -- so CHAT(N) still reports every one of them.
+
+        A message with no message_id is never trimmed at any size: it is
+        not in the store yet, so the mounted widget is the only copy
+        that exists.
+        """
         trimmed = False
+        ceiling = self._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING
+        # One pass over the mounted widgets, not one pass per removal --
+        # coming back to a night of messages trims hundreds at once, and
+        # re-querying inside the loop made that quadratic exactly when
+        # the app was already struggling.
+        widgets = {
+            id(widget.entry): widget for widget in self.query(ChatEntryWidget)
+        }
         while len(self.chat_history) > self._mounted_chat_target:
             oldest = self.chat_history[0]
-            removable_index = (
-                0
-                if oldest.message_id is not None
-                and not oldest.is_new
-                and not oldest.unread
-                else None
-            )
-            if removable_index is None:
+            if oldest.message_id is None:
                 break
-            removed = self.chat_history.pop(removable_index)
-            widget = next(
-                (
-                    candidate
-                    for candidate in self.query(ChatEntryWidget)
-                    if candidate.entry is removed
-                ),
-                None,
-            )
+            if (oldest.is_new or oldest.unread) and len(self.chat_history) <= ceiling:
+                break
+            removed = self.chat_history.pop(0)
+            widget = widgets.pop(id(removed), None)
             if widget is not None:
                 widget.remove()
             trimmed = True
@@ -8636,6 +9161,9 @@ class MeshtasticPassApp(App[None]):
         current_time = monotonic() if now is None else now
         for widget in self.query(ChatEntryWidget):
             widget.refresh_timestamp(current_time)
+        if self.current_tab == "passes" and self._passes_dirty:
+            self._passes_dirty = False
+            self._refresh_passes()
         self._refresh_mesh(wall_now)
 
     def _mesh_last_message_activity(self) -> dict[str, float]:
@@ -8725,6 +9253,245 @@ class MeshtasticPassApp(App[None]):
             working_set, seen_depths=self._mesh_seen_hop_depths
         )
 
+    def _refresh_passes(self) -> None:
+        """Re-read the pass list and repaint PASSES.
+
+        Reads from the store rather than from any live radio state: a
+        pass is a record of having met someone, so the view must show
+        nodes the radio has since forgotten. Cheap enough to call on
+        every tab entry and every sort change -- 58 rows on the user's
+        own radio, and the ordering is a pure sort.
+        """
+        views = list(self.query(PassesView))
+        if not views:
+            return
+        view = views[0]
+        if self.chat_store is None:
+            view.set_passes(())
+        else:
+            try:
+                view.set_passes(self.chat_store.encounters(self._pass_order))
+            except ChatStoreError:
+                view.set_passes(())
+        total = len(view.passes)
+        passes = sum(1 for encounter in view.passes if encounter.has_pass)
+        count = self.query_one("#passes-count", Static)
+        # Two different numbers, and the second is the one the app is
+        # named after. NODES is everyone the radio has ever encountered;
+        # PASSES is the subset that exchanged a pass with us, which only
+        # another MeshtasticPass install can do. The PASSES count is
+        # printed even at zero -- unlike the omit-empty-fields rule the
+        # node bar follows, "0 PASSES" out of 196 NODES is itself the
+        # information (nobody out there is running this yet), and a
+        # field that vanishes at zero would read as a field that does
+        # not exist.
+        count.update(f" \u00b7 {total} NODES \u00b7 {passes} PASSES")
+        self._update_passes_node_bar()
+
+    def _update_passes_node_bar(self) -> None:
+        """One line describing the highlighted pass, MESH-bar shaped."""
+        bars = list(self.query("#passes-node-bar"))
+        if not bars:
+            return
+        views = list(self.query(PassesView))
+        encounter = views[0].selected if views else None
+        if encounter is None:
+            bars[0].update("")
+            return
+        bars[0].update(format_pass_bar(encounter, now=self._now()))
+
+    @on(PassesView.SelectionChanged)
+    def passes_selection_changed(self, _event: PassesView.SelectionChanged) -> None:
+        self._update_passes_node_bar()
+
+    @on(PassesView.OpenRequested)
+    def open_pass_menu(self, event: PassesView.OpenRequested) -> None:
+        """ENTER on a pass opens the SAME node menu CHAT's sender names do.
+
+        Not a shortcut straight into a DM, which is what this used to be.
+        A DM is one of several things a person wants from a name on this
+        board -- highlight it, reply to it, remove it -- and jumping
+        straight into a conversation made the other four unreachable.
+
+        This is CHAT's menu unchanged, which means it does NOT print the
+        node ID for a remote node (see _open_node_menu: that row exists
+        only in the is_local branch). Telling two identical cells apart
+        is the bar's job, and the bar states the node ID unconditionally
+        for exactly that reason -- see format_pass_bar. Arrow onto a
+        name and it is already answered, before any menu is opened.
+
+        Built the way CHAT builds its own (see open_user_menu): start
+        from what is ON RECORD for this node, then overlay whatever the
+        live NodeDB currently says. The order matters in that direction
+        -- PASSES exists to outlive the radio's own bounded NodeDB, so a
+        node the radio has since forgotten still opens a menu with the
+        name it was met under, rather than an empty one.
+        """
+        encounter = event.encounter
+        metadata = NodeMetadata(
+            encounter.node_id,
+            encounter.long_name,
+            encounter.short_name,
+            encounter.hops_away,
+        )
+        getter = getattr(self.radio, "get_node_metadata", None)
+        if callable(getter):
+            try:
+                current = getter(encounter.node_id)
+            except Exception:
+                current = None
+            if isinstance(current, NodeMetadata):
+                metadata = NodeMetadata(
+                    encounter.node_id,
+                    metadata.long_name or current.long_name,
+                    metadata.short_name or current.short_name,
+                    # Hops from the LIVE radio when it has them: the
+                    # recorded value is where the node was when we last
+                    # met it, which can be months stale.
+                    current.hops_away
+                    if current.hops_away is not None
+                    else metadata.hops_away,
+                    current.last_heard,
+                    current.is_local,
+                    is_unmessagable=current.is_unmessagable,
+                )
+        view = self.query_one(PassesView)
+        self._open_node_menu(
+            metadata, view, None, anchor=view.selected_region()
+        )
+
+    def _record_pass_encounters(
+        self, nodes: tuple[NodeMetadata, ...], *, now: float
+    ) -> None:
+        """Record every currently-known node as a PASSES entry (gossip).
+
+        Fed the FULL known-node tuple, not MESH's bounded working set:
+        the board deliberately shows at most a handful, while PASSES is
+        the record of everyone met.
+
+        A node at hops_away == 0 is recorded as HEARD DIRECTLY. That is
+        not an inference -- zero hops is the radio stating there is no
+        intermediary between us, which is the same fact this app already
+        reserves MESH ring 1 for. Waiting for a text message instead
+        would leave the heard/gossip split almost always empty: on a
+        real mesh you are in constant direct radio contact with your
+        neighbours (position, telemetry, nodeinfo) and receive text from
+        almost none of them. Measured on the user's own radio: 47 nodes
+        known, one of them at zero hops, and zero text messages during
+        the sample -- so the distinction the whole view rests on would
+        have shown nothing.
+
+        Any other depth is gossip: the radio knows of that node, but
+        whatever reached us came through somebody else.
+
+        Never allowed to break a refresh: PASSES is a side record, and a
+        storage problem must not take the MESH board down with it.
+
+        Records NOTHING from a simulated radio. Its nodes are inventions
+        (see SIMULATED_NODES), and a pass list is the one place in this
+        app where a row outlives the radio that made it -- so a fake one
+        written here is indistinguishable from a real encounter for ever
+        after. One --simulate run used to leave eight invented people in
+        the real list permanently, one of them a 13-cell "No Short Name"
+        that set the column width for the entire board.
+        """
+        store = self.chat_store
+        if store is None or getattr(self.radio, "is_simulated", False):
+            return
+        for node in nodes:
+            if getattr(node, "is_local", False):
+                continue
+            node_id = getattr(node, "node_id", None)
+            if not isinstance(node_id, str) or not node_id.strip():
+                continue
+            last_heard = getattr(node, "last_heard", None)
+            seen_at = (
+                float(last_heard)
+                if isinstance(last_heard, (int, float))
+                and not isinstance(last_heard, bool)
+                and last_heard > 0
+                else now
+            )
+            hops_away = getattr(node, "hops_away", None)
+            direct = (
+                isinstance(hops_away, int)
+                and not isinstance(hops_away, bool)
+                and hops_away == 0
+            )
+            # Suppression keys on directness as well as time: a node that
+            # becomes a direct neighbour without its timestamp moving is
+            # exactly the upgrade this view exists to show, and keying on
+            # the timestamp alone would skip it.
+            if self._recorded_passes.get(node_id) == (seen_at, direct):
+                continue
+            try:
+                store.record_encounter(
+                    node_id,
+                    seen_at=seen_at,
+                    long_name=getattr(node, "long_name", None),
+                    short_name=getattr(node, "short_name", None),
+                    hops_away=hops_away,
+                    heard_directly=direct,
+                )
+            except Exception:
+                continue
+            self._recorded_passes[node_id] = (seen_at, direct)
+            self._passes_dirty = True
+
+    def _record_pass_from_message(self, message: ReceivedMessage) -> None:
+        """Record the sender of an arriving message as a PASSES encounter.
+
+        NOT as a direct one. It is tempting to read "a packet from this
+        node reached us" as proximity, and that was this method's first
+        mistake: for a multi-hop message the packet that physically
+        arrived came from the LAST RELAY, not from the node that wrote
+        it. Hardware caught it -- a node six hops away was marked as
+        directly heard purely because its message got here.
+
+        ReceivedMessage carries no hop count (see radio_service), so this
+        path genuinely cannot tell a direct arrival from a relayed one
+        and must not guess. hops_away == 0 in the NodeDB sweep is the one
+        trustworthy proximity signal, and it stays the only thing that
+        sets heard_directly.
+
+        What this path is still worth: a sender's freshest names and
+        timestamp, which may be better than anything the sweep has --
+        and it is deliberately not write-suppressed, because a message
+        arriving is a real event about a real node.
+
+        Unless the radio is simulated, in which case the sender is an
+        invention too and nothing here may reach the store -- the same
+        rule, and for the same reason, as _record_pass_encounters.
+        """
+        store = self.chat_store
+        if store is None or getattr(self.radio, "is_simulated", False):
+            return
+        node_id = getattr(message, "sender_node_id", None)
+        if not isinstance(node_id, str) or not node_id.strip():
+            return
+        received_at = getattr(message, "radio_rx_at", None)
+        seen_at = (
+            float(received_at)
+            if isinstance(received_at, (int, float))
+            and not isinstance(received_at, bool)
+            and received_at > 0
+            else self._now()
+        )
+        try:
+            store.record_encounter(
+                node_id,
+                seen_at=seen_at,
+                long_name=getattr(message, "sender_long_name", None),
+                short_name=getattr(message, "sender_short_name", None),
+            )
+        except Exception:
+            return
+        self._passes_dirty = True
+        # Left out of the suppression map on purpose: this path never
+        # establishes directness, so it must not record a (time, direct)
+        # pair that could make the next sweep skip a real upgrade.
+        self._recorded_passes.pop(node_id, None)
+
     def _mesh_working_set(self, wall_now: float | None = None) -> tuple[MeshNodeState, ...]:
         """Build MESH's displayed real-node set without touching the board.
 
@@ -8754,6 +9521,9 @@ class MeshtasticPassApp(App[None]):
         if not all(isinstance(node, NodeMetadata) for node in nodes):
             nodes = ()
         current_time = self._now() if wall_now is None else wall_now
+        # PASSES sees every node the radio knows, before MESH bounds the
+        # list down to what fits on the board.
+        self._record_pass_encounters(nodes, now=current_time)
         working_set = build_mesh_working_set(
             nodes,
             now=current_time,
@@ -8855,6 +9625,15 @@ class MeshtasticPassApp(App[None]):
             # wording like the old "RADIO DISCONNECTED" either -- that
             # was exactly the kind of independent reinterpretation this
             # is meant to eliminate.
+            #
+            # The one thing that IS drawn here: the bare dot grid, when
+            # there is no stale topology to preserve because none has
+            # ever arrived. On a first connect the board would otherwise
+            # be a blank rectangle for the whole handshake, which reads
+            # as a broken view rather than a waiting one. render_empty_grid
+            # is itself a no-op once a working set exists, so a reconnect
+            # keeps showing what it was showing.
+            views[0].render_empty_grid(self._current_theme)
             return
         view = views[0]
         status = statuses[0]
@@ -11227,6 +12006,7 @@ class MeshtasticPassApp(App[None]):
         allow_reply: bool = True,
         allow_dm: bool = True,
         allow_traceroute: bool = False,
+        anchor: Region | None = None,
     ) -> None:
         """Open the shared CHAT/MESH node-details menu.
 
@@ -11244,6 +12024,15 @@ class MeshtasticPassApp(App[None]):
         says it cannot receive messages (metadata.is_unmessagable --
         see RadioService/NodeMetadata). Never offered for YOU (the
         is_local branch below has no actionable rows at all).
+
+        anchor overrides where the popup is placed, for a caller whose
+        selection is not its own widget. CHAT and MESH both anchor to a
+        real mounted widget -- a sender name, a node glyph -- and pass
+        nothing here. PASSES draws its entire grid as one widget, so
+        `origin` is the whole board and anchoring to it would put the
+        menu at the board's edge rather than beside the highlighted
+        name; it passes the selected cell's region instead. `origin`
+        still governs focus restoration either way.
 
         allow_traceroute defaults to False; TRACE ROUTE (Part C) is
         explicit, user-triggered RF traffic offered ONLY from MESH's own
@@ -11328,7 +12117,7 @@ class MeshtasticPassApp(App[None]):
         )
         width = max(cell_len(item.label) for item in items) + 4
         self.screen.mount(menu)
-        menu.place(origin.region, self.screen.region, width)
+        menu.place(origin.region if anchor is None else anchor, self.screen.region, width)
 
     def _activate_menu_item(self, metadata: NodeMetadata, action: str) -> None:
         """Dispatch a node-context-menu action -- REPLY needs the node's
@@ -11398,6 +12187,11 @@ class MeshtasticPassApp(App[None]):
             if widget.entry.node_id and widget.entry.node_id.lower() == node_id.lower():
                 widget.set_favorite(self.settings.is_favorite(node_id))
         self._refresh_mesh()
+        # PASSES reads is_favorite at render time, so it needs telling
+        # that the answer changed -- including when the highlight was
+        # toggled from CHAT or MESH rather than from the grid itself.
+        for view in self.query(PassesView):
+            view.refresh()
         self._close_user_menu()
 
     def _request_node_remove(self, metadata: NodeMetadata) -> None:
@@ -12036,14 +12830,18 @@ class MeshtasticPassApp(App[None]):
                     "CTRL+P edit channel    F4 quit"
                 )
         elif self.current_tab == "chat" and self.current_dm_node_id is None:
-            text = "C channel    1-3 tabs    F4 quit"
+            text = "C channel    1-4 tabs    F4 quit"
         elif self.current_tab == "chat":
             text = "C channel    CTRL+D delete    ESC back    F4 quit"
+        elif self.current_tab == "passes":
+            # S is the only way to reach the sort control, so the footer
+            # is the only place a person finds out it exists.
+            text = "S sort    1-4 tabs    F4 quit"
         else:
             text = (
-                "1-3 tabs    F4 quit"
+                "1-4 tabs    F4 quit"
                 if self.current_tab == "mesh"
-                else "1-3 switch tabs    F4 quit"
+                else "1-4 switch tabs    F4 quit"
             )
         self.query_one("#footer", Static).update(text)
 
@@ -12498,19 +13296,46 @@ class MeshtasticPassApp(App[None]):
                 # widget -- land on the SAME neutral per-mode target
                 # C/D/ESC already use elsewhere, never a dropdown.
                 self._focus_chat_mode(self._chat_mode)
-        dm_status_widgets = list(self.query("#dm-connection-status"))
+        # DM owns a status line of its own: written and shown here while
+        # NOT ONLINE, hidden here once ONLINE. MESH is written here but
+        # hidden by _update_mesh_node_bar, because its line has a second
+        # job. CHAT and PASSES have no such line at all -- their status
+        # goes inside their header dropdown (below, and via
+        # ChannelSelector's own override above), which is what keeps the
+        # view from reflowing every time the radio reconnects.
+        self_hiding = list(self.query("#dm-connection-status"))
+        # PASSES puts the connecting state where CHAT does: inside the
+        # dropdown itself, replacing "[ RECENT v ]" for as long as it
+        # lasts. Nothing is added to the layout and nothing moves.
+        #
+        # The count beside it deliberately stays. CHAT hides its network
+        # name while connecting because that is a fact about a live
+        # radio; "220 NODES" is a fact about the database, just as true
+        # with no radio attached, and hiding it would suggest the list
+        # itself was unavailable.
+        for selector in self.query(PassSortSelector):
+            was_focused = selector.has_focus
+            selector.set_status_override(self._connection_status_rich_text())
+            # An overridden dropdown is disabled (see set_status_override),
+            # so focus must not be left sitting on it -- the same hazard
+            # CHAT handles a few lines above, and here it would leave the
+            # arrows doing nothing on a board that is entirely arrows.
+            if was_focused and selector.disabled:
+                views = list(self.query(PassesView))
+                if views:
+                    views[0].focus()
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:
                 widget = mesh_status_widgets[0]
                 widget.update(status_rich_text)
                 widget.display = True
-            if dm_status_widgets:
-                widget = dm_status_widgets[0]
+            for widget in self_hiding:
                 widget.update(status_rich_text)
                 widget.display = True
-        elif dm_status_widgets:
-            dm_status_widgets[0].display = False
+        else:
+            for widget in self_hiding:
+                widget.display = False
 
     def _advance_connection_animation(self) -> None:
         if self._radio_state is RadioState.ONLINE:
@@ -12722,6 +13547,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _names_to_measure(chat_store: ChatStore | None) -> tuple[str, ...]:
+    """The display names startup should measure the terminal against.
+
+    PASSES holds every node ever met, so its names are both the widest
+    variety of emoji the app will be asked to draw and the only place
+    where a mis-measured one corrupts a grid. Returns nothing rather than
+    raising if the store cannot be read -- an unmeasured terminal is a
+    cosmetic problem, and refusing to start over it would not be.
+    """
+    if chat_store is None:
+        return ()
+    try:
+        return tuple(encounter.display_name for encounter in chat_store.encounters())
+    except Exception:
+        return ()
+
+
 def main() -> int:
     args = parse_args()
     settings = AppSettings.load()
@@ -12742,10 +13584,18 @@ def main() -> int:
     except ChatStoreError as error:
         chat_store = None
         history_error = str(error)
+    # Measure the terminal BEFORE Textual takes the screen -- it needs to
+    # print characters and read the cursor position back, which is not
+    # possible once a Textual app owns stdin. Measured against the names
+    # about to be displayed, so the cost is bounded by what is actually
+    # on the board. Never raises; a terminal that will not answer yields
+    # no measurements and everything below behaves as it always has.
+    painted_widths = measure_terminal(_names_to_measure(chat_store))
     app = MeshtasticPassApp(
         radio,
         settings,
         chat_store=chat_store,
+        painted_widths=painted_widths,
         history_error=history_error,
     )
     try:
