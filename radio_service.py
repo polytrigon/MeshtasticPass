@@ -784,15 +784,30 @@ class RadioService:
 
         stopped = stop_event or Event()
 
+        # The receive trace records [RX] packet lines only, and connection
+        # state changes went to print(), which Textual swallows. That left
+        # the log unable to answer the one question a silent gap in it
+        # raises: did the link drop and come back, or did it stall while
+        # the app went on believing it was connected? Those need opposite
+        # fixes, so the transitions belong in the same file as the packets.
         try:
             while not stopped.is_set():
+                if rx_debug_enabled():
+                    rx_debug_log(f"LINK connecting target={self.device_path}")
                 yield RadioEvent(RadioState.CONNECTING)
 
                 try:
                     info = self.connect()
                 except RadioConnectionError as error:
+                    if rx_debug_enabled():
+                        rx_debug_log(f"LINK failed reason={error}")
                     yield RadioEvent(error.state, message=str(error))
                 else:
+                    if rx_debug_enabled():
+                        rx_debug_log(
+                            f"LINK online node={info.node_id} "
+                            f"short={info.short_name} nodes={info.known_nodes}"
+                        )
                     yield RadioEvent(RadioState.ONLINE, info=info)
 
                     while not stopped.is_set():
@@ -805,6 +820,8 @@ class RadioService:
                         break
 
                     self.close()
+                    if rx_debug_enabled():
+                        rx_debug_log("LINK offline reason=connection_lost")
                     yield RadioEvent(
                         RadioState.OFFLINE,
                         message=f"Connection to {self.device_path} was lost.",
