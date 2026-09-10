@@ -27,6 +27,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from rich.color import Color
 from textual.widgets import Static
 
 from types import SimpleNamespace
@@ -41,6 +42,18 @@ from theme_palette import THEME_PALETTES
 
 
 T = 1_700_000_000.0
+
+
+def _painted(token: str) -> Color:
+    """A palette token as the Color a rendered span actually carries.
+
+    Never compare a span's colour NAME to a palette string: Rich
+    normalises "#B84DFF" to "#b84dff", so the spellings differ while the
+    colours are identical -- which is a test failing over how a value
+    was typed. Parsing both sides compares the colour itself, and keeps
+    working if a palette ever uses a named colour instead of hex.
+    """
+    return Color.parse(token)
 
 
 def _cells(view: PassesView) -> dict[str, object]:
@@ -99,10 +112,6 @@ class PassesHarness(unittest.IsolatedAsyncioTestCase):
         """
         app._radio_state = RadioState.ONLINE
         app._update_chat_connection_state()
-        # Twice: the sort control was DISABLED a moment ago, and a
-        # widget only re-enters the focus chain once the refresh that
-        # re-enabled it has actually been applied.
-        await pilot.pause()
         await pilot.pause()
 
 
@@ -209,9 +218,9 @@ class PassesViewTests(PassesHarness):
 
             by_name = _cells(view)
             self.assertEqual(set(by_name), {"ALFA", "BRVO", "CHRL"})
-            self.assertEqual(by_name["BRVO"].name, palette.accent)
+            self.assertEqual(by_name["BRVO"], _painted(palette.accent))
             for name in ("ALFA", "CHRL"):
-                self.assertEqual(by_name[name].name, palette.base)
+                self.assertEqual(by_name[name], _painted(palette.base))
 
 
 class PassMenuTests(PassesHarness):
@@ -356,8 +365,8 @@ class PassHighlightTests(PassesHarness):
             self.assertNotIn(palette.accent2, (palette.base, palette.accent))
 
             by_name = _cells(view)
-            self.assertEqual(by_name["ALFA"].name, palette.accent2)
-            self.assertEqual(by_name["BRVO"].name, palette.base)
+            self.assertEqual(by_name["ALFA"], _painted(palette.accent2))
+            self.assertEqual(by_name["BRVO"], _painted(palette.base))
 
     async def test_highlighting_from_the_menu_repaints_the_grid(self) -> None:
         """The recurring failure this project watches for.
@@ -372,14 +381,14 @@ class PassHighlightTests(PassesHarness):
             await self._open_passes(pilot)
             view = app.query_one(PassesView)
             palette = THEME_PALETTES[app._current_theme]
-            self.assertEqual(_cells(view)["ALFA"].name, palette.base)
+            self.assertEqual(_cells(view)["ALFA"], _painted(palette.base))
 
             # The real production path, not a direct settings poke: the
             # menu action is what a person actually triggers.
             app._activate_node_action("!aaaa0001", "favorite")
             await pilot.pause()
 
-            self.assertEqual(_cells(view)["ALFA"].name, palette.accent2)
+            self.assertEqual(_cells(view)["ALFA"], _painted(palette.accent2))
 
 
 class PassMenuKeyTests(PassesHarness):
