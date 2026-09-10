@@ -109,6 +109,13 @@ from terminal_width import (
     measure_terminal,
     plan_corrections,
 )
+from backlog import (
+    Backlog,
+    backlog_label,
+    is_banked,
+    record_banked,
+    settle,
+)
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -2099,6 +2106,41 @@ class EndOfChatHistoryMarker(Static):
             id="end-of-chat-history",
             markup=False,
         )
+
+
+class BacklogIndicator(Static):
+    """The newest block in the transcript while the radio's backlog drains.
+
+    A radio left running collects messages and hands them over when a
+    client finally attaches, so the first thing a person sees after
+    opening the app is a burst arriving faster than anyone can read,
+    indistinguishable from a very busy mesh. This says what is actually
+    happening, in the place they are already looking: the bottom of the
+    transcript, where the newest message would be.
+
+    Animated on the SAME frame SENDING's arrows use (see
+    _sending_arrows_text/SENDING_ARROW_FRAMES) rather than a timer of
+    its own -- two animations on the same screen ticking independently
+    read as a glitch, and this app already made that decision once.
+
+    Not focusable and never an entry: it is a status line that happens
+    to live in the transcript, and arrow navigation must not stop on
+    something that is about to vanish.
+    """
+
+    can_focus = False
+
+    def __init__(self) -> None:
+        super().__init__(id="backlog-indicator", markup=False)
+        self._count = 0
+
+    def update_backlog(self, count: int, animation_frame: int, theme: str) -> None:
+        self._count = count
+        palette = THEME_PALETTES[theme]
+        text = _sending_arrows_text(animation_frame, theme)
+        text.append("  ")
+        text.append(backlog_label(count), style=Style(color=palette.base))
+        self.update(text)
 
 
 class StartOfChannelHistoryMarker(Static):
@@ -5409,6 +5451,16 @@ class MeshtasticPassApp(App[None]):
         border: none;
     }
 
+    #backlog-indicator {
+        width: 100%;
+        height: 1;
+        color: $snow_base;
+    }
+
+    Screen.theme-{THEME} #backlog-indicator {
+        color: ${THEME}_base;
+    }
+
     #chat-new-below {
         height: 1;
         color: $snow_accent;
@@ -5697,6 +5749,12 @@ class MeshtasticPassApp(App[None]):
         self._has_older_history = False
         self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
+        # When this session attached, and how much history the radio
+        # handed over afterwards (see backlog.py). _connected_at is the
+        # dividing line: anything the radio timestamped before it was
+        # already sitting on the device.
+        self._connected_at: float | None = None
+        self._backlog = Backlog()
         self._user_menu: ViewportMenu | None = None
         self._user_menu_origin: Widget | None = None
         self._user_menu_scroll_target: ScrollableContainer | None = None
@@ -8674,6 +8732,13 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
+        # History the radio was already holding, rather than something
+        # that just happened (see backlog.py). Counted before anything
+        # else can return early, so the indicator's number matches what
+        # actually arrived.
+        if is_banked(getattr(message, "radio_rx_at", None), self._connected_at):
+            self._backlog = record_banked(self._backlog, self._monotonic())
+            self._refresh_backlog_indicator()
         # Before anything else: this sender is a PASSES encounter
         # whatever happens to the message afterwards -- though not
         # necessarily a DIRECT one (see _record_pass_from_message).
@@ -9204,6 +9269,37 @@ class MeshtasticPassApp(App[None]):
                 if widget.entry is following_entry
             ),
             None,
+        )
+
+    def _refresh_backlog_indicator(self) -> None:
+        """Mount, update or remove the drain indicator.
+
+        Mounted LAST inside the transcript so it is the newest block --
+        the position the next message would take, which is where
+        somebody watching a burst arrive is already looking. Removed
+        rather than hidden once the drain is over: a spent indicator
+        left in the DOM is one more thing every later mount has to be
+        positioned around.
+
+        Cheap enough to call on every arriving message and every 0.45s
+        tick, because the common case is "not draining, nothing
+        mounted" and returns immediately.
+        """
+        existing = list(self.query(BacklogIndicator))
+        if not self._backlog.draining:
+            for indicator in existing:
+                indicator.remove()
+            return
+        transcripts = list(self.query("#chat-log"))
+        if not transcripts:
+            return
+        indicator = existing[0] if existing else BacklogIndicator()
+        if not existing:
+            transcripts[0].mount(indicator)
+        indicator.update_backlog(
+            self._backlog.count,
+            self._send_animation_frame,
+            self._current_theme,
         )
 
     def _trim_mounted_chat_window(self, transcript: ChatTranscript) -> None:
@@ -10331,6 +10427,11 @@ class MeshtasticPassApp(App[None]):
             SENDING_ARROW_FRAMES
         ) + 1
         now = monotonic()
+        # The backlog indicator shares this frame rather than running a
+        # timer of its own, and this is also where it notices the drain
+        # has gone quiet and retires itself.
+        self._backlog = settle(self._backlog, self._monotonic())
+        self._refresh_backlog_indicator()
         # Every channel's AND every DM conversation's entries, not just
         # the currently-viewed one -- a send left in flight on a channel
         # or DM the user has since switched away from must still
@@ -13157,6 +13258,15 @@ class MeshtasticPassApp(App[None]):
         # already-ONLINE radio calling this again (e.g. a redundant
         # event) must never re-trigger a sync.
         was_online = self._radio_state is RadioState.ONLINE
+        # The dividing line the backlog is measured against. Set on the
+        # TRANSITION into ONLINE only: a redundant ONLINE event must not
+        # move it forward, or messages still draining would start
+        # looking live.
+        if state is RadioState.ONLINE and not was_online:
+            self._connected_at = self._now()
+            self._backlog = Backlog()
+        elif state is not RadioState.ONLINE:
+            self._connected_at = None
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
         # TRACE ROUTE (Part C): a disconnect (for any reason -- dropped
