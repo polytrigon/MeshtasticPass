@@ -14,7 +14,11 @@ from typing import Any, Callable, Iterator
 
 from geo import GeoPosition, make_geo_position
 from node_activity import count_active_other_nodes
-from serial_devices import discover_serial_devices
+from serial_devices import (
+    describe_connection_target,
+    discover_connection_targets,
+    parse_connection_target,
+)
 
 
 RX_DEBUG_ENV_VAR = "MESHTASTICPASS_RX_DEBUG"
@@ -679,17 +683,28 @@ class RadioService:
             self.close()
             message = str(error).strip() or error.__class__.__name__
             raise RadioConnectionError(
-                f"Could not connect to the radio on {self.device_path}: {message}"
+                f"Could not connect to the radio on "
+                f"{describe_connection_target(self.device_path)}: {message}"
             ) from error
 
     def available_device_paths(self) -> tuple[str, ...]:
-        """Return serial devices currently reported by pyserial."""
-        return discover_serial_devices()
+        """Connection targets currently on offer: serial devices, plus the
+
+        local meshtasticd target when something is listening on its port
+        (see serial_devices.discover_connection_targets -- a passive
+        socket probe, no protocol spoken and no RF generated).
+        """
+        return discover_connection_targets()
 
     def set_device_path(self, device_path: str) -> None:
-        """Change ports only after closing the current serial interface."""
-        if not isinstance(device_path, str) or not device_path.strip():
-            raise ValueError("USB device path cannot be empty.")
+        """Change targets only after closing the current interface.
+
+        Accepts either form of connection target (see
+        serial_devices.parse_connection_target); the argument keeps its
+        name because it is also the persisted config key, and every
+        already-saved settings file holds a serial path under it.
+        """
+        parse_connection_target(device_path)
         self.close()
         self.device_path = device_path.strip()
         self._direct_observations.clear()
@@ -2150,13 +2165,33 @@ class RadioService:
                 pass
 
     def _open_interface(self) -> Any:
-        # Import here so a missing dependency becomes a friendly runtime error.
-        from meshtastic.serial_interface import SerialInterface
+        """Open the SDK interface this connection target calls for.
+
+        SerialInterface for a device path, TCPInterface for a tcp://
+        target. Both are MeshInterface subclasses, so everything above
+        this method -- the node database, sends, the pubsub connection
+        events, hardware_identity() and the whole capability matrix --
+        is identical either way and needs no transport branch. This is
+        the ONLY place the two differ.
+
+        The TCP path is what makes Linux-native radios work: on a
+        HackerGadgets uConsole AIO board the SX1262 hangs off the Pi's
+        SPI with GPIO IRQ/Busy/Reset lines and is owned by meshtasticd,
+        so there is no serial port to open -- meshtasticd republishes
+        the same API on TCP 4403 instead.
+        """
+        # Imported here so a missing dependency becomes a friendly runtime error.
         from pubsub import pub
 
+        kind, location, port = parse_connection_target(self.device_path)
         self._subscribe_to_events(pub)
+        if kind == "tcp":
+            from meshtastic.tcp_interface import TCPInterface
 
-        return SerialInterface(devPath=self.device_path)
+            return TCPInterface(hostname=location, portNumber=port)
+        from meshtastic.serial_interface import SerialInterface
+
+        return SerialInterface(devPath=location)
 
     def _subscribe_to_events(self, pub: Any) -> None:
         if self._pub is not None:

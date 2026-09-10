@@ -101,6 +101,7 @@ from pass_layout import (
     lay_out_passes,
     pass_row_offset,
 )
+from serial_devices import describe_connection_target
 from terminal_width import PaintedWidths, measure_terminal
 from radio_service import (
     ChannelInfo,
@@ -510,8 +511,16 @@ class DeviceSelector(KeyboardDropdown):
     def __init__(self, device_path: str, options: tuple[str, ...]) -> None:
         super().__init__(
             "device_path",
-            "USB DEVICE",
-            (DropdownOption(path, path) for path in options),
+            # Not "USB DEVICE" any more: this list can also offer a
+            # tcp:// target for a Linux-native radio owned by
+            # meshtasticd (a HackerGadgets AIO board has no serial port
+            # at all). The setting key stays device_path for config
+            # compatibility -- see AppSettings.is_valid_device_path.
+            "RADIO",
+            (
+                DropdownOption(describe_connection_target(path), path)
+                for path in options
+            ),
             device_path,
             widget_id="device-selector",
             label_width=CONNECTION_LABEL_WIDTH,
@@ -2576,6 +2585,58 @@ def _mesh_active_hop_counts(
     }
 
 
+def mesh_hop_rings_for(
+    working_set: tuple[MeshNodeState, ...],
+    *,
+    seen_depths: Iterable[int] = (),
+) -> dict[str, int]:
+    """Each remote node's ring, ranked over `seen_depths` plus the working
+    set's own depths (see _mesh_hop_ring_ladder for the ranking itself).
+
+    Pure, and complete from the working set alone: a caller with no
+    session history passes no seen_depths and still gets correct rings
+    for the nodes it holds. MeshtasticPassApp._mesh_hop_rings adds the
+    depths seen so far this session, so the ladder ratchets rather than
+    collapsing under a node that leaves.
+
+    RING 1 IS NEVER GIVEN TO AN UNKNOWN DEPTH. "We do not know how deep
+    this is" is the one state ranking cannot place, so it takes the ring
+    just beyond the deepest measured one -- but never ring 1, which
+    means "directly reachable, no intermediary". Flooring at 2 is not
+    cosmetic: on a mesh where NO node reports a hop count the ladder is
+    empty, and an unfloored `max(..., default=0) + 1` put every unknown
+    node on ring 1, telling the user every node was a direct neighbour.
+    That is the claim reserving ring 1 was meant to protect, arrived at
+    from the opposite direction.
+    """
+    depths = {
+        depth for depth in seen_depths if depth is not None and depth >= 0
+    }
+    depths |= {
+        state.node.hops_away
+        for state in working_set
+        if not state.node.is_local
+        and state.node.hops_away is not None
+        and state.node.hops_away >= 0
+    }
+    ladder = _mesh_hop_ring_ladder(depths)
+    unknown_ring = min(
+        max(max(ladder.values(), default=0) + 1, 2), MESH_UNKNOWN_HOPS_RING
+    )
+    rings: dict[str, int] = {}
+    for state in working_set:
+        node = state.node
+        if node.is_local:
+            continue
+        depth = node.hops_away
+        rings[node.node_id] = (
+            ladder.get(depth, unknown_ring)
+            if depth is not None and depth >= 0
+            else unknown_ring
+        )
+    return rings
+
+
 class MeshNodeWidget(Static):
     """The node's glyph: a single cell, anchored exactly on its grid
 
@@ -2892,6 +2953,16 @@ class MeshTopologyView(Container):
         )
         self._selected_node_id = ""
         self._working_set: tuple[MeshNodeState, ...] = ()
+        # The hop rings last used to paint this board, and the exact
+        # working set they were computed for. A re-render triggered by
+        # selection or resize hands set_nodes the SAME working set back
+        # and supplies no rings; reusing them keeps the app's ratcheted
+        # ladder (which remembers depths seen earlier this session, and so
+        # can differ from what this working set alone implies) rather than
+        # silently re-deriving a shallower one and reflowing the board on
+        # a mere selection change.
+        self._node_rings: dict[str, int] = {}
+        self._node_rings_source: tuple[MeshNodeState, ...] | None = None
         self._base_positions: dict[str, tuple[int, int]] = {}
         self._relay_stages: tuple[RelayStage, ...] = ()
         self._edge_node_ids: frozenset[str] = frozenset()
@@ -3086,6 +3157,7 @@ class MeshTopologyView(Container):
         *,
         theme: str,
         now: float,
+        node_rings: Mapping[str, int] | None = None,
     ) -> None:
         """Render the current working set, recentered on the selection.
 
@@ -3179,7 +3251,27 @@ class MeshTopologyView(Container):
         # must never be treated as zero or imply any specific path depth --
         # and a STALE node still gets none either, since it has no
         # known-active route to draw stages along.
-        node_rings = getattr(self.app, "_mesh_node_rings", {})
+        # Rings come from the caller when it has them (_refresh_mesh
+        # passes its ratcheted ladder), from the previous render when this
+        # is the same working set being re-painted, and otherwise are
+        # derived from THIS working set.
+        #
+        # What must NOT happen is reading self.app._mesh_node_rings here.
+        # That dict is keyed by whatever nodes the app last refreshed, so
+        # for any caller handing set_nodes a different working set it is
+        # non-empty and entirely irrelevant: every lookup misses, every
+        # node defaults to ring 1, and the board renders with no hop
+        # markers at all -- not an error, just silently less than the data
+        # it was given. The view now answers from the working set in its
+        # hands.
+        if node_rings is None:
+            node_rings = (
+                self._node_rings
+                if working_set is self._node_rings_source
+                else mesh_hop_rings_for(working_set)
+            )
+        self._node_rings = dict(node_rings)
+        self._node_rings_source = working_set
         active_hop_counts = {
             node_id: node_rings[node_id] - 1
             for node_id in _mesh_active_hop_counts(working_set, now=now)
@@ -6894,7 +6986,7 @@ class MeshtasticPassApp(App[None]):
             self._show_connection(RadioState.CONNECTING)
             self._monitor.start()
         except (OSError, ValueError) as error:
-            status.update(f"USB DEVICE NOT CHANGED — {error}")
+            status.update(f"RADIO NOT CHANGED — {error}")
 
     def _connection_nav_controls(self) -> list[Widget]:
         """The explicit, ordered CONNECTION/CONFIG up/down focus list --
@@ -9157,20 +9249,9 @@ class MeshtasticPassApp(App[None]):
             and state.node.hops_away is not None
             and state.node.hops_away >= 0
         }
-        ladder = _mesh_hop_ring_ladder(self._mesh_seen_hop_depths)
-        unknown_ring = min(max(ladder.values(), default=0) + 1, MESH_UNKNOWN_HOPS_RING)
-        rings: dict[str, int] = {}
-        for state in working_set:
-            node = state.node
-            if node.is_local:
-                continue
-            depth = node.hops_away
-            rings[node.node_id] = (
-                ladder.get(depth, unknown_ring)
-                if depth is not None and depth >= 0
-                else unknown_ring
-            )
-        return rings
+        return mesh_hop_rings_for(
+            working_set, seen_depths=self._mesh_seen_hop_depths
+        )
 
     def _refresh_passes(self) -> None:
         """Re-read the pass list and repaint PASSES.
@@ -9682,7 +9763,13 @@ class MeshtasticPassApp(App[None]):
             column_count=MESH_LOGICAL_GRID_COLUMNS,
             min_extent=self._mesh_extent_ratchet,
         )
-        view.set_nodes(working_set, base_positions, theme=self._current_theme, now=current_time)
+        view.set_nodes(
+            working_set,
+            base_positions,
+            theme=self._current_theme,
+            now=current_time,
+            node_rings=self._mesh_node_rings,
+        )
         # Called again here (the earlier call above only ever sees LAST
         # cycle's selected_node_id, since set_nodes -- which can fix up
         # selection, e.g. when the previously selected node just

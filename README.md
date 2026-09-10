@@ -1,29 +1,31 @@
 # MeshtasticPass - A Custom uConsole Meshtastic Chat Client
 
-This project began because I was having a difficult time finding a custom 
+This project began because I was having a difficult time finding a custom
 meshtastic chat client that matched the aesthetic of the Clockwork uConsole.
-So at it's core it's a simple chat client that should handle the majority of
-functions that are neccessary to communicate on the meshtastic network. However
+So at its core it's a simple chat client that should handle the majority of
+functions that are necessary to communicate on the meshtastic network. However
 the ultimate goal is to build an extra layer on top of meshtastic that enables
-the sharing of profiles through proximity, similar to the <a href="https://www.nintendo.com/en-gb/Hardware/Nintendo-3DS-Family/StreetPass/What-is-StreetPass-/What-is-StreetPass-827701.html?srsltid=AfmBOooUZNyrtWkPAhIn3gKmHdLussQEdnuykfBuIPBdSH2fAcvNThEk">Nintendo 3DS street
-pass system.</a>
+the sharing of profiles through proximity, similar to the [Nintendo 3DS StreetPass
+system](https://www.nintendo.com/en-gb/Hardware/Nintendo-3DS-Family/StreetPass/What-is-StreetPass-/What-is-StreetPass-827701.html).
 
 Plug a Meshtastic ESP32 radio into a uConsole over USB and MeshtasticPass gives
 you channel chat, direct messages, persistent local history, delivery-state
 feedback, and a passive map of the mesh around you -- all in a terminal UI
 driven entirely from the keyboard, with no mouse and no touchscreen required.
 
+![The MESH board in the MATRIX theme, running on a ClockworkPi uConsole](assets/mesh-view.jpg)
+
 **This is early-stage software and is being shared for testing.** Expect rough
 edges, and see [Known limitations](#known-limitations) before you file anything.
 MeshtasticPass is an independent project, not affiliated with or endorsed by
 Meshtastic.
 
-# MeshtasticPass Philosophy
+## MeshtasticPass Philosophy
 
 MeshtasticPass isn't intended to be the end all be all most productive meshtastic
 chat client, for this reason the mesh view isn't your typical geographic-centric
-representation of the mesh. This is the root of the app's philosophy. Give you 
-just as much information as required. As mentioned above the ultimate goal of 
+representation of the mesh. This is the root of the app's philosophy. Give you
+just as much information as required. As mentioned above the ultimate goal of
 this app isn't to just be another chat client, it's to eventually enable peer
 to peer sharing of profiles on the meshtastic network through discrete packets.
 
@@ -99,9 +101,13 @@ Note that `q` is ordinary text, not a quit key -- you can type it in a message
 without the app closing. Direct messages are a mode inside CHAT rather than a
 separate tab, reached from the header's DM peer selector.
 
+![CONNECTION/CONFIG showing the connected radio, identity and preset](assets/settings-view.jpg)
+
 **CONNECTION/CONFIG** is the radio connection, device selection, your identity,
 channel management, and appearance settings (SNOW, AMBER and MATRIX themes,
 UI scale).
+
+![CHAT on the primary channel, with delivery ticks and relative receive times](assets/chat-view.jpg)
 
 **CHAT** is the currently selected broadcast channel, with persistent history,
 per-message delivery state, and unread tracking. History survives restarts.
@@ -143,7 +149,15 @@ thing on this board that transmits, and only when you ask it to.
 
 1. **Does it connect?** Different radios, different USB devices, different
    Linux distributions. The connection path has only been exercised on a
-   uConsole with an ESP32.
+   uConsole with a USB-attached ESP32.
+
+   **If you have a HackerGadgets AIO board**, start `meshtasticd` as its
+   setup guide describes, then open CONNECTION/CONFIG: the RADIO list
+   should offer `meshtasticd (localhost:4403)` alongside any serial
+   devices. Picking it should connect, populate the identity and radio
+   rows, and let CHAT and MESH work normally. Tell me what happens either
+   way -- a failure here is more useful to me right now than a success
+   anywhere else.
 2. **Unplug the radio mid-session,** then plug it back in. It should reconnect on
    its own and keep working.
 3. **Send and receive on a real mesh.** Delivery states, ordering when packets
@@ -167,19 +181,31 @@ thing on this board that transmits, and only when you ask it to.
 
 ## Known limitations
 
-- USB serial only. `meshtasticd` and HackerGadgets integration are not
-  implemented.
+- **AIO / meshtasticd support is new and untested on real hardware.**
+  MeshtasticPass can now connect over TCP to a `meshtasticd` daemon as well
+  as to a USB serial radio, which is what a HackerGadgets uConsole AIO
+  board needs -- its SX1262 hangs off the Pi's SPI and has no serial port.
+  The parsing and discovery around it are unit-tested, but no one has yet
+  confirmed an actual connection to an AIO board. If you have one, this is
+  the single most useful thing you can try.
 - Tested on one hardware combination: ClockworkPi uConsole plus a Meshtastic
   ESP32.
-- Some tests currently fail on `main`, and they are known rather than caused by
-  your setup. Two are real defects
-  (`test_collision_routing_fallback_cannot_leave_an_orphan_marker` and
-  `test_arrow_navigation_reaches_and_recenters_on_an_off_screen_node`); the
-  rest still assert the older "one marker per hop" rule that the ring layout
-  replaced, and are being updated.
-- `test_you_and_remote_selection_yield_identical_logical_graph` is flaky. It
-  drives the board by hand while the app's own 1s refresh is running, and
-  sometimes loses that race. A re-run usually passes.
+- Some tests in `tests/test_mesh_topology.py` fail. They are known, and none of
+  them is caused by your setup. They fall into two groups.
+
+  Most still assert the old "one marker per hop" rule that the hop-ring layout
+  replaced -- markers now count RINGS crossed. Those are being updated one at a
+  time, against each fixture's own depths rather than by copying whatever the
+  code currently emits, so an expectation cannot be quietly fitted to a bug.
+
+  The rest are open questions rather than stale expectations: whether a node
+  showing the TRACE ROUTE star should still draw anonymous hop markers; why a
+  GPS update no longer reflows placement; arrow navigation landing on a
+  different node than it used to; and one traceroute label lookup that raises.
+
+- `test_you_and_remote_selection_yield_identical_logical_graph` can fail
+  intermittently. It drives the board by hand while the app's own 1s refresh is
+  running and sometimes loses that race. A re-run usually passes.
 
 ## Reporting problems
 
