@@ -13319,16 +13319,18 @@ class MeshtasticPassApp(App[None]):
         # with no radio attached, and hiding it would suggest the list
         # itself was unavailable.
         for selector in self.query(PassSortSelector):
-            was_focused = selector.has_focus
-            selector.set_status_override(self._connection_status_rich_text())
-            # An overridden dropdown is disabled (see set_status_override),
-            # so focus must not be left sitting on it -- the same hazard
-            # CHAT handles a few lines above, and here it would leave the
-            # arrows doing nothing on a board that is entirely arrows.
-            if was_focused and selector.disabled:
-                views = list(self.query(PassesView))
-                if views:
-                    views[0].focus()
+            # blocking=False: sorting a list held on disk needs no radio
+            # (see set_status_override). The control only shows the
+            # connection state because putting it anywhere else would
+            # reflow the grid -- and a layout decision must not take a
+            # working feature away for the length of a handshake.
+            #
+            # Nothing to do about focus here for the same reason: the
+            # control never becomes inert, so it can never strand the
+            # keyboard the way CHAT's channel selector can.
+            selector.set_status_override(
+                self._connection_status_rich_text(), blocking=False
+            )
         if status_rich_text is not None:
             mesh_status_widgets = list(self.query("#mesh-connection-status"))
             if mesh_status_widgets:

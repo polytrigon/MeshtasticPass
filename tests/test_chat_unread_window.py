@@ -76,11 +76,17 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
         for index in range(count):
             app._accept_received_message(
                 ReceivedMessage(
-                    text=f"message {index}",
                     sender_node_id="!aaaa0001",
                     sender_long_name="Alfa Trail",
                     sender_short_name="ALFA",
                     channel_index=0,
+                    text=f"message {index}",
+                    # Required, no defaults -- an ordinary decoded packet
+                    # carries all three, and omitting them is a TypeError
+                    # rather than a plausible message.
+                    rssi=None,
+                    snr=None,
+                    packet_id=1000 + index,
                 )
             )
         await pilot.pause()

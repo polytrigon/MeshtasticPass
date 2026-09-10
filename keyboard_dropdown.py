@@ -71,6 +71,10 @@ class KeyboardDropdown(Static):
         self.value = value
         self.is_open = False
         self._status_override: Text | None = None
+        # Whether the current override also makes the control inert (see
+        # set_status_override). Tracked separately from the override
+        # itself, because a non-blocking one still has to render.
+        self._status_blocks = False
         self._highlighted_index = self._selected_index()
         default_palette = THEME_PALETTES["snow"]
         self._base_color = default_palette.base
@@ -104,7 +108,9 @@ class KeyboardDropdown(Static):
         self.suffix = suffix
         self._render_dropdown()
 
-    def set_status_override(self, status: Text | None) -> None:
+    def set_status_override(
+        self, status: Text | None, *, blocking: bool = True
+    ) -> None:
         """Temporarily replace this dropdown's normal heading with a
 
         plain, non-interactive status line (e.g. "STATUS CONNECTING...")
@@ -116,6 +122,20 @@ class KeyboardDropdown(Static):
         keypress can never edit a setting the UI is telling the user is
         currently unavailable.
 
+        `blocking` is what makes the override also DISABLE the control,
+        and it defaults to True because that is usually the point: a
+        CHANNEL cannot be picked without a radio, so a dropdown saying
+        so must not still be operable.
+
+        Pass blocking=False where the underlying choice does NOT depend
+        on the radio and the status is only being displayed HERE for
+        want of anywhere better to put it. PASSES sorts a list held on
+        disk -- valid with no radio attached at all -- and it borrows
+        its sort control to show the connection state purely so the view
+        does not reflow. Blocking that would take a working feature away
+        for the duration of a handshake, for a reason that is about
+        layout.
+
         `status` is rendered exactly as given, span styling included --
         the caller is expected to have already built it component-level
         (e.g. the "STATUS" word in BASE, the state word in its own
@@ -124,8 +144,9 @@ class KeyboardDropdown(Static):
         one uniform color over the whole line itself.
         """
         self._status_override = status
-        self.disabled = status is not None
-        if status is not None:
+        self._status_blocks = status is not None and blocking
+        self.disabled = self._status_blocks
+        if self._status_blocks:
             self.close_menu()
         else:
             self._render_dropdown()
@@ -138,7 +159,7 @@ class KeyboardDropdown(Static):
         self._render_dropdown()
 
     def open_menu(self) -> None:
-        if not self.options or self._status_override is not None:
+        if not self.options or self._status_blocks:
             return
         self.is_open = True
         self._highlighted_index = self._selected_index()
