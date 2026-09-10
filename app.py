@@ -100,7 +100,7 @@ from pass_layout import (
     pass_gutter,
     lay_out_passes,
     pass_row_offset,
-    scroll_window_offset,
+    scroll_window_step,
 )
 from serial_devices import describe_connection_target
 from terminal_width import (
@@ -1610,14 +1610,15 @@ EMOJI_PICKER_CHOICES: tuple[str, ...] = (
     "\u2728",  # sparkles
     "\U0001f4e1",  # satellite antenna
     "\U0001f9ed",  # compass
-    "\U0001f5fa",  # world map
-    "\U0001f3d5",  # camping
+    "\U0001f30d",  # globe
+    "\u26fa",  # tent
     "\U0001f97e",  # hiking boot
+    "\U0001f526",  # flashlight
     "\U0001f50b",  # battery
-    "\u2600\ufe0f",  # sun
-    "\U0001f327",  # rain
+    "\U0001f31e",  # sun with face
+    "\U0001f308",  # rainbow
     "\U0001f319",  # crescent moon
-    "\u26a0\ufe0f",  # warning
+    "\u2757",  # exclamation
     "\u2705",  # check mark
     "\u274c",  # cross mark
 )
@@ -1630,6 +1631,35 @@ EMOJI_PICKER_CHOICES: tuple[str, ...] = (
 # Thirteen keeps the box exactly the width it has always been, so adding
 # choices changed what is reachable without changing what is seen.
 EMOJI_PICKER_VISIBLE = 13
+
+# Every choice above is 2 terminal cells, and that is a REQUIREMENT, not
+# an observation. Many pictographs are Emoji but not Emoji_Presentation
+# -- U+1F5FA WORLD MAP, U+1F3D5 CAMPING, U+1F327 CLOUD WITH RAIN, U+1F6F0
+# SATELLITE -- and default to a NARROW text glyph unless a variation
+# selector is appended. Three of those were in the first draft of this
+# set and would have rendered as one-cell monochrome oddities among
+# two-cell colour emoji.
+#
+# Appending U+FE0F would widen them, at the cost of making each one a
+# variation-selector sequence, whose width a terminal may decline to
+# promote (see terminal_width). Picking an Emoji_Presentation character
+# instead costs nothing and has no such failure mode -- so the globe,
+# the tent, the flashlight and the rainbow, rather than the map, the
+# campsite, the satellite and the rain cloud.
+#
+# test_chat_emoji_picker pins this: a new choice that is not two cells
+# wide fails there rather than on somebody's screen.
+#
+# For the same reason there is exactly ONE variation-selector sequence
+# here, the heart. A VS16 sequence's width is a PROMOTION a terminal may
+# decline (see terminal_width), and the picker's one cell of spare
+# right-hand padding absorbs exactly one such shortfall per visible
+# window. Two of them in one window -- which a sun and a warning sign
+# duly produced -- overruns it. Emoji_Presentation characters have no
+# such failure mode, so the sun-with-face and the exclamation mark
+# stand in for them, and the heart stays because it is the one people
+# reach for. Widening the padding instead would cost a column on every
+# theme to insure against a case that is avoidable outright.
 # Must match the ".emoji-picker { height: ... }" CSS rule below.
 EMOJI_PICKER_HEIGHT = 3
 # What the ".emoji-picker" CSS rule below actually costs in columns:
@@ -1751,15 +1781,17 @@ class EmojiPicker(Static):
         self._render_picker()
 
     def move_highlight(self, direction: int) -> None:
-        """Move one choice, wrapping, scrolling the window if needed."""
-        self.highlighted_index = (self.highlighted_index + direction) % len(
-            EMOJI_PICKER_CHOICES
-        )
-        self._scroll_offset = scroll_window_offset(
+        """Move one choice, wrapping, scrolling the window if needed.
+
+        The rule itself is scroll_window_step, kept pure so it can be
+        tested without standing up an app -- see its docstring.
+        """
+        self.highlighted_index, self._scroll_offset = scroll_window_step(
             len(EMOJI_PICKER_CHOICES),
             EMOJI_PICKER_VISIBLE,
             self.highlighted_index,
             self._scroll_offset,
+            direction,
         )
         self._render_picker()
 

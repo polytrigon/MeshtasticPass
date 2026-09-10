@@ -333,6 +333,23 @@ def scroll_window_offset(
     return offset
 
 
+def scroll_window_step(
+    total: int, visible: int, index: int, offset: int, direction: int
+) -> tuple[int, int]:
+    """Move `index` by `direction`, wrapping, and follow with the window.
+
+    Returns (index, offset). Pure, and separate from the widget that
+    calls it, because a widget cannot be constructed outside a running
+    Textual app -- so state-machine rules living inside one can only be
+    tested by standing up a whole app, which is slow and hides the rule
+    among the scaffolding.
+    """
+    if total <= 0:
+        return 0, 0
+    index = (index + direction) % total
+    return index, scroll_window_offset(total, visible, index, offset)
+
+
 # The PASSES grid's own name for it, kept because that is what the view
 # and its tests call. The rule is not grid-specific -- the CHAT emoji
 # picker scrolls its strip by exactly the same one -- so the general
