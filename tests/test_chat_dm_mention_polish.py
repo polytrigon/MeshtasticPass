@@ -79,9 +79,17 @@ class SnowAccent2ColorTests(unittest.TestCase):
 
 class TopLevelNavigationTests(ChatDmMentionAppTestsBase):
     async def test_top_nav_has_no_dm_entry(self) -> None:
+        """DM is a MODE inside CHAT, so it is not a tab.
+
+        Asserts the ABSENCE it is named for rather than a snapshot of
+        the whole nav -- pinning the exact list made adding PASSES look
+        like a DM regression.
+        """
         from app import TAB_NAMES
 
-        self.assertEqual(list(TAB_NAMES), ["connection", "chat", "mesh"])
+        self.assertNotIn("dm", TAB_NAMES)
+        self.assertNotIn("profile", TAB_NAMES)
+        self.assertEqual(list(TAB_NAMES)[:2], ["connection", "chat"])
 
     async def test_no_stale_dm_tab_footer_reference(self) -> None:
         app = MeshtasticPassApp(_simulated_radio(), self.settings)
@@ -89,7 +97,13 @@ class TopLevelNavigationTests(ChatDmMentionAppTestsBase):
             await pilot.pause()
             footer_text = str(app.query_one("#footer", Static).render())
             self.assertNotIn("DM", footer_text.split("F4")[0].upper() or "")
-            self.assertNotIn("1-4", footer_text)
+            # The digit range must match the number of tabs there
+            # actually are. It read "no 1-4" when there were three, as a
+            # proxy for "no DM tab"; with four tabs that proxy inverted
+            # and started asserting the footer was wrong.
+            from app import TAB_NAMES
+
+            self.assertIn(f"1-{len(TAB_NAMES)}", footer_text)
 
 
 # ---- CHAT header (Part B) ----------------------------------------------

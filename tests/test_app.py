@@ -624,20 +624,21 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             self.assertEqual(app.current_tab, "connection")
-            await pilot.press("4")
-            await pilot.pause()
-            self.assertEqual(app.current_tab, "connection")
-            self.assertNotEqual(app.current_tab, "dm")
-            self.assertNotEqual(app.current_tab, "profile")
+
+            # No digit reaches DM or PROFILE. "4" is MESH since PASSES
+            # took [3]; what this test is about is that neither of those
+            # two is behind ANY digit, not which view a given digit
+            # happens to open.
+            for key in ("1", "2", "3", "4", "5"):
+                await pilot.press(key)
+                await pilot.pause()
+                self.assertNotEqual(app.current_tab, "dm")
+                self.assertNotEqual(app.current_tab, "profile")
 
             await pilot.press("2")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
             self.assertEqual(app._chat_mode, "channel")
-
-            await pilot.press("4")
-            await pilot.pause()
-            self.assertEqual(app.current_tab, "chat")
             self.assertEqual(app._chat_mode, "channel")
             chat_input = app.query_one("#chat-input", Input)
             self.assertEqual(chat_input.value, "4")
