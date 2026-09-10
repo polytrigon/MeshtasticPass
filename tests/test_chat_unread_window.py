@@ -19,15 +19,26 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from app import (
-    MOUNTED_CHAT_UNREAD_CEILING,
-    ChatEntryWidget,
-    MeshtasticPassApp,
-)
+from app import ChatEntryWidget, MeshtasticPassApp
 from app_settings import AppSettings
 from chat_store import ChatStore
 from simulated_radio_service import SimulatedRadioService
+
+
+# Deliberately tiny, and patched over the production values below.
+#
+# The properties here are scale-free -- a window that stays bounded at
+# 10 stays bounded at 100 -- and driving the real constants meant
+# pushing 350 messages through the full production path in each of four
+# tests. Every one of those is a SQLite write, a mounted widget and a
+# Textual relayout, which on a uConsole turned this file alone into
+# minutes of the suite. Small numbers test the same rule and let the
+# rule's real values change without rewriting the tests.
+TEST_TARGET = 10
+TEST_CEILING = 10
+TEST_OVERSHOOT = 15
 
 
 class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
@@ -40,10 +51,22 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
             profile_path=root / "terminal.conf",
         )
         self.store = ChatStore.open(str(root / "chat.db"))
+        # _trim_mounted_chat_window reads this as a module global at call
+        # time, so patching it here reaches the production code path --
+        # the rule under test is the real one, only its numbers shrink.
+        ceiling = patch("app.MOUNTED_CHAT_UNREAD_CEILING", TEST_CEILING)
+        ceiling.start()
+        self.addCleanup(ceiling.stop)
 
     def _app(self) -> MeshtasticPassApp:
         radio = SimulatedRadioService(connect_delay=60, message_interval=0)
         return MeshtasticPassApp(radio, self.settings, chat_store=self.store)
+
+    @staticmethod
+    def _bound(app: MeshtasticPassApp) -> int:
+        """Shrink the window and report how many arrivals overshoot it."""
+        app._mounted_chat_target = TEST_TARGET
+        return TEST_TARGET + TEST_CEILING + TEST_OVERSHOOT
 
     @staticmethod
     async def _receive(app, pilot, count: int) -> None:
@@ -66,13 +89,13 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            arrived = app._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING + 150
+            arrived = self._bound(app)
             await self._receive(app, pilot, arrived)
 
             mounted = len(app.query(ChatEntryWidget))
             self.assertLessEqual(
                 mounted,
-                app._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING,
+                TEST_TARGET + TEST_CEILING,
                 f"{arrived} unread messages left {mounted} widgets mounted",
             )
 
@@ -85,11 +108,10 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            await self._receive(app, pilot, app._mounted_chat_target + 10)
+            app._mounted_chat_target = TEST_TARGET
+            await self._receive(app, pilot, TEST_TARGET + 5)
 
-            self.assertEqual(
-                len(app.chat_history), app._mounted_chat_target + 10
-            )
+            self.assertEqual(len(app.chat_history), TEST_TARGET + 5)
 
     async def test_trimming_never_loses_the_unread_count(self) -> None:
         """CHAT(N) counts arrivals, not mounted widgets.
@@ -101,7 +123,7 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            arrived = app._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING + 150
+            arrived = self._bound(app)
             await self._receive(app, pilot, arrived)
 
             self.assertEqual(app._channel_states[0].unread_count, arrived)
@@ -111,7 +133,7 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
         app = self._app()
         async with app.run_test(size=(90, 28)) as pilot:
             await pilot.pause()
-            arrived = app._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING + 150
+            arrived = self._bound(app)
             await self._receive(app, pilot, arrived)
 
             stored = app.chat_store.load_recent(0, limit=arrived)
@@ -127,11 +149,7 @@ class MountedWindowTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             outgoing = app._start_outgoing("still sending")
             outgoing.message_id = None
-            await self._receive(
-                app,
-                pilot,
-                app._mounted_chat_target + MOUNTED_CHAT_UNREAD_CEILING + 150,
-            )
+            await self._receive(app, pilot, self._bound(app))
 
             self.assertIn(outgoing, app.chat_history)
 
