@@ -102,7 +102,12 @@ from pass_layout import (
     pass_row_offset,
 )
 from serial_devices import describe_connection_target
-from terminal_width import PaintedWidths, measure_terminal
+from terminal_width import (
+    PaintedWidths,
+    install_terminal_widths,
+    measure_terminal,
+    plan_corrections,
+)
 from radio_service import (
     ChannelInfo,
     ClockSyncResult,
@@ -13547,21 +13552,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _names_to_measure(chat_store: ChatStore | None) -> tuple[str, ...]:
-    """The display names startup should measure the terminal against.
+def _text_to_measure(chat_store: ChatStore | None) -> tuple[str, ...]:
+    """Everything startup should measure this terminal against.
 
-    PASSES holds every node ever met, so its names are both the widest
-    variety of emoji the app will be asked to draw and the only place
-    where a mis-measured one corrupts a grid. Returns nothing rather than
-    raising if the store cannot be read -- an unmeasured terminal is a
-    cosmetic problem, and refusing to start over it would not be.
+    In priority order, because the measurement is budgeted (see
+    terminal_width.MEASUREMENT_LIMIT) and a board of several hundred
+    nodes could otherwise spend all of it before reaching anything else:
+
+    1. The emoji picker's own choices. A fixed set, always displayed,
+       and one of them ("\u2764\ufe0f") is the reason the picker carries a
+       spare column of padding.
+    2. Recent CHAT text. This is the scrollbar case: Textual computes
+       wrap points and the transcript's virtual size from cell_len, so a
+       glyph in a MESSAGE that paints at an unexpected width corrupts
+       the scrollbar, not just the message.
+    3. PASSES display names -- every node ever met, and the widest
+       variety of emoji the app will be asked to draw.
+
+    Returns what it can rather than raising: an unmeasured terminal is a
+    cosmetic problem, and refusing to start over one would not be.
     """
+    text: list[str] = list(EMOJI_PICKER_CHOICES)
     if chat_store is None:
-        return ()
+        return tuple(text)
     try:
-        return tuple(encounter.display_name for encounter in chat_store.encounters())
+        text.extend(message.text for message in chat_store.load_recent(0, limit=200))
     except Exception:
-        return ()
+        pass
+    try:
+        text.extend(
+            encounter.display_name for encounter in chat_store.encounters()
+        )
+    except Exception:
+        pass
+    return tuple(text)
 
 
 def main() -> int:
@@ -13590,7 +13614,14 @@ def main() -> int:
     # about to be displayed, so the cost is bounded by what is actually
     # on the board. Never raises; a terminal that will not answer yields
     # no measurements and everything below behaves as it always has.
-    painted_widths = measure_terminal(_names_to_measure(chat_store))
+    painted_widths = measure_terminal(_text_to_measure(chat_store))
+    # Correct RICH itself, not only this app's own layout code. Every
+    # wrap point, virtual size and scrollbar position Textual computes
+    # comes from rich.cells.cell_len, so a glyph the terminal paints at
+    # an unexpected width corrupts all of them -- which is what the CHAT
+    # scrollbar has been doing. Must happen before the app renders
+    # anything, and is a no-op when nothing was measured.
+    install_terminal_widths(plan_corrections(painted_widths))
     app = MeshtasticPassApp(
         radio,
         settings,

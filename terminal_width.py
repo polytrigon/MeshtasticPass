@@ -29,9 +29,18 @@ PaintedWidths then reports exactly what cell_len does.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping
 
 from grapheme_text import cell_len, grapheme_clusters
+
+
+# U+FE0F. Rich does not measure a sequence ending in this by looking the
+# sequence up; it measures the BASE character and then adds one if that
+# base is in the cell table's `narrow_to_wide` set (see rich.cells.
+# _cell_len). So a terminal that ignores the promotion is corrected by
+# removing the base from that set, never by a per-character width.
+VARIATION_SELECTOR_16 = "\ufe0f"
 
 
 # Per-grapheme wait for the terminal's reply. Generous for a local
@@ -44,7 +53,7 @@ REPLY_TIMEOUT_SECONDS = 0.35
 # board of a few hundred nodes rarely holds more than a couple of dozen
 # distinct emoji, and an unbounded loop here would be a startup delay
 # nobody asked for.
-MEASUREMENT_LIMIT = 64
+MEASUREMENT_LIMIT = 96
 
 
 class PaintedWidths:
@@ -214,3 +223,122 @@ def _measure_on_tty(graphemes: tuple[str, ...]) -> dict[str, int]:
     finally:
         termios.tcsetattr(stdin, termios.TCSADRAIN, saved)
         write("\r\x1b[K\x1b[?25h")
+
+
+@dataclass(frozen=True)
+class WidthCorrections:
+    """What this terminal disagrees with Rich about, in Rich's own terms.
+
+    Rich computes every width through two mechanisms and they need
+    different corrections, which is why this is not simply a dict:
+
+    `per_character` is for characters measured directly -- the ordinary
+    case, and the one that covers an emoji the font has no glyph for.
+
+    `unpromoted_bases` is for VARIATION SELECTOR-16 sequences. Rich never
+    looks such a sequence up as a unit: it measures the base character
+    and adds one if that base is in the cell table's narrow_to_wide set.
+    A terminal that does not honour the promotion is corrected by
+    removing the base from the set.
+
+    `unexpressible` records measured disagreements that neither
+    mechanism can carry -- a ZWJ sequence the font renders at an
+    unexpected width, say. They are left alone rather than approximated,
+    and named so a bug report can say so.
+    """
+
+    per_character: Mapping[int, int]
+    unpromoted_bases: frozenset[str]
+    unexpressible: tuple[str, ...]
+
+    def __bool__(self) -> bool:
+        return bool(self.per_character or self.unpromoted_bases)
+
+
+def plan_corrections(painted: PaintedWidths) -> WidthCorrections:
+    """Translate measurements into the corrections Rich can accept.
+
+    MUST run before install_terminal_widths: it compares each
+    measurement against what Rich currently believes, and once Rich has
+    been corrected there is nothing left to disagree with.
+    """
+    per_character: dict[int, int] = {}
+    unpromoted: set[str] = set()
+    unexpressible: list[str] = []
+    for grapheme, measured in sorted(painted.corrections.items()):
+        if len(grapheme) == 1:
+            per_character[ord(grapheme)] = measured
+        elif VARIATION_SELECTOR_16 in grapheme and measured < cell_len(grapheme):
+            # The promotion is what this terminal is not doing.
+            unpromoted.add(grapheme[0])
+        else:
+            unexpressible.append(grapheme)
+    return WidthCorrections(per_character, frozenset(unpromoted), tuple(unexpressible))
+
+
+def install_terminal_widths(corrections: WidthCorrections) -> bool:
+    """Make Rich itself measure the way this terminal paints.
+
+    Everything Textual lays out -- where CHAT wraps a message, how tall
+    the transcript thinks it is, where the scrollbar's thumb goes, how
+    wide a panel border is drawn -- is computed from rich.cells.cell_len.
+    Correcting our own layout code only fixes our own grids; correcting
+    Rich fixes all of it, for every glyph the terminal disagrees about,
+    including ones nobody has thought to hard-code a workaround for.
+
+    Both patches go on rich.cells module attributes rather than on the
+    functions callers hold. That is deliberate and it is what makes this
+    work at all: a dozen Rich modules do `from .cells import cell_len` at
+    import time, so patching cell_len itself would miss them -- but
+    cell_len's implementation resolves BOTH get_character_cell_size and
+    load_cell_table as bare names in rich.cells' own globals at CALL
+    time, so patching those reaches every caller no matter how it
+    imported anything. Verified against Rich's real source, including
+    rich.text's by-value copy.
+
+    Idempotent, and a no-op when there is nothing to correct -- so an
+    unmeasurable terminal leaves Rich exactly as it found it.
+    """
+    if not corrections:
+        return False
+    try:
+        import functools
+
+        import rich.cells as cells
+    except Exception:
+        return False
+    if getattr(cells.get_character_cell_size, "_meshtasticpass_corrected", False):
+        return False
+    try:
+        original_size = cells.get_character_cell_size
+        original_load = cells.load_cell_table
+        per_character = dict(corrections.per_character)
+        unpromoted = corrections.unpromoted_bases
+
+        @functools.lru_cache(maxsize=4096)
+        def corrected_size(character: str, unicode_version: str = "auto") -> int:
+            width = per_character.get(ord(character))
+            if width is None:
+                return original_size(character, unicode_version)
+            return width
+
+        corrected_size._meshtasticpass_corrected = True  # type: ignore[attr-defined]
+
+        @functools.lru_cache(maxsize=32)
+        def corrected_load(unicode_version: str = "auto"):
+            table = original_load(unicode_version)
+            if not unpromoted:
+                return table
+            return table._replace(
+                narrow_to_wide=table.narrow_to_wide - unpromoted
+            )
+
+        cells.get_character_cell_size = corrected_size
+        cells.load_cell_table = corrected_load
+        # Rich memoises both the per-character size and whole-string
+        # lengths. Anything measured before this point is now wrong.
+        original_size.cache_clear()
+        cells.cached_cell_len.cache_clear()
+    except Exception:
+        return False
+    return True

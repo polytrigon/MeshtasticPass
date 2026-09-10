@@ -26,8 +26,10 @@ from grapheme_text import cell_len  # noqa: E402
 from terminal_width import (  # noqa: E402
     PaintedWidths,
     distinct_graphemes,
+    install_terminal_widths,
     measure_painted_widths,
     measure_terminal,
+    plan_corrections,
 )
 
 
@@ -190,6 +192,148 @@ class MeasureTerminalTests(unittest.TestCase):
     def test_all_ascii_names_skip_the_terminal_entirely(self) -> None:
         """Nothing to disagree about means no reason to touch stdout."""
         self.assertFalse(measure_terminal(("ALFA", "BRVO")))
+
+
+HEART = "\u2764\ufe0f"        # HEAVY BLACK HEART + VARIATION SELECTOR-16
+KEYCAP = "5\ufe0f\u20e3"       # DIGIT FIVE + VS16 + COMBINING ENCLOSING KEYCAP
+FAMILY = "\U0001f468\u200d\U0001f469\u200d\U0001f466"
+
+
+class CorrectionPlanTests(unittest.TestCase):
+    """Translating measurements into terms Rich can actually accept.
+
+    Rich computes widths two different ways and they need different
+    corrections, which is the whole reason this is a plan rather than a
+    dict. Getting the classification wrong means a correction that
+    silently does nothing.
+    """
+
+    @staticmethod
+    def _plan(measured):
+        return plan_corrections(PaintedWidths(measured))
+
+    def test_a_single_codepoint_becomes_a_per_character_width(self) -> None:
+        plan = self._plan({BEAR: 1})
+        self.assertEqual(plan.per_character, {ord(BEAR): 1})
+        self.assertEqual(plan.unpromoted_bases, frozenset())
+
+    def test_a_variation_selector_sequence_unpromotes_its_base(self) -> None:
+        """Rich never looks such a sequence up as a unit.
+
+        It measures the BASE and adds one if the base is in the cell
+        table's narrow_to_wide set, so a per-character width for the
+        whole sequence would be a correction Rich never consults.
+        """
+        plan = self._plan({HEART: 1})
+        self.assertEqual(plan.unpromoted_bases, frozenset({"\u2764"}))
+        self.assertEqual(plan.per_character, {})
+
+    def test_a_keycap_unpromotes_its_digit(self) -> None:
+        """Three codepoints, same mechanism -- and the reason CHAT
+
+        currently substitutes circled digits for keycaps at the display
+        boundary.
+        """
+        plan = self._plan({KEYCAP: 1})
+        self.assertEqual(plan.unpromoted_bases, frozenset({"5"}))
+
+    def test_a_zwj_sequence_is_reported_rather_than_approximated(self) -> None:
+        """Neither mechanism can carry it, so it is named and left alone.
+
+        Guessing at a correction Rich cannot express would be worse than
+        the disagreement: it would move widths for every OTHER sequence
+        sharing that base.
+        """
+        plan = self._plan({FAMILY: 4})
+        self.assertEqual(plan.unexpressible, (FAMILY,))
+        self.assertEqual(plan.per_character, {})
+        self.assertEqual(plan.unpromoted_bases, frozenset())
+
+    def test_agreement_produces_no_plan_at_all(self) -> None:
+        """A terminal that paints what Rich expects must not be patched."""
+        plan = self._plan({BEAR: cell_len(BEAR), "A": 1})
+        self.assertFalse(plan)
+
+
+class InstallTests(unittest.TestCase):
+    """Correcting Rich itself.
+
+    Every wrap point, virtual size and scrollbar position Textual
+    computes comes from rich.cells.cell_len, so this is what makes the
+    measurement reach CHAT rather than only this app's own grids.
+
+    These tests patch a THIRD-PARTY MODULE GLOBALLY. Every one of them
+    restores it, because a leak would silently change the widths every
+    later test in the run measures with.
+    """
+
+    def setUp(self) -> None:
+        import rich.cells as cells
+
+        self.cells = cells
+        original_size = cells.get_character_cell_size
+        original_load = cells.load_cell_table
+
+        def restore() -> None:
+            cells.get_character_cell_size = original_size
+            cells.load_cell_table = original_load
+            original_size.cache_clear()
+            cells.cached_cell_len.cache_clear()
+
+        self.addCleanup(restore)
+
+    def test_a_correction_reaches_rich_and_everything_built_on_it(self) -> None:
+        """Including the modules that imported cell_len BY VALUE.
+
+        A dozen Rich modules do `from .cells import cell_len` at import
+        time, so patching cell_len itself would miss them. cell_len's
+        implementation resolves get_character_cell_size as a bare name
+        in rich.cells' globals at CALL time, which is why patching that
+        reaches them anyway -- and is the single fact this whole
+        approach rests on.
+        """
+        from rich.text import Text
+
+        self.assertEqual(self.cells.cell_len(BEAR), 2)
+        self.assertTrue(install_terminal_widths(plan_corrections(PaintedWidths({BEAR: 1}))))
+
+        self.assertEqual(self.cells.cell_len(BEAR), 1)
+        self.assertEqual(Text(f"{BEAR}70fa").cell_len, 5)
+        self.assertEqual(sys.modules["rich.text"].cell_len(BEAR), 1)
+
+    def test_an_unpromoted_base_reaches_rich(self) -> None:
+        self.assertEqual(self.cells.cell_len(HEART), 2)
+        install_terminal_widths(plan_corrections(PaintedWidths({HEART: 1})))
+        self.assertEqual(self.cells.cell_len(HEART), 1)
+
+    def test_uncorrected_characters_are_untouched(self) -> None:
+        """The blast radius has to stay exactly as wide as the evidence."""
+        install_terminal_widths(plan_corrections(PaintedWidths({BEAR: 1})))
+        self.assertEqual(self.cells.cell_len("ALFA"), 4)
+        self.assertEqual(self.cells.cell_len("\u4e2d"), 2)
+        self.assertEqual(self.cells.cell_len(CORN), 2)
+
+    def test_nothing_to_correct_patches_nothing(self) -> None:
+        """An unmeasurable terminal must leave Rich exactly as found."""
+        before = self.cells.get_character_cell_size
+        self.assertFalse(install_terminal_widths(plan_corrections(PaintedWidths())))
+        self.assertIs(self.cells.get_character_cell_size, before)
+
+    def test_installing_twice_is_a_no_op(self) -> None:
+        plan = plan_corrections(PaintedWidths({BEAR: 1}))
+        self.assertTrue(install_terminal_widths(plan))
+        self.assertFalse(install_terminal_widths(plan))
+        self.assertEqual(self.cells.cell_len(BEAR), 1)
+
+    def test_rich_caches_are_cleared(self) -> None:
+        """Rich memoises widths. Anything measured before the patch is
+
+        now wrong, and an uncleared cache would serve it for the rest of
+        the process -- which on this app means for the whole session.
+        """
+        self.assertEqual(self.cells.cell_len(f"{BEAR} hello"), 8)
+        install_terminal_widths(plan_corrections(PaintedWidths({BEAR: 1})))
+        self.assertEqual(self.cells.cell_len(f"{BEAR} hello"), 7)
 
 
 if __name__ == "__main__":

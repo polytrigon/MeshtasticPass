@@ -29,6 +29,19 @@ EMOJI_MODIFIER_RANGE = range(0x1F3FB, 0x1F400)  # Fitzpatrick skin-tone modifier
 REGIONAL_INDICATOR_RANGE = range(0x1F1E6, 0x1F200)  # flag letter pairs
 
 
+# Unicode general categories that never stand alone: non-spacing marks,
+# ENCLOSING marks, and spacing combining marks.
+#
+# unicodedata.combining() alone is not enough, and the gap is not
+# theoretical: U+20E3 COMBINING ENCLOSING KEYCAP -- the third codepoint
+# of every keycap emoji -- is category Me with a canonical combining
+# class of ZERO, so a combining()-only test reported it as a standalone
+# grapheme and split "5\ufe0f\u20e3" into two clusters. That is exactly
+# the severed cluster this module exists to prevent: it can be truncated
+# apart, and it made the sequence unmeasurable as a unit.
+COMBINING_CATEGORIES = frozenset({"Mn", "Me", "Mc"})
+
+
 def attaches_to_previous(
     character: str, previous_cluster: str, join_next: bool
 ) -> bool:
@@ -40,6 +53,7 @@ def attaches_to_previous(
         or character in VARIATION_SELECTORS
         or code_point in EMOJI_MODIFIER_RANGE
         or unicodedata.combining(character)
+        or unicodedata.category(character) in COMBINING_CATEGORIES
     ):
         return True
     return (
