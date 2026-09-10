@@ -13,7 +13,11 @@ how an earlier round of this concluded, wrongly, that nothing was
 diverging at all.
 
 Usage:
-    python3 terminal_width_probe.py [output-file]
+    .venv/bin/python terminal_width_probe.py [output-file]
+
+Run it from the virtual environment, not system Python -- it needs the
+same rich this app runs against, and a bare `python3` typically has no
+rich at all.
 
 Prints a table and writes the same table to `output-file` (default
 ~/terminal_width_probe.txt) so it can be read back over SSH.
@@ -105,7 +109,10 @@ def main() -> int:
         from grapheme_text import cell_len
         from terminal_width import measure_terminal
     except Exception:
-        print("Run this from the MeshtasticPass checkout.")
+        print(
+            "Could not import rich. Run this with .venv/bin/python from the "
+            "MeshtasticPass checkout, not system python3."
+        )
         return 2
 
     names = names_in_use()

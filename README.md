@@ -173,11 +173,12 @@ thing on this board that transmits, and only when you ask it to.
    now understood: a terminal with no glyph for an emoji falls back to a text
    font and advances ONE column where the layout accounted for two, so
    everything after it on that line slides. The app measures your terminal at
-   startup and corrects for it. If a grid still looks misaligned, run
-   `python3 terminal_width_probe.py` **in the uConsole's own terminal, not over
-   SSH** -- over SSH it measures the machine you connected from -- and include
-   the output in the report. It names the exact glyphs your font disagrees
-   about.
+   startup and corrects for it -- and corrects Rich's own measurements too, so
+   wrapping and the CHAT scrollbar follow. If anything still looks misaligned,
+   run `.venv/bin/python terminal_width_probe.py` **in the uConsole's own
+   terminal, not over SSH** -- over SSH it measures the machine you connected
+   from -- and include the output in the report. It names the exact glyphs your
+   font disagrees about and the corrections the app applied.
 
 ## Known limitations
 
