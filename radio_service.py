@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
+import functools
 import os
 from pathlib import Path
 from threading import Event
@@ -22,6 +23,151 @@ from serial_devices import (
 
 
 RX_DEBUG_ENV_VAR = "MESHTASTICPASS_RX_DEBUG"
+
+# Upper bound on packets held during the connect window
+# (_on_text_received). The firmware's own queue for a disconnected
+# client is MAX_RX_TOPHONE -- 8, 16 or 32 depending on the board -- so
+# this cannot legitimately be reached by a backlog drain; it exists only
+# so a pathological connect can never grow this list without limit.
+MAX_CONNECT_ARRIVALS = 256
+
+# How long to let the radio finish its initial node-DB download.
+#
+# 30.0 is the SDK's own serial default (stream_interface.connect() ->
+# _waitConnected(); BLE asks for 60). Kept deliberately.
+#
+# DO NOT RAISE THIS AGAIN WITHOUT NEW EVIDENCE. Raising it to 90 looked
+# obvious -- the first attempt was dying at ~33s and the retry then
+# succeeded in 3, so the handshake "must" be slow. It is not slow, it is
+# STUCK: at 90s the attempts still failed, three in a row at 94/92/92s,
+# and the fourth succeeded in 6. config_complete simply never arrives on
+# a failing attempt, so waiting longer only turns a 40-second connect
+# into four and a half minutes.
+#
+# What the failures actually cost is the backlog: the device appears to
+# send config_complete and move on to draining its queue while our
+# client never registers it, so a failed attempt consumes messages that
+# are then gone. _handleFromRadio tracing (below) exists to find out
+# where that handshake stalls.
+CONNECT_TIMEOUT_SECONDS = 30.0
+
+# What the FIRST attempt of a connect sequence gets instead.
+#
+# Measured on real hardware (handshake tracing, 13:06): attempt one ran
+# the full 33s and received exactly ONE node_info -- no config, no
+# config_complete. Attempt two, six seconds later on the same port,
+# pulled 95 node_info plus 10 config, 16 moduleConfig, 8 channel,
+# metadata and my_info in THREE SECONDS. Waiting two minutes between
+# runs changed nothing, so it is not settle time; the first open after
+# process start simply does not take, and want_config_id goes nowhere.
+#
+# So the first attempt is not slow, it is dead, and the only question is
+# how long we stare at it before trying the one that works. 8s turns a
+# ~40s startup into ~12s, and shrinks the window in which a doomed
+# attempt can consume the radio's queue. If it ever IS merely slow, the
+# cost is one wasted 8s and every later attempt still gets the full 30.
+FIRST_CONNECT_TIMEOUT_SECONDS = 8.0
+
+# Whether to ask the radio for its whole node database during the
+# handshake. Default: NO.
+#
+# The node replay is what makes the handshake unreliable. Measured
+# across ten attempts, max node_info received before the attempt ended:
+#
+#   FAILED:  55, 9, 53, 0, 65, 106, 100
+#   ONLINE:  13, 24, 98
+#
+# No relationship between how far the replay gets and whether it
+# completes -- attempt 2 failed at 9 and attempt 3 succeeded at 13, one
+# attempt failed having received ZERO, and two successful connects ended
+# after only 13 and 24 nodes. The device sends an arbitrary prefix of its
+# database each time and often never signals the end, so a connect either
+# finishes in ~3s or never finishes at all (confirmed at 8s, 30s and 90s
+# budgets). Nothing on this side can make that state machine terminate.
+#
+# noNodes=True sends NODELESS_WANT_CONFIG_ID, so the device skips the
+# node DB entirely and config_complete arrives almost immediately -- the
+# erratic part of the handshake simply does not happen. Nodes still
+# arrive afterwards as ordinary NODEINFO_APP packets.
+#
+# The trade: MESH starts empty and fills in. PASSES is unaffected (it
+# reads node_encounters from chat.db, not the live interface). And the
+# node DB was already a coin flip -- connects reporting nodes=13 and
+# nodes=24 were happening before this change.
+#
+# Set MESHTASTICPASS_NODE_DB_AT_CONNECT=1 to restore the old behaviour
+# without a rebuild, for comparing the two on real hardware.
+NODE_DB_AT_CONNECT_ENV_VAR = "MESHTASTICPASS_NODE_DB_AT_CONNECT"
+
+
+def node_db_at_connect_enabled() -> bool:
+    """Whether the handshake should include the radio's node database."""
+    value = os.environ.get(NODE_DB_AT_CONNECT_ENV_VAR, "").strip().lower()
+    return value not in ("", "0", "false")
+
+
+@functools.lru_cache(maxsize=8)
+def _traced_interface(interface_class: type, timeout: float) -> type:
+    """`interface_class` with handshake tracing (and the timeout above).
+
+    A subclass overriding one default argument, rather than patching the
+    SDK's class or reimplementing StreamInterface.connect()'s handshake
+    (which would pin us to today's private internals -- START2, the
+    reader thread, _startConfig -- across SDK upgrades).
+    """
+
+    class TracedInterface(interface_class):  # type: ignore[valid-type,misc]
+        def _waitConnected(self, _timeout: float = 0.0):
+            # The SDK calls this with no argument; the value that
+            # matters is the one this class was built for.
+            return super()._waitConnected(timeout)
+
+        def _handleFromRadio(self, fromRadioBytes):
+            # The one choke point for EVERYTHING the device sends, config
+            # replay included -- none of which reaches pubsub, so the
+            # [RX] packet trace cannot see a handshake at all. That blind
+            # spot is why a stuck connect looks identical to a quiet one.
+            if rx_debug_enabled():
+                self._trace_from_radio(fromRadioBytes)
+            return super()._handleFromRadio(fromRadioBytes)
+
+        def _trace_from_radio(self, raw: bytes) -> None:
+            """Name each FromRadio variant, in order, with a running count.
+
+            Parses a second time rather than hooking the SDK's own parse:
+            this is opt-in diagnostic code and must not alter what the
+            real path sees, even by leaving a half-consumed buffer
+            behind. Never raises -- a broken trace must not break a
+            connect.
+            """
+            try:
+                from meshtastic.protobuf import mesh_pb2
+
+                message = mesh_pb2.FromRadio()
+                message.ParseFromString(raw)
+                variant = message.WhichOneof("payload_variant") or "unset"
+            except Exception:
+                rx_debug_log(f"HANDSHAKE unparsable bytes={len(raw)}")
+                return
+            counts = getattr(self, "_handshake_counts", None)
+            if counts is None:
+                counts = {}
+                self._handshake_counts = counts
+            counts[variant] = counts.get(variant, 0) + 1
+            if variant == "config_complete_id":
+                # The moment the device stops replaying config and starts
+                # draining its queue. If this line never appears, the
+                # handshake died mid-replay and the tally says how far it
+                # got.
+                tally = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                rx_debug_log(f"HANDSHAKE config_complete_id AFTER {tally}")
+            else:
+                rx_debug_log(f"HANDSHAKE {variant} #{counts[variant]}")
+
+    TracedInterface.__name__ = f"Traced{interface_class.__name__}"
+    TracedInterface.__qualname__ = TracedInterface.__name__
+    return TracedInterface
+RX_DEBUG_FILE_ENV_VAR = "MESHTASTICPASS_RX_DEBUG_FILE"
 
 
 def rx_debug_enabled() -> bool:
@@ -41,13 +187,35 @@ def rx_debug_enabled() -> bool:
 
 
 def rx_debug_log(line: str) -> None:
-    """Print one concise receive-pipeline diagnostic line.
+    """Record one concise receive-pipeline diagnostic line.
 
     Deliberately plain print() (not logging.*): this is a lightweight,
     opt-in terminal trace meant to run for hours in a normal foreground
     session on the uConsole, not a structured log file.
+
+    print() alone is invisible under the TUI, though. Textual owns the
+    terminal and redirects stdout, so the one session whose decisions we
+    most need to read -- the real app, deciding whether an arriving
+    packet is new or a duplicate -- is exactly the one that cannot show
+    them. Naming a path in MESHTASTICPASS_RX_DEBUG_FILE appends the same
+    lines there too, which is what lets the running app testify about
+    itself.
+
+    The file is opened per line and never held: the trace has to survive
+    a kill -9 mid-session, and an unwritable path must never be able to
+    take the radio down with it.
     """
-    print(f"[RX] {line}", flush=True)
+    entry = f"[RX] {line}"
+    print(entry, flush=True)
+    path = os.environ.get(RX_DEBUG_FILE_ENV_VAR, "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as sink:
+            sink.write(f"{time.strftime('%H:%M:%S')} {entry}\n")
+    except OSError:
+        # A diagnostic that can break the app is worse than no diagnostic.
+        pass
 
 
 def _canonical_node_number(number: Any) -> int | None:
@@ -643,14 +811,71 @@ class RadioService:
         # is the only reader and always reflects the CURRENT connection.
         self._connection_generation = 0
         self._config_snapshot: RadioConfigurationSnapshot | None = None
+        # See _on_text_received / _drain_connect_arrivals: packets the
+        # radio delivers while connect() is still blocked inside the SDK
+        # constructor, before self._interface can possibly be assigned.
+        self._connect_in_progress = False
+        self._connect_arrivals: list[tuple[Any, Any]] = []
+        # See _connect_timeout(): the first open after a close is the
+        # one that reliably does not take.
+        self._connected_since_open = False
 
-    def connect(self) -> RadioInfo:
-        """Connect, wait for the SDK's initial sync, and return local node info."""
+    def connect(self, *, defer_held: bool = False) -> RadioInfo:
+        """Connect, wait for the SDK's initial sync, and return local node info.
+
+        `defer_held` leaves packets caught during the connect window
+        (see _on_text_received) queued instead of delivering them before
+        returning. connection_events() uses it because delivering them
+        here is TOO EARLY: the app binds its CHAT history profile while
+        handling the ONLINE event, so a message replayed before that
+        lands with profile_key NULL and every later read -- narrowed by
+        `AND profile_key = ?` -- hides it. Observed exactly once in the
+        field: id 2034 stored in the same second as LINK online and
+        invisible ever after, while id 2035 arrived two seconds later
+        and was fine.
+        """
         self._connection_lost.clear()
         self._check_device()
 
         try:
-            self._interface = self._open_interface()
+            # THE BANKED-MESSAGE WINDOW.
+            #
+            # _open_interface() subscribes to meshtastic.receive.text and
+            # only THEN constructs the SDK interface, which blocks until
+            # config_complete_id. The firmware answers that by entering
+            # STATE_SEND_PACKETS and draining everything it queued for us
+            # while no client was attached (MeshService::toPhoneQueue) --
+            # on the SDK's reader thread, while this thread is still
+            # inside the constructor. Those packets therefore arrive
+            # BEFORE the assignment below can run, so _on_text_received
+            # sees a self._interface that is still None (first connect)
+            # or still the previous object (reconnect), and its
+            # stale-interface guard throws away the entire backlog.
+            #
+            # Whether that guard wins is a pure race, which is why this
+            # was intermittent for weeks and then total. Rather than
+            # weaken the guard -- it exists to reject a genuinely dead
+            # interface, which matters -- close the window: hold
+            # arrivals that cannot yet be judged, then replay them once
+            # the identity they must be judged against exists.
+            # NOT cleared here: a connect attempt that FAILS still drained
+            # the radio. The SDK's serial path waits only 30s for
+            # config_complete (stream_interface.connect ->
+            # _waitConnected(); BLE gets 60), and on a slow host with a
+            # large node DB the first attempt times out while the device
+            # is already replaying its backlog into it. Delivery is
+            # destructive, so those packets exist nowhere else -- the
+            # retry connects to an emptied queue and everything looks
+            # healthy. Anything held by a failed attempt is therefore
+            # carried into the next one and delivered when a connect
+            # finally succeeds.
+            self._connect_in_progress = True
+            try:
+                self._interface = self._open_interface()
+            finally:
+                self._connect_in_progress = False
+            if not defer_held:
+                self._drain_connect_arrivals()
             info = self._read_radio_info()
             if (
                 self._activity_local_node_id is not None
@@ -667,6 +892,7 @@ class RadioService:
             # from, so stale V3 settings can never leak into a V4's own
             # snapshot (see item 8: capability comes from what the SDK
             # actually reports here, never from device_path).
+            self._connected_since_open = True
             self._connection_generation += 1
             self._rebuild_config_snapshot()
             return info
@@ -723,16 +949,38 @@ class RadioService:
 
         stopped = stop_event or Event()
 
+        # The receive trace records [RX] packet lines only, and connection
+        # state changes went to print(), which Textual swallows. That left
+        # the log unable to answer the one question a silent gap in it
+        # raises: did the link drop and come back, or did it stall while
+        # the app went on believing it was connected? Those need opposite
+        # fixes, so the transitions belong in the same file as the packets.
         try:
             while not stopped.is_set():
+                if rx_debug_enabled():
+                    rx_debug_log(f"LINK connecting target={self.device_path}")
                 yield RadioEvent(RadioState.CONNECTING)
 
                 try:
-                    info = self.connect()
+                    info = self.connect(defer_held=True)
                 except RadioConnectionError as error:
+                    if rx_debug_enabled():
+                        rx_debug_log(f"LINK failed reason={error}")
                     yield RadioEvent(error.state, message=str(error))
                 else:
+                    if rx_debug_enabled():
+                        rx_debug_log(
+                            f"LINK online node={info.node_id} "
+                            f"short={info.short_name} nodes={info.known_nodes}"
+                        )
                     yield RadioEvent(RadioState.ONLINE, info=info)
+                    # A generator resumes only on the consumer's NEXT
+                    # iteration, so by here the ONLINE event has been
+                    # fully handled -- for the app that means the CHAT
+                    # history profile and channel list are bound, which
+                    # is what a replayed packet needs to be persisted
+                    # somewhere the reads can still see it.
+                    self._drain_connect_arrivals()
 
                     while not stopped.is_set():
                         if self._connection_lost.wait(poll_interval):
@@ -744,6 +992,8 @@ class RadioService:
                         break
 
                     self.close()
+                    if rx_debug_enabled():
+                        rx_debug_log("LINK offline reason=connection_lost")
                     yield RadioEvent(
                         RadioState.OFFLINE,
                         message=f"Connection to {self.device_path} was lost.",
@@ -2153,6 +2403,12 @@ class RadioService:
         # successful connect() always re-establishes both fresh from
         # that NEW radio's own reported identity.
         self._activity_local_node_id = None
+        # The next open is a FIRST open again, and the first open after a
+        # close is the one that reliably does not take (see
+        # FIRST_CONNECT_TIMEOUT_SECONDS). Forgetting this here would make
+        # every reconnect after the first spend 30s on an attempt that
+        # receives nothing.
+        self._connected_since_open = False
         self._direct_observations.clear()
         self._link_observations.clear()
         if self._interface is not None:
@@ -2184,14 +2440,26 @@ class RadioService:
         from pubsub import pub
 
         kind, location, port = parse_connection_target(self.device_path)
+        timeout = self._connect_timeout()
+        # See NODE_DB_AT_CONNECT_ENV_VAR: skipping the node replay is
+        # what makes the handshake complete reliably.
+        no_nodes = not node_db_at_connect_enabled()
+        if rx_debug_enabled():
+            rx_debug_log(
+                f"LINK opening node_db={'yes' if not no_nodes else 'skipped'}"
+            )
         self._subscribe_to_events(pub)
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
 
-            return TCPInterface(hostname=location, portNumber=port)
+            return _traced_interface(TCPInterface, timeout)(
+                hostname=location, portNumber=port, noNodes=no_nodes
+            )
         from meshtastic.serial_interface import SerialInterface
 
-        return SerialInterface(devPath=location)
+        return _traced_interface(SerialInterface, timeout)(
+            devPath=location, noNodes=no_nodes
+        )
 
     def _subscribe_to_events(self, pub: Any) -> None:
         if self._pub is not None:
@@ -2401,6 +2669,26 @@ class RadioService:
     ) -> None:
         debug = rx_debug_enabled()
         if interface is not None and interface is not self._interface:
+            if self._connect_in_progress:
+                # Mid-connect: self._interface is not assigned yet, so
+                # "is it ours?" has no answer to compare against. This is
+                # exactly when the radio replays its banked queue, so
+                # discarding here loses precisely the messages the user
+                # was away for. Hold it; connect() replays it against the
+                # real interface a moment later.
+                if len(self._connect_arrivals) < MAX_CONNECT_ARRIVALS:
+                    self._connect_arrivals.append((packet, interface))
+                    if debug:
+                        rx_debug_log(
+                            f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
+                            "held reason=connect_in_progress"
+                        )
+                elif debug:
+                    rx_debug_log(
+                        f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
+                        "dropped reason=connect_backlog_full"
+                    )
+                return
             if debug:
                 rx_debug_log(
                     f"{self._format_from_id(packet)} TEXT_MESSAGE_APP "
@@ -2432,6 +2720,54 @@ class RadioService:
             except Exception:
                 # One consumer should not stop radio packet processing.
                 pass
+
+    def _discard_connect_arrivals(self) -> None:
+        """Drop anything held, for a connect sequence that is over."""
+        dropped = len(self._connect_arrivals)
+        self._connect_arrivals = []
+        if dropped and rx_debug_enabled():
+            rx_debug_log(f"CONNECT discarding {dropped} held packet(s)")
+
+    def _connect_timeout(self) -> float:
+        """How long to wait for THIS attempt's initial download.
+
+        Short for the first attempt after a close, full-length after one
+        has succeeded -- see FIRST_CONNECT_TIMEOUT_SECONDS for the
+        measurement behind that.
+        """
+        if self._connected_since_open:
+            return CONNECT_TIMEOUT_SECONDS
+        return FIRST_CONNECT_TIMEOUT_SECONDS
+
+    def _drain_connect_arrivals(self) -> None:
+        """Replay packets held while the interface was being constructed.
+
+        Called immediately after self._interface is assigned, so every
+        held packet is now judged by the ordinary rule in
+        _on_text_received: one belonging to the interface we just opened
+        is delivered normally, and one from any other (a leftover from a
+        previous connection that lost the race) is discarded exactly as
+        it would have been.
+
+        The list is swapped out before iterating: the SDK reader thread
+        can still be appending, and re-entering _on_text_received must
+        not walk a list that is being mutated underneath it.
+        """
+        held, self._connect_arrivals = self._connect_arrivals, []
+        if not held:
+            return
+        if rx_debug_enabled():
+            rx_debug_log(f"CONNECT replaying {len(held)} held packet(s)")
+        # Replayed against the interface that SUCCEEDED, not the one that
+        # happened to deliver them. A packet held during this connect
+        # sequence may have arrived on an attempt that then timed out;
+        # that object is dead and its node database with it, so judging
+        # or parsing against it would throw away the very backlog this
+        # exists to rescue. Same radio, same device path -- the live node
+        # DB is the better authority anyway, and add_incoming's packet
+        # identity index absorbs anything that arrives twice.
+        for packet, _delivered_by in held:
+            self._on_text_received(packet=packet, interface=self._interface)
 
     def _record_direct_observation(
         self,

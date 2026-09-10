@@ -58,7 +58,6 @@ from geo import format_distance_miles
 from host_timezone import detect_host_timezone
 from grapheme_text import (
     install_flag_pair_protection,
-    terminal_safe_text,
     truncate_to_cells,
 )
 from keyboard_dropdown import DropdownOption, KeyboardDropdown
@@ -108,6 +107,13 @@ from terminal_width import (
     install_terminal_widths,
     measure_terminal,
     plan_corrections,
+)
+from backlog import (
+    Backlog,
+    backlog_label,
+    is_banked,
+    record_banked,
+    settle,
 )
 from radio_service import (
     ChannelInfo,
@@ -2101,6 +2107,41 @@ class EndOfChatHistoryMarker(Static):
         )
 
 
+class BacklogIndicator(Static):
+    """The newest block in the transcript while the radio's backlog drains.
+
+    A radio left running collects messages and hands them over when a
+    client finally attaches, so the first thing a person sees after
+    opening the app is a burst arriving faster than anyone can read,
+    indistinguishable from a very busy mesh. This says what is actually
+    happening, in the place they are already looking: the bottom of the
+    transcript, where the newest message would be.
+
+    Animated on the SAME frame SENDING's arrows use (see
+    _sending_arrows_text/SENDING_ARROW_FRAMES) rather than a timer of
+    its own -- two animations on the same screen ticking independently
+    read as a glitch, and this app already made that decision once.
+
+    Not focusable and never an entry: it is a status line that happens
+    to live in the transcript, and arrow navigation must not stop on
+    something that is about to vanish.
+    """
+
+    can_focus = False
+
+    def __init__(self) -> None:
+        super().__init__(id="backlog-indicator", markup=False)
+        self._count = 0
+
+    def update_backlog(self, count: int, animation_frame: int, theme: str) -> None:
+        self._count = count
+        palette = THEME_PALETTES[theme]
+        text = _sending_arrows_text(animation_frame, theme)
+        text.append("  ")
+        text.append(backlog_label(count), style=Style(color=palette.base))
+        self.update(text)
+
+
 class StartOfChannelHistoryMarker(Static):
     """Informational-only proof a channel has zero stored messages yet.
 
@@ -4049,16 +4090,15 @@ class ChatEntryWidget(Vertical):
         # or its width -- see ChatEntryWidget.on_focus/on_blur, which
         # only ever update the separate, fixed-width selection_marker.
         #
-        # terminal_safe_text() additionally substitutes keycap-digit
-        # emoji (e.g. a boxed/keycap-style "5") with the equivalent
-        # single-codepoint circled digit -- see grapheme_text.py for
-        # why that specific sequence's Rich/Textual-accounted width can
-        # disagree with what a plain terminal font actually paints.
-        # Display-only: self.entry.text itself, chat_store persistence,
-        # the outgoing RF payload, and @mention matching all still use
-        # the original, untouched text.
+        # The text renders EXACTLY as received. A keycap emoji used to
+        # be swapped here for a circled digit, because Rich accounted it
+        # 2 cells and a bare terminal font might paint 1. The startup
+        # terminal measurement (terminal_width.py) fixes that at the
+        # source now, and the substitution was actively wrong -- it
+        # showed the wrong glyph for every keycap on a mesh where people
+        # count off with them.
         self.message_label = Static(
-            terminal_safe_text(self.entry.text),
+            self.entry.text,
             classes="chat-entry-text",
             markup=False,
         )
@@ -5409,6 +5449,16 @@ class MeshtasticPassApp(App[None]):
         border: none;
     }
 
+    #backlog-indicator {
+        width: 100%;
+        height: 1;
+        color: $snow_base;
+    }
+
+    Screen.theme-{THEME} #backlog-indicator {
+        color: ${THEME}_base;
+    }
+
     #chat-new-below {
         height: 1;
         color: $snow_accent;
@@ -5697,6 +5747,12 @@ class MeshtasticPassApp(App[None]):
         self._has_older_history = False
         self._mounted_chat_target = DEFAULT_HISTORY_LIMIT
         self._chat_open_scroll_pending = False
+        # When this session attached, and how much history the radio
+        # handed over afterwards (see backlog.py). _connected_at is the
+        # dividing line: anything the radio timestamped before it was
+        # already sitting on the device.
+        self._connected_at: float | None = None
+        self._backlog = Backlog()
         self._user_menu: ViewportMenu | None = None
         self._user_menu_origin: Widget | None = None
         self._user_menu_scroll_target: ScrollableContainer | None = None
@@ -8674,6 +8730,13 @@ class MeshtasticPassApp(App[None]):
         self._show_connection(event.state, event.info, event.message)
 
     def _accept_received_message(self, message: ReceivedMessage) -> None:
+        # History the radio was already holding, rather than something
+        # that just happened (see backlog.py). Counted before anything
+        # else can return early, so the indicator's number matches what
+        # actually arrived.
+        if is_banked(getattr(message, "radio_rx_at", None), self._connected_at):
+            self._backlog = record_banked(self._backlog, self._monotonic())
+            self._refresh_backlog_indicator()
         # Before anything else: this sender is a PASSES encounter
         # whatever happens to the message afterwards -- though not
         # necessarily a DIRECT one (see _record_pass_from_message).
@@ -8691,6 +8754,10 @@ class MeshtasticPassApp(App[None]):
             # item 3) already decided this; route it to its own DM
             # conversation, never mingled into channel history merely
             # because packet.channel happens to be present (item 12).
+            if rx_debug_enabled():
+                rx_debug_log(
+                    f"ROUTE dm node={message.sender_node_id} reason=is_direct"
+                )
             self._accept_received_dm(message)
             return
         channel_index = message.channel_index or 0
@@ -9042,12 +9109,22 @@ class MeshtasticPassApp(App[None]):
             chat_inputs[0].value = state.draft
             chat_inputs[0].cursor_position = len(state.draft)
         transcript = self.query_one("#chat-log", ChatTranscript)
-        await transcript.remove_children()
+        # Raised BEFORE the first await, not after it. remove_children()
+        # yields to the event loop, and a message arriving in that gap
+        # runs _insert_chat_widget against a transcript this method has
+        # just emptied and is about to refill -- which mounted a second
+        # LoadOlderControl and killed the app with DuplicateIds, on the
+        # very reconnect where a backlog was being delivered. Cleared in
+        # a finally so a failed rebuild cannot wedge the flag on and
+        # silently stop every later arrival from rendering.
         self._transcript_rebuilding = True
-        widgets = self._initial_chat_widgets(channel_index, state)
-        if widgets:
-            await transcript.mount(*widgets)
-        self._transcript_rebuilding = False
+        try:
+            await transcript.remove_children()
+            widgets = self._initial_chat_widgets(channel_index, state)
+            if widgets:
+                await transcript.mount(*widgets)
+        finally:
+            self._transcript_rebuilding = False
         if self.current_tab == "chat" and self._chat_mode == "channel":
             self._mark_unread_messages_viewed()
             self._recount_unread()
@@ -9143,6 +9220,13 @@ class MeshtasticPassApp(App[None]):
         *,
         older: bool,
     ) -> None:
+        if self._transcript_rebuilding:
+            # A rebuild is mid-flight and renders the whole transcript
+            # from state.entries, which already contains this entry
+            # (it was appended, and persisted, before we got here).
+            # Mounting it separately would duplicate it -- and race the
+            # rebuild's own widgets for the singleton control IDs.
+            return
         transcript = self.query_one("#chat-log", ChatTranscript)
         # The empty-channel marker (StartOfChannelHistoryMarker) is only
         # ever mounted when a channel has zero entries -- the first real
@@ -9204,6 +9288,37 @@ class MeshtasticPassApp(App[None]):
                 if widget.entry is following_entry
             ),
             None,
+        )
+
+    def _refresh_backlog_indicator(self) -> None:
+        """Mount, update or remove the drain indicator.
+
+        Mounted LAST inside the transcript so it is the newest block --
+        the position the next message would take, which is where
+        somebody watching a burst arrive is already looking. Removed
+        rather than hidden once the drain is over: a spent indicator
+        left in the DOM is one more thing every later mount has to be
+        positioned around.
+
+        Cheap enough to call on every arriving message and every 0.45s
+        tick, because the common case is "not draining, nothing
+        mounted" and returns immediately.
+        """
+        existing = list(self.query(BacklogIndicator))
+        if not self._backlog.draining:
+            for indicator in existing:
+                indicator.remove()
+            return
+        transcripts = list(self.query("#chat-log"))
+        if not transcripts:
+            return
+        indicator = existing[0] if existing else BacklogIndicator()
+        if not existing:
+            transcripts[0].mount(indicator)
+        indicator.update_backlog(
+            self._backlog.count,
+            self._send_animation_frame,
+            self._current_theme,
         )
 
     def _trim_mounted_chat_window(self, transcript: ChatTranscript) -> None:
@@ -10331,6 +10446,11 @@ class MeshtasticPassApp(App[None]):
             SENDING_ARROW_FRAMES
         ) + 1
         now = monotonic()
+        # The backlog indicator shares this frame rather than running a
+        # timer of its own, and this is also where it notices the drain
+        # has gone quiet and retires itself.
+        self._backlog = settle(self._backlog, self._monotonic())
+        self._refresh_backlog_indicator()
         # Every channel's AND every DM conversation's entries, not just
         # the currently-viewed one -- a send left in flight on a channel
         # or DM the user has since switched away from must still
@@ -11848,6 +11968,17 @@ class MeshtasticPassApp(App[None]):
         )
         self._assign_arrival_order(entry)
         inserted = self._persist_incoming(entry)
+        if rx_debug_enabled():
+            if entry.message_id is not None:
+                rx_debug_log(
+                    f"DM STORE id={entry.message_id} node={node_id} "
+                    + ("inserted" if inserted else "duplicate, ignored")
+                )
+            else:
+                rx_debug_log(
+                    f"DM STORE not persisted node={node_id} "
+                    "reason=no_chat_store_attached"
+                )
         if not inserted:
             return
         state.entries.append(entry)
@@ -13157,6 +13288,15 @@ class MeshtasticPassApp(App[None]):
         # already-ONLINE radio calling this again (e.g. a redundant
         # event) must never re-trigger a sync.
         was_online = self._radio_state is RadioState.ONLINE
+        # The dividing line the backlog is measured against. Set on the
+        # TRANSITION into ONLINE only: a redundant ONLINE event must not
+        # move it forward, or messages still draining would start
+        # looking live.
+        if state is RadioState.ONLINE and not was_online:
+            self._connected_at = self._now()
+            self._backlog = Backlog()
+        elif state is not RadioState.ONLINE:
+            self._connected_at = None
         self._radio_state = state
         self._radio_info = info if state is RadioState.ONLINE else None
         # TRACE ROUTE (Part C): a disconnect (for any reason -- dropped

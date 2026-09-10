@@ -16,7 +16,6 @@ implementation rather than two independent copies of the same algorithm.
 
 from __future__ import annotations
 
-import re
 import unicodedata
 
 import rich.cells
@@ -217,45 +216,20 @@ COMBINING_ENCLOSING_KEYCAP = "⃣"
 # such divergence corrupts everything drawn after the mismatch, not just
 # the emoji glyph itself -- in CHAT, that means the scrollbar.
 #
-# Unlike install_flag_pair_protection() above (which only changes where
-# a wrap break may fall), this is a genuine text substitution: there is
-# no wrap-boundary trick that can fix a terminal painting a different
-# number of columns than were accounted for. terminal_safe_text() is
-# applied only at the display boundary (see app.py's ChatEntryWidget) --
-# never to entry.text itself, chat_store persistence, the outgoing RF
-# payload, or @mention matching -- so the message a user typed or
-# received is always stored and transmitted exactly as-is.
-_KEYCAP_BASE_TO_CIRCLED = {
-    "0": "⓪",  # CIRCLED DIGIT ZERO
-    "1": "①",
-    "2": "②",
-    "3": "③",
-    "4": "④",
-    "5": "⑤",
-    "6": "⑥",
-    "7": "⑦",
-    "8": "⑧",
-    "9": "⑨",
-}
-_KEYCAP_DIGIT_PATTERN = re.compile(r"([0-9])️?" + COMBINING_ENCLOSING_KEYCAP)
-
-
-def terminal_safe_text(text: str) -> str:
-    """Replace unreliable-width keycap-digit sequences for display.
-
-    Each digit keycap emoji ("0️⃣"-"9️⃣", qualified or unqualified) is
-    replaced with the single-codepoint CIRCLED DIGIT of the same
-    number -- an ordinary Number-category character with no
-    presentation-selector or combining-mark interaction, so its
-    rendered width can never disagree with what Rich/Textual accounted
-    for. No other emoji or character is touched: a bare digit or a
-    COMBINING ENCLOSING KEYCAP not paired with the other is left alone,
-    since only the full sequence carries the width risk above. "#" and
-    "*" keycap sequences are left untouched -- not the reported bug and
-    without a matching single-codepoint circled glyph to substitute.
-    """
-    if COMBINING_ENCLOSING_KEYCAP not in text:
-        return text
-    return _KEYCAP_DIGIT_PATTERN.sub(
-        lambda match: _KEYCAP_BASE_TO_CIRCLED[match.group(1)], text
-    )
+# This USED to be fixed by substituting the single-codepoint CIRCLED
+# DIGIT at the display boundary (terminal_safe_text()). That is gone.
+#
+# The app now MEASURES its own terminal at startup and corrects Rich's
+# width table to match what the font actually paints (terminal_width.py),
+# so the accounted width no longer disagrees and there is nothing left to
+# substitute around. Keeping the substitution cost correctness: real
+# traffic on this mesh is full of keycaps -- people count off with them --
+# and every one rendered as the wrong glyph, so a message reading "2" in
+# a box arrived looking like a circled 2. It was not even width-neutral,
+# since CIRCLED DIGIT is itself East_Asian_Width=AMBIGUOUS.
+#
+# COMBINING_ENCLOSING_KEYCAP above is kept as the named codepoint these
+# notes and the tests refer to. Nothing here matches on it any more:
+# attaches_to_previous() keeps a keycap whole across a wrap boundary via
+# the mark's Unicode CATEGORY (Me, in COMBINING_CATEGORIES), which is
+# the general rule and needs no per-emoji special case.
