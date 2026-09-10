@@ -3470,6 +3470,14 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 (1_001.0, "RX 9s"),
                 (1_002.0, "RX 10s"),
             ):
+                # Pin the app's whole notion of "now", not just this
+                # call's. The 1s timer calls _refresh_chat_timestamps()
+                # with NO argument and recomputes against the real wall
+                # clock, so a pause here could overwrite the fixture
+                # instant with a real one -- which is what produced
+                # "RX 2d 6h" where "RX 9s" was expected. Same reason
+                # _pin_clock exists for the MESH tests.
+                app._clock = lambda now=now: now
                 app._refresh_chat_timestamps(now)
                 await pilot.pause()
                 self.assertEqual(
@@ -3478,7 +3486,9 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIs(list(app.query(ChatEntryWidget))[0], original_widget)
 
-            app._refresh_chat_timestamps(incoming_entry.age_reference + 63 * 60)
+            later = incoming_entry.age_reference + 63 * 60
+            app._clock = lambda: later
+            app._refresh_chat_timestamps(later)
             await pilot.pause()
             incoming_timestamp = widgets[0].query_one(
                 ".chat-entry-timestamp", Static
@@ -6489,11 +6499,19 @@ class MeshtasticPassAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("2")
             await pilot.pause()
             self.assertEqual(app.current_tab, "chat")
-            chat_heading = str(app.query_one("#chat-title", Static).render())
-
             await pilot.press("4")
             await pilot.pause()
             self.assertEqual(app.current_tab, "mesh")
+
+            # Read BOTH after the same refresh. The status text carries
+            # an animated dot count that advances on its own ~0.45s
+            # timer, so reading CHAT's before the tab switch and MESH's
+            # after compared two different animation frames and failed
+            # with "RETRYING..." != "RETRYING." -- the two widgets
+            # agreeing was never in question, only the instant each was
+            # read at. Both widgets stay mounted, so both can be read
+            # at once.
+            chat_heading = str(app.query_one("#chat-title", Static).render())
             mesh_heading = str(app.query_one("#mesh-connection-status", Static).render())
 
             self.assertEqual(chat_heading, mesh_heading)
