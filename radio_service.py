@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
+import functools
 import os
 from pathlib import Path
 from threading import Event
@@ -29,6 +30,41 @@ RX_DEBUG_ENV_VAR = "MESHTASTICPASS_RX_DEBUG"
 # this cannot legitimately be reached by a backlog drain; it exists only
 # so a pathological connect can never grow this list without limit.
 MAX_CONNECT_ARRIVALS = 256
+
+# How long to let the radio finish its initial node-DB download.
+#
+# The SDK's serial path waits 30s (stream_interface.connect ->
+# _waitConnected(); BLE asks for 60 explicitly, so 30 is a default
+# nobody chose for this case). On a CM4 with a 34-node database the
+# first attempt times out at ~33s while the device is mid-replay, and
+# the retry then succeeds in about 3 -- because the first attempt
+# already drained the radio. Everything banked while the app was closed
+# dies in that gap.
+#
+# Carrying held packets across a failed attempt (see connect()) makes
+# that survivable; this makes it rare. A connect that is genuinely going
+# to fail still fails, just later -- and the reconnect loop was already
+# willing to spend 33s on the attempt plus a retry delay.
+CONNECT_TIMEOUT_SECONDS = 90.0
+
+
+@functools.lru_cache(maxsize=4)
+def _patient_interface(interface_class: type) -> type:
+    """`interface_class` with a longer initial-download timeout.
+
+    A subclass overriding one default argument, rather than patching the
+    SDK's class or reimplementing StreamInterface.connect()'s handshake
+    (which would pin us to today's private internals -- START2, the
+    reader thread, _startConfig -- across SDK upgrades).
+    """
+
+    class PatientInterface(interface_class):  # type: ignore[valid-type,misc]
+        def _waitConnected(self, timeout: float = CONNECT_TIMEOUT_SECONDS):
+            return super()._waitConnected(timeout)
+
+    PatientInterface.__name__ = f"Patient{interface_class.__name__}"
+    PatientInterface.__qualname__ = PatientInterface.__name__
+    return PatientInterface
 RX_DEBUG_FILE_ENV_VAR = "MESHTASTICPASS_RX_DEBUG_FILE"
 
 
@@ -705,8 +741,18 @@ class RadioService:
             # interface, which matters -- close the window: hold
             # arrivals that cannot yet be judged, then replay them once
             # the identity they must be judged against exists.
+            # NOT cleared here: a connect attempt that FAILS still drained
+            # the radio. The SDK's serial path waits only 30s for
+            # config_complete (stream_interface.connect ->
+            # _waitConnected(); BLE gets 60), and on a slow host with a
+            # large node DB the first attempt times out while the device
+            # is already replaying its backlog into it. Delivery is
+            # destructive, so those packets exist nowhere else -- the
+            # retry connects to an emptied queue and everything looks
+            # healthy. Anything held by a failed attempt is therefore
+            # carried into the next one and delivered when a connect
+            # finally succeeds.
             self._connect_in_progress = True
-            self._connect_arrivals = []
             try:
                 self._interface = self._open_interface()
             finally:
@@ -2266,10 +2312,12 @@ class RadioService:
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
 
-            return TCPInterface(hostname=location, portNumber=port)
+            return _patient_interface(TCPInterface)(
+                hostname=location, portNumber=port
+            )
         from meshtastic.serial_interface import SerialInterface
 
-        return SerialInterface(devPath=location)
+        return _patient_interface(SerialInterface)(devPath=location)
 
     def _subscribe_to_events(self, pub: Any) -> None:
         if self._pub is not None:
@@ -2531,6 +2579,13 @@ class RadioService:
                 # One consumer should not stop radio packet processing.
                 pass
 
+    def _discard_connect_arrivals(self) -> None:
+        """Drop anything held, for a connect sequence that is over."""
+        dropped = len(self._connect_arrivals)
+        self._connect_arrivals = []
+        if dropped and rx_debug_enabled():
+            rx_debug_log(f"CONNECT discarding {dropped} held packet(s)")
+
     def _drain_connect_arrivals(self) -> None:
         """Replay packets held while the interface was being constructed.
 
@@ -2550,8 +2605,16 @@ class RadioService:
             return
         if rx_debug_enabled():
             rx_debug_log(f"CONNECT replaying {len(held)} held packet(s)")
-        for packet, interface in held:
-            self._on_text_received(packet=packet, interface=interface)
+        # Replayed against the interface that SUCCEEDED, not the one that
+        # happened to deliver them. A packet held during this connect
+        # sequence may have arrived on an attempt that then timed out;
+        # that object is dead and its node database with it, so judging
+        # or parsing against it would throw away the very backlog this
+        # exists to rescue. Same radio, same device path -- the live node
+        # DB is the better authority anyway, and add_incoming's packet
+        # identity index absorbs anything that arrives twice.
+        for packet, _delivered_by in held:
+            self._on_text_received(packet=packet, interface=self._interface)
 
     def _record_direct_observation(
         self,

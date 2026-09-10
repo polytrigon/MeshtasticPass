@@ -155,22 +155,28 @@ class ConnectWindowTests(unittest.TestCase):
 
     # ---- the guard still has to guard --------------------------------
 
-    def test_a_packet_from_a_different_interface_is_still_discarded(self) -> None:
-        """The stale-interface guard exists for a reason; keep it.
+    def test_everything_held_during_a_connect_is_attributed_to_the_winner(self) -> None:
+        """A held packet is judged by the connection that succeeded.
 
-        A leftover packet from a previous connection must not be
-        smuggled in by the hold -- being replayed is not the same as
-        being trusted.
+        Deliberate, and a change from the first version of this fix. The
+        SDK's serial path waits 30s for config_complete; on a slow host
+        with a large node DB the FIRST attempt times out while the radio
+        is already replaying its backlog into it. Those packets arrive
+        on an interface that is about to die. Insisting they match the
+        final interface would discard exactly the backlog this exists to
+        rescue -- and since delivery drains the radio destructively,
+        nothing else holds a copy.
         """
-        stale = make_interface()
+        doomed = make_interface()
         opened = make_interface()
 
         def open_interface():
             self.service._on_text_received(
-                packet=banked_packet("from the dead connection"), interface=stale
+                packet=banked_packet("held by the attempt that timed out"),
+                interface=doomed,
             )
             self.service._on_text_received(
-                packet=banked_packet("from the live one"), interface=opened
+                packet=banked_packet("held by the one that worked"), interface=opened
             )
             return opened
 
@@ -180,7 +186,42 @@ class ConnectWindowTests(unittest.TestCase):
         ):
             self.service.connect()
 
-        self.assertEqual([m.text for m in self.received], ["from the live one"])
+        self.assertEqual(
+            [m.text for m in self.received],
+            ["held by the attempt that timed out", "held by the one that worked"],
+        )
+
+    def test_packets_held_by_a_failed_attempt_survive_into_the_next(self) -> None:
+        """The real observed failure, end to end.
+
+        12:10:39 LINK connecting / 12:11:12 LINK failed (timed out) /
+        12:11:18 LINK connecting / 12:11:21 LINK online. The radio
+        drained into the attempt that died. Before this, `connect()`
+        raised before the interface was ever assigned, so the drain was
+        never replayed and the retry met an empty queue.
+        """
+        opened = make_interface()
+        attempts = []
+
+        def open_interface():
+            attempts.append(1)
+            if len(attempts) == 1:
+                self.service._on_text_received(
+                    packet=banked_packet("banked overnight"), interface=make_interface()
+                )
+                raise OSError("Timed out waiting for connection completion")
+            return opened
+
+        with (
+            patch.object(self.service, "_check_device"),
+            patch.object(self.service, "_open_interface", side_effect=open_interface),
+        ):
+            with self.assertRaises(Exception):
+                self.service.connect()
+            self.assertEqual(self.received, [], "not deliverable until a connect wins")
+            self.service.connect()
+
+        self.assertEqual([m.text for m in self.received], ["banked overnight"])
 
     def test_after_connecting_a_stale_packet_is_discarded_as_before(self) -> None:
         """Outside the window, nothing about the old behaviour changes."""
@@ -221,6 +262,11 @@ class ConnectWindowTests(unittest.TestCase):
                 self.service.connect()
 
         self.assertFalse(self.service._connect_in_progress)
+        self.assertEqual(
+            self.service._connect_arrivals,
+            [],
+            "nothing arrived, so nothing should be carried",
+        )
 
     def test_the_hold_is_bounded(self) -> None:
         """A pathological connect must not grow the list without limit."""
